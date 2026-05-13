@@ -41,13 +41,18 @@ type JobMeta = {
   };
 };
 
+type CompletionDeliveryContext = {
+  isIdle: () => boolean;
+};
+
 type JobRuntime = JobMeta & {
   process: ChildProcessByStdio<null, Readable, Readable>;
   waiters: Array<() => void>;
   activeWaiters: number;
-  // Suppresses completion follow-ups until shell_start returns its in-band result.
+  // Suppresses completion notices until shell_start returns its in-band result.
   startResultPending: boolean;
   cancelRequested: boolean;
+  completionContext: CompletionDeliveryContext;
 };
 
 type JobSummaryDetails = {
@@ -78,7 +83,7 @@ type CompletionNotificationTarget = {
 type CompletionNotificationOptions = {
   isReady: () => boolean;
   markNotified: () => void;
-  send: () => void;
+  queue: () => void;
 };
 
 type CommandSpec = {
@@ -93,6 +98,7 @@ const START_WAIT_FOR_COMPLETION_SECONDS = 6;
 const START_RESULT_TAIL_MAX_CHARS = 20000;
 const NOTIFICATION_TAIL_LINES = 8;
 const NOTIFICATION_TAIL_MAX_CHARS = 2000;
+const COMPLETION_BATCH_FLUSH_DELAY_MS = 100;
 const CommandItem = Type.Object({
   command: Type.String({ minLength: 1, description: "Shell command to start." }),
   cwd: Type.String({ minLength: 1, description: "Working directory for this command. Use per-command cwd; shell_start has no top-level cwd." }),
@@ -135,6 +141,9 @@ type CancelInput = Static<typeof CancelParams>;
 
 const jobs = new Map<string, JobRuntime>();
 const scheduledCompletionNotifications = new WeakSet<CompletionNotificationTarget>();
+const pendingCompletionNotifications = new Map<string, JobRuntime>();
+let completionBatchFlushTimer: NodeJS.Timeout | undefined;
+let latestCompletionContext: CompletionDeliveryContext | undefined;
 
 export default function asyncShellExtension(api: ExtensionAPI): void {
   registerCommandWithAliases(
@@ -153,6 +162,18 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     return renderAsyncShellMessage(message.details, options, theme);
   });
 
+  api.on("message_end", (event, context) => {
+    if (event.message.role === "user") {
+      flushCompletionNotificationBatch(api, createCompletionDeliveryContext(context), { allowActive: true });
+    }
+  });
+  api.on("turn_end", (_event, context) => {
+    flushCompletionNotificationBatch(api, createCompletionDeliveryContext(context), { allowActive: true });
+  });
+  api.on("agent_end", (_event, context) => {
+    scheduleCompletionBatchFlush(api, createCompletionDeliveryContext(context));
+  });
+
   api.registerTool(defineTool({
     name: "shell_start",
     label: "Async Shell Start",
@@ -162,8 +183,8 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
       "Each command item must include its own command and cwd, and starts as a durable async job with its own jobId, status, cwd, logs, and stdout/stderr output. Standard input is ignored, so do not use shell_start for interactive commands.",
       "Results are grouped per job as { jobs: Array<{ job: JobMeta, output: { stdout: string, stderr: string } }> }. A single shell_start call accepts at most 12 commands.",
       `shell_start waits only for a fixed ${START_WAIT_FOR_COMPLETION_SECONDS}s grace period: jobs that finish quickly return in-band; unfinished jobs continue in the background and, by default, append completion notices when they exit.`,
-      "In-band shell_start results include compact job fields plus bounded stdout/stderr tails. Completion notices are short result notices added to history/TUI without triggering a new assistant turn; use shell_tail for output. Start-result output is capped by tailLines and about 20 KB per stream.",
-      "Continue useful work while jobs run. If there is no useful work, stop after reporting that jobs are running; completion notices will appear in history. Do not poll or wait.",
+      "In-band shell_start results include compact job fields plus bounded stdout/stderr tails. Completion notices are short result notices batched into history/TUI, then Pi triggers one assistant turn for each flushed batch; use shell_tail for output. Start-result output is capped by tailLines and about 20 KB per stream.",
+      "Continue useful work while jobs run. If there is no useful work, stop after reporting that jobs are running; completion notices will appear in history and resume the agent. Do not poll or wait.",
       "Set per-command notifyOnExit:false only when the result is unimportant.",
       "Use shell_status to inspect jobs and shell_tail to read output after a result/notification, or only when necessary for a specific active job; do not use them for polling."
     ].join(" "),
@@ -175,8 +196,8 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
       "Prefer search_many for code/file discovery. If using shell_start for custom search, start with rg --files, rg -n, git grep -n, or bounded find before reading file contents.",
       `shell_start waits only for a fixed ${START_WAIT_FOR_COMPLETION_SECONDS}s grace period; there is no wait parameter. Jobs that do not finish in-band continue in the background and append per-job completion notices by default.`,
       "Set per-command notifyOnExit:false only when the result is unimportant.",
-      "Async-shell completion notices are short result notices added to history/TUI without triggering a new assistant turn. Use shell_tail if the user asks about or needs job output; do not paste raw shell output unless explicitly requested.",
-      "Continue useful work while jobs run; if there is no useful work, stop after reporting that jobs are running. Do not poll or wait. Use shell_status and shell_tail only after a result/notification or when necessary for a specific active job."
+      "Async-shell completion notices are short result notices batched into history/TUI before Pi resumes the agent once for the flushed batch. Use shell_tail if the user asks about or needs job output; do not paste raw shell output unless explicitly requested.",
+      "Continue useful work while jobs run; if there is no useful work, stop after reporting that jobs are running and let the completion batch resume the agent. Do not poll or wait. Use shell_status and shell_tail only after a result/notification or when necessary for a specific active job."
     ],
     parameters: StartParams,
     executionMode: "parallel",
@@ -333,6 +354,7 @@ function startJob(
     activeWaiters: 0,
     startResultPending: true,
     cancelRequested: false,
+    completionContext: createCompletionDeliveryContext(context),
     pid: child.pid
   };
 
@@ -421,18 +443,7 @@ function scheduleCompletionNotification(api: ExtensionAPI, job: JobRuntime): voi
   scheduleCompletionFollowUp(job, {
     isReady: () => !job.startResultPending && job.activeWaiters === 0,
     markNotified: () => writeMeta(job),
-    send: () => api.sendMessage(
-      {
-        customType: "async-shell",
-        content: formatCompletionMessage(job),
-        display: true,
-        details: {
-          job: publicJob(job),
-          output: readJobOutput(job, NOTIFICATION_TAIL_LINES, NOTIFICATION_TAIL_MAX_CHARS)
-        }
-      },
-      { deliverAs: "steer" }
-    )
+    queue: () => queueCompletionNotification(api, job)
   });
 }
 
@@ -455,19 +466,78 @@ function scheduleCompletionFollowUp(target: CompletionNotificationTarget, option
 
     target.completionNotified = true;
     options.markNotified();
-
-    try {
-      options.send();
-    } catch {
-      // Pi may be shutting down; the persisted logs still hold the result.
-    }
+    options.queue();
   }, 0);
+}
+
+function queueCompletionNotification(api: ExtensionAPI, job: JobRuntime): void {
+  pendingCompletionNotifications.set(job.jobId, job);
+  scheduleCompletionBatchFlush(api, job.completionContext);
+}
+
+function scheduleCompletionBatchFlush(api: ExtensionAPI, context: CompletionDeliveryContext): void {
+  latestCompletionContext = context;
+  if (completionBatchFlushTimer !== undefined) {
+    return;
+  }
+
+  completionBatchFlushTimer = setTimeout(() => {
+    completionBatchFlushTimer = undefined;
+    flushCompletionNotificationBatch(api, latestCompletionContext, { allowActive: false });
+  }, COMPLETION_BATCH_FLUSH_DELAY_MS);
+}
+
+function flushCompletionNotificationBatch(api: ExtensionAPI, context: CompletionDeliveryContext | undefined, options: { allowActive: boolean }): void {
+  if (pendingCompletionNotifications.size === 0) {
+    return;
+  }
+  if (!options.allowActive && context !== undefined && !context.isIdle()) {
+    return;
+  }
+
+  const entries = Array.from(pendingCompletionNotifications.values()).map((job) => ({
+    job: publicJob(job),
+    output: readJobOutput(job, NOTIFICATION_TAIL_LINES, NOTIFICATION_TAIL_MAX_CHARS)
+  }));
+  pendingCompletionNotifications.clear();
+
+  try {
+    api.sendMessage(
+      {
+        customType: "async-shell",
+        content: formatCompletionBatchMessage(entries.map((entry) => entry.job)),
+        display: true,
+        details: entries.length === 1 ? entries[0] : { jobs: entries }
+      },
+      { triggerTurn: true, deliverAs: "steer" }
+    );
+  } catch {
+    // Pi may be shutting down; the persisted logs still hold the result.
+  }
+}
+
+function createCompletionDeliveryContext(context: Partial<Pick<ExtensionContext, "isIdle">> | undefined): CompletionDeliveryContext {
+  const isIdle = typeof context?.isIdle === "function"
+    ? () => context.isIdle?.() === true
+    : () => true;
+  return { isIdle };
 }
 
 function formatCompletionMessage(job: JobMeta): string {
   return [
     `async shell result: ${formatShellJobStatus(job)}`,
     `more: shell_tail jobId=${job.jobId}`
+  ].join("\n");
+}
+
+function formatCompletionBatchMessage(jobsList: JobMeta[]): string {
+  if (jobsList.length === 1) {
+    return formatCompletionMessage(jobsList[0]);
+  }
+
+  return [
+    `async shell results: ${jobsList.length} jobs completed`,
+    ...jobsList.map((job) => `- ${formatShellJobStatus(job)}\n  more: shell_tail jobId=${job.jobId}`)
   ].join("\n");
 }
 
@@ -780,6 +850,7 @@ function normalizeCommandSpecs(input: StartInput): CommandSpec[] {
 function finishStartGracePeriod(jobsList: JobRuntime[]): void {
   for (const job of jobsList.filter((candidate) => isTerminal(candidate.status))) {
     job.completionNotified = true;
+    pendingCompletionNotifications.delete(job.jobId);
     writeMeta(job);
   }
 
@@ -795,6 +866,7 @@ function acknowledgeObservedJobCompletion(job: JobMeta): void {
   }
 
   runtime.completionNotified = true;
+  pendingCompletionNotifications.delete(runtime.jobId);
   writeMeta(runtime);
 }
 
@@ -837,7 +909,7 @@ export function buildAsyncShellStatusText(context: Pick<ExtensionContext, "cwd">
     `Job root: ${root}`,
     `Job root state: ${describePathAccess(root)}`,
     `Recent jobs: ${recentJobs.length} (${running} running, ${terminal} terminal or detached)`,
-    running > 0 ? "Use shell_status without a jobId to list jobs, shell_tail with a jobId to read output, or shell_cancel to stop a running job. Do not poll; completion notices will be added to history." : "No running jobs in the recent async-shell registry.",
+    running > 0 ? "Use shell_status without a jobId to list jobs, shell_tail with a jobId to read output, or shell_cancel to stop a running job. Do not poll; completion notices will be batched into history and resume the agent." : "No running jobs in the recent async-shell registry.",
     recentJobs.some((job) => job.status === "unknown") ? "Some jobs were started by a previous Pi process and are no longer attached." : undefined
   ].filter((line): line is string => line !== undefined).join("\n");
 }

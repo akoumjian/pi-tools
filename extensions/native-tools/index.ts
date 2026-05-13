@@ -258,7 +258,7 @@ const EditManyParams = Type.Object({
 
 const BashParams = Type.Object({
   command: Type.String({ description: "Disabled. Use shell_start with commands: [...] instead." }),
-  timeout: Type.Optional(Type.Number({ description: "Disabled. shell_start uses a fixed short quick-command wait and async follow-up for unfinished jobs." }))
+  timeout: Type.Optional(Type.Number({ description: "Disabled. shell_start uses a fixed short quick-command wait and async completion notices for unfinished jobs." }))
 }, { additionalProperties: false });
 
 export type ReadManyInput = Static<typeof ReadManyParams>;
@@ -592,7 +592,7 @@ export function addBatchNativeToolGuidance(prompt: string): string {
     "- When several known files or ranges are needed, read them in one read_many.files array instead of serial read calls.",
     "- For shell work, use shell_start with commands: [...]. Start independent shell work together in one commands list instead of making serial shell_start calls; split only when commands depend on previous output, must run in order, or are not safe to run concurrently. Each shell_start command item must include its own command and cwd.",
     "- shell_start briefly waits only for quick commands using a fixed 6s grace period. There is no wait parameter; unfinished jobs continue in the background and append per-job completion notices by default.",
-    "- While shell commands run in the background, do other useful work. Leave per-command notifyOnExit at its true default when you want a completion notice. Set notifyOnExit:false only when you do not care about this command's result. Do not poll or wait; completion notices will be added to history/TUI without triggering a new assistant turn.",
+    "- While shell commands run in the background, do other useful work. Leave per-command notifyOnExit at its true default when you want a completion notice. Set notifyOnExit:false only when you do not care about this command's result. Do not poll or wait; completion notices are batched into history/TUI and then Pi resumes once for the flushed batch.",
     "- Async-shell completion notices are short result notices. Use shell_tail if the user asks about or needs job output; do not paste raw shell output unless explicitly requested.",
     "- Use shell_status for inspection, shell_tail for more output after a result/notification, and shell_cancel to stop jobs.",
     "- Do not perform a sequence of single-item search_many/read_many/shell_start calls when one multi-item tool call can cover the independent work.",

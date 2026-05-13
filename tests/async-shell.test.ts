@@ -15,26 +15,42 @@ type FakeApi = ExtensionAPI & {
   registeredTools: ToolDefinition[];
   sentMessages: SentMessage[];
   commands: Map<string, { description: string; handler: Function }>;
+  handlers: Map<string, Function[]>;
+  emit(event: string, data: unknown, context: ExtensionContext): Promise<void>;
 };
 
-function createContext(cwd: string): ExtensionContext {
-  return { cwd } as ExtensionContext;
+function createContext(cwd: string, isIdle: boolean | (() => boolean) = true): ExtensionContext {
+  return {
+    cwd,
+    isIdle: typeof isIdle === "function" ? isIdle : () => isIdle,
+    hasPendingMessages: () => false
+  } as ExtensionContext;
 }
 
 function createFakeApi(): FakeApi {
   const registeredTools: ToolDefinition[] = [];
   const sentMessages: SentMessage[] = [];
   const commands = new Map<string, { description: string; handler: Function }>();
+  const handlers = new Map<string, Function[]>();
   const fake = {
     registeredTools,
     sentMessages,
     commands,
+    handlers,
     registerCommand(name: string, command: { description: string; handler: Function }): void {
       commands.set(name, command);
     },
     registerMessageRenderer(): void {},
     registerTool(tool: ToolDefinition): void {
       registeredTools.push(tool);
+    },
+    on(event: string, handler: Function): void {
+      handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+    },
+    async emit(event: string, data: unknown, context: ExtensionContext): Promise<void> {
+      for (const handler of handlers.get(event) ?? []) {
+        await handler(data, context);
+      }
     },
     sendMessage(message: unknown, options: unknown): void {
       sentMessages.push({ message, options });
@@ -180,7 +196,7 @@ test("shell_status marks stranded running job metadata as unknown", async () => 
   });
 });
 
-test("shell_start suppresses deferred follow-ups when jobs complete in-band", async () => {
+test("shell_start suppresses deferred completion notices when jobs complete in-band", async () => {
   await withTempDir(async (dir) => {
     const api = createFakeApi();
     asyncShellExtension(api);
@@ -214,7 +230,7 @@ test("shell_start suppresses deferred follow-ups when jobs complete in-band", as
   });
 });
 
-test("shell_start sends one deferred follow-up per notified completed job", async () => {
+test("shell_start sends one deferred completion batch for notified completed jobs", async () => {
   await withTempDir(async (dir) => {
     const api = createFakeApi();
     asyncShellExtension(api);
@@ -244,32 +260,67 @@ test("shell_start sends one deferred follow-up per notified completed job", asyn
 
     await delay(1200);
 
-    assert.equal(api.sentMessages.length, 2);
-    for (const sentMessage of api.sentMessages) {
-      assert.deepEqual(sentMessage.options, { deliverAs: "steer" });
-      assert.doesNotMatch(JSON.stringify(sentMessage.message), /Job completed\./);
-      assert.doesNotMatch(JSON.stringify(sentMessage.message), /async-shell notification/);
+    assert.equal(api.sentMessages.length, 1);
+    const sentMessage = api.sentMessages[0];
+    assert.deepEqual(sentMessage.options, { triggerTurn: true, deliverAs: "steer" });
+    assert.doesNotMatch(JSON.stringify(sentMessage.message), /Job completed\./);
+    assert.doesNotMatch(JSON.stringify(sentMessage.message), /async-shell notification/);
 
-      const message = sentMessage.message as { content?: unknown };
-      assert.equal(typeof message.content, "string");
-      const content = message.content as string;
-      assert.match(content, /^async shell result: /);
-      assert.match(content, /more: shell_tail jobId=/);
-      assert.doesNotMatch(content, /job_id:|stdout:|stderr:|```|logs:/);
-    }
+    const message = sentMessage.message as { content?: unknown; details?: { jobs?: Array<{ job?: { job_name?: string } }> } };
+    assert.equal(typeof message.content, "string");
+    const content = message.content as string;
+    assert.match(content, /^async shell results: 2 jobs completed/);
+    assert.match(content, /more: shell_tail jobId=/);
+    assert.doesNotMatch(content, /job_id:|stdout:|stderr:|```|logs:/);
 
-    const notifiedNames = api.sentMessages
-      .map((sentMessage) => {
-        const message = sentMessage.message as { details?: { job?: { job_name?: string } } };
-        return message.details?.job?.job_name;
-      })
+    const notifiedNames = (message.details?.jobs ?? [])
+      .map((entry) => entry.job?.job_name)
       .sort();
     assert.deepEqual(notifiedNames, ["one", "three"]);
-    assert.doesNotMatch(JSON.stringify(api.sentMessages.map((sentMessage) => sentMessage.message)), /ignored/);
+    assert.doesNotMatch(JSON.stringify(sentMessage.message), /ignored/);
   });
 });
 
-test("per-command notifyOnExit false suppresses deferred follow-up", async () => {
+test("shell_start queues active completions until the current turn can flush one batch", async () => {
+  await withTempDir(async (dir) => {
+    const api = createFakeApi();
+    asyncShellExtension(api);
+    const shellStart = required(api.registeredTools.find((tool) => tool.name === "shell_start"), "shell_start tool");
+    assert.ok(shellStart.execute);
+    let idle = false;
+    const context = createContext(dir, () => idle);
+
+    await shellStart.execute(
+      "tool-call-id",
+      {
+        commands: [
+          { command: "sleep 7; printf one", cwd: dir, job_name: "one" },
+          { command: "sleep 7; printf two", cwd: dir, job_name: "two" }
+        ],
+        tailLines: 1
+      } as never,
+      new AbortController().signal,
+      undefined,
+      context
+    );
+
+    await delay(1200);
+    assert.equal(api.sentMessages.length, 0);
+
+    await api.emit("turn_end", { type: "turn_end", turnIndex: 0, timestamp: Date.now(), message: {}, toolResults: [] }, context);
+    assert.equal(api.sentMessages.length, 1);
+    assert.deepEqual(api.sentMessages[0].options, { triggerTurn: true, deliverAs: "steer" });
+    const message = api.sentMessages[0].message as { content?: string; details?: { jobs?: Array<{ job?: { job_name?: string } }> } };
+    assert.match(message.content ?? "", /^async shell results: 2 jobs completed/);
+    assert.deepEqual((message.details?.jobs ?? []).map((entry) => entry.job?.job_name).sort(), ["one", "two"]);
+
+    idle = true;
+    await delay(50);
+    assert.equal(api.sentMessages.length, 1);
+  });
+});
+
+test("per-command notifyOnExit false suppresses deferred completion notices", async () => {
   await withTempDir(async (dir) => {
     const api = createFakeApi();
     asyncShellExtension(api);
@@ -409,7 +460,7 @@ test("shell_tail reads stdout and stderr separately", async () => {
   });
 });
 
-test("shell_cancel transitions a running job to cancelled and suppresses follow-up", async () => {
+test("shell_cancel transitions a running job to cancelled and suppresses completion notices", async () => {
   await withTempDir(async (dir) => {
     const api = createFakeApi();
     asyncShellExtension(api);

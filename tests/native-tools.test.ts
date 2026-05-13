@@ -272,7 +272,7 @@ test("native file tool renderers append the reviewer summary on partial mutation
   });
 });
 
-test("shell_start schema exposes commands list and async follow-up guidance", () => {
+test("shell_start schema exposes commands list and async completion guidance", () => {
   const api = createFakeApi([], []);
 
   asyncShellExtension(api);
@@ -285,7 +285,7 @@ test("shell_start schema exposes commands list and async follow-up guidance", ()
   assert.match(shellStart.description, /Each command item must include its own command and cwd/);
   assert.match(shellStart.description, /In-band shell_start results include compact job fields/);
   assert.match(shellStart.description, /Completion notices are short result notices/);
-  assert.match(shellStart.description, /without triggering a new assistant turn/);
+  assert.match(shellStart.description, /triggers one assistant turn for each flushed batch/);
   assert.match(shellStart.description, /20 KB per stream/);
   assert.match(shellStart.description, /at most 12 commands/);
   assert.match(shellStart.description, /Standard input is ignored/);
@@ -909,7 +909,7 @@ test("buildNativeToolsSystemPrompt removes default Pi tool prose and injects rea
   assert.match(result, /Each shell_start command item must include its own command and cwd/);
   assert.match(result, /fixed 6s grace period/);
   assert.match(result, /Leave per-command notifyOnExit at its true default/);
-  assert.match(result, /completion notices will be added to history\/TUI without triggering a new assistant turn/);
+  assert.match(result, /completion notices are batched into history\/TUI and then Pi resumes once for the flushed batch/);
   assert.match(result, /Async-shell completion notices are short result notices/);
   assert.match(result, /do not paste raw shell output unless explicitly requested/);
   assert.match(result, /<name>pi-agent<\/name>/);

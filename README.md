@@ -76,7 +76,7 @@ Use `shell_start` for shell work. It accepts only `commands: [...]`; use one ite
 
 Each command gets a durable job id, metadata, and stdout/stderr logs under `.pi/async-shell/`. `shell_start` uses one fixed 6-second in-band grace period for quick commands. Jobs that do not finish in-band continue in the background and, by default, append a short completion notice when they exit.
 
-There is no polling/wait tool. Continue useful work while jobs run. If there is no useful work, stop after reporting that jobs are running. Completion notices are intentionally brief and do not trigger a new assistant turn; use `shell_tail` for output, `shell_status` for inspection, and `shell_cancel` to stop a job.
+There is no polling/wait tool. Continue useful work while jobs run. If there is no useful work, stop after reporting that jobs are running. Completion notices are intentionally brief; ready notices are batched into history/TUI before Pi resumes the agent once for the flushed batch. Use `shell_tail` for output, `shell_status` for inspection, and `shell_cancel` to stop a job.
 
 ## Public package boundary
 
