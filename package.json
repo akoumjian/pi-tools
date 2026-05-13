@@ -60,6 +60,7 @@
   "files": [
     "README.md",
     "config/",
+    "docs/",
     "extensions/",
     "scripts/dev-pi.mjs"
   ]

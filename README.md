@@ -40,6 +40,12 @@ npm update @akoumjian/pi-tools
 
 Do not use `npm install @akoumjian/pi-tools@<git+ssh url>`: that form rewrites `package.json` to the `github:owner/repo` shorthand and breaks namespace-form conventions. `npm update` re-resolves the existing git ref to the latest commit and updates only `package-lock.json`.
 
+## Documentation
+
+- [`docs/README.md`](docs/README.md) is the index for deep-dive per-extension documentation.
+- Each extension has its own file under `docs/extensions/`. Use those when you need exact tool schemas, behaviors, caps, result shapes, or rendering details.
+- The sections below in this README are short overviews and pointers; the doc files are the source of truth for details.
+
 ## Quick reference
 
 Tools (LLM-callable):
@@ -73,239 +79,141 @@ Each extension below documents what it does, what it provides, and how to set it
 
 ### tui-scrollback
 
-**Purpose.** Preserve terminal scrollback during Pi TUI redraws by patching `ProcessTerminal.write` to strip the clear-scrollback escape sequence (`ESC [3J`). Without it, every full redraw can erase your prior terminal output.
+[Full docs](docs/extensions/tui-scrollback.md).
 
-**Provides.**
-- Idempotent runtime patch installed at extension load.
-- `/scrollback:status` to show whether the patch is active and how many sequences have been stripped.
+**Purpose.** Preserve terminal scrollback during Pi TUI redraws by patching `ProcessTerminal.write` to strip the clear-scrollback escape sequence (`ESC [3J`).
 
-**Setup.** None. Loads first so the patch applies before any redraws.
+**Provides.** Idempotent runtime patch; `/scrollback:status` diagnostics. No LLM tools, no setup.
 
 ---
 
 ### tmux-scrollback
 
-**Purpose.** Keep Pi output on tmux's main screen and let tmux own scrollback and copy mode. Pi's default TUI behavior conflicts with several tmux private modes (alternate screen, mouse tracking variants); this extension strips those enables and emits a reset sequence on attach.
+[Full docs](docs/extensions/tmux-scrollback.md).
 
-**Provides.**
-- Idempotent runtime patch installed at extension load. Inactive when `TMUX` is not set.
-- `/tmux-scrollback:status` for diagnostics.
+**Purpose.** Keep Pi output on tmux's main screen and let tmux own scrollback. Strips tmux-incompatible private-mode enables and emits a reset sequence on attach.
 
-**Setup.** None. Recommended tmux options for best results:
-
-```tmux
-set -g extended-keys on
-set -g extended-keys-format csi-u
-```
-
-Pi will warn on startup if these are not set.
+**Provides.** Idempotent runtime patch (inactive outside tmux); `/tmux-scrollback:status`. Recommended `tmux` options: `set -g extended-keys on` / `set -g extended-keys-format csi-u`.
 
 ---
 
 ### tool-safety
 
-**Purpose.** Optional model + human review gate for tool calls. Pi-host pre-classification is a routing hint; the loaded policy and the configured approval model are the source of truth for the final allow/review/deny decision.
+[Full docs](docs/extensions/tool-safety.md).
 
-**Provides.**
-- `tool_call` event handler that classifies actions as `allow` / `review` / `deny` using:
-  1. Built-in heuristics for credentials, shared infrastructure, history rewrites, etc.
-  2. A configurable approval-judge model (`approvalModel`) for ambiguous cases.
-  3. Human review prompts when policy or the approval model says `review`.
-- Commands:
-  - `/safety:setup provider/model[:thinking]` — persist the approval judge model for this machine/profile.
-  - `/safety:status` — show the current policy file, approval model, and runtime overrides.
-  - `/safety:model provider/model[:thinking] | reset` — override the approval model for this session.
-  - `/safety:toggle [on|off]` — enable/disable runtime enforcement (the policy and approval judge still load, but no review/deny is applied).
-- Default policy text in [`config/tool-safety-policy.md`](config/tool-safety-policy.md).
+**Purpose.** Rule + model + human review gate for tool calls. Pi-host pre-classification is a routing hint; the loaded policy and configured approval-judge model are the source of truth for the final allow/review/deny.
 
-**Setup.**
+**Provides.** `tool_call` handler that classifies via heuristics + approval model + human prompt; `/safety:setup`, `/safety:status`, `/safety:model`, `/safety:toggle`; default policy in [`config/tool-safety-policy.md`](config/tool-safety-policy.md).
 
-1. Pick a model that can act as the approval judge (reasoning-friendly, cheap, fast). Run:
-   ```text
-   /safety:setup provider/model[:thinking]
-   ```
-   This writes the chosen model into your Pi profile's tool-safety settings.
-2. Optional environment overrides:
-   - `PI_TOOL_SAFETY_APPROVAL_MODEL=provider/model[:thinking]`
-   - `PI_TOOL_SAFETY_TRUSTED_WORKSPACE=/path/to/repo` (treats this path as the active workspace for routing decisions).
-3. Run `/safety:status` after restart to confirm the policy file, approval model, and trusted workspace are correct.
-
-The package default policy is in [`config/tool-safety-policy.md`](config/tool-safety-policy.md). Override it by placing your own `tool-safety-settings.json` + `tool-safety-policy.md` in a higher-priority config directory (see [Configuration](#configuration)).
+**Setup.** Run `/safety:setup provider/model[:thinking]` once per machine. Optional `PI_TOOL_SAFETY_APPROVAL_MODEL` / `PI_TOOL_SAFETY_TRUSTED_WORKSPACE` env overrides.
 
 ---
 
 ### async-shell
 
-**Purpose.** Run shell commands as durable async jobs instead of blocking the agent. Each `shell_start` call accepts a list of commands; the call returns within a fixed 6-second in-band grace period, and any unfinished jobs continue in the background and deliver compact completion notices.
+[Full docs](docs/extensions/async-shell.md).
 
-**Provides.**
-- Tools:
-  - `shell_start({ commands: [{ command, cwd, job_name?, shell?, notifyOnExit? }, ...], tailLines? })`
-  - `shell_status({ jobId? })`
-  - `shell_tail({ jobId, stream?, lines?, maxChars? })`
-  - `shell_cancel({ jobId, signal? })`
-- Durable per-job logs and metadata under `.pi/async-shell/jobs/<jobId>/`.
-- Batched completion notices: multiple ready completions are coalesced (~100 ms debounce) and delivered as one custom message that triggers exactly one assistant turn.
-- `/async:status` for storage and recent-job diagnostics.
+**Purpose.** Durable async shell jobs instead of blocking the agent. Each `shell_start` call accepts a list of commands; finished jobs return in-band within a fixed 6 s grace period, and background jobs deliver batched completion notices that resume the agent exactly once per batch.
 
-**Setup.** None required. There is no polling or wait tool: continue useful work while jobs run, and rely on completion notices to resume.
+**Provides.** `shell_start`, `shell_status`, `shell_tail`, `shell_cancel`; `/async:status`; durable per-job logs and metadata under `.pi/async-shell/jobs/<jobId>/`.
 
-Key behaviors:
-- `shell_start` is the preferred shell surface. Independent commands should be grouped in one call.
-- `notifyOnExit: false` suppresses the completion notice for that command.
-- `shell_tail` / `shell_status` are for inspection after a notice, not for polling.
+**Setup.** None. No polling/wait tool: continue useful work; completion notices will resume the agent.
 
 ---
 
 ### native-tools
 
-**Purpose.** Replace Pi's stock single-file `read`, `grep`/`find`, `write`, `edit` tools with batch-native equivalents and steer the agent toward them. This dramatically reduces tool-call chatter for multi-file workflows.
+[Full docs](docs/extensions/native-tools.md).
 
-**Provides.**
-- `read_many({ files: [{ path, offset?, limit? }, ...] })`
-- `search_many({ searches: [{ kind, pattern?, path?, glob?, context?, maxResults?, ignoreCase?, literal? }, ...] })`
-- `write_many({ writes: [{ path, content }, ...] })`
-- `edit_many({ files: [{ path, edits: [{ oldText, newText }, ...] }, ...] })`
-- Strict-replacement enforcement: when active, the stock `read`/`grep`/`find`/`write`/`edit` tools are disabled and re-enabling them fails loudly.
-- Compact, defensive renderers that show one-line summaries instead of dumping raw output, including a `⎿ error: ...` row when arguments fail validation.
-- `/native:status` to show which native tools are loaded and which stock tools were replaced.
+**Purpose.** Replace stock single-file `read`/`grep`/`find`/`write`/`edit` tools with batch-native equivalents. Strict-replacement enforcement removes banned tools and adds required replacements at session start.
 
-**Setup.** None. The replacement is automatic on load. To inspect, run `/native:status`.
+**Provides.** `read_many`, `search_many`, `write_many`, `edit_many`; disabled `bash` stub redirecting to `shell_start`; `/native:status`; compact renderers with `⎿ error: …` fallback on validation/exec errors.
+
+**Setup.** None. Automatic on load.
 
 ---
 
 ### mutation-review
 
-**Purpose.** Optional reviewer that inspects pending file mutations (`write_many`, `edit_many`, and stock `write`/`edit`) for reuse opportunities and obvious problems before they apply. Blocks the call with concrete guidance when it has cited evidence; allows otherwise. Caches the original mutation so the agent can cheaply re-apply it via `apply_reviewed_mutation` after addressing the feedback.
+[Full docs](docs/extensions/mutation-review.md).
 
-**Provides.**
-- Pre-tool-call review using a configured reviewer model.
-- `apply_reviewed_mutation({ id })` tool to re-apply the cached original after acknowledgement.
-- Commands:
-  - `/mutation:setup provider/model[:thinking]`
-  - `/mutation:status`
-  - `/mutation:model provider/model[:thinking] | reset`
-  - `/mutation:toggle [on|off]`
-  - `/mutation:apply <id>` (manual re-apply path)
-- Reviewer guidance: [`config/mutation-review-guidance.md`](config/mutation-review-guidance.md).
-- Tunable transcript/diff caps and reviewer tool allowlist in [`config/mutation-review-settings.json`](config/mutation-review-settings.json) (defaults: `search_many`, `read_many`; reviewedTools: `edit_many`, `write_many`, `edit`, `write`).
+**Purpose.** Pre-write/pre-edit reviewer focused on reuse: block only on cited evidence of duplication, otherwise allow. Caches blocked proposals so the agent can cheaply re-apply via `apply_reviewed_mutation` after addressing feedback.
 
-**Setup.**
+**Provides.** `apply_reviewed_mutation` tool; `/mutation:setup`, `/mutation:status`, `/mutation:model`, `/mutation:toggle`, `/mutation:apply`; reviewer guidance in [`config/mutation-review-guidance.md`](config/mutation-review-guidance.md).
 
-1. Run `/mutation:setup provider/model[:thinking]` to persist the reviewer model.
-2. `/mutation:status` shows the active reviewer, guidance source, tool allowlist, and runtime state.
-3. To disable temporarily: `/mutation:toggle off`.
-
-Reviewer defaults are conservative: block only on cited reuse/correctness evidence, otherwise allow.
+**Setup.** `/mutation:setup provider/model[:thinking]`. When no reviewer model is configured, the extension stays out of the way and warns once.
 
 ---
 
 ### searxng-search
 
-**Purpose.** Web search via an explicitly configured self-hosted SearXNG instance. Public instances are not recommended for agent use.
+[Full docs](docs/extensions/searxng-search.md).
 
-**Provides.**
-- Tool: `searxng_search({ query, results?, page?, language?, categories?, timeRange? })`.
-- Commands:
-  - `/searxng:setup` — create and optionally start a local SearXNG Docker Compose helper. Supports flags such as `--port`, `--start`, `--dry-run`.
-  - `/searxng:status` — probe configured endpoint reachability and JSON output.
-- Example env file: [`config/searxng.env.example`](config/searxng.env.example).
+**Purpose.** Web search via an explicitly configured self-hosted SearXNG instance. Public instances are intentionally not the default.
 
-**Setup.**
+**Provides.** `searxng_search` tool; `/searxng:setup` (writes a local Docker Compose helper with a random secret; only starts containers with `--start`); `/searxng:status`; example env file in [`config/searxng.env.example`](config/searxng.env.example).
 
-1. Either run `/searxng:setup --dry-run` then `/searxng:setup --start` for a Docker-Compose helper, or set `SEARXNG_URL=https://your.searxng.host` to point at an existing instance. Optional `SEARXNG_API_KEY` for protected deployments.
-2. Verify with `/searxng:status` — it must report `Status: ok` and a reachable JSON endpoint.
-3. Pi must be (re)started after changing environment variables.
+**Setup.** Run `/searxng:setup --dry-run` → `/searxng:setup --start`, or set `SEARXNG_URL=https://your.host`. Verify with `/searxng:status`.
 
 ---
 
 ### web-fetch
 
-**Purpose.** Safe, batched HTTP(S) fetch with caching, readability extraction, and a handoff hint to `document_parse` for non-HTML payloads. Refuses private-network and localhost URLs.
+[Full docs](docs/extensions/web-fetch.md).
 
-**Provides.**
-- Tool: `web_fetch_many({ urls: [{ url, label?, mode?, maxBytes?, timeoutSeconds? }, ...], concurrency? })`. `mode` is `auto`, `html`, or `download`.
-- Cached artifacts under `.pi/web-fetch/`. HTML pages produce both raw source and readability-extracted Markdown/text.
-- `documentParseHint` on the result when the content type is best handled by `document_parse`.
-- `/fetch:status` for cache and dependency diagnostics.
+**Purpose.** Safe, batched HTTP(S) fetch with caching, readability extraction, and a `document_parse` handoff for non-HTML. Refuses private-network and localhost URLs.
 
-**Setup.** None. Reads built-in `fetch`; no API key required.
+**Provides.** `web_fetch_many` (1–12 URLs, modes `auto`/`html`/`download`, configurable byte/time caps, parallel up to 8); cached artifacts under `.pi/web-fetch/`; `/fetch:status`.
+
+**Setup.** None.
 
 ---
 
 ### file-open
 
-**Purpose.** Picker that lists recent file references discovered in the current chat/tool-result transcript and opens the chosen file in your terminal editor with same-pane handoff.
+[Full docs](docs/extensions/file-open.md).
 
-**Provides.**
-- `/file:open` command. Opens with `$VISUAL`, then `$EDITOR`, then `hx`.
-- Optional keyboard shortcut via [`config/file-open-settings.json`](config/file-open-settings.json) (`"shortcut": "ctrl+e"` or similar). Default is no shortcut to avoid stealing Pi's default Ctrl+E binding.
+**Purpose.** Picker of recent file references discovered in the current transcript; opens the chosen file in `$VISUAL` / `$EDITOR` / `hx` with same-pane handoff.
 
-**Setup.**
+**Provides.** `/file:open` command; optional keyboard shortcut via [`config/file-open-settings.json`](config/file-open-settings.json) (off by default to avoid stealing Pi's Ctrl+E).
 
-1. Export an editor in your shell, e.g. add to `~/.zshrc`:
-   ```bash
-   export VISUAL="hx"
-   export EDITOR="hx"
-   ```
-   Re-source or restart your shell.
-2. (Optional) Set `"shortcut"` in `file-open-settings.json` to bind a key.
+**Setup.** Export `VISUAL`/`EDITOR` in your shell. Optional: set `"shortcut"` in `file-open-settings.json`.
 
 ---
 
 ### theme-preview
 
-**Purpose.** Live theme showcase and selector inside Pi's TUI. Lets you preview each registered theme's tool/result/markdown/code rendering and either apply it or revert.
+[Full docs](docs/extensions/theme-preview.md).
 
-**Provides.**
-- `/themes:preview [theme-name]` command. Arrow keys to cycle; `Enter` to apply; `Esc` to cancel.
-- Renders all 51 Pi color tokens against representative surfaces (markdown, code, tool calls/results, error/success rows, hidden-thinking labels, etc.).
+**Purpose.** Live Pi theme showcase and selector. Cycle themes with arrow keys, `Enter` to apply, `Esc`/`q` to restore the original.
 
-**Setup.** None. Themes are discovered from Pi's theme registry; vendored themes are not included in this package.
+**Provides.** `/themes:preview [theme-name]` command; renders all 51 Pi color tokens against representative surfaces.
+
+**Setup.** None. Themes are discovered from Pi's theme registry.
 
 ---
 
 ### review-subagent
 
-**Purpose.** Spawn an in-process tool-using review subagent over recent main-agent context. The reviewer runs its own session with a restricted read-only tool allowlist, produces a critique, and optionally sends it back to the main agent.
+[Full docs](docs/extensions/review-subagent.md).
 
-**Provides.**
-- Commands:
-  - `/review [--model provider/model[:thinking]] [--send|--no-send] [focus]`
-  - `/review:setup provider/model[:thinking]`
-  - `/review:status`
-  - `/review:cancel`
-  - `/review:send-last`
-- Default reviewer tool allowlist: `search_many`, `read_many`, `searxng_search`, `web_fetch_many`, `document_parse`, `shell_start`, `shell_status`, `shell_tail`, `shell_cancel`. Configured in [`config/review-subagent-settings.json`](config/review-subagent-settings.json).
-- Reviewer guidance: [`config/review-subagent-guidance.md`](config/review-subagent-guidance.md).
-- Background-safe: the critique renders as a custom message; if the main agent is still active, display is deferred until it goes idle.
+**Purpose.** Tool-using review subagent over recent main-agent context. Runs in its own session with a read-only tool allowlist, produces a structured critique, optionally sends back to the main agent.
 
-**Setup.**
+**Provides.** `/review`, `/review:setup`, `/review:status`, `/review:cancel`, `/review:send-last`; reviewer guidance in [`config/review-subagent-guidance.md`](config/review-subagent-guidance.md); never modifies files.
 
-1. Run `/review:setup provider/model[:thinking]` to persist the reviewer model (typical choice: a strong reasoning model).
-2. `/review:status` shows the active reviewer, guidance source, tool allowlist, and any in-flight run.
-3. Run `/review focus text...` to start a review; pass `--send` to auto-send the critique back to the main agent without confirmation.
-
-The reviewer never calls write/edit tools, never installs dependencies, and only runs shell for read-only inspection/validation commands.
+**Setup.** Run `/review:setup provider/model[:thinking]` once per machine (typical: a strong reasoning model). Run `/review focus...` to review.
 
 ---
 
 ### tool-display
 
-**Purpose.** Optional opt-in display wrapper for `document_parse` (and any future bundled tool wrappers). Provides a compact `Parse(...)` call row, a single-line success/error result, and proxies through to LiteParse's tool implementation.
+[Full docs](docs/extensions/tool-display.md).
 
-**Provides.**
-- Tool: `document_parse({ path, format?, targetPages?, screenshotPages?, ocr?, ocrLanguage?, ocrLanguages?, ocrServerUrl?, numWorkers?, maxPages?, dpi?, preciseBoundingBox?, preserveSmallText?, preserveLayoutAlignmentAcrossPages? })`.
-- `/docparser:doctor` command (registered unconditionally) for diagnosing missing host parser dependencies.
-- Custom renderers are off by default. Toggle in [`config/tool-display-settings.json`](config/tool-display-settings.json):
-  ```json
-  { "enableDisplayOverrides": true }
-  ```
+**Purpose.** Opt-in display wrapper for `document_parse`. Proxies through to LiteParse and, when enabled, replaces verbose rendering with a compact `Parse(...)` call row and a `⎿ pages · screenshots ...` result row.
 
-**Setup.**
+**Provides.** `document_parse` tool registration; `/docparser:doctor` for host dependency diagnostics; compact renderers gated by `enableDisplayOverrides` in [`config/tool-display-settings.json`](config/tool-display-settings.json) (default `false`).
 
-1. Run `/docparser:doctor` if you intend to parse PDFs/Office files/images. It checks for system dependencies (e.g. Tesseract, libreoffice/soffice, image tools).
-2. Set `enableDisplayOverrides` to `true` only if you want the compact `Parse(...)` rendering; otherwise the wrapper is transparent and Pi's default rendering applies.
+**Setup.** Run `/docparser:doctor` for LiteParse host deps. Set `enableDisplayOverrides: true` only if you want the compact rendering.
 
 ---
 

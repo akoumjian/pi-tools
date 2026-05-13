@@ -61,7 +61,20 @@ test("pi-tools registered extensions have shipping default config files where re
     "config/review-subagent-settings.json",
     "config/review-subagent-guidance.md",
     "config/tool-display-settings.json",
-    "config/file-open-settings.json"
+    "config/file-open-settings.json",
+    "docs/README.md",
+    "docs/extensions/async-shell.md",
+    "docs/extensions/file-open.md",
+    "docs/extensions/mutation-review.md",
+    "docs/extensions/native-tools.md",
+    "docs/extensions/review-subagent.md",
+    "docs/extensions/searxng-search.md",
+    "docs/extensions/theme-preview.md",
+    "docs/extensions/tmux-scrollback.md",
+    "docs/extensions/tool-display.md",
+    "docs/extensions/tool-safety.md",
+    "docs/extensions/tui-scrollback.md",
+    "docs/extensions/web-fetch.md"
   ];
   for (const file of requiredConfigs) {
     assert.ok(readText(file).length > 0, file);
@@ -106,6 +119,7 @@ test("pi-tools package files whitelist excludes tests and local runtime artifact
   assert.deepEqual(manifest.files, [
     "README.md",
     "config/",
+    "docs/",
     "extensions/",
     "scripts/dev-pi.mjs"
   ]);
