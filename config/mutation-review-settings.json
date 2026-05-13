@@ -1,0 +1,18 @@
+{
+  "guidanceFile": "mutation-review-guidance.md",
+  "thinkingLevel": "low",
+  "maxRecentMessages": 8,
+  "maxTranscriptChars": 8000,
+  "maxDiffChars": 24000,
+  "maxOutputTokens": 600,
+  "tools": [
+    "search_many",
+    "read_many"
+  ],
+  "reviewedTools": [
+    "edit_many",
+    "write_many",
+    "edit",
+    "write"
+  ]
+}

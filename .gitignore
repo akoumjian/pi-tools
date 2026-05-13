@@ -1,0 +1,26 @@
+node_modules/
+dist/
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Pi/runtime state should stay machine-local.
+.pi/cache/
+.pi/git/
+.pi/npm/
+.pi/npm-cache/
+.pi/runtime/
+.pi/sessions/
+.pi/async-shell/
+.pi/tool-safety/
+.pi/web-fetch/
+.pi/debug-export/
+.pi/eval-build/
+.pi/mutation-review-evals/
+.pi/test-build/
+.pi/dev-agent/
+
+# Local grounding files per repository AGENTS instructions.
+decisions.md
+journal.md

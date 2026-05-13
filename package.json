@@ -1,0 +1,66 @@
+{
+  "name": "@akoumjian/pi-tools",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "description": "Reusable Pi coding-agent extensions: async shell jobs, batch file tools, web research, tool safety, review workflows, and compact TUI rendering.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "coding-agent"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit",
+    "pretest": "rm -rf .pi/test-build",
+    "test": "PI_TOOLS_CONFIG_DIR=config tsc -p tsconfig.test.json && PI_TOOLS_CONFIG_DIR=config node --test .pi/test-build/tests/*.test.js",
+    "validate": "npm run check && npm test && git diff --check",
+    "pi": "pi -e .",
+    "dev:pi": "node scripts/dev-pi.mjs",
+    "dev:pi:reset": "node scripts/dev-pi.mjs reset",
+    "dev:pi:status": "node scripts/dev-pi.mjs status"
+  },
+  "pi": {
+    "extensions": [
+      "extensions/tui-scrollback/index.ts",
+      "extensions/tmux-scrollback/index.ts",
+      "extensions/tool-safety/index.ts",
+      "extensions/async-shell/index.ts",
+      "extensions/native-tools/index.ts",
+      "extensions/mutation-review/index.ts",
+      "extensions/searxng-search/index.ts",
+      "extensions/web-fetch/index.ts",
+      "extensions/file-open/index.ts",
+      "extensions/theme-preview/index.ts",
+      "extensions/review-subagent/index.ts",
+      "extensions/tool-display/index.ts"
+    ]
+  },
+  "dependencies": {
+    "@mozilla/readability": "^0.6.0",
+    "jsdom": "^27.0.1",
+    "pi-docparser": "1.1.1",
+    "turndown": "^7.2.4"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-agent-core": "0.70.5",
+    "@mariozechner/pi-ai": "0.70.5",
+    "@mariozechner/pi-coding-agent": "0.70.5",
+    "@mariozechner/pi-tui": "0.70.5",
+    "@types/jsdom": "^28.0.1",
+    "@types/node": "^24.0.0",
+    "@types/turndown": "^5.0.6",
+    "typescript": "^5.9.3"
+  },
+  "files": [
+    "README.md",
+    "config/",
+    "extensions/",
+    "scripts/dev-pi.mjs"
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "guidanceFile": "review-subagent-guidance.md",
+  "thinkingLevel": "xhigh",
+  "maxRecentMessages": 30,
+  "maxTranscriptChars": 30000,
+  "maxDiffChars": 50000,
+  "maxOutputTokens": 6000,
+  "commandTimeoutMs": 10000,
+  "tools": [
+    "search_many",
+    "read_many",
+    "searxng_search",
+    "web_fetch_many",
+    "document_parse",
+    "shell_start",
+    "shell_status",
+    "shell_tail",
+    "shell_cancel"
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "policyFile": "tool-safety-policy.md",
+  "approvalMaxTokens": 600,
+  "currentUserMaxChars": 2400,
+  "recentUserMessages": 3,
+  "recentUserMaxChars": 900,
+  "toolInputMaxChars": 6000,
+  "policyMaxChars": 12000
+}
