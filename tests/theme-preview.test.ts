@@ -145,6 +145,9 @@ function createFakeUi(): FakeUi {
     },
     addAutocompleteProvider(): void {},
     setEditorComponent(): void {},
+    getEditorComponent(): undefined {
+      return undefined;
+    },
     theme: { name: "dark" } as Theme,
     getAllThemes(): Array<{ name: string; path: string | undefined }> {
       return [
