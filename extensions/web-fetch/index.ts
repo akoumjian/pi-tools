@@ -22,12 +22,6 @@ const MAX_REDIRECTS = 5;
 const PREVIEW_MAX_CHARS = 4000;
 const PREVIEW_MAX_LINES = 80;
 
-const FetchMode = Type.Union([
-  Type.Literal("auto"),
-  Type.Literal("html"),
-  Type.Literal("download")
-]);
-
 const FetchUrlItem = Type.Object({
   url: Type.String({
     minLength: 1,
@@ -36,7 +30,13 @@ const FetchUrlItem = Type.Object({
   label: Type.Optional(Type.String({
     description: "Optional short source label for the fetched URL."
   })),
-  mode: Type.Optional(FetchMode),
+  mode: Type.Optional(Type.Union([
+    Type.Literal("auto"),
+    Type.Literal("html"),
+    Type.Literal("download")
+  ], {
+    description: "Fetch mode. auto extracts readable HTML when possible and downloads non-HTML; html forces HTML extraction; download saves the response without readability extraction."
+  })),
   maxBytes: Type.Optional(Type.Number({
     minimum: 1024,
     maximum: MAX_MAX_BYTES,
@@ -138,11 +138,11 @@ export default function webFetchExtension(api: ExtensionAPI): void {
       "Result details shape: { cacheRoot, results: [{ url, finalUrl, status, kind, httpStatus, contentType, title?, sourcePath?, textPath?, downloadedPath?, documentParseHint?, preview?, truncated?, error? }] }.",
       "This tool refuses non-HTTP(S), localhost, and private-network URLs. Use shell_start only when the user explicitly asks for a special network fetch that should go through safety review."
     ].join(" "),
-    promptSnippet: "web_fetch_many: fetch URLs, cache artifacts, extract readable HTML, and save non-HTML files for document_parse.",
+    promptSnippet: "Fetch URLs, cache artifacts, extract readable HTML, and save non-HTML files for document_parse.",
     promptGuidelines: [
       "Use searxng_search for discovery, then web_fetch_many for in-depth source retrieval.",
-      "After fetching HTML, use read_many on textPath when the preview is not enough.",
-      "After fetching PDFs, Office documents, spreadsheets, or images, call document_parse on downloadedPath when source content must be inspected.",
+      "After web_fetch_many fetches HTML, use read_many on textPath when the preview is not enough.",
+      "After web_fetch_many fetches PDFs, Office documents, spreadsheets, or images, call document_parse on downloadedPath when source content must be inspected.",
       "Use a urls list even for one URL. Fetch several independent URLs in one call when comparing sources."
     ],
     parameters: WebFetchManyParams,

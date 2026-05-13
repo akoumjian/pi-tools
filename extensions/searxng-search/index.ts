@@ -6,16 +6,16 @@ import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 import { handleSearxngSetupCommand, SEARXNG_AGENT_CONFIG_FILE } from "./setup.js";
 
 const SearchParams = Type.Object({
-  query: Type.String({ minLength: 1, description: "Search query" }),
-  results: Type.Optional(Type.Number({ minimum: 1, maximum: 20, default: 8 })),
-  page: Type.Optional(Type.Number({ minimum: 1, default: 1 })),
-  language: Type.Optional(Type.String({ default: "en-US" })),
-  categories: Type.Optional(Type.String({ default: "general" })),
+  query: Type.String({ minLength: 1, description: "Search query." }),
+  results: Type.Optional(Type.Number({ minimum: 1, maximum: 20, default: 8, description: "Maximum number of search results to return, from 1 to 20. Defaults to 8." })),
+  page: Type.Optional(Type.Number({ minimum: 1, default: 1, description: "One-indexed SearXNG result page to fetch. Defaults to 1." })),
+  language: Type.Optional(Type.String({ default: "en-US", description: "Search language/locale code understood by SearXNG, such as en-US. Defaults to en-US." })),
+  categories: Type.Optional(Type.String({ default: "general", description: "SearXNG category list, such as general, news, science, or it. Defaults to general." })),
   timeRange: Type.Optional(Type.Union([
     Type.Literal("day"),
     Type.Literal("month"),
     Type.Literal("year")
-  ]))
+  ], { description: "Optional freshness filter for SearXNG results." }))
 });
 
 type SearchInput = Static<typeof SearchParams>;
@@ -50,8 +50,11 @@ type SearxngEndpoint = {
 const searxngSearchTool = defineTool({
   name: "searxng_search",
   label: "SearXNG Search",
-  description: "Search the web through an explicitly configured self-hosted SearXNG instance. Run /searxng:setup or set SEARXNG_URL before using this tool.",
-  promptSnippet: "searxng_search: search the web through the configured SearXNG instance.",
+  description: "Search the web through a configured self-hosted SearXNG instance. Use for web discovery when SearXNG is configured; if it is unconfigured or unreachable, report that /searxng:setup or SEARXNG_URL is needed.",
+  promptSnippet: "Search the configured SearXNG instance for web discovery.",
+  promptGuidelines: [
+    "Use searxng_search for web discovery before web_fetch_many when the user needs current online information or source candidates."
+  ],
   parameters: SearchParams,
   executionMode: "parallel",
   renderShell: "self",

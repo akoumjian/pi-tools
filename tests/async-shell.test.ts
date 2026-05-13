@@ -270,7 +270,10 @@ test("shell_start sends one deferred completion batch for notified completed job
     assert.equal(typeof message.content, "string");
     const content = message.content as string;
     assert.match(content, /^async shell results: 2 jobs completed/);
-    assert.match(content, /more: shell_tail jobId=/);
+    assert.match(content, /stdout_log:/);
+    assert.match(content, /stderr_log:/);
+    assert.match(content, /more: shell_tail jobId=.*max 500 lines/);
+    assert.match(content, /older_output: use search_many\/read_many/);
     assert.doesNotMatch(content, /job_id:|stdout:|stderr:|```|logs:/);
 
     const notifiedNames = (message.details?.jobs ?? [])
@@ -456,7 +459,14 @@ test("shell_tail reads stdout and stderr separately", async () => {
     assert.deepEqual((stdoutOnly.details as { output: { stdout: string; stderr: string } }).output, { stdout: "out", stderr: "" });
     assert.deepEqual((stderrOnly.details as { output: { stdout: string; stderr: string } }).output, { stdout: "", stderr: "err" });
     assert.deepEqual((both.details as { output: { stdout: string; stderr: string } }).output, { stdout: "out", stderr: "err" });
-    assert.doesNotMatch(JSON.stringify(stderrOnly.content), /stdout:/);
+    const stdoutText = JSON.stringify(stdoutOnly.content);
+    const stderrText = JSON.stringify(stderrOnly.content);
+    assert.match(stdoutText, /stdout_log:/);
+    assert.match(stdoutText, /tail_window: showing last up to 80 lines and 20 KB per selected stream/);
+    assert.match(stdoutText, /older_output: use search_many\/read_many on stdout_log or stderr_log/);
+    assert.doesNotMatch(stdoutText, /stderr_log:/);
+    assert.match(stderrText, /stderr_log:/);
+    assert.doesNotMatch(stderrText, /stdout:/);
   });
 });
 

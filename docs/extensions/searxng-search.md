@@ -17,11 +17,11 @@ Give the agent web search through an explicitly configured self-hosted [SearXNG]
 ```ts
 searxng_search({
   query: string,
-  results?: number,                  // 1..20, default 8
-  page?: number,                     // >= 1, default 1
-  language?: string,                 // default "en-US"
-  categories?: string,               // default "general"
-  timeRange?: "day" | "month" | "year"
+  results?: number,                  // 1..20, default 8; maximum returned results
+  page?: number,                     // >= 1, default 1; one-indexed page
+  language?: string,                 // default "en-US"; SearXNG language/locale
+  categories?: string,               // default "general"; e.g. general, news, science, it
+  timeRange?: "day" | "month" | "year" // optional freshness filter
 })
 ```
 
@@ -89,7 +89,7 @@ Pick one:
 - Run `/searxng:setup --dry-run`, then `/searxng:setup --start` to get a local Docker Compose stack.
 - Or set `SEARXNG_URL=https://your.searxng.host` in your shell (and `SEARXNG_API_KEY=...` if needed) and restart Pi.
 
-Verify with `/searxng:status`. Once `Status: reachable JSON search endpoint` is reported, `searxng_search` is usable. Pair with [`web_fetch_many`](web-fetch.md) for full retrieval workflows.
+Verify with `/searxng:status`. Once `Status: reachable JSON search endpoint` is reported, `searxng_search` is usable. Models should use it for web discovery, then pass promising URLs to [`web_fetch_many`](web-fetch.md) for full retrieval workflows. If the endpoint is unconfigured or unreachable, report that `/searxng:setup` or `SEARXNG_URL` is needed rather than guessing results.
 
 ## Notes
 

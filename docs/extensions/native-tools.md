@@ -23,7 +23,7 @@ Command:
 Side effects:
 
 - Strict-replacement policy enforcement at session start and on each `before_agent_start`. Banned stock tools (`bash`, `read`, `edit`, `write`) are removed and required replacements added; re-enabling a banned tool fails loudly.
-- Slim system-prompt steering toward batch-native usage.
+- Slim system-prompt steering toward batch-native usage, including search/read distinction, edit/write distinction, async-shell log-path handling, and web/document retrieval workflows.
 - Defensive renderers that produce compact `⎿ ...` summaries and a `⎿ error: ...` row on tool errors.
 
 ## Tool schemas
@@ -104,6 +104,16 @@ edit_many({
 - Each `oldText` must occur exactly once in the original file and must not overlap another replacement in the same file. Pre-validates before writing.
 - Replacements are applied against the original file contents, not after earlier replacements.
 - Triggers `mutation-review` (when configured) before edits apply.
+
+## Model-facing steering
+
+The slim prompt removes Pi's default `Available tools`/`Guidelines` prose and injects compact guidance instead:
+
+- Use `search_many` for discovery and `read_many` directly for known paths/ranges.
+- Batch independent `search_many`, `read_many`, and `shell_start` work into one call where possible.
+- Use `edit_many` for precise existing-file edits and `write_many` for new files or complete overwrites.
+- Treat async-shell completion notices as compact status plus log paths; use `shell_tail` for recent output and `search_many`/`read_many` on `stdout_log`/`stderr_log` for older or targeted output.
+- Use `searxng_search` → `web_fetch_many` → `read_many`/`document_parse` for online and document research.
 
 ## Behavior
 

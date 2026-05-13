@@ -55,6 +55,6 @@ document_parse({
 
 ## Notes
 
-- The wrapper does not modify LiteParse's tool description, schema, or output. Only renderers are added.
+- The wrapper keeps LiteParse's execution behavior and output shape while providing explicit `document_parse` model guidance and, when enabled, compact renderers.
 - Output files for parsed documents (text, JSON, screenshots) are saved by LiteParse to temp locations. Use `read_many` on the returned `outputPath`/screenshot paths when the in-call preview is insufficient.
 - See also [native-tools](native-tools.md) for the `read_many` follow-up.

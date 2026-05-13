@@ -115,7 +115,7 @@ Each extension below documents what it does, what it provides, and how to set it
 
 **Purpose.** Durable async shell jobs instead of blocking the agent. Each `shell_start` call accepts a list of commands; finished jobs return in-band within a fixed 6 s grace period, and background jobs deliver batched completion notices that resume the agent exactly once per batch.
 
-**Provides.** `shell_start`, `shell_status`, `shell_tail`, `shell_cancel`; `/async:status`; durable per-job logs and metadata under `.pi/async-shell/jobs/<jobId>/`.
+**Provides.** `shell_start`, `shell_status`, `shell_tail`, `shell_cancel`; `/async:status`; durable per-job logs and metadata under `.pi/async-shell/jobs/<jobId>/`. Completion notices point at `stdout_log`/`stderr_log`; use `shell_tail` for recent output and `search_many`/`read_many` on log paths for older or targeted output.
 
 **Setup.** None. No polling/wait tool: continue useful work; completion notices will resume the agent.
 
@@ -125,7 +125,7 @@ Each extension below documents what it does, what it provides, and how to set it
 
 [Full docs](docs/extensions/native-tools.md).
 
-**Purpose.** Replace stock single-file `read`/`grep`/`find`/`write`/`edit` tools with batch-native equivalents. Strict-replacement enforcement removes banned tools and adds required replacements at session start.
+**Purpose.** Replace stock single-file `read`/`grep`/`find`/`write`/`edit` tools with batch-native equivalents. Strict-replacement enforcement removes banned tools and adds required replacements at session start, while slim prompt guidance steers search-vs-read, edit-vs-write, shell log inspection, and research/document workflows.
 
 **Provides.** `read_many`, `search_many`, `write_many`, `edit_many`; disabled `bash` stub redirecting to `shell_start`; `/native:status`; compact renderers with `⎿ error: …` fallback on validation/exec errors.
 
@@ -161,7 +161,7 @@ Each extension below documents what it does, what it provides, and how to set it
 
 [Full docs](docs/extensions/web-fetch.md).
 
-**Purpose.** Safe, batched HTTP(S) fetch with caching, readability extraction, and a `document_parse` handoff for non-HTML. Refuses private-network and localhost URLs.
+**Purpose.** Safe, batched HTTP(S) fetch with caching, readability extraction, and a `document_parse` handoff for non-HTML. Refuses private-network and localhost URLs. Use after `searxng_search` discovers candidate URLs.
 
 **Provides.** `web_fetch_many` (1–12 URLs, modes `auto`/`html`/`download`, configurable byte/time caps, parallel up to 8); cached artifacts under `.pi/web-fetch/`; `/fetch:status`.
 

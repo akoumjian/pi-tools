@@ -39,7 +39,7 @@ shell_start({
     },
     ...
   ],
-  tailLines?: number                    // 1..200, default 40; cap on in-band stdout/stderr preview per stream
+  tailLines?: number                    // 1..200, default 40; in-band stdout/stderr preview per stream
 })
 ```
 
@@ -57,7 +57,7 @@ shell_status({
 })
 ```
 
-- With `jobId`: returns a single-job summary including small stdout/stderr tails.
+- With `jobId`: returns a single-job summary including `stdout_log`/`stderr_log` paths plus bounded recent stdout/stderr tails.
 - Without `jobId`: lists recent jobs from the on-disk registry plus active runtime jobs.
 
 ### shell_tail
@@ -66,10 +66,12 @@ shell_status({
 shell_tail({
   jobId: string,
   stream?: "stdout" | "stderr",         // omit for both
-  lines?: number,                       // 1..500, default 80
-  maxChars?: number                     // 1000..120000, default 20000
+  lines?: number,                       // 1..500, default 80; recent tail only
+  maxChars?: number                     // 1000..120000, default 20000; per stream
 })
 ```
+
+`shell_tail` intentionally returns recent output only. For older or targeted output, use the returned `stdout_log`/`stderr_log` paths with `search_many`, then `read_many` with `offset`/`limit` around relevant lines.
 
 ### shell_cancel
 
@@ -90,7 +92,7 @@ Cancel implicitly suppresses the completion notice for that job (`notifyOnExit` 
    ```ts
    { jobs: [{ job: JobMeta, output: { stdout: string, stderr: string } }, ...] }
    ```
-   with bounded `stdout`/`stderr` tails per `tailLines` and a hard ~20 KB per-stream cap.
+   with `stdout_log`/`stderr_log` paths, bounded `stdout`/`stderr` tails per `tailLines`, and a hard ~20 KB per-stream cap.
 4. For each background job that finishes later (with `notifyOnExit !== false`), the extension queues a completion notice. A ~100 ms debounce coalesces near-simultaneous completions into one batch.
 5. When the agent is idle, the batch is delivered as a custom message of type `async-shell` with `triggerTurn: true, deliverAs: "steer"`, so Pi resumes exactly once for the whole batch. When the agent is active, the flush is deferred to the next `turn_end`/`message_end (user)`/`agent_end` safe point.
 6. `shell_status` and `shell_tail` acknowledge an observed completion: if you inspect a job after it finished, no further notice is sent for that job.
@@ -100,17 +102,23 @@ Cancel implicitly suppresses the completion notice for that job (`notifyOnExit` 
 - Single job:
   ```
   async shell result: <status> · <duration> · <job_name>: <command-preview>
-  more: shell_tail jobId=<jobId>
+  stdout_log: <path-to-stdout.log>
+  stderr_log: <path-to-stderr.log>
+  more: shell_tail jobId=<jobId> (recent output; max 500 lines)
+  older_output: use search_many/read_many on stdout_log or stderr_log for older or targeted log output
   ```
 - Multiple jobs in one batch:
   ```
   async shell results: N jobs completed
   - <status> · <duration> · <job_name>: <command-preview>
-    more: shell_tail jobId=<jobId>
+    stdout_log: <path-to-stdout.log>
+    stderr_log: <path-to-stderr.log>
+    more: shell_tail jobId=<jobId> (recent output; max 500 lines)
+    older_output: use search_many/read_many on stdout_log or stderr_log for older or targeted log output
   - ...
   ```
 
-The `details` payload on the custom message carries the structured job metadata and short stdout/stderr tails for renderer/tool use.
+Completion notice content deliberately points at log paths rather than embedding stdout/stderr samples. The `details` payload still carries structured job metadata and short stdout/stderr tails for renderer/tool use.
 
 ## In-band result shape
 
@@ -147,8 +155,9 @@ Defaults (constants, not configurable):
 
 - In-band grace period: **6 s**.
 - Per-job completion batch debounce: **~100 ms**.
-- Notification stdout/stderr cap: **8 lines / 2 KB**.
-- Start-result per-stream cap: **20 KB**.
+- Completion-notice model-facing content: status summary plus `stdout_log`/`stderr_log` paths; no stdout/stderr sample.
+- Notification details/TUI stdout/stderr cap: **8 lines / 2 KB**.
+- Start/status/tail result per-stream caps: `shell_start` **20 KB**, `shell_tail` max **500 lines / 120 KB**.
 - Maximum commands per call: **12**.
 
 If you need to inspect storage health, run `/async:status`.
@@ -156,5 +165,5 @@ If you need to inspect storage health, run `/async:status`.
 ## Notes
 
 - There is intentionally no model-facing `shell_wait` or polling tool. Continue useful work while jobs run; if there is no useful work, stop after reporting that jobs are running. Completion notices will resume the agent.
-- Do not paste raw stdout/stderr unless the user explicitly asks. The intended use of `shell_tail`/`shell_status` is targeted inspection after a completion notice, not transcript dumping.
+- Do not paste raw stdout/stderr unless the user explicitly asks. Use `shell_tail`/`shell_status` for targeted recent inspection after a completion notice, not transcript dumping; use `search_many`/`read_many` on `stdout_log` or `stderr_log` for older or targeted log ranges.
 - Tests cover spawn, durable logs, batched completions, `notifyOnExit:false`, cancel suppression, compact rendering, and error fallback (`tests/async-shell.test.ts`, `tests/native-tools.test.ts`).

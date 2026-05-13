@@ -111,8 +111,8 @@ export function createDocumentParseTool(settings: ToolDisplaySettings): ToolDefi
     promptSnippet:
       "Parse local documents to text or JSON with OCR, bounding boxes, page ranges, and optional PDF screenshots. Full results are saved to temp files for follow-up inspection with read_many.",
     promptGuidelines: [
-      "Use this tool instead of composing LiteParse CLI commands manually when the user wants local document parsing.",
-      "After this tool returns outputPath or screenshot paths, use read_many on those files when full parsed content or screenshot metadata is needed.",
+      "Use document_parse instead of composing LiteParse CLI commands manually when the user wants local document parsing.",
+      "After document_parse returns outputPath or screenshot paths, use read_many on those files when full parsed content or screenshot metadata is needed.",
       "If document_parse reports missing host parser dependencies, run /docparser:doctor for guided setup."
     ],
     parameters: DocumentParseSchema,

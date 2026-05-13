@@ -19,7 +19,7 @@ web_fetch_many({
     {
       url: string,                                // HTTP(S); refuses localhost/private networks
       label?: string,                             // short source label for citations
-      mode?: "auto" | "html" | "download",        // default "auto"
+      mode?: "auto" | "html" | "download",        // default "auto"; auto extracts HTML and downloads non-HTML
       maxBytes?: number,                          // 1024..50 MiB, default 10 MiB
       timeoutSeconds?: number                      // 1..120, default 20
     },
@@ -110,6 +110,6 @@ If you want to verify the cache state, run `/fetch:status`.
 
 ## Notes
 
-- For agent workflows, use `searxng_search` first to discover URLs, then `web_fetch_many` for retrieval. After HTML fetches, follow up with `read_many` on `textPath` when the preview is not enough. After non-HTML fetches, follow up with `document_parse` on `downloadedPath`.
+- For agent workflows, use `searxng_search` first to discover URLs, then `web_fetch_many` for retrieval. After `web_fetch_many` fetches HTML, follow up with `read_many` on `textPath` when the preview is not enough. After `web_fetch_many` fetches PDFs, Office documents, spreadsheets, or images, follow up with `document_parse` on `downloadedPath`.
 - The redirect limit and `User-Agent` are intentionally fixed; if you need a custom UA, plumb it through `mode: "download"` plus a `shell_start` `curl` call instead.
 - Tests cover URL safety, HTML extraction, redirect handling, and download/document-parse hints (`tests/web-fetch.test.ts`).

@@ -29,6 +29,14 @@ async function withEnv(name: string, value: string | undefined, run: () => Promi
   }
 }
 
+function required<T>(value: T | undefined, name: string): T {
+  assert.notEqual(value, undefined, name);
+  if (value === undefined) {
+    throw new Error(name);
+  }
+  return value;
+}
+
 function createFakeApi(): FakeApi {
   const registeredTools: ToolDefinition[] = [];
   const commands = new Map<string, { description: string; handler: Function }>();
@@ -48,7 +56,13 @@ test("searxng extension registers search tool and status command", () => {
   const api = createFakeApi();
   searxngSearchExtension(api);
 
-  assert.ok(api.registeredTools.some((tool) => tool.name === "searxng_search"));
+  const tool = required(api.registeredTools.find((registeredTool) => registeredTool.name === "searxng_search"), "searxng_search tool");
+  assert.match(tool.description, /if it is unconfigured or unreachable/);
+  assert.match(tool.promptSnippet ?? "", /^Search the configured SearXNG instance/);
+  assert.match(tool.promptGuidelines?.join("\n") ?? "", /Use searxng_search for web discovery before web_fetch_many/);
+  const schemaText = JSON.stringify(tool.parameters);
+  assert.match(schemaText, /Maximum number of search results/);
+  assert.match(schemaText, /Optional freshness filter/);
   assert.ok(api.commands.has("searxng:status"));
   assert.ok(api.commands.has("searxng:setup"));
   assert.equal(api.commands.has("searxng-status"), false, "deprecated kebab alias removed");
