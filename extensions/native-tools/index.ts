@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { Type, type Static } from "@mariozechner/pi-ai";
+import { Type, type Static } from "@earendil-works/pi-ai";
 import {
   defineTool,
   type AgentToolResult,
@@ -11,8 +11,8 @@ import {
   type ExtensionContext,
   type Skill,
   withFileMutationQueue
-} from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 
 type TruncationDetails = {

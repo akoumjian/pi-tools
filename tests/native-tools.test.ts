@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import type { ExtensionAPI, ExtensionContext, MessageRenderer, Skill, ToolDefinition } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, MessageRenderer, Skill, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import asyncShellExtension from "../extensions/async-shell/index.js";
 import nativeToolsExtension, {
   buildNativeToolsStatusText,

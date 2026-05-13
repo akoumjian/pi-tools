@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import webFetchExtension, { buildWebFetchStatusText, extractReadableHtml, isPrivateOrLocalHostname, webFetchMany } from "../extensions/web-fetch/index.js";
 
 type FakeApi = ExtensionAPI & {

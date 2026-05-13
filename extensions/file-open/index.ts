@@ -2,9 +2,9 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import type { ExtensionAPI, ExtensionContext, Theme } from "@mariozechner/pi-coding-agent";
-import { DynamicBorder } from "@mariozechner/pi-coding-agent";
-import { Container, SelectList, Text, type Component, type KeyId, type SelectItem, type TUI } from "@mariozechner/pi-tui";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder } from "@earendil-works/pi-coding-agent";
+import { Container, SelectList, Text, type Component, type KeyId, type SelectItem, type TUI } from "@earendil-works/pi-tui";
 import { formatConfigPath, readPiToolsJsonConfigSource, type ConfigPath } from "../_shared/config.js";
 
 type FileOpenCommandArgs = {

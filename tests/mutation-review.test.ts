@@ -3,8 +3,8 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import type { Api, AssistantMessage, Model } from "@mariozechner/pi-ai";
-import { SessionManager, type ExtensionAPI, type ExtensionContext, type ToolCallEvent, type ToolDefinition } from "@mariozechner/pi-coding-agent";
+import type { Api, AssistantMessage, Model } from "@earendil-works/pi-ai";
+import { SessionManager, type ExtensionAPI, type ExtensionContext, type ToolCallEvent, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import mutationReviewExtension, {
   applyReviewedMutation,
   blockedOperationsForDecision,

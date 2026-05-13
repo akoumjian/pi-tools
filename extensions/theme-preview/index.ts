@@ -1,6 +1,6 @@
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionUIContext, Theme, ThemeColor } from "@mariozechner/pi-coding-agent";
-import { getMarkdownTheme, highlightCode } from "@mariozechner/pi-coding-agent";
-import { Key, Markdown, matchesKey, truncateToWidth, visibleWidth, type Component, type TUI } from "@mariozechner/pi-tui";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionUIContext, Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
+import { getMarkdownTheme, highlightCode } from "@earendil-works/pi-coding-agent";
+import { Key, Markdown, matchesKey, truncateToWidth, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 
 type ThemeBgColor = Parameters<Theme["bg"]>[0];

@@ -1,9 +1,9 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { isIP } from "node:net";
 import path from "node:path";
-import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
-import { completeSimple, type Api, type Message, type Model } from "@mariozechner/pi-ai";
-import type { ExtensionAPI, ExtensionContext, ToolCallEvent, ToolCallEventResult } from "@mariozechner/pi-coding-agent";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { completeSimple, type Api, type Message, type Model } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ExtensionContext, ToolCallEvent, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
 import { formatConfigPath, piToolsConfigCandidates, readPiToolsJsonConfig, readPiToolsReferencedTextConfig, removeAgentExtensionConfig, writeAgentExtensionConfig, writeAgentExtensionTextConfig, type ConfigPath, type PiToolsConfigCandidate } from "../_shared/config.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 import { formatModelName, normalizeThinkingLevel, parseOptionalModelThinkingPair, resolveExtensionModel, type ExtensionModelRegistry } from "../_shared/model-spec.js";

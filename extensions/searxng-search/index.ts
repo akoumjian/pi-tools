@@ -1,6 +1,6 @@
-import { Type, type Static } from "@mariozechner/pi-ai";
-import { defineTool, type AgentToolResult, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import { Type, type Static } from "@earendil-works/pi-ai";
+import { defineTool, type AgentToolResult, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { formatConfigPath, readPiToolsJsonConfigSource } from "../_shared/config.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 import { handleSearxngSetupCommand, SEARXNG_AGENT_CONFIG_FILE } from "./setup.js";

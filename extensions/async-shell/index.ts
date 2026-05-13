@@ -3,9 +3,9 @@ import { accessSync, closeSync, constants, existsSync, mkdirSync, openSync, read
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { Readable } from "node:stream";
-import { Type, type Static } from "@mariozechner/pi-ai";
-import { defineTool, type AgentToolResult, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import { Type, type Static } from "@earendil-works/pi-ai";
+import { defineTool, type AgentToolResult, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 
 type JobStatus = "running" | "exited" | "failed" | "cancelled" | "unknown";

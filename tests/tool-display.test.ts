@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { ExtensionAPI, ToolDefinition } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import searxngSearchExtension from "../extensions/searxng-search/index.js";
 import toolDisplayExtension, { createDocumentParseTool, readToolDisplaySettings } from "../extensions/tool-display/index.js";
 

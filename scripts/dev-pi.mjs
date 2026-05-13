@@ -14,7 +14,7 @@
 
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { delimiter, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -83,7 +83,15 @@ function defaultSettingsJson() {
 }
 
 function startPi(args) {
+  const localBinDir = resolve(repoRoot, "node_modules", ".bin");
+  const localPi = resolve(localBinDir, "pi");
   const env = { ...process.env, PI_CODING_AGENT_DIR: devAgentDir };
+  if (existsSync(localPi)) {
+    env.PATH = `${localBinDir}${delimiter}${process.env.PATH ?? ""}`;
+    if (process.stderr.isTTY) {
+      process.stderr.write(`[dev-pi] using local pi: ${localPi}\n`);
+    }
+  }
   if (process.stderr.isTTY) {
     process.stderr.write(`[dev-pi] PI_CODING_AGENT_DIR=${devAgentDir}\n`);
   }

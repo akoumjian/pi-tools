@@ -2,7 +2,7 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
   RegisteredCommand
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 
 type CommandOptions = Omit<RegisteredCommand, "name" | "sourceInfo">;
 

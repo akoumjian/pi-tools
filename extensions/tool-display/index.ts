@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
-import { Type, type Static } from "@mariozechner/pi-ai";
-import type { AgentToolResult, ExtensionAPI, ExtensionCommandContext, RegisteredCommand, ToolDefinition } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import { Type, type Static } from "@earendil-works/pi-ai";
+import type { AgentToolResult, ExtensionAPI, ExtensionCommandContext, RegisteredCommand, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { findPiToolsConfigFile, readPiToolsJsonConfig } from "../_shared/config.js";
 
 const DocumentParseSchema = Type.Object({

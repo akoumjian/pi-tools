@@ -1,5 +1,5 @@
-import type { AgentMessage, ThinkingLevel } from "@mariozechner/pi-agent-core";
-import type { Api, AssistantMessage, ImageContent, Message, Model, TextContent, ToolResultMessage } from "@mariozechner/pi-ai";
+import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { Api, AssistantMessage, ImageContent, Message, Model, TextContent, ToolResultMessage } from "@earendil-works/pi-ai";
 import {
   buildSessionContext,
   convertToLlm,
@@ -15,8 +15,8 @@ import {
   type ExtensionError,
   type ExtensionFactory,
   type LoadExtensionsResult
-} from "@mariozechner/pi-coding-agent";
-import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-coding-agent";
+import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import {
   formatModelName,
   normalizeThinkingLevel,

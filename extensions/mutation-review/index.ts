@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { AgentMessage, ThinkingLevel } from "@mariozechner/pi-agent-core";
-import { Type, type Api, type AssistantMessage, type Model, type Static, type TextContent, type ToolCall } from "@mariozechner/pi-ai";
+import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { Type, type Api, type AssistantMessage, type Model, type Static, type TextContent, type ToolCall } from "@earendil-works/pi-ai";
 import {
   buildSessionContext,
   convertToLlm,
@@ -21,7 +21,7 @@ import {
   type ToolCallEventResult,
   type ToolDefinition,
   type ToolResultEvent
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import {
   applyExactReplacements,
   nativeEditMutationEntryId,

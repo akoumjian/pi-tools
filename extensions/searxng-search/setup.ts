@@ -15,7 +15,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import type { ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { writeAgentExtensionConfig } from "../_shared/config.js";
 
 export const SEARXNG_AGENT_CONFIG_FILE = "searxng-settings.json";

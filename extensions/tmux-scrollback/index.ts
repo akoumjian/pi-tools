@@ -1,6 +1,6 @@
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { ProcessTerminal } from "@mariozechner/pi-tui";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { ProcessTerminal } from "@earendil-works/pi-tui";
 
 const TMUX_CONFLICTING_PRIVATE_MODES = new Set([
   "47",
