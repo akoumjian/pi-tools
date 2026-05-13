@@ -133,8 +133,8 @@ export function createDocumentParseTool(settings: ToolDisplaySettings): ToolDefi
     renderCall(args, theme) {
       return new Text(claudeToolCall("Parse", formatDocumentParseCall(args as DocumentParseInput), theme), 0, 0);
     },
-    renderResult(result, options, theme) {
-      return renderDocumentParseResult(result as AgentToolResult<DocumentParseDetails>, options as RenderOptions, theme);
+    renderResult(result, options, theme, context) {
+      return renderDocumentParseResult(result as AgentToolResult<DocumentParseDetails>, options as RenderOptions, theme, context as { isError?: boolean } | undefined);
     }
   };
 }
@@ -210,7 +210,17 @@ async function captureOriginalDocparserDoctorCommand(): Promise<DeferredCommand>
   return captured;
 }
 
-function renderDocumentParseResult(result: AgentToolResult<DocumentParseDetails>, options: RenderOptions, theme: RenderTheme): Text {
+function renderDocumentParseResult(result: AgentToolResult<DocumentParseDetails>, options: RenderOptions, theme: RenderTheme, context?: { isError?: boolean }): Text {
+  if (context?.isError === true) {
+    const text = result.content
+      .map((item) => item.type === "text" ? item.text : "")
+      .join("\n")
+      .trim();
+    const oneLine = text.replace(/\s+/g, " ").trim();
+    const summary = oneLine.length === 0 ? "Tool failed." : (oneLine.length <= 160 ? oneLine : `${oneLine.slice(0, 157)}...`);
+    return new Text(claudeToolResult(`error: ${summary}`, "error", theme), 0, 0);
+  }
+
   if (options.isPartial || result.details?.outputPath === undefined) {
     return new Text(claudeToolResult(compactProgressText(result), "warning", theme), 0, 0);
   }

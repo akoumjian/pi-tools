@@ -61,7 +61,21 @@ const searxngSearchTool = defineTool({
   renderCall(args, theme) {
     return new Text(claudeToolCall("Search", quotePreview(args.query, 72), theme), 0, 0);
   },
-  renderResult(result, options, theme) {
+  renderResult(result, options, theme, context) {
+    if (context?.isError === true) {
+      const text = result.content
+        .map((item) => item.type === "text" ? item.text : "")
+        .join("\n")
+        .trim();
+      const summary = text.length === 0
+        ? "Tool failed."
+        : (() => {
+            const oneLine = text.replace(/\s+/g, " ").trim();
+            return oneLine.length <= 160 ? oneLine : `${oneLine.slice(0, 157)}...`;
+          })();
+      return new Text(claudeToolResult(`error: ${summary}`, "error", theme), 0, 0);
+    }
+
     if (options.isPartial) {
       return new Text(claudeToolResult("searching", "warning", theme), 0, 0);
     }

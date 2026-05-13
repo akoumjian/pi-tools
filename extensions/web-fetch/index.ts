@@ -154,8 +154,8 @@ export default function webFetchExtension(api: ExtensionAPI): void {
     renderCall(args, theme) {
       return renderWebFetchCall(args, theme);
     },
-    renderResult(result, options, theme) {
-      return renderWebFetchResult(result, options, theme);
+    renderResult(result, options, theme, context) {
+      return renderWebFetchResult(result, options, theme, context);
     }
   }));
 }
@@ -774,7 +774,33 @@ function renderWebFetchCall(args: WebFetchManyInput, theme: RenderTheme): Text {
   return new Text(claudeToolCall("Fetch", summarizeItems(args.urls.map((item) => compactUrl(item.url)), 3), theme), 0, 0);
 }
 
-function renderWebFetchResult(result: AgentToolResult<WebFetchManyDetails>, options: RenderOptions, theme: RenderTheme): Text {
+type RenderContext = {
+  isError?: boolean;
+};
+
+function renderToolErrorRow(result: AgentToolResult<unknown>, theme: RenderTheme, context: RenderContext | undefined): Text | undefined {
+  if (context?.isError !== true) {
+    return undefined;
+  }
+  const text = result.content
+    .map((item) => item.type === "text" ? item.text : "")
+    .join("\n")
+    .trim();
+  const summary = text.length === 0 ? "Tool failed." : truncateOneLineForError(text, 160);
+  return new Text(claudeToolResult(`error: ${summary}`, "error", theme), 0, 0);
+}
+
+function truncateOneLineForError(text: string, maxLength: number): string {
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  return oneLine.length <= maxLength ? oneLine : `${oneLine.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function renderWebFetchResult(result: AgentToolResult<WebFetchManyDetails>, options: RenderOptions, theme: RenderTheme, context?: RenderContext): Text {
+  const errorRow = renderToolErrorRow(result, theme, context);
+  if (errorRow !== undefined) {
+    return errorRow;
+  }
+
   if (options.isPartial) {
     return new Text(claudeToolResult("fetching", "warning", theme), 0, 0);
   }

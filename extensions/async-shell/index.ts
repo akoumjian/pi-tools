@@ -208,8 +208,8 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     renderCall(args, theme) {
       return renderShellStartCall(args, theme);
     },
-    renderResult(result, options, theme) {
-      return renderShellStartResult(result, options, theme);
+    renderResult(result, options, theme, context) {
+      return renderShellStartResult(result, options, theme, context);
     }
   }));
 
@@ -239,8 +239,8 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
       }
       return renderJobCall("Status", args.jobId, theme);
     },
-    renderResult(result, options, theme) {
-      return renderShellStatusResult(result, options, theme);
+    renderResult(result, options, theme, context) {
+      return renderShellStatusResult(result, options, theme, context);
     }
   }));
 
@@ -264,8 +264,8 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
       const lines = args.lines ?? 80;
       return new Text(claudeToolCall("Tail", `${shortDisplayId(args.jobId)} ${stream} ${lines} lines`, theme), 0, 0);
     },
-    renderResult(result, options, theme) {
-      return renderJobSummaryResult(result, options, theme, "tail");
+    renderResult(result, options, theme, context) {
+      return renderJobSummaryResult(result, options, theme, context, "tail");
     }
   }));
 
@@ -285,8 +285,8 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     renderCall(args, theme) {
       return new Text(claudeToolCall("Cancel", `${shortDisplayId(args.jobId)} ${args.signal ?? "SIGTERM"}`, theme), 0, 0);
     },
-    renderResult(result, options, theme) {
-      return renderJobSummaryResult(result, options, theme, "cancel requested");
+    renderResult(result, options, theme, context) {
+      return renderJobSummaryResult(result, options, theme, context, "cancel requested");
     }
   }));
 
@@ -1000,6 +1000,22 @@ type RenderOptions = {
   isPartial?: boolean;
 };
 
+type RenderContext = {
+  isError?: boolean;
+};
+
+function renderShellToolError(result: AgentToolResult<unknown>, theme: RenderTheme, context: RenderContext | undefined): Text | undefined {
+  if (context?.isError !== true) {
+    return undefined;
+  }
+  const text = result.content
+    .map((item) => item.type === "text" ? item.text : "")
+    .join("\n")
+    .trim();
+  const summary = text.length === 0 ? "Tool failed." : truncateOneLine(text, 160);
+  return new Text(claudeToolResult(`error: ${summary}`, "error", theme), 0, 0);
+}
+
 function renderShellStartCall(args: StartInput, theme: RenderTheme): Text {
   const commands = args.commands.map(formatCommandRequest);
   const summary = commands.length === 1
@@ -1008,8 +1024,13 @@ function renderShellStartCall(args: StartInput, theme: RenderTheme): Text {
   return new Text(claudeToolCall("Call", summary, theme), 0, 0);
 }
 
-function renderShellStartResult(result: AgentToolResult<StartDetails>, options: RenderOptions, theme: RenderTheme): Text {
-  const jobsList = result.details?.jobs.map((entry) => entry.job) ?? [];
+function renderShellStartResult(result: AgentToolResult<StartDetails>, options: RenderOptions, theme: RenderTheme, context?: RenderContext): Text {
+  const errorRow = renderShellToolError(result, theme, context);
+  if (errorRow !== undefined) {
+    return errorRow;
+  }
+
+  const jobsList = result.details?.jobs?.map((entry) => entry.job) ?? [];
   if (jobsList.length === 0) {
     return new Text(claudeToolResult(options.isPartial ? "starting" : "done", "muted", theme), 0, 0);
   }
@@ -1021,9 +1042,14 @@ function renderJobCall(name: string, jobId: string, theme: RenderTheme): Text {
   return new Text(claudeToolCall(name, shortDisplayId(jobId), theme), 0, 0);
 }
 
-function renderShellStatusResult(result: AgentToolResult<JobSummaryDetails | JobListDetails>, options: RenderOptions, theme: RenderTheme): Text {
+function renderShellStatusResult(result: AgentToolResult<JobSummaryDetails | JobListDetails>, options: RenderOptions, theme: RenderTheme, context?: RenderContext): Text {
+  const errorRow = renderShellToolError(result, theme, context);
+  if (errorRow !== undefined) {
+    return errorRow;
+  }
+
   if (isJobSummaryDetails(result.details)) {
-    return renderJobSummaryResult(result as AgentToolResult<JobSummaryDetails>, options, theme);
+    return renderJobSummaryResult(result as AgentToolResult<JobSummaryDetails>, options, theme, context);
   }
 
   return renderJobListResult(result as AgentToolResult<JobListDetails>, options, theme);
@@ -1033,7 +1059,12 @@ function isJobSummaryDetails(details: unknown): details is JobSummaryDetails {
   return isRecord(details) && isJobMeta(details.job);
 }
 
-function renderJobSummaryResult(result: AgentToolResult<JobSummaryDetails>, options: RenderOptions, theme: RenderTheme, prefix?: string): Text {
+function renderJobSummaryResult(result: AgentToolResult<JobSummaryDetails>, options: RenderOptions, theme: RenderTheme, context?: RenderContext, prefix?: string): Text {
+  const errorRow = renderShellToolError(result, theme, context);
+  if (errorRow !== undefined) {
+    return errorRow;
+  }
+
   if (options.isPartial) {
     return new Text(claudeToolResult(prefix ?? "working", "warning", theme), 0, 0);
   }
@@ -1059,17 +1090,21 @@ function renderJobListResult(result: AgentToolResult<JobListDetails>, options: R
 }
 
 function renderAsyncShellMessage(details: unknown, _options: RenderOptions, theme: RenderTheme): Text {
-  const jobsList = jobsFromAsyncShellMessage(details);
-  if (jobsList.length === 0) {
+  try {
+    const jobsList = jobsFromAsyncShellMessage(details);
+    if (jobsList.length === 0) {
+      return new Text(claudeToolResult("async shell completed", "muted", theme), 0, 0);
+    }
+
+    if (jobsList.length === 1) {
+      const job = jobsList[0];
+      return new Text(claudeToolResult(formatShellJobStatus(job), shellStatusColor(job), theme), 0, 0);
+    }
+
+    return new Text(claudeToolResult(formatJobListStatus(jobsList), jobListStatusColor(jobsList), theme), 0, 0);
+  } catch {
     return new Text(claudeToolResult("async shell completed", "muted", theme), 0, 0);
   }
-
-  if (jobsList.length === 1) {
-    const job = jobsList[0];
-    return new Text(claudeToolResult(formatShellJobStatus(job), shellStatusColor(job), theme), 0, 0);
-  }
-
-  return new Text(claudeToolResult(formatJobListStatus(jobsList), jobListStatusColor(jobsList), theme), 0, 0);
 }
 
 function claudeToolCall(name: string, summary: string, theme: RenderTheme): string {

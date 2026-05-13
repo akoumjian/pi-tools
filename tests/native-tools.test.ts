@@ -408,6 +408,37 @@ test("shell_start emits partial status updates while waiting", async () => {
   });
 });
 
+test("async shell tool result renders compactly on schema/exec errors instead of dumping content", () => {
+  const api = createFakeApi([], []);
+  asyncShellExtension(api);
+  const shellStart = required(api.registeredTools.find((tool) => tool.name === "shell_start"), "shell_start tool");
+  const shellStatus = required(api.registeredTools.find((tool) => tool.name === "shell_status"), "shell_status tool");
+  const shellTail = required(api.registeredTools.find((tool) => tool.name === "shell_tail"), "shell_tail tool");
+  const shellCancel = required(api.registeredTools.find((tool) => tool.name === "shell_cancel"), "shell_cancel tool");
+
+  const longErrorText = [
+    "Expected required property",
+    "commands.0.cwd is required",
+    "  /Users/aleck/Code/pi-tools/extensions/async-shell/index.ts:118",
+    "    at Object.execute",
+    "    at TypeBoxValueCheck",
+    "    at runAgentLoop /Users/aleck/Code/pi-tools/.pi/test-build/extensions/async-shell/index.js:42"
+  ].join("\n");
+  const errorResult = {
+    content: [{ type: "text", text: longErrorText }],
+    details: undefined
+  };
+
+  for (const tool of [shellStart, shellStatus, shellTail, shellCancel]) {
+    const rendered = renderToolResult(tool, errorResult, false, { isError: true });
+    assert.match(rendered, /⎿ error: /);
+    const trimmed = rendered.trimEnd();
+    assert.doesNotMatch(trimmed, /\n/, `${tool.name} error row should be single-line`);
+    assert.ok(trimmed.length <= 200, `${tool.name} error row should be bounded, got length ${trimmed.length}`);
+    assert.ok(trimmed.endsWith("...") || trimmed.length <= 168, `${tool.name} error row should be truncated past ~160 chars (got ${trimmed.length})`);
+  }
+});
+
 test("async shell management tools render compactly without raw output", () => {
   const api = createFakeApi([], []);
   asyncShellExtension(api);
