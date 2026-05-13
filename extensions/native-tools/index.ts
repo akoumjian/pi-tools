@@ -591,9 +591,9 @@ export function addBatchNativeToolGuidance(prompt: string): string {
     "- Prefer search_many before reading code. Put independent file/content/symbol searches into one search_many.searches array.",
     "- When several known files or ranges are needed, read them in one read_many.files array instead of serial read calls.",
     "- For shell work, use shell_start with commands: [...]. Start independent shell work together in one commands list instead of making serial shell_start calls; split only when commands depend on previous output, must run in order, or are not safe to run concurrently. Each shell_start command item must include its own command and cwd.",
-    "- shell_start briefly waits only for quick commands using a fixed 6s grace period. There is no wait parameter; unfinished jobs continue in the background and send per-job follow-ups by default.",
-    "- While shell commands run in the background, do other useful work. Leave per-command notifyOnExit at its true default when you want Pi to resume on completion. Set notifyOnExit:false only when you do not care about that command's result. Do not poll or wait, you will be notified.",
-    "- Async-shell completion follow-ups are short result notices. Use shell_tail if the user asks about or needs job output; do not paste raw shell output unless explicitly requested.",
+    "- shell_start briefly waits only for quick commands using a fixed 6s grace period. There is no wait parameter; unfinished jobs continue in the background and append per-job completion notices by default.",
+    "- While shell commands run in the background, do other useful work. Leave per-command notifyOnExit at its true default when you want a completion notice. Set notifyOnExit:false only when you do not care about this command's result. Do not poll or wait; completion notices will be added to history/TUI without triggering a new assistant turn.",
+    "- Async-shell completion notices are short result notices. Use shell_tail if the user asks about or needs job output; do not paste raw shell output unless explicitly requested.",
     "- Use shell_status for inspection, shell_tail for more output after a result/notification, and shell_cancel to stop jobs.",
     "- Do not perform a sequence of single-item search_many/read_many/shell_start calls when one multi-item tool call can cover the independent work.",
     ""

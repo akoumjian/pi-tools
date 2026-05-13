@@ -246,7 +246,7 @@ test("shell_start sends one deferred follow-up per notified completed job", asyn
 
     assert.equal(api.sentMessages.length, 2);
     for (const sentMessage of api.sentMessages) {
-      assert.deepEqual(sentMessage.options, { triggerTurn: true, deliverAs: "followUp" });
+      assert.deepEqual(sentMessage.options, { deliverAs: "steer" });
       assert.doesNotMatch(JSON.stringify(sentMessage.message), /Job completed\./);
       assert.doesNotMatch(JSON.stringify(sentMessage.message), /async-shell notification/);
 

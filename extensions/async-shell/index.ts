@@ -98,7 +98,7 @@ const CommandItem = Type.Object({
   cwd: Type.String({ minLength: 1, description: "Working directory for this command. Use per-command cwd; shell_start has no top-level cwd." }),
   job_name: Type.Optional(Type.String({ minLength: 1, description: "Optional human-readable name for this job." })),
   shell: Type.Optional(Type.String({ description: "Shell executable for this command. Defaults to $SHELL or /bin/zsh." })),
-  notifyOnExit: Type.Optional(Type.Boolean({ default: true, description: "Defaults to true. When this command is still running after shell_start returns, send a per-job completion follow-up when it exits. Set false only when you do not care about this command's result." }))
+  notifyOnExit: Type.Optional(Type.Boolean({ default: true, description: "Defaults to true. When this command is still running after shell_start returns, append a per-job completion notice when it exits. Set false only when you do not care about this command's result." }))
 }, { additionalProperties: false });
 
 const StartParams = Type.Object({
@@ -161,22 +161,22 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
       "Start independent shell work together in one commands list instead of making serial shell_start calls; split into separate calls only when commands depend on previous output, must run in order, or are not safe to run concurrently.",
       "Each command item must include its own command and cwd, and starts as a durable async job with its own jobId, status, cwd, logs, and stdout/stderr output. Standard input is ignored, so do not use shell_start for interactive commands.",
       "Results are grouped per job as { jobs: Array<{ job: JobMeta, output: { stdout: string, stderr: string } }> }. A single shell_start call accepts at most 12 commands.",
-      `shell_start waits only for a fixed ${START_WAIT_FOR_COMPLETION_SECONDS}s grace period: jobs that finish quickly return in-band; unfinished jobs continue in the background and, by default, each sends a completion follow-up when it exits.`,
-      "In-band shell_start results include compact job fields plus bounded stdout/stderr tails. Completion follow-ups are short result notices; use shell_tail for output. Start-result output is capped by tailLines and about 20 KB per stream.",
-      "Continue useful work while jobs run; if there is no useful work, stop and wait for the follow-up. Do not poll or wait.",
+      `shell_start waits only for a fixed ${START_WAIT_FOR_COMPLETION_SECONDS}s grace period: jobs that finish quickly return in-band; unfinished jobs continue in the background and, by default, append completion notices when they exit.`,
+      "In-band shell_start results include compact job fields plus bounded stdout/stderr tails. Completion notices are short result notices added to history/TUI without triggering a new assistant turn; use shell_tail for output. Start-result output is capped by tailLines and about 20 KB per stream.",
+      "Continue useful work while jobs run. If there is no useful work, stop after reporting that jobs are running; completion notices will appear in history. Do not poll or wait.",
       "Set per-command notifyOnExit:false only when the result is unimportant.",
       "Use shell_status to inspect jobs and shell_tail to read output after a result/notification, or only when necessary for a specific active job; do not use them for polling."
     ].join(" "),
-    promptSnippet: "shell_start: run shell commands as durable async jobs. Start independent shell work together in one commands list, keep doing useful work, and rely on per-job completion follow-ups instead of polling.",
+    promptSnippet: "shell_start: run shell commands as durable async jobs. Start independent shell work together in one commands list, keep doing useful work, and rely on per-job completion notices instead of polling.",
     promptGuidelines: [
       "Use shell_start for shell commands instead of bash.",
       "Start independent shell work together in one commands list instead of making serial shell_start calls; split into separate calls only when commands depend on previous output, must run in order, or are not safe to run concurrently.",
       "Each command item must include its own command and cwd. Use optional job_name only when a short human-readable name helps distinguish concurrent jobs. Standard input is ignored, so avoid interactive commands.",
       "Prefer search_many for code/file discovery. If using shell_start for custom search, start with rg --files, rg -n, git grep -n, or bounded find before reading file contents.",
-      `shell_start waits only for a fixed ${START_WAIT_FOR_COMPLETION_SECONDS}s grace period; there is no wait parameter. Jobs that do not finish in-band continue in the background and send per-job follow-ups by default.`,
+      `shell_start waits only for a fixed ${START_WAIT_FOR_COMPLETION_SECONDS}s grace period; there is no wait parameter. Jobs that do not finish in-band continue in the background and append per-job completion notices by default.`,
       "Set per-command notifyOnExit:false only when the result is unimportant.",
-      "Async-shell completion follow-ups are short result notices. Use shell_tail if the user asks about or needs job output; do not paste raw shell output unless explicitly requested.",
-      "Continue useful work while jobs run; if there is no useful work, stop and wait for the follow-up. Do not poll or wait. Use shell_status and shell_tail only after a result/notification or when necessary for a specific active job."
+      "Async-shell completion notices are short result notices added to history/TUI without triggering a new assistant turn. Use shell_tail if the user asks about or needs job output; do not paste raw shell output unless explicitly requested.",
+      "Continue useful work while jobs run; if there is no useful work, stop after reporting that jobs are running. Do not poll or wait. Use shell_status and shell_tail only after a result/notification or when necessary for a specific active job."
     ],
     parameters: StartParams,
     executionMode: "parallel",
@@ -431,7 +431,7 @@ function scheduleCompletionNotification(api: ExtensionAPI, job: JobRuntime): voi
           output: readJobOutput(job, NOTIFICATION_TAIL_LINES, NOTIFICATION_TAIL_MAX_CHARS)
         }
       },
-      { triggerTurn: true, deliverAs: "followUp" }
+      { deliverAs: "steer" }
     )
   });
 }
@@ -837,7 +837,7 @@ export function buildAsyncShellStatusText(context: Pick<ExtensionContext, "cwd">
     `Job root: ${root}`,
     `Job root state: ${describePathAccess(root)}`,
     `Recent jobs: ${recentJobs.length} (${running} running, ${terminal} terminal or detached)`,
-    running > 0 ? "Use shell_status without a jobId to list jobs, shell_tail with a jobId to read output, or shell_cancel to stop a running job. Do not poll or wait, you will be notified." : "No running jobs in the recent async-shell registry.",
+    running > 0 ? "Use shell_status without a jobId to list jobs, shell_tail with a jobId to read output, or shell_cancel to stop a running job. Do not poll; completion notices will be added to history." : "No running jobs in the recent async-shell registry.",
     recentJobs.some((job) => job.status === "unknown") ? "Some jobs were started by a previous Pi process and are no longer attached." : undefined
   ].filter((line): line is string => line !== undefined).join("\n");
 }
