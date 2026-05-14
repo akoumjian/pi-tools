@@ -112,7 +112,7 @@ The slim prompt removes Pi's default `Available tools`/`Guidelines` prose and in
 - Use `search_many` for discovery and `read_many` directly for known paths/ranges.
 - Batch independent `search_many`, `read_many`, and `shell_start` work into one call where possible.
 - Use `edit_many` for precise existing-file edits and `write_many` for new files or complete overwrites.
-- Treat async-shell completion notices as compact status plus log paths; use `shell_tail` for recent output and `search_many`/`read_many` on `stdout_log`/`stderr_log` for older or targeted output.
+- Treat async-shell completion notices and `shell_start` results as compact status plus log paths; use `shell_read` tail mode for recent output, `shell_read` range mode for exact lines/continuation, and `search_many`/`read_many` on `stdout_log`/`stderr_log` for targeted file inspection.
 - Use `searxng_search` → `web_fetch_many` → `read_many`/`document_parse` for online and document research.
 
 ## Behavior
@@ -142,7 +142,7 @@ The slim prompt removes Pi's default `Available tools`/`Guidelines` prose and in
 At `session_start` and on each `before_agent_start`, the extension reconciles the active tool list:
 
 - Removes banned stock tools (`bash`, `read`, `edit`, `write`).
-- Adds required replacements (`shell_start`/`shell_status`/`shell_tail`/`shell_cancel`, `read_many`, `search_many`, `write_many`, `edit_many`).
+- Adds required replacements (`shell_start`/`shell_status`/`shell_read`/`shell_cancel`, `read_many`, `search_many`, `write_many`, `edit_many`).
 - Optionally activates `web_fetch_many` when present.
 
 If a profile or extension re-adds a banned stock tool, strict mode reports the conflict via `/native:status` and a one-shot session warning.

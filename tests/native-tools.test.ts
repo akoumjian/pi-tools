@@ -284,12 +284,12 @@ test("shell_start schema exposes commands list and async completion guidance", (
   assert.match(shellStart.description, /jobId/);
   assert.match(shellStart.description, /Each command item must include its own command and cwd/);
   assert.match(shellStart.description, /In-band shell_start results include compact job fields/);
+  assert.match(shellStart.description, /does not return stdout\/stderr samples/);
   assert.match(shellStart.description, /Completion notices are short result notices/);
   assert.match(shellStart.description, /triggers one assistant turn for each flushed batch/);
-  assert.match(shellStart.description, /20 KB per stream/);
   assert.match(shellStart.description, /at most 12 commands/);
   assert.match(shellStart.description, /Standard input is ignored/);
-  assert.match(shellStart.description, /Do not use status\/tail for polling/);
+  assert.match(shellStart.description, /Do not use status\/read for polling/);
   assert.equal(typeof shellStart.renderCall, "function");
   assert.equal(typeof shellStart.renderResult, "function");
   assert.equal(shellStart.renderShell, "self");
@@ -301,6 +301,7 @@ test("shell_start schema exposes commands list and async completion guidance", (
   assert.equal(shellSchema.properties?.cwd, undefined);
   assert.equal(shellSchema.properties?.label, undefined);
   assert.equal(shellSchema.properties?.shell, undefined);
+  assert.equal(shellSchema.properties?.tailLines, undefined);
   assert.equal(shellSchema.additionalProperties, false);
   assert.equal(shellSchema.properties.commands.minItems, 1);
   assert.match(JSON.stringify(shellSchema.properties.commands), /notifyOnExit/);
@@ -308,7 +309,7 @@ test("shell_start schema exposes commands list and async completion guidance", (
   assert.match(JSON.stringify(shellSchema.properties.commands), /cwd/);
   assert.doesNotMatch(JSON.stringify(shellSchema.properties.commands), /label/);
 
-  for (const toolName of ["shell_status", "shell_tail", "shell_cancel"]) {
+  for (const toolName of ["shell_status", "shell_read", "shell_cancel"]) {
     const tool = required(api.registeredTools.find((registeredTool) => registeredTool.name === toolName), `${toolName} tool`);
     assert.equal(typeof tool.renderCall, "function");
     assert.equal(typeof tool.renderResult, "function");
@@ -316,10 +317,16 @@ test("shell_start schema exposes commands list and async completion guidance", (
     assert.equal(schemaFor(tool).additionalProperties, false);
   }
 
-  const shellTail = required(api.registeredTools.find((registeredTool) => registeredTool.name === "shell_tail"), "shell_tail tool");
-  const shellTailSchema = schemaFor(shellTail);
-  assert.match(shellTailSchema.properties?.lines?.description ?? "", /Maximum output lines/);
-  assert.match(shellTailSchema.properties?.maxChars?.description ?? "", /Maximum bytes/);
+  assert.equal(api.registeredTools.some((registeredTool) => registeredTool.name === "shell_tail"), false);
+  const shellRead = required(api.registeredTools.find((registeredTool) => registeredTool.name === "shell_read"), "shell_read tool");
+  const shellReadSchema = schemaFor(shellRead);
+  assert.match(shellRead.description, /mode='tail'/);
+  assert.match(shellRead.description, /mode='range'/);
+  assert.match(JSON.stringify(shellReadSchema.properties?.mode), /"default":"tail"/);
+  assert.match(shellReadSchema.properties?.lines?.description ?? "", /Tail mode only/);
+  assert.match(shellReadSchema.properties?.maxChars?.description ?? "", /Tail mode only/);
+  assert.equal(shellReadSchema.properties?.offset.minimum, 1);
+  assert.equal(shellReadSchema.properties?.limit.minimum, 1);
 
   const singleCallText = renderToolCall(shellStart, {
     commands: [{ command: "pwd", cwd: ".", job_name: "where" }]
@@ -342,14 +349,14 @@ test("shell_start schema exposes commands list and async completion guidance", (
     details: {
       jobs: [
         {
-          job: {
-            jobId: "job_20260427160000_abcdef12",
-            job_name: "scan",
-            command: "rg -n \"needle\" extensions",
-            cwd: "/repo",
-            status: "running"
-          },
-          output: { stdout: "", stderr: "" }
+          jobId: "job_20260427160000_abcdef12",
+          job_name: "scan",
+          command: "rg -n \"needle\" extensions",
+          cwd: "/repo",
+          status: "running",
+          stdoutLog: "/repo/.pi/async-shell/jobs/job_20260427160000_abcdef12/stdout.log",
+          stderrLog: "/repo/.pi/async-shell/jobs/job_20260427160000_abcdef12/stderr.log",
+          outputBytes: { stdout: 0, stderr: 0 }
         }
       ]
     }
@@ -361,16 +368,16 @@ test("shell_start schema exposes commands list and async completion guidance", (
     details: {
       jobs: [
         {
-          job: {
-            jobId: "job_20260427160000_abcdef12",
-            job_name: "scan",
-            command: "rg -n \"needle\" extensions",
-            cwd: "/repo",
-            status: "exited",
-            exitCode: 0,
-            durationMs: 1234
-          },
-          output: { stdout: "extensions/native-tools/index.ts:12:needle", stderr: "" }
+          jobId: "job_20260427160000_abcdef12",
+          job_name: "scan",
+          command: "rg -n \"needle\" extensions",
+          cwd: "/repo",
+          status: "exited",
+          exitCode: 0,
+          durationMs: 1234,
+          stdoutLog: "/repo/.pi/async-shell/jobs/job_20260427160000_abcdef12/stdout.log",
+          stderrLog: "/repo/.pi/async-shell/jobs/job_20260427160000_abcdef12/stderr.log",
+          outputBytes: { stdout: 42, stderr: 0 }
         }
       ]
     }
@@ -390,8 +397,7 @@ test("shell_start emits partial status updates while waiting", async () => {
     const result = await shellStart.execute(
       "tool-call-id",
       {
-        commands: [{ command: "printf ok", cwd: dir, notifyOnExit: false }],
-        tailLines: 1
+        commands: [{ command: "printf ok", cwd: dir, notifyOnExit: false }]
       } as never,
       new AbortController().signal,
       (update: unknown) => updates.push(update),
@@ -401,9 +407,9 @@ test("shell_start emits partial status updates while waiting", async () => {
     assert.ok(updates.length > 0);
     const renderedUpdate = shellStart.renderResult?.(updates[0] as never, { expanded: false, isPartial: true }, renderTheme as never, {} as never).render(200).join("\n") ?? "";
     assert.match(renderedUpdate, /⎿ running · printf ok/);
-    const details = result.details as { jobs: Array<{ job: { status: string; exitCode?: number | null } }> };
-    assert.equal(details.jobs[0].job.status, "exited");
-    assert.equal(details.jobs[0].job.exitCode, 0);
+    const details = result.details as { jobs: Array<{ status: string; exitCode?: number | null }> };
+    assert.equal(details.jobs[0].status, "exited");
+    assert.equal(details.jobs[0].exitCode, 0);
     assert.match(renderToolResult(shellStart, result), /⎿ ok .* · printf ok/);
   });
 });
@@ -413,7 +419,7 @@ test("async shell tool result renders compactly on schema/exec errors instead of
   asyncShellExtension(api);
   const shellStart = required(api.registeredTools.find((tool) => tool.name === "shell_start"), "shell_start tool");
   const shellStatus = required(api.registeredTools.find((tool) => tool.name === "shell_status"), "shell_status tool");
-  const shellTail = required(api.registeredTools.find((tool) => tool.name === "shell_tail"), "shell_tail tool");
+  const shellRead = required(api.registeredTools.find((tool) => tool.name === "shell_read"), "shell_read tool");
   const shellCancel = required(api.registeredTools.find((tool) => tool.name === "shell_cancel"), "shell_cancel tool");
 
   const longErrorText = [
@@ -429,7 +435,7 @@ test("async shell tool result renders compactly on schema/exec errors instead of
     details: undefined
   };
 
-  for (const tool of [shellStart, shellStatus, shellTail, shellCancel]) {
+  for (const tool of [shellStart, shellStatus, shellRead, shellCancel]) {
     const rendered = renderToolResult(tool, errorResult, false, { isError: true });
     assert.match(rendered, /⎿ error: /);
     const trimmed = rendered.trimEnd();
@@ -444,7 +450,7 @@ test("async shell management tools render compactly without raw output", () => {
   asyncShellExtension(api);
   assert.equal(api.registeredTools.some((tool) => tool.name === "shell_wait"), false);
   const shellCancel = required(api.registeredTools.find((tool) => tool.name === "shell_cancel"), "shell_cancel tool");
-  const shellTail = required(api.registeredTools.find((tool) => tool.name === "shell_tail"), "shell_tail tool");
+  const shellRead = required(api.registeredTools.find((tool) => tool.name === "shell_read"), "shell_read tool");
   const shellStatus = required(api.registeredTools.find((tool) => tool.name === "shell_status"), "shell_status tool");
 
   const job = {
@@ -481,10 +487,27 @@ test("async shell management tools render compactly without raw output", () => {
   assert.match(cancelText, /⎿ cancel requested · cancelled/);
   assert.doesNotMatch(cancelText, /Output:|stderr/);
 
-  assert.match(renderToolCall(shellTail, { jobId: job.jobId, lines: 80 }), /⏺ Tail\(07a634dd stdout\/stderr 80 lines\)/);
-  const tailText = renderToolResult(shellTail, result);
-  assert.match(tailText, /⎿ tail · exit 7/);
-  assert.doesNotMatch(tailText, /Output:|stderr|exiting with code 7 now/);
+  assert.match(renderToolCall(shellRead, { jobId: job.jobId, mode: "tail", lines: 80 }), /⏺ Read\(07a634dd stdout\/stderr tail 80 lines\)/);
+  const tailText = renderToolResult(shellRead, {
+    content: [{ type: "text", text: "tail output" }],
+    details: {
+      job,
+      streams: [{ stream: "stderr", logPath: "/repo/.pi/stderr.log", mode: "tail", requestedLines: 80, requestedMaxChars: 20000, previewLines: ["line"] }]
+    }
+  });
+  assert.match(tailText, /⎿ read stderr:tail80 · exit 7/);
+  assert.doesNotMatch(tailText, /tail output|line|exiting with code 7 now/);
+
+  assert.match(renderToolCall(shellRead, { jobId: job.jobId, stream: "stderr", mode: "range", offset: 2, limit: 3 }), /⏺ Read\(07a634dd stderr range offset 2 limit 3\)/);
+  const readText = renderToolResult(shellRead, {
+    content: [{ type: "text", text: "range output" }],
+    details: {
+      job,
+      streams: [{ stream: "stderr", logPath: "/repo/.pi/stderr.log", mode: "range", offset: 2, requestedLimit: 3, truncation: { truncated: false, truncatedBy: null, totalLines: 5, outputLines: 3, totalBytes: 100, outputBytes: 50 }, previewLines: ["line"] }]
+    }
+  });
+  assert.match(readText, /⎿ read stderr:2:4 · exit 7/);
+  assert.doesNotMatch(readText, /range output|line/);
 
   assert.match(renderToolCall(shellStatus, { jobId: job.jobId }), /⏺ Status\(07a634dd\)/);
   assert.match(renderToolResult(shellStatus, result), /⎿ exit 7/);
@@ -534,7 +557,7 @@ test("async shell management tools render compactly without raw output", () => {
 test("enforceDefaultTools removes single-file and bash tools while preserving unrelated tools", () => {
   const api = createFakeApi(
     ["read", "bash", "edit", "write", "searxng_search"],
-    ["read", "bash", "edit", "write", "searxng_search", "read_many", "search_many", "write_many", "edit_many", "web_fetch_many", "shell_start", "shell_status", "shell_tail", "shell_cancel"]
+    ["read", "bash", "edit", "write", "searxng_search", "read_many", "search_many", "write_many", "edit_many", "web_fetch_many", "shell_start", "shell_status", "shell_read", "shell_cancel"]
   );
 
   const report = enforceDefaultTools(api, { strict: true });
@@ -550,7 +573,7 @@ test("enforceDefaultTools removes single-file and bash tools while preserving un
     "web_fetch_many",
     "shell_start",
     "shell_status",
-    "shell_tail",
+    "shell_read",
     "shell_cancel"
   ]);
 });
@@ -564,15 +587,15 @@ test("enforceDefaultTools fails loudly when required replacements are unavailabl
 
 test("enforceDefaultTools supports read-only restricted profiles without mutation tools", () => {
   const api = createFakeApi(
-    ["read_many", "search_many", "shell_start", "shell_status", "shell_tail", "shell_cancel"],
-    ["read_many", "search_many", "shell_start", "shell_status", "shell_tail", "shell_cancel"]
+    ["read_many", "search_many", "shell_start", "shell_status", "shell_read", "shell_cancel"],
+    ["read_many", "search_many", "shell_start", "shell_status", "shell_read", "shell_cancel"]
   );
 
   const report = enforceDefaultTools(api, { strict: true });
 
   assert.equal(report.ok, true);
   assert.deepEqual(report.missingReplacementTools, []);
-  assert.deepEqual(api.getActiveTools(), ["read_many", "search_many", "shell_start", "shell_status", "shell_tail", "shell_cancel"]);
+  assert.deepEqual(api.getActiveTools(), ["read_many", "search_many", "shell_start", "shell_status", "shell_read", "shell_cancel"]);
 });
 
 test("enforceDefaultTools still fails when active stock write/edit lack replacements", () => {
@@ -584,8 +607,8 @@ test("enforceDefaultTools still fails when active stock write/edit lack replacem
 
 test("native-tools-status reports strict replacement diagnostics", () => {
   const api = createFakeApi(
-    ["read_many", "search_many", "write_many", "edit_many", "shell_start", "shell_status", "shell_tail", "shell_cancel"],
-    ["bash", "read", "write", "edit", "read_many", "search_many", "write_many", "edit_many", "shell_start", "shell_status", "shell_tail", "shell_cancel"]
+    ["read_many", "search_many", "write_many", "edit_many", "shell_start", "shell_status", "shell_read", "shell_cancel"],
+    ["bash", "read", "write", "edit", "read_many", "search_many", "write_many", "edit_many", "shell_start", "shell_status", "shell_read", "shell_cancel"]
   );
   nativeToolsExtension(api);
 
@@ -944,7 +967,9 @@ test("buildNativeToolsSystemPrompt removes default Pi tool prose and injects rea
   assert.match(result, /fixed 6s grace period/);
   assert.match(result, /Leave per-command notifyOnExit at its true default/);
   assert.match(result, /completion notices are batched into history\/TUI and then Pi resumes once for the flushed batch/);
-  assert.match(result, /Async-shell completion notices are short result notices with log paths/);
+  assert.match(result, /Async-shell completion notices and shell_start results are short status\/log-path summaries/);
+  assert.match(result, /shell_read mode='tail' for recent output/);
+  assert.match(result, /shell_read mode='range' for exact line ranges/);
   assert.match(result, /search_many\/read_many on stdout_log or stderr_log paths/);
   assert.match(result, /For online research, use searxng_search for discovery/);
   assert.match(result, /use document_parse on downloadedPath\/path/);

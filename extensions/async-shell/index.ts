@@ -10,10 +10,21 @@ import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 
 type JobStatus = "running" | "exited" | "failed" | "cancelled" | "unknown";
 type OutputStreamName = "stdout" | "stderr";
+type ShellReadMode = "tail" | "range";
 
 type JobOutput = {
   stdout: string;
   stderr: string;
+};
+
+type LogReadTruncation = {
+  truncated: boolean;
+  truncatedBy: "lines" | null;
+  totalLines: number;
+  outputLines: number;
+  totalBytes: number;
+  outputBytes: number;
+  nextOffset?: number;
 };
 
 type JobMeta = {
@@ -41,6 +52,21 @@ type JobMeta = {
   };
 };
 
+type JobStartDetails = Pick<JobMeta,
+  | "jobId"
+  | "job_name"
+  | "command"
+  | "cwd"
+  | "status"
+  | "durationMs"
+  | "exitCode"
+  | "signal"
+  | "error"
+  | "stdoutLog"
+  | "stderrLog"
+  | "outputBytes"
+>;
+
 type CompletionDeliveryContext = {
   isIdle: () => boolean;
 };
@@ -64,13 +90,29 @@ type JobListDetails = {
   jobs: JobMeta[];
 };
 
-type StartJobDetails = {
-  job: JobMeta;
-  output: JobOutput;
+type StartDetails = {
+  jobs: JobStartDetails[];
 };
 
-type StartDetails = {
-  jobs: StartJobDetails[];
+type LogReadStreamDetails = {
+  stream: OutputStreamName;
+  logPath: string;
+  mode: ShellReadMode;
+  offset?: number;
+  requestedLimit?: number;
+  requestedLines?: number;
+  requestedMaxChars?: number;
+  truncation?: LogReadTruncation;
+  previewLines: string[];
+};
+
+type LogReadStreamResult = LogReadStreamDetails & {
+  content: string;
+};
+
+type ShellReadDetails = {
+  job: JobMeta;
+  streams: LogReadStreamDetails[];
 };
 
 type StartUpdate = (partial: AgentToolResult<StartDetails>) => void;
@@ -95,16 +137,12 @@ type CommandSpec = {
 };
 
 const START_WAIT_FOR_COMPLETION_SECONDS = 6;
-const START_RESULT_TAIL_MAX_LINES = 200;
-const START_RESULT_TAIL_MAX_CHARS = 20000;
 const SHELL_STATUS_DEFAULT_TAIL_LINES = 40;
 const SHELL_TAIL_DEFAULT_LINES = 80;
 const SHELL_TAIL_MAX_LINES = 500;
 const SHELL_TAIL_MIN_CHARS = 1000;
 const SHELL_TAIL_DEFAULT_MAX_CHARS = 20000;
 const SHELL_TAIL_MAX_CHARS = 120000;
-const NOTIFICATION_TAIL_LINES = 8;
-const NOTIFICATION_TAIL_MAX_CHARS = 2000;
 const COMPLETION_BATCH_FLUSH_DELAY_MS = 100;
 const CommandItem = Type.Object({
   command: Type.String({ minLength: 1, description: "Shell command to start." }),
@@ -119,21 +157,23 @@ const StartParams = Type.Object({
     minItems: 1,
     maxItems: 12,
     description: "Required list of shell commands to start from one tool call. Each item is an object with command and per-command cwd, and optional job_name, shell, or notifyOnExit. Multiple commands start in parallel, each command receives its own jobId, and a single call accepts at most 12 commands."
-  }),
-  tailLines: Type.Optional(Type.Number({ minimum: 1, maximum: START_RESULT_TAIL_MAX_LINES, default: SHELL_STATUS_DEFAULT_TAIL_LINES, description: "Output lines per stream to include in the shell_start result after the fixed short wait. Max 200; result text also includes stdout_log/stderr_log paths for older or targeted output." }))
+  })
 }, { additionalProperties: false });
 
 const StatusParams = Type.Object({
   jobId: Type.Optional(Type.String({ minLength: 1, description: "Async shell job id. Omit to list active and recent jobs." })),
   limit: Type.Optional(Type.Number({ minimum: 1, maximum: 100, default: 20, description: "When jobId is omitted, maximum number of recent jobs to list." })),
-  tailLines: Type.Optional(Type.Number({ minimum: 1, maximum: SHELL_TAIL_MAX_LINES, default: SHELL_STATUS_DEFAULT_TAIL_LINES, description: "When jobId is set, recent output lines per stream to include. Max 500; for older or targeted output use the returned stdout_log/stderr_log paths with search_many or read_many." }))
+  tailLines: Type.Optional(Type.Number({ minimum: 1, maximum: SHELL_TAIL_MAX_LINES, default: SHELL_STATUS_DEFAULT_TAIL_LINES, description: "When jobId is set, diagnostic status tail lines per stream. Prefer shell_read mode='tail' for output reading and shell_read mode='range' for exact lines; max 500." }))
 }, { additionalProperties: false });
 
-const TailParams = Type.Object({
+const ReadParams = Type.Object({
   jobId: Type.String({ minLength: 1, description: "Async shell job id." }),
-  stream: Type.Optional(Type.Union([Type.Literal("stdout"), Type.Literal("stderr")], { description: "Optional stream to read. Omit to read stdout and stderr separately." })),
-  lines: Type.Optional(Type.Number({ minimum: 1, maximum: SHELL_TAIL_MAX_LINES, default: SHELL_TAIL_DEFAULT_LINES, description: "Maximum output lines per selected stream, from the recent tail. shell_tail is capped at 500 lines; use stdout_log/stderr_log with search_many or read_many for older ranges." })),
-  maxChars: Type.Optional(Type.Number({ minimum: SHELL_TAIL_MIN_CHARS, maximum: SHELL_TAIL_MAX_CHARS, default: SHELL_TAIL_DEFAULT_MAX_CHARS, description: "Maximum bytes to read per selected stream before line trimming. Max 120 KB per stream." }))
+  mode: Type.Optional(Type.Union([Type.Literal("tail"), Type.Literal("range")], { default: "tail", description: "Output read mode. Use mode='tail' (default) for recent output after a result/notification. Use mode='range' when you know exact line numbers, when continuing with nextOffset, or after search_many finds matching log lines. If offset or limit is provided without mode, range mode is inferred." })),
+  stream: Type.Optional(Type.Union([Type.Literal("stdout"), Type.Literal("stderr")], { description: "Optional stream to read. Omit to read both stdout and stderr for the selected mode." })),
+  lines: Type.Optional(Type.Number({ minimum: 1, maximum: SHELL_TAIL_MAX_LINES, default: SHELL_TAIL_DEFAULT_LINES, description: "Tail mode only: maximum recent lines per selected stream. Default 80, max 500. Prefer tail mode for progress, recent failures, and completion summaries." })),
+  maxChars: Type.Optional(Type.Number({ minimum: SHELL_TAIL_MIN_CHARS, maximum: SHELL_TAIL_MAX_CHARS, default: SHELL_TAIL_DEFAULT_MAX_CHARS, description: "Tail mode only: maximum bytes per selected stream before line trimming. Default 20 KB, max 120 KB." })),
+  offset: Type.Optional(Type.Number({ minimum: 1, description: "Range mode only: 1-indexed line number to start from, like read_many offset. Use returned nextOffset to continue a truncated log stream." })),
+  limit: Type.Optional(Type.Number({ minimum: 1, description: "Range mode only: maximum lines per selected stream, like read_many limit. Omit only when the full remaining log output is actually needed." }))
 }, { additionalProperties: false });
 
 const CancelParams = Type.Object({
@@ -143,7 +183,7 @@ const CancelParams = Type.Object({
 
 type StartInput = Static<typeof StartParams>;
 type StatusInput = Static<typeof StatusParams>;
-type TailInput = Static<typeof TailParams>;
+type ReadInput = Static<typeof ReadParams>;
 type CancelInput = Static<typeof CancelParams>;
 
 const jobs = new Map<string, JobRuntime>();
@@ -187,13 +227,13 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     description: [
       "Use shell_start for shell commands. Pass inputs as commands: [...].",
       "Start independent shell work together in one commands list instead of making serial shell_start calls; split into separate calls only when commands depend on previous output, must run in order, or are not safe to run concurrently.",
-      "Each command item must include its own command and cwd, and starts as a durable async job with its own jobId, status, cwd, logs, and stdout/stderr output. Standard input is ignored, so do not use shell_start for interactive commands.",
-      "Results are grouped per job as { jobs: Array<{ job: JobMeta, output: { stdout: string, stderr: string } }> }. A single shell_start call accepts at most 12 commands.",
-      `shell_start waits only for a fixed ${START_WAIT_FOR_COMPLETION_SECONDS}s grace period: jobs that finish quickly return in-band; unfinished jobs continue in the background and, by default, append completion notices when they exit.`,
-      "In-band shell_start results include compact job fields, stdout_log/stderr_log paths, and bounded stdout/stderr tails. Completion notices are short result notices with log paths, batched into history/TUI, then Pi triggers one assistant turn for each flushed batch; use shell_tail for recent output and search/read log paths for older or targeted output. Start-result output is capped by tailLines and about 20 KB per stream.",
+      "Each command item must include its own command and cwd, and starts as a durable async job with its own jobId, status, cwd, stdout_log, stderr_log, and output byte counts. Standard input is ignored, so do not use shell_start for interactive commands.",
+      "Results are grouped per job as { jobs: Array<JobStartDetails> }; shell_start does not return stdout/stderr samples. A single shell_start call accepts at most 12 commands.",
+      `shell_start waits only for a fixed ${START_WAIT_FOR_COMPLETION_SECONDS}s grace period: jobs that finish quickly return status/log metadata in-band; unfinished jobs continue in the background and, by default, append completion notices when they exit.`,
+      "In-band shell_start results include compact job fields plus stdout_log/stderr_log paths only. Completion notices are short result notices with log paths, batched into history/TUI, then Pi triggers one assistant turn for each flushed batch; use shell_read mode='tail' for recent output, shell_read mode='range' for exact line ranges, or search_many/read_many on log paths for targeted output.",
       "Continue useful work while jobs run. If there is no useful work, stop after reporting that jobs are running; completion notices will appear in history and resume the agent. Do not poll or wait.",
       "Set per-command notifyOnExit:false only when the result is unimportant.",
-      "Use shell_status to inspect jobs and shell_tail to read recent output after a result/notification, or only when necessary for a specific active job; use search_many/read_many on stdout_log/stderr_log for older or targeted log output. Do not use status/tail for polling."
+      "Use shell_status to inspect jobs and shell_read to read stdout/stderr. Prefer shell_read mode='tail' after a result/notification or for progress/failure summaries; use shell_read mode='range' only when you know line numbers, are continuing nextOffset, or searched log paths first. Use search_many/read_many on stdout_log/stderr_log for targeted file inspection. Do not use status/read for polling."
     ].join(" "),
     promptSnippet: "Run shell commands as durable async jobs. Start independent shell work together in one commands list, keep doing useful work, and rely on per-job completion notices instead of polling.",
     promptGuidelines: [
@@ -203,8 +243,8 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
       "Prefer search_many for code/file discovery. If using shell_start for custom search, start with rg --files, rg -n, git grep -n, or bounded find before reading file contents.",
       `shell_start waits only for a fixed ${START_WAIT_FOR_COMPLETION_SECONDS}s grace period; there is no wait parameter. Jobs that do not finish in-band continue in the background and append per-job completion notices by default.`,
       "Set per-command notifyOnExit:false only when the result is unimportant.",
-      "Async-shell completion notices are short result notices with stdout_log/stderr_log paths, batched into history/TUI before Pi resumes the agent once for the flushed batch. Use shell_tail for recent output; use search_many/read_many on log paths for older or targeted output. Do not paste raw shell output unless explicitly requested.",
-      "Continue useful work while jobs run; if there is no useful work, stop after reporting that jobs are running and let the completion batch resume the agent. Do not poll or wait. Use shell_status and shell_tail only after a result/notification or when necessary for a specific active job."
+      "Async-shell completion notices and shell_start results are short status/log-path summaries without stdout/stderr samples. Use shell_read mode='tail' for recent output, shell_read mode='range' for exact lines/continuation, and search_many/read_many on log paths for targeted file inspection. Do not paste raw shell output unless explicitly requested.",
+      "Continue useful work while jobs run; if there is no useful work, stop after reporting that jobs are running and let the completion batch resume the agent. Do not poll or wait. Use shell_status and shell_read only after a result/notification or when necessary for a specific active job."
     ],
     parameters: StartParams,
     executionMode: "parallel",
@@ -223,7 +263,7 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
   api.registerTool(defineTool({
     name: "shell_status",
     label: "Async Shell Status",
-    description: "Get async shell job status. Pass jobId for one job; omit jobId to list active and recent jobs. Single-job results include job metadata, stdout_log/stderr_log paths, and bounded recent output; use search_many/read_many on log paths for older or targeted output. Single-job result details shape: { job: JobMeta, output: { stdout: string, stderr: string } }. List result details shape: { jobs: JobMeta[] }.",
+    description: "Get async shell job status. Pass jobId for one job; omit jobId to list active and recent jobs. Use shell_status for job metadata/health, not routine output reading. Single-job results include job metadata, stdout_log/stderr_log paths, and a small diagnostic tail; prefer shell_read mode='tail' for recent stdout/stderr, shell_read mode='range' for exact line ranges/nextOffset continuation, or search_many/read_many on log paths for targeted file inspection. List result details shape: { jobs: JobMeta[] }.",
     promptSnippet: "Check one async shell job by jobId, or omit jobId to list active/recent jobs.",
     parameters: StatusParams,
     executionMode: "parallel",
@@ -252,27 +292,23 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
   }));
 
   api.registerTool(defineTool({
-    name: "shell_tail",
-    label: "Async Shell Tail",
-    description: "Read recent output from one async shell job log by jobId. Choose stdout or stderr, or omit stream to read both separately. shell_tail returns only the tail: max 500 lines and 120 KB per selected stream. For older or targeted output, use the returned stdout_log/stderr_log paths with search_many, then read_many with offset/limit. Result details shape: { job: JobMeta, output: { stdout: string, stderr: string } }.",
-    promptSnippet: "Read recent stdout/stderr output from an async shell job; use log paths with search_many/read_many for older ranges.",
-    parameters: TailParams,
+    name: "shell_read",
+    label: "Async Shell Read",
+    description: "Read async shell stdout/stderr logs by jobId. Use mode='tail' (default) for recent output after shell_start results or completion notices. Use mode='range' for exact read_many-style line ranges, when continuing with nextOffset, or after search_many finds log matches. Choose stream='stdout' or 'stderr', or omit stream to read both selected streams. Tail mode accepts lines/maxChars; range mode accepts offset/limit. Result details shape: { job: JobMeta, streams: [{ stream, logPath, mode, offset?, requestedLimit?, requestedLines?, requestedMaxChars?, truncation?, previewLines }] }.",
+    promptSnippet: "Read async shell stdout/stderr by jobId: mode='tail' for recent output, mode='range' for exact line ranges.",
+    parameters: ReadParams,
     executionMode: "parallel",
     renderShell: "self",
-    async execute(_toolCallId, params, _signal, _onUpdate, context): Promise<AgentToolResult<JobSummaryDetails>> {
+    async execute(_toolCallId, params: ReadInput, _signal, _onUpdate, context): Promise<AgentToolResult<ShellReadDetails>> {
       const job = requireJob(context, params.jobId);
       acknowledgeObservedJobCompletion(job);
-      const stream = params.stream as OutputStreamName | undefined;
-      const title = stream === undefined ? "Recent output" : `Recent ${stream} output`;
-      return jobResult(job, title, params.lines ?? SHELL_TAIL_DEFAULT_LINES, stream, params.maxChars ?? SHELL_TAIL_DEFAULT_MAX_CHARS);
+      return shellReadResult(job, params);
     },
     renderCall(args, theme) {
-      const stream = args.stream ?? "stdout/stderr";
-      const lines = args.lines ?? SHELL_TAIL_DEFAULT_LINES;
-      return new Text(claudeToolCall("Tail", `${shortDisplayId(args.jobId)} ${stream} ${lines} lines`, theme), 0, 0);
+      return renderShellReadCall(args, theme);
     },
     renderResult(result, options, theme, context) {
-      return renderJobSummaryResult(result, options, theme, context, "tail");
+      return renderShellReadResult(result, options, theme, context);
     }
   }));
 
@@ -315,7 +351,7 @@ async function startJobs(api: ExtensionAPI, context: ExtensionContext, input: St
   await waitForJobsWithUpdates(runtimes, secondsToMilliseconds(START_WAIT_FOR_COMPLETION_SECONDS), onUpdate);
 
   finishStartGracePeriod(runtimes);
-  return startResult(runtimes, input.tailLines ?? 40);
+  return startResult(runtimes);
 }
 
 function startJob(
@@ -502,19 +538,16 @@ function flushCompletionNotificationBatch(api: ExtensionAPI, context: Completion
     return;
   }
 
-  const entries = Array.from(pendingCompletionNotifications.values()).map((job) => ({
-    job: publicJob(job),
-    output: readJobOutput(job, NOTIFICATION_TAIL_LINES, NOTIFICATION_TAIL_MAX_CHARS)
-  }));
+  const completedJobs = Array.from(pendingCompletionNotifications.values()).map(publicJob);
   pendingCompletionNotifications.clear();
 
   try {
     api.sendMessage(
       {
         customType: "async-shell",
-        content: formatCompletionBatchMessage(entries.map((entry) => entry.job)),
+        content: formatCompletionBatchMessage(completedJobs),
         display: true,
-        details: entries.length === 1 ? entries[0] : { jobs: entries }
+        details: completedJobs.length === 1 ? completedJobs[0] : { jobs: completedJobs }
       },
       { triggerTurn: true, deliverAs: "steer" }
     );
@@ -552,8 +585,9 @@ function formatCompletionAccess(job: JobMeta): string {
   return [
     `stdout_log: ${job.stdoutLog}`,
     `stderr_log: ${job.stderrLog}`,
-    `more: shell_tail jobId=${job.jobId} (recent output; max ${SHELL_TAIL_MAX_LINES} lines)`,
-    "older_output: use search_many/read_many on stdout_log or stderr_log for older or targeted log output"
+    `recent_output: shell_read jobId=${job.jobId} mode=tail lines=${SHELL_TAIL_DEFAULT_LINES} (recent stdout/stderr; max ${SHELL_TAIL_MAX_LINES} lines / ${formatBytes(SHELL_TAIL_MAX_CHARS)})`,
+    `range_output: shell_read jobId=${job.jobId} mode=range stream=stdout offset=<line> limit=<lines> (exact line ranges; use nextOffset to continue)`,
+    "targeted_output: use search_many on stdout_log/stderr_log, then shell_read mode=range or read_many around relevant lines"
   ].join("\n");
 }
 
@@ -566,7 +600,7 @@ function formatJobMessage(job: JobMeta, output: JobOutput, tailLines: number, ma
     formatJobMessageFields(job),
     formatJobOutputAccess(job, tailLines, maxChars, stream),
     formatJobMessageOutput(output, stream),
-    `more: shell_tail jobId=${job.jobId} lines=${SHELL_TAIL_DEFAULT_LINES} (recent output; max ${SHELL_TAIL_MAX_LINES} lines)`
+    `more: shell_read jobId=${job.jobId} mode=tail lines=${SHELL_TAIL_DEFAULT_LINES} (recent output; max ${SHELL_TAIL_MAX_LINES} lines)`
   ].filter((line) => line.length > 0).join("\n");
 }
 
@@ -586,12 +620,52 @@ function formatJobMessageFields(job: JobMeta): string {
   return lines.join("\n");
 }
 
+function startJobDetails(job: JobMeta): JobStartDetails {
+  return {
+    jobId: job.jobId,
+    job_name: job.job_name,
+    command: job.command,
+    cwd: job.cwd,
+    status: job.status,
+    durationMs: job.durationMs,
+    exitCode: job.exitCode,
+    signal: job.signal,
+    error: job.error,
+    stdoutLog: job.stdoutLog,
+    stderrLog: job.stderrLog,
+    outputBytes: { ...job.outputBytes }
+  };
+}
+
+function formatStartJobMessage(job: JobStartDetails): string {
+  const lines = [
+    `job_id: ${job.jobId}`,
+    job.job_name ? `job_name: ${job.job_name}` : undefined,
+    `status: ${shellStatusText(job)}`,
+    job.exitCode === undefined || job.exitCode === null ? undefined : `exit_code: ${job.exitCode}`,
+    job.signal === undefined || job.signal === null ? undefined : `signal: ${job.signal}`,
+    job.durationMs === undefined ? undefined : `duration: ${formatDuration(job.durationMs)}`,
+    job.error === undefined ? undefined : `error: ${job.error}`,
+    `cwd: ${job.cwd}`,
+    `command: ${truncateOneLine(job.command, 160)}`,
+    `stdout_log: ${job.stdoutLog}`,
+    `stderr_log: ${job.stderrLog}`,
+    `output_bytes: stdout=${formatBytes(job.outputBytes.stdout)} stderr=${formatBytes(job.outputBytes.stderr)}`,
+    `recent_output: shell_read jobId=${job.jobId} mode=tail lines=${SHELL_TAIL_DEFAULT_LINES} (recent stdout/stderr; max ${SHELL_TAIL_MAX_LINES} lines / ${formatBytes(SHELL_TAIL_MAX_CHARS)})`,
+    `range_output: shell_read jobId=${job.jobId} mode=range stream=stdout offset=<line> limit=<lines> (exact line ranges; use nextOffset to continue)`
+  ].filter((line): line is string => line !== undefined);
+
+  return lines.join("\n");
+}
+
 function formatJobOutputAccess(job: JobMeta, tailLines: number, maxChars: number, stream?: OutputStreamName): string {
   const streams = selectedStreams(stream);
   return [
     ...streams.map((selected) => `${selected}_log: ${selected === "stdout" ? job.stdoutLog : job.stderrLog}`),
-    `tail_window: showing last up to ${tailLines} line${tailLines === 1 ? "" : "s"} and ${formatBytes(maxChars)} per selected stream (shell_tail max ${SHELL_TAIL_MAX_LINES} lines / ${formatBytes(SHELL_TAIL_MAX_CHARS)}).`,
-    "older_output: use search_many/read_many on stdout_log or stderr_log for older or targeted log output."
+    `tail_window: showing last up to ${tailLines} line${tailLines === 1 ? "" : "s"} and ${formatBytes(maxChars)} per selected stream (shell_read mode=tail max ${SHELL_TAIL_MAX_LINES} lines / ${formatBytes(SHELL_TAIL_MAX_CHARS)}).`,
+    `recent_output: use shell_read jobId=${job.jobId} mode=tail lines=${SHELL_TAIL_DEFAULT_LINES} for recent stdout/stderr.`,
+    `range_output: use shell_read jobId=${job.jobId} mode=range stream=stdout offset=<line> limit=<lines> for exact log lines.`,
+    "targeted_output: use search_many/read_many on stdout_log or stderr_log for targeted file inspection."
   ].join("\n");
 }
 
@@ -717,20 +791,70 @@ function jobResult(
   };
 }
 
-function startResult(jobsList: JobRuntime[], tailLines: number): AgentToolResult<StartDetails> {
-  const jobsWithOutput = jobsList.map((job) => ({
-    job: publicJob(job),
-    output: readJobOutput(job, tailLines, START_RESULT_TAIL_MAX_CHARS)
-  }));
-  const lines = clampInteger(tailLines, 1, START_RESULT_TAIL_MAX_LINES);
-  const text = jobsWithOutput
-    .map(({ job, output }) => formatJobMessage(job, output, lines, START_RESULT_TAIL_MAX_CHARS))
-    .join("\n\n");
+function shellReadResult(job: JobMeta, input: ReadInput): AgentToolResult<ShellReadDetails> {
+  const mode = normalizeShellReadMode(input);
+  if (mode === "tail") {
+    return shellReadTailResult(job, input);
+  }
+  return shellReadRangeResult(job, input);
+}
+
+function normalizeShellReadMode(input: ReadInput): ShellReadMode {
+  const hasRangeParams = input.offset !== undefined || input.limit !== undefined;
+  const hasTailParams = input.lines !== undefined || input.maxChars !== undefined;
+  const mode = inferShellReadMode(input);
+
+  if (mode === "tail" && hasRangeParams) {
+    throw new Error("shell_read offset/limit require mode='range'. Use mode='tail' with lines/maxChars for recent output.");
+  }
+  if (mode === "range" && hasTailParams) {
+    throw new Error("shell_read lines/maxChars require mode='tail'. Use mode='range' with offset/limit for exact log lines.");
+  }
+  return mode;
+}
+
+function inferShellReadMode(input: ReadInput): ShellReadMode {
+  return input.mode ?? (input.offset !== undefined || input.limit !== undefined ? "range" : "tail");
+}
+
+function shellReadTailResult(job: JobMeta, input: ReadInput): AgentToolResult<ShellReadDetails> {
+  const lines = clampInteger(input.lines ?? SHELL_TAIL_DEFAULT_LINES, 1, SHELL_TAIL_MAX_LINES);
+  const maxChars = clampInteger(input.maxChars ?? SHELL_TAIL_DEFAULT_MAX_CHARS, SHELL_TAIL_MIN_CHARS, SHELL_TAIL_MAX_CHARS);
+  const streams = selectedStreams(input.stream as OutputStreamName | undefined).map((selected) => readLogTailResult(job, selected, lines, maxChars));
+  return logReadResult(job, "Read recent async shell output", streams, formatLogTail);
+}
+
+function shellReadRangeResult(job: JobMeta, input: ReadInput): AgentToolResult<ShellReadDetails> {
+  const offset = input.offset ?? 1;
+  const streams = selectedStreams(input.stream as OutputStreamName | undefined).map((selected) => readLogRange(job, selected, offset, input.limit));
+  return logReadResult(job, "Read async shell output range", streams, formatLogRange);
+}
+
+function logReadResult(job: JobMeta, title: string, streams: LogReadStreamResult[], formatStream: (result: LogReadStreamResult) => string): AgentToolResult<ShellReadDetails> {
+  const details = streams.map(({ content: _content, ...detail }) => detail);
+  const text = [
+    `${title} for ${job.jobId}.`,
+    "",
+    streams.map(formatStream).join("\n\n")
+  ].join("\n");
 
   return {
     content: [{ type: "text", text }],
     details: {
-      jobs: jobsWithOutput
+      job: publicJob(job),
+      streams: details
+    }
+  };
+}
+
+function startResult(jobsList: JobRuntime[]): AgentToolResult<StartDetails> {
+  const jobSummaries = jobsList.map(startJobDetails);
+  const text = jobSummaries.map(formatStartJobMessage).join("\n\n");
+
+  return {
+    content: [{ type: "text", text }],
+    details: {
+      jobs: jobSummaries
     }
   };
 }
@@ -739,10 +863,7 @@ function partialStartResult(jobsList: JobRuntime[]): AgentToolResult<StartDetail
   return {
     content: [{ type: "text", text: "Async shell jobs running." }],
     details: {
-      jobs: jobsList.map((job) => ({
-        job: publicJob(job),
-        output: { stdout: "", stderr: "" }
-      }))
+      jobs: jobsList.map(startJobDetails)
     }
   };
 }
@@ -861,7 +982,7 @@ function publicJob(job: JobMeta): JobMeta {
     logDir: job.logDir,
     stdoutLog: job.stdoutLog,
     stderrLog: job.stderrLog,
-    outputBytes: job.outputBytes
+    outputBytes: { ...job.outputBytes }
   };
 }
 
@@ -929,6 +1050,96 @@ function readLogTail(logFile: string, lines: number, maxChars: number): string {
   return buffer.toString("utf8").trimEnd().split(/\r?\n/).slice(-lines).join("\n");
 }
 
+function readLogTailResult(job: JobMeta, stream: OutputStreamName, lines: number, maxChars: number): LogReadStreamResult {
+  const logPath = logPathForStream(job, stream);
+  const content = readLogTail(logPath, lines, maxChars);
+  return {
+    stream,
+    logPath,
+    mode: "tail",
+    requestedLines: lines,
+    requestedMaxChars: maxChars,
+    previewLines: previewLogLines(content, 2),
+    content
+  };
+}
+
+function readLogRange(job: JobMeta, stream: OutputStreamName, offset: number, limit: number | undefined): LogReadStreamResult {
+  const logPath = logPathForStream(job, stream);
+  const content = existsSync(logPath) ? readFileSync(logPath, "utf8") : "";
+  const lines = content.length === 0 ? [] : content.split("\n");
+  const totalLines = lines.length;
+  const normalizedOffset = clampInteger(offset, 1, Number.MAX_SAFE_INTEGER);
+  if (totalLines === 0 && normalizedOffset > 1) {
+    throw new Error(`Offset ${normalizedOffset} is beyond end of ${stream} log for ${job.jobId} (0 lines total).`);
+  }
+  if (totalLines > 0 && normalizedOffset > totalLines) {
+    throw new Error(`Offset ${normalizedOffset} is beyond end of ${stream} log for ${job.jobId} (${totalLines} lines total).`);
+  }
+
+  const start = normalizedOffset - 1;
+  const selected = limit === undefined ? lines.slice(start) : lines.slice(start, start + clampInteger(limit, 1, Number.MAX_SAFE_INTEGER));
+  const outputContent = selected.join("\n");
+  return {
+    stream,
+    logPath,
+    mode: "range",
+    offset: normalizedOffset,
+    requestedLimit: limit,
+    truncation: buildLogReadTruncation(selected, outputContent, totalLines, Buffer.byteLength(content, "utf8"), start),
+    previewLines: previewLogLines(outputContent, 2),
+    content: outputContent
+  };
+}
+
+function buildLogReadTruncation(selected: string[], outputContent: string, totalLines: number, totalBytes: number, startIndex: number): LogReadTruncation {
+  const outputLines = selected.length;
+  const hasMoreLogLines = startIndex + outputLines < totalLines;
+  return {
+    truncated: hasMoreLogLines,
+    truncatedBy: hasMoreLogLines ? "lines" : null,
+    totalLines,
+    outputLines,
+    totalBytes,
+    outputBytes: Buffer.byteLength(outputContent, "utf8"),
+    nextOffset: hasMoreLogLines ? startIndex + outputLines + 1 : undefined
+  };
+}
+
+function formatLogTail(result: LogReadStreamResult): string {
+  const lines = result.requestedLines ?? SHELL_TAIL_DEFAULT_LINES;
+  const maxChars = result.requestedMaxChars ?? SHELL_TAIL_DEFAULT_MAX_CHARS;
+  const header = `--- ${result.stream} tail (${result.logPath}; last up to ${lines} line${lines === 1 ? "" : "s"}, ${formatBytes(maxChars)} max) ---`;
+  const output = result.content.length === 0 ? "(no output)" : result.content;
+  return `${header}\n${output}`;
+}
+
+function formatLogRange(result: LogReadStreamResult): string {
+  if (result.offset === undefined || result.truncation === undefined) {
+    throw new Error("Range log result is missing offset/truncation metadata.");
+  }
+
+  const startLine = result.offset;
+  const endLine = result.offset + result.truncation.outputLines - 1;
+  const header = `--- ${result.stream} range (${result.logPath}; lines ${startLine}-${Math.max(startLine, endLine)} of ${result.truncation.totalLines}) ---`;
+  const output = result.content.length === 0 ? "(no output)" : result.content;
+  const continuation = result.truncation.nextOffset === undefined
+    ? ""
+    : `\n[truncated by ${result.truncation.truncatedBy}; continue with mode=range offset=${result.truncation.nextOffset}]`;
+  return `${header}\n${output}${continuation}`;
+}
+
+function previewLogLines(content: string, limit: number): string[] {
+  if (content.length === 0) {
+    return [];
+  }
+  return content.split(/\r?\n/).slice(0, limit);
+}
+
+function logPathForStream(job: JobMeta, stream: OutputStreamName): string {
+  return stream === "stdout" ? job.stdoutLog : job.stderrLog;
+}
+
 function resolveCwd(context: ExtensionContext, requestedCwd: string | undefined): string {
   const base = path.resolve(context.cwd ?? process.cwd());
   if (requestedCwd === undefined || requestedCwd.trim() === "") {
@@ -949,7 +1160,7 @@ export function buildAsyncShellStatusText(context: Pick<ExtensionContext, "cwd">
     `Job root: ${root}`,
     `Job root state: ${describePathAccess(root)}`,
     `Recent jobs: ${recentJobs.length} (${running} running, ${terminal} terminal or detached)`,
-    running > 0 ? "Use shell_status without a jobId to list jobs, shell_tail with a jobId to read output, or shell_cancel to stop a running job. Do not poll; completion notices will be batched into history and resume the agent." : "No running jobs in the recent async-shell registry.",
+    running > 0 ? "Use shell_status without a jobId to list jobs, shell_read mode=tail for recent output, shell_read mode=range for exact log lines, or shell_cancel to stop a running job. Do not poll; completion notices will be batched into history and resume the agent." : "No running jobs in the recent async-shell registry.",
     recentJobs.some((job) => job.status === "unknown") ? "Some jobs were started by a previous Pi process and are no longer attached." : undefined
   ].filter((line): line is string => line !== undefined).join("\n");
 }
@@ -1070,12 +1281,25 @@ function renderShellStartResult(result: AgentToolResult<StartDetails>, options: 
     return errorRow;
   }
 
-  const jobsList = result.details?.jobs?.map((entry) => entry.job) ?? [];
+  const jobsList = result.details?.jobs ?? [];
   if (jobsList.length === 0) {
     return new Text(claudeToolResult(options.isPartial ? "starting" : "done", "muted", theme), 0, 0);
   }
 
   return new Text(jobsList.map((job) => claudeToolResult(formatShellJobStatus(job), shellStatusColor(job), theme)).join("\n"), 0, 0);
+}
+
+function renderShellReadCall(args: ReadInput, theme: RenderTheme): Text {
+  const stream = args.stream ?? "stdout/stderr";
+  const mode = inferShellReadMode(args);
+  if (mode === "tail") {
+    const lines = args.lines ?? SHELL_TAIL_DEFAULT_LINES;
+    return new Text(claudeToolCall("Read", `${shortDisplayId(args.jobId)} ${stream} tail ${lines} lines`, theme), 0, 0);
+  }
+
+  const offset = args.offset ?? 1;
+  const limit = args.limit === undefined ? "end" : String(args.limit);
+  return new Text(claudeToolCall("Read", `${shortDisplayId(args.jobId)} ${stream} range offset ${offset} limit ${limit}`, theme), 0, 0);
 }
 
 function renderJobCall(name: string, jobId: string, theme: RenderTheme): Text {
@@ -1118,6 +1342,40 @@ function renderJobSummaryResult(result: AgentToolResult<JobSummaryDetails>, opti
     ? formatShellJobStatus(job)
     : `${prefix} · ${formatShellJobStatus(job)}`;
   return new Text(claudeToolResult(summary, shellStatusColor(job), theme), 0, 0);
+}
+
+function renderShellReadResult(result: AgentToolResult<ShellReadDetails>, options: RenderOptions, theme: RenderTheme, context?: RenderContext): Text {
+  const errorRow = renderShellToolError(result, theme, context);
+  if (errorRow !== undefined) {
+    return errorRow;
+  }
+
+  if (options.isPartial) {
+    return new Text(claudeToolResult("reading shell output", "warning", theme), 0, 0);
+  }
+
+  const details = result.details;
+  if (details === undefined) {
+    return new Text(claudeToolResult("read shell output", "muted", theme), 0, 0);
+  }
+
+  const spans = details.streams.map(formatLogReadSpan).join(", ");
+  const summary = spans.length === 0 ? `read · ${formatShellJobStatus(details.job)}` : `read ${spans} · ${formatShellJobStatus(details.job)}`;
+  return new Text(claudeToolResult(summary, shellStatusColor(details.job), theme), 0, 0);
+}
+
+function formatLogReadSpan(stream: LogReadStreamDetails): string {
+  if (stream.mode === "tail") {
+    const lines = stream.requestedLines ?? SHELL_TAIL_DEFAULT_LINES;
+    return stream.previewLines.length === 0 ? `${stream.stream}:tail empty` : `${stream.stream}:tail${lines}`;
+  }
+
+  if (stream.offset === undefined || stream.truncation === undefined || stream.truncation.outputLines === 0) {
+    return `${stream.stream}:range empty`;
+  }
+
+  const end = stream.offset + stream.truncation.outputLines - 1;
+  return `${stream.stream}:${stream.offset}:${end}`;
 }
 
 function renderJobListResult(result: AgentToolResult<JobListDetails>, options: RenderOptions, theme: RenderTheme): Text {
@@ -1227,14 +1485,18 @@ function formatCommandRequest(item: StartInput["commands"][number]): string {
   return `${jobName}${truncateOneLine(item.command, 80)} (cwd ${compactDisplayPath(item.cwd)})`;
 }
 
-function formatShellJobStatus(job: JobMeta): string {
+type ShellJobDisplay = Pick<JobMeta, "job_name" | "command" | "status" | "durationMs" | "exitCode">;
+
+type ShellJobStatusFields = Pick<JobMeta, "status" | "exitCode">;
+
+function formatShellJobStatus(job: ShellJobDisplay): string {
   const jobName = job.job_name === undefined ? "" : `${job.job_name}: `;
   const status = shellStatusText(job);
   const duration = job.durationMs === undefined ? "" : ` · ${formatDuration(job.durationMs)}`;
   return `${status}${duration} · ${jobName}${truncateOneLine(job.command, 80)}`;
 }
 
-function shellStatusText(job: JobMeta): string {
+function shellStatusText(job: ShellJobStatusFields): string {
   if (job.status === "running") {
     return "running";
   }
@@ -1253,7 +1515,7 @@ function shellStatusText(job: JobMeta): string {
   return job.status;
 }
 
-function shellStatusColor(job: JobMeta): string {
+function shellStatusColor(job: ShellJobStatusFields): string {
   if (job.status === "running") {
     return "warning";
   }

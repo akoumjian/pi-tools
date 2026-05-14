@@ -127,8 +127,7 @@ test("shell_status lists recent jobs when jobId is omitted", async () => {
     await shellStart.execute(
       "tool-call-id",
       {
-        commands: [{ command: "printf listed", cwd: dir, notifyOnExit: false }],
-        tailLines: 1
+        commands: [{ command: "printf listed", cwd: dir, notifyOnExit: false }]
       } as never,
       new AbortController().signal,
       undefined,
@@ -210,16 +209,15 @@ test("shell_start suppresses deferred completion notices when jobs complete in-b
           { command: "printf one", cwd: dir },
           { command: "printf two", cwd: dir },
           { command: "printf three", cwd: dir }
-        ],
-        tailLines: 1
+        ]
       } as never,
       new AbortController().signal,
       undefined,
       createContext(dir)
     );
 
-    const details = result.details as { jobs: Array<{ job: { status: string; exitCode?: number | null } }> };
-    assert.deepEqual(details.jobs.map(({ job }) => [job.status, job.exitCode]), [
+    const details = result.details as { jobs: Array<{ status: string; exitCode?: number | null }> };
+    assert.deepEqual(details.jobs.map((job) => [job.status, job.exitCode]), [
       ["exited", 0],
       ["exited", 0],
       ["exited", 0]
@@ -244,8 +242,7 @@ test("shell_start sends one deferred completion batch for notified completed job
           { command: "sleep 7; printf one", cwd: dir, job_name: "one" },
           { command: "sleep 7; printf ignored", cwd: dir, job_name: "ignored", notifyOnExit: false },
           { command: "sleep 7; printf three", cwd: dir, job_name: "three" }
-        ],
-        tailLines: 1
+        ]
       } as never,
       new AbortController().signal,
       undefined,
@@ -255,8 +252,12 @@ test("shell_start sends one deferred completion batch for notified completed job
     const startText = JSON.stringify(startResult.content);
     assert.doesNotMatch(startText, /Started async shell/);
     assert.doesNotMatch(startText, /logs:/);
-    assert.doesNotMatch(startText, /stderr:/);
-    assert.match(startText, /more: shell_tail jobId=/);
+    assert.doesNotMatch(startText, /stdout:\\n|stderr:\\n|```/);
+    assert.match(startText, /stdout_log:/);
+    assert.match(startText, /stderr_log:/);
+    assert.match(startText, /output_bytes:/);
+    assert.match(startText, /recent_output: shell_read jobId=.*mode=tail/);
+    assert.match(startText, /range_output: shell_read jobId=.*mode=range/);
 
     await delay(1200);
 
@@ -266,18 +267,19 @@ test("shell_start sends one deferred completion batch for notified completed job
     assert.doesNotMatch(JSON.stringify(sentMessage.message), /Job completed\./);
     assert.doesNotMatch(JSON.stringify(sentMessage.message), /async-shell notification/);
 
-    const message = sentMessage.message as { content?: unknown; details?: { jobs?: Array<{ job?: { job_name?: string } }> } };
+    const message = sentMessage.message as { content?: unknown; details?: { jobs?: Array<{ job_name?: string }> } };
     assert.equal(typeof message.content, "string");
     const content = message.content as string;
     assert.match(content, /^async shell results: 2 jobs completed/);
     assert.match(content, /stdout_log:/);
     assert.match(content, /stderr_log:/);
-    assert.match(content, /more: shell_tail jobId=.*max 500 lines/);
-    assert.match(content, /older_output: use search_many\/read_many/);
+    assert.match(content, /recent_output: shell_read jobId=.*mode=tail.*max 500 lines/);
+    assert.match(content, /range_output: shell_read jobId=.*mode=range/);
+    assert.match(content, /targeted_output: use search_many on stdout_log\/stderr_log/);
     assert.doesNotMatch(content, /job_id:|stdout:|stderr:|```|logs:/);
 
     const notifiedNames = (message.details?.jobs ?? [])
-      .map((entry) => entry.job?.job_name)
+      .map((job) => job.job_name)
       .sort();
     assert.deepEqual(notifiedNames, ["one", "three"]);
     assert.doesNotMatch(JSON.stringify(sentMessage.message), /ignored/);
@@ -299,8 +301,7 @@ test("shell_start queues active completions until the current turn can flush one
         commands: [
           { command: "sleep 7; printf one", cwd: dir, job_name: "one" },
           { command: "sleep 7; printf two", cwd: dir, job_name: "two" }
-        ],
-        tailLines: 1
+        ]
       } as never,
       new AbortController().signal,
       undefined,
@@ -313,9 +314,9 @@ test("shell_start queues active completions until the current turn can flush one
     await api.emit("turn_end", { type: "turn_end", turnIndex: 0, timestamp: Date.now(), message: {}, toolResults: [] }, context);
     assert.equal(api.sentMessages.length, 1);
     assert.deepEqual(api.sentMessages[0].options, { triggerTurn: true, deliverAs: "steer" });
-    const message = api.sentMessages[0].message as { content?: string; details?: { jobs?: Array<{ job?: { job_name?: string } }> } };
+    const message = api.sentMessages[0].message as { content?: string; details?: { jobs?: Array<{ job_name?: string }> } };
     assert.match(message.content ?? "", /^async shell results: 2 jobs completed/);
-    assert.deepEqual((message.details?.jobs ?? []).map((entry) => entry.job?.job_name).sort(), ["one", "two"]);
+    assert.deepEqual((message.details?.jobs ?? []).map((job) => job.job_name).sort(), ["one", "two"]);
 
     idle = true;
     await delay(50);
@@ -333,8 +334,7 @@ test("per-command notifyOnExit false suppresses deferred completion notices", as
     await shellStart.execute(
       "tool-call-id",
       {
-        commands: [{ command: "sleep 7; printf ignored", cwd: dir, notifyOnExit: false }],
-        tailLines: 1
+        commands: [{ command: "sleep 7; printf ignored", cwd: dir, notifyOnExit: false }]
       } as never,
       new AbortController().signal,
       undefined,
@@ -357,17 +357,16 @@ test("shell_start reports spawn errors for missing shells", async () => {
     const result = await shellStart.execute(
       "tool-call-id",
       {
-        commands: [{ command: "printf never", cwd: dir, shell: "/no/such/shell", notifyOnExit: false }],
-        tailLines: 1
+        commands: [{ command: "printf never", cwd: dir, shell: "/no/such/shell", notifyOnExit: false }]
       } as never,
       new AbortController().signal,
       undefined,
       createContext(dir)
     );
 
-    const details = result.details as { jobs: Array<{ job: { status: string; error?: string } }> };
-    assert.equal(details.jobs[0].job.status, "failed");
-    assert.match(details.jobs[0].job.error ?? "", /ENOENT|no such/i);
+    const details = result.details as { jobs: Array<{ status: string; error?: string }> };
+    assert.equal(details.jobs[0].status, "failed");
+    assert.match(details.jobs[0].error ?? "", /ENOENT|no such/i);
   });
 });
 
@@ -384,17 +383,16 @@ test("shell_start expands home in per-command cwd", async () => {
       const result = await shellStart.execute(
         "tool-call-id",
         {
-          commands: [{ command: "pwd", cwd: "~", notifyOnExit: false }],
-          tailLines: 1
+          commands: [{ command: "pwd", cwd: "~", notifyOnExit: false }]
         } as never,
         new AbortController().signal,
         undefined,
         createContext(path.join(dir, "project"))
       );
 
-      const details = result.details as { jobs: Array<{ job: { cwd: string }; output: { stdout: string } }> };
-      assert.equal(details.jobs[0].job.cwd, dir);
-      assert.equal(path.basename(details.jobs[0].output.stdout), path.basename(dir));
+      const details = result.details as { jobs: Array<{ cwd: string; stdoutLog: string }> };
+      assert.equal(details.jobs[0].cwd, dir);
+      assert.equal(path.basename((await readFile(details.jobs[0].stdoutLog, "utf8")).trim()), path.basename(dir));
     } finally {
       if (previousHome === undefined) {
         delete process.env.HOME;
@@ -415,58 +413,109 @@ test("shell_start preserves raw output bytes", async () => {
     const result = await shellStart.execute(
       "tool-call-id",
       {
-        commands: [{ command: "node -e 'process.stdout.write(Buffer.from([0xc3])); setTimeout(() => process.stdout.write(Buffer.from([0xa9])), 50)'", cwd: dir, notifyOnExit: false }],
-        tailLines: 1
+        commands: [{ command: "node -e 'process.stdout.write(Buffer.from([0xc3])); setTimeout(() => process.stdout.write(Buffer.from([0xa9])), 50)'", cwd: dir, notifyOnExit: false }]
       } as never,
       new AbortController().signal,
       undefined,
       createContext(dir)
     );
 
-    const details = result.details as { jobs: Array<{ job: { stdoutLog: string; outputBytes: { stdout: number } }; output: { stdout: string } }> };
-    assert.equal(details.jobs[0].job.outputBytes.stdout, 2);
-    assert.equal((await stat(details.jobs[0].job.stdoutLog)).size, 2);
-    assert.deepEqual([...(await readFile(details.jobs[0].job.stdoutLog))], [0xc3, 0xa9]);
-    assert.equal(details.jobs[0].output.stdout, "é");
+    const details = result.details as { jobs: Array<{ stdoutLog: string; outputBytes: { stdout: number } }> };
+    assert.equal(details.jobs[0].outputBytes.stdout, 2);
+    assert.equal((await stat(details.jobs[0].stdoutLog)).size, 2);
+    assert.deepEqual([...(await readFile(details.jobs[0].stdoutLog))], [0xc3, 0xa9]);
+    assert.equal(await readFile(details.jobs[0].stdoutLog, "utf8"), "é");
   });
 });
 
-test("shell_tail reads stdout and stderr separately", async () => {
+test("shell_read tail mode reads stdout and stderr separately", async () => {
   await withTempDir(async (dir) => {
     const api = createFakeApi();
     asyncShellExtension(api);
     const shellStart = required(api.registeredTools.find((tool) => tool.name === "shell_start"), "shell_start tool");
-    const shellTail = required(api.registeredTools.find((tool) => tool.name === "shell_tail"), "shell_tail tool");
+    const shellRead = required(api.registeredTools.find((tool) => tool.name === "shell_read"), "shell_read tool");
     assert.ok(shellStart.execute);
-    assert.ok(shellTail.execute);
+    assert.ok(shellRead.execute);
+    assert.equal(api.registeredTools.some((tool) => tool.name === "shell_tail"), false);
 
     const started = await shellStart.execute(
       "tool-call-id",
       {
-        commands: [{ command: "printf out; printf err >&2", cwd: dir, notifyOnExit: false }],
-        tailLines: 1
+        commands: [{ command: "printf out; printf err >&2", cwd: dir, notifyOnExit: false }]
       } as never,
       new AbortController().signal,
       undefined,
       createContext(dir)
     );
-    const jobId = (started.details as { jobs: Array<{ job: { jobId: string } }> }).jobs[0].job.jobId;
+    const jobId = (started.details as { jobs: Array<{ jobId: string }> }).jobs[0].jobId;
 
-    const stdoutOnly = await shellTail.execute("tool-call-id", { jobId, stream: "stdout" } as never, new AbortController().signal, undefined, createContext(dir));
-    const stderrOnly = await shellTail.execute("tool-call-id", { jobId, stream: "stderr" } as never, new AbortController().signal, undefined, createContext(dir));
-    const both = await shellTail.execute("tool-call-id", { jobId } as never, new AbortController().signal, undefined, createContext(dir));
+    const stdoutOnly = await shellRead.execute("tool-call-id", { jobId, mode: "tail", stream: "stdout" } as never, new AbortController().signal, undefined, createContext(dir));
+    const stderrOnly = await shellRead.execute("tool-call-id", { jobId, mode: "tail", stream: "stderr" } as never, new AbortController().signal, undefined, createContext(dir));
+    const both = await shellRead.execute("tool-call-id", { jobId } as never, new AbortController().signal, undefined, createContext(dir));
 
-    assert.deepEqual((stdoutOnly.details as { output: { stdout: string; stderr: string } }).output, { stdout: "out", stderr: "" });
-    assert.deepEqual((stderrOnly.details as { output: { stdout: string; stderr: string } }).output, { stdout: "", stderr: "err" });
-    assert.deepEqual((both.details as { output: { stdout: string; stderr: string } }).output, { stdout: "out", stderr: "err" });
+    const stdoutDetails = stdoutOnly.details as { streams: Array<{ stream: string; mode: string; requestedLines?: number; previewLines: string[] }> };
+    const stderrDetails = stderrOnly.details as { streams: Array<{ stream: string; mode: string; requestedLines?: number; previewLines: string[] }> };
+    const bothDetails = both.details as { streams: Array<{ stream: string; mode: string; previewLines: string[] }> };
+    assert.deepEqual(stdoutDetails.streams, [{ stream: "stdout", mode: "tail", logPath: path.join(dir, ".pi", "async-shell", "jobs", jobId, "stdout.log"), requestedLines: 80, requestedMaxChars: 20000, previewLines: ["out"] }]);
+    assert.deepEqual(stderrDetails.streams, [{ stream: "stderr", mode: "tail", logPath: path.join(dir, ".pi", "async-shell", "jobs", jobId, "stderr.log"), requestedLines: 80, requestedMaxChars: 20000, previewLines: ["err"] }]);
+    assert.deepEqual(bothDetails.streams.map((stream) => [stream.stream, stream.mode, stream.previewLines[0]]), [["stdout", "tail", "out"], ["stderr", "tail", "err"]]);
     const stdoutText = JSON.stringify(stdoutOnly.content);
     const stderrText = JSON.stringify(stderrOnly.content);
-    assert.match(stdoutText, /stdout_log:/);
-    assert.match(stdoutText, /tail_window: showing last up to 80 lines and 20 KB per selected stream/);
-    assert.match(stdoutText, /older_output: use search_many\/read_many on stdout_log or stderr_log/);
-    assert.doesNotMatch(stdoutText, /stderr_log:/);
-    assert.match(stderrText, /stderr_log:/);
-    assert.doesNotMatch(stderrText, /stdout:/);
+    assert.match(stdoutText, /--- stdout tail .*last up to 80 lines, 20 KB max\) ---\\nout/);
+    assert.doesNotMatch(stdoutText, /stderr tail/);
+    assert.match(stderrText, /--- stderr tail .*last up to 80 lines, 20 KB max\) ---\\nerr/);
+    assert.doesNotMatch(stderrText, /stdout tail/);
+  });
+});
+
+test("shell_read reads stdout and stderr ranges by jobId with offset and limit", async () => {
+  await withTempDir(async (dir) => {
+    const api = createFakeApi();
+    asyncShellExtension(api);
+    const shellStart = required(api.registeredTools.find((tool) => tool.name === "shell_start"), "shell_start tool");
+    const shellRead = required(api.registeredTools.find((tool) => tool.name === "shell_read"), "shell_read tool");
+    assert.ok(shellStart.execute);
+    assert.ok(shellRead.execute);
+
+    const started = await shellStart.execute(
+      "tool-call-id",
+      {
+        commands: [{ command: "printf 'out1\\nout2\\nout3\\n'; printf 'err1\\nerr2\\n' >&2", cwd: dir, notifyOnExit: false }]
+      } as never,
+      new AbortController().signal,
+      undefined,
+      createContext(dir)
+    );
+    const jobId = (started.details as { jobs: Array<{ jobId: string }> }).jobs[0].jobId;
+
+    const stdoutRange = await shellRead.execute(
+      "tool-call-id",
+      { jobId, stream: "stdout", offset: 2, limit: 1 } as never,
+      new AbortController().signal,
+      undefined,
+      createContext(dir)
+    );
+    const bothRanges = await shellRead.execute(
+      "tool-call-id",
+      { jobId, offset: 1, limit: 1 } as never,
+      new AbortController().signal,
+      undefined,
+      createContext(dir)
+    );
+
+    const stdoutDetails = stdoutRange.details as { streams: Array<{ stream: string; mode: string; offset: number; requestedLimit?: number; truncation: { nextOffset?: number; totalLines: number; outputLines: number }; previewLines: string[] }> };
+    assert.deepEqual(stdoutDetails.streams.map((stream) => stream.stream), ["stdout"]);
+    assert.equal(stdoutDetails.streams[0].offset, 2);
+    assert.equal(stdoutDetails.streams[0].requestedLimit, 1);
+    assert.equal(stdoutDetails.streams[0].truncation.nextOffset, 3);
+    assert.deepEqual(stdoutDetails.streams[0].previewLines, ["out2"]);
+    assert.equal(stdoutDetails.streams[0].mode, "range");
+    assert.match(JSON.stringify(stdoutRange.content), /--- stdout range .*lines 2-2 of 4\) ---\\nout2/);
+    assert.match(JSON.stringify(stdoutRange.content), /continue with mode=range offset=3/);
+
+    const bothDetails = bothRanges.details as { streams: Array<{ stream: string; truncation: { nextOffset?: number } }> };
+    assert.deepEqual(bothDetails.streams.map((stream) => stream.stream), ["stdout", "stderr"]);
+    assert.deepEqual(bothDetails.streams.map((stream) => stream.truncation.nextOffset), [2, 2]);
   });
 });
 
@@ -483,12 +532,12 @@ test("shell_cancel transitions a running job to cancelled and suppresses complet
 
     const started = await shellStart.execute(
       "tool-call-id",
-      { commands: [{ command: "sleep 30", cwd: dir }], tailLines: 1 } as never,
+      { commands: [{ command: "sleep 30", cwd: dir }] } as never,
       new AbortController().signal,
       undefined,
       createContext(dir)
     );
-    const jobId = (started.details as { jobs: Array<{ job: { jobId: string } }> }).jobs[0].job.jobId;
+    const jobId = (started.details as { jobs: Array<{ jobId: string }> }).jobs[0].jobId;
 
     const cancelled = await shellCancel.execute("tool-call-id", { jobId, signal: "SIGTERM" } as never, new AbortController().signal, undefined, createContext(dir));
     assert.equal((cancelled.details as { job: { notifyOnExit: boolean } }).job.notifyOnExit, false);

@@ -50,7 +50,7 @@ Do not use `npm install @akoumjian/pi-tools@<git+ssh url>`: that form rewrites `
 
 Tools (LLM-callable):
 
-- `shell_start`, `shell_status`, `shell_tail`, `shell_cancel` — async shell jobs
+- `shell_start`, `shell_status`, `shell_read`, `shell_cancel` — async shell jobs
 - `read_many`, `search_many`, `write_many`, `edit_many` — batch-native file tools
 - `apply_reviewed_mutation` — cheap re-apply of a previously-reviewed edit/write
 - `searxng_search` — search through a configured SearXNG instance
@@ -115,7 +115,7 @@ Each extension below documents what it does, what it provides, and how to set it
 
 **Purpose.** Durable async shell jobs instead of blocking the agent. Each `shell_start` call accepts a list of commands; finished jobs return in-band within a fixed 6 s grace period, and background jobs deliver batched completion notices that resume the agent exactly once per batch.
 
-**Provides.** `shell_start`, `shell_status`, `shell_tail`, `shell_cancel`; `/async:status`; durable per-job logs and metadata under `.pi/async-shell/jobs/<jobId>/`. Completion notices point at `stdout_log`/`stderr_log`; use `shell_tail` for recent output and `search_many`/`read_many` on log paths for older or targeted output.
+**Provides.** `shell_start`, `shell_status`, `shell_read`, `shell_cancel`; `/async:status`; durable per-job logs and metadata under `.pi/async-shell/jobs/<jobId>/`. `shell_start` and completion notices point at `stdout_log`/`stderr_log` without embedding output samples; use `shell_read` tail mode for recent output, `shell_read` range mode for exact log lines, and `search_many`/`read_many` on log paths for targeted file inspection.
 
 **Setup.** None. No polling/wait tool: continue useful work; completion notices will resume the agent.
 

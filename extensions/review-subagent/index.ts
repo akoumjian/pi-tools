@@ -41,7 +41,7 @@ const DEFAULT_REVIEW_TOOLS = [
   "document_parse",
   "shell_start",
   "shell_status",
-  "shell_tail",
+  "shell_read",
   "shell_cancel"
 ];
 

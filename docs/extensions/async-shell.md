@@ -8,9 +8,9 @@ Run shell commands as durable async jobs instead of blocking the agent. Each `sh
 
 LLM-callable tools:
 
-- `shell_start({ commands: [...], tailLines? })`
+- `shell_start({ commands: [...] })`
 - `shell_status({ jobId?, limit?, tailLines? })`
-- `shell_tail({ jobId, stream?, lines?, maxChars? })`
+- `shell_read({ jobId, mode?, stream?, lines?, maxChars?, offset?, limit? })`
 - `shell_cancel({ jobId, signal? })`
 
 Command:
@@ -38,8 +38,7 @@ shell_start({
       notifyOnExit?: boolean            // default true; set false to silence completion notice
     },
     ...
-  ],
-  tailLines?: number                    // 1..200, default 40; in-band stdout/stderr preview per stream
+  ]
 })
 ```
 
@@ -57,21 +56,24 @@ shell_status({
 })
 ```
 
-- With `jobId`: returns a single-job summary including `stdout_log`/`stderr_log` paths plus bounded recent stdout/stderr tails.
+- With `jobId`: returns a single-job summary including `stdout_log`/`stderr_log` paths plus a small diagnostic tail. Prefer `shell_read` for normal stdout/stderr output reading.
 - Without `jobId`: lists recent jobs from the on-disk registry plus active runtime jobs.
 
-### shell_tail
+### shell_read
 
 ```ts
-shell_tail({
+shell_read({
   jobId: string,
+  mode?: "tail" | "range",              // default "tail"; offset/limit infer "range"
   stream?: "stdout" | "stderr",         // omit for both
-  lines?: number,                       // 1..500, default 80; recent tail only
-  maxChars?: number                     // 1000..120000, default 20000; per stream
+  lines?: number,                       // tail mode: 1..500, default 80
+  maxChars?: number,                    // tail mode: 1000..120000, default 20000 per stream
+  offset?: number,                      // range mode: 1-indexed starting line, default 1
+  limit?: number                        // range mode: maximum lines per selected stream
 })
 ```
 
-`shell_tail` intentionally returns recent output only. For older or targeted output, use the returned `stdout_log`/`stderr_log` paths with `search_many`, then `read_many` with `offset`/`limit` around relevant lines.
+Use `mode: "tail"` for recent output after `shell_start` results or completion notices. Use `mode: "range"` when you know line numbers, are continuing with `nextOffset`, or searched a log path first. Range mode returns one entry per selected stream with `offset`, `requestedLimit`, `truncation`, `previewLines`, and text content in the model-facing result. Use returned `nextOffset` to continue.
 
 ### shell_cancel
 
@@ -88,14 +90,14 @@ Cancel implicitly suppresses the completion notice for that job (`notifyOnExit` 
 
 1. Each command is spawned via `spawn(shell, ["-lc", command], { cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] })`. A durable `jobId` of the form `job_<yyyymmddhhmmss>_<random8>` is created, metadata is written to `meta.json`, and stdout/stderr are streamed to `stdout.log` and `stderr.log` under `.pi/async-shell/jobs/<jobId>/`.
 2. `shell_start` then waits up to a fixed **6-second** in-band grace period for all jobs in the call to finish. Jobs that finish in-band are reported as completed in the start result and never produce a completion notice; jobs still running at the end of the grace period continue in the background.
-3. The in-band result groups one entry per command:
+3. The in-band result groups one metadata entry per command:
    ```ts
-   { jobs: [{ job: JobMeta, output: { stdout: string, stderr: string } }, ...] }
+   { jobs: [{ jobId, job_name?, command, cwd, status, durationMs?, exitCode?, signal?, error?, stdoutLog, stderrLog, outputBytes }, ...] }
    ```
-   with `stdout_log`/`stderr_log` paths, bounded `stdout`/`stderr` tails per `tailLines`, and a hard ~20 KB per-stream cap.
+   `shell_start` deliberately does not return stdout/stderr samples. Use `shell_read` with `mode: "tail"` for recent output, `shell_read` with `mode: "range"` for exact log lines, or `search_many`/`read_many` on log paths for targeted file inspection.
 4. For each background job that finishes later (with `notifyOnExit !== false`), the extension queues a completion notice. A ~100 ms debounce coalesces near-simultaneous completions into one batch.
 5. When the agent is idle, the batch is delivered as a custom message of type `async-shell` with `triggerTurn: true, deliverAs: "steer"`, so Pi resumes exactly once for the whole batch. When the agent is active, the flush is deferred to the next `turn_end`/`message_end (user)`/`agent_end` safe point.
-6. `shell_status` and `shell_tail` acknowledge an observed completion: if you inspect a job after it finished, no further notice is sent for that job.
+6. `shell_status` and `shell_read` acknowledge an observed completion: if you inspect a job after it finished, no further notice is sent for that job.
 
 ## Completion notice shape
 
@@ -104,8 +106,9 @@ Cancel implicitly suppresses the completion notice for that job (`notifyOnExit` 
   async shell result: <status> · <duration> · <job_name>: <command-preview>
   stdout_log: <path-to-stdout.log>
   stderr_log: <path-to-stderr.log>
-  more: shell_tail jobId=<jobId> (recent output; max 500 lines)
-  older_output: use search_many/read_many on stdout_log or stderr_log for older or targeted log output
+  recent_output: shell_read jobId=<jobId> mode=tail lines=80 (recent stdout/stderr; max 500 lines / 120 KB)
+  range_output: shell_read jobId=<jobId> mode=range stream=stdout offset=<line> limit=<lines> (exact line ranges; use nextOffset to continue)
+  targeted_output: use search_many on stdout_log/stderr_log, then shell_read mode=range or read_many around relevant lines
   ```
 - Multiple jobs in one batch:
   ```
@@ -113,12 +116,13 @@ Cancel implicitly suppresses the completion notice for that job (`notifyOnExit` 
   - <status> · <duration> · <job_name>: <command-preview>
     stdout_log: <path-to-stdout.log>
     stderr_log: <path-to-stderr.log>
-    more: shell_tail jobId=<jobId> (recent output; max 500 lines)
-    older_output: use search_many/read_many on stdout_log or stderr_log for older or targeted log output
+    recent_output: shell_read jobId=<jobId> mode=tail lines=80 (recent stdout/stderr; max 500 lines / 120 KB)
+    range_output: shell_read jobId=<jobId> mode=range stream=stdout offset=<line> limit=<lines> (exact line ranges; use nextOffset to continue)
+    targeted_output: use search_many on stdout_log/stderr_log, then shell_read mode=range or read_many around relevant lines
   - ...
   ```
 
-Completion notice content deliberately points at log paths rather than embedding stdout/stderr samples. The `details` payload still carries structured job metadata and short stdout/stderr tails for renderer/tool use.
+Completion notice content deliberately points at log paths rather than embedding stdout/stderr samples. The `details` payload carries structured job metadata for renderer/tool use.
 
 ## In-band result shape
 
@@ -126,14 +130,10 @@ Completion notice content deliberately points at log paths rather than embedding
 {
   jobs: [
     {
-      job: {
-        jobId, job_name?, command, cwd, shell, status,
-        pid?, startedAt, endedAt?, durationMs?, exitCode?, signal?, error?,
-        notifyOnExit, completionNotified,
-        logDir, stdoutLog, stderrLog,
-        outputBytes: { stdout, stderr }
-      },
-      output: { stdout: string, stderr: string }
+      jobId, job_name?, command, cwd, status,
+      durationMs?, exitCode?, signal?, error?,
+      stdoutLog, stderrLog,
+      outputBytes: { stdout, stderr }
     },
     ...
   ]
@@ -156,8 +156,8 @@ Defaults (constants, not configurable):
 - In-band grace period: **6 s**.
 - Per-job completion batch debounce: **~100 ms**.
 - Completion-notice model-facing content: status summary plus `stdout_log`/`stderr_log` paths; no stdout/stderr sample.
-- Notification details/TUI stdout/stderr cap: **8 lines / 2 KB**.
-- Start/status/tail result per-stream caps: `shell_start` **20 KB**, `shell_tail` max **500 lines / 120 KB**.
+- `shell_start` result content: status/log metadata only; no stdout/stderr samples.
+- `shell_read` tail mode cap: max **500 lines / 120 KB** per selected stream. Range mode uses explicit `offset`/`limit` and has no fixed line cap.
 - Maximum commands per call: **12**.
 
 If you need to inspect storage health, run `/async:status`.
@@ -165,5 +165,5 @@ If you need to inspect storage health, run `/async:status`.
 ## Notes
 
 - There is intentionally no model-facing `shell_wait` or polling tool. Continue useful work while jobs run; if there is no useful work, stop after reporting that jobs are running. Completion notices will resume the agent.
-- Do not paste raw stdout/stderr unless the user explicitly asks. Use `shell_tail`/`shell_status` for targeted recent inspection after a completion notice, not transcript dumping; use `search_many`/`read_many` on `stdout_log` or `stderr_log` for older or targeted log ranges.
-- Tests cover spawn, durable logs, batched completions, `notifyOnExit:false`, cancel suppression, compact rendering, and error fallback (`tests/async-shell.test.ts`, `tests/native-tools.test.ts`).
+- Do not paste raw stdout/stderr unless the user explicitly asks. Use `shell_read` tail mode for recent inspection after a completion notice, `shell_read` range mode for exact line ranges/continuation, and `search_many`/`read_many` on `stdout_log` or `stderr_log` for targeted file inspection.
+- Tests cover spawn, durable logs, batched completions, `notifyOnExit:false`, cancel suppression, `shell_read` tail/range reads, compact rendering, and error fallback (`tests/async-shell.test.ts`, `tests/native-tools.test.ts`).

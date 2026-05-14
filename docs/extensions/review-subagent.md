@@ -33,7 +33,7 @@ Config:
     "tools": [
       "search_many", "read_many",
       "searxng_search", "web_fetch_many", "document_parse",
-      "shell_start", "shell_status", "shell_tail", "shell_cancel"
+      "shell_start", "shell_status", "shell_read", "shell_cancel"
     ]
   }
   ```

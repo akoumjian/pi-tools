@@ -274,7 +274,7 @@ const BANNED_DEFAULT_TOOL_NAMES = ["bash", "read", "edit", "write"] as const;
 const STOCK_TOOL_REPLACEMENT_GROUPS = [
   {
     stockTool: "bash",
-    replacementTools: ["shell_start", "shell_status", "shell_tail", "shell_cancel"]
+    replacementTools: ["shell_start", "shell_status", "shell_read", "shell_cancel"]
   },
   {
     stockTool: "read",
@@ -298,7 +298,7 @@ const DEFAULT_ACTIVE_TOOL_NAMES = [
   "web_fetch_many",
   "shell_start",
   "shell_status",
-  "shell_tail",
+  "shell_read",
   "shell_cancel"
 ] as const;
 
@@ -594,8 +594,8 @@ export function addBatchNativeToolGuidance(prompt: string): string {
     "- For shell work, use shell_start with commands: [...]. Start independent shell work together in one commands list instead of making serial shell_start calls; split only when commands depend on previous output, must run in order, or are not safe to run concurrently. Each shell_start command item must include its own command and cwd.",
     "- shell_start briefly waits only for quick commands using a fixed 6s grace period. There is no wait parameter; unfinished jobs continue in the background and append per-job completion notices by default.",
     "- While shell commands run in the background, do other useful work. Leave per-command notifyOnExit at its true default when you want a completion notice. Set notifyOnExit:false only when the result is unimportant. Do not poll or wait; completion notices are batched into history/TUI and then Pi resumes once for the flushed batch.",
-    "- Async-shell completion notices are short result notices with log paths and shell_tail hints. Use shell_tail for recent output; use search_many/read_many on stdout_log or stderr_log paths for older or targeted log output. Do not paste raw shell output unless explicitly requested.",
-    "- Use shell_status for inspection, shell_tail for more output after a result/notification, and shell_cancel to stop jobs.",
+    "- Async-shell completion notices and shell_start results are short status/log-path summaries. Use shell_read mode='tail' for recent output, shell_read mode='range' for exact line ranges/nextOffset continuation, and search_many/read_many on stdout_log or stderr_log paths for targeted log inspection. Do not paste raw shell output unless explicitly requested.",
+    "- Use shell_status for inspection, shell_read for output (tail mode for recent output; range mode for exact lines), and shell_cancel to stop jobs.",
     "- For online research, use searxng_search for discovery, then web_fetch_many for promising sources; read web_fetch_many textPath results with read_many when previews are insufficient.",
     "- For fetched PDFs, Office documents, spreadsheets, images, or other local documents, use document_parse on downloadedPath/path, then read_many on outputPath when full parsed content is needed.",
     "- Do not perform a sequence of single-item search_many/read_many/shell_start calls when one multi-item tool call can cover the independent work.",

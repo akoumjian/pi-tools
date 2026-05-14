@@ -324,7 +324,7 @@ function evaluateToolCall(event: ToolCallEvent, context: ExtensionContext): Safe
     return evaluateAsyncShellStart(input, context);
   }
 
-  if (["shell_status", "shell_tail", "shell_cancel"].includes(toolName)) {
+  if (["shell_status", "shell_read", "shell_cancel"].includes(toolName)) {
     return {
       action: "allow",
       risk: "low",
