@@ -62,7 +62,7 @@ const searxngSearchTool = defineTool({
     return search(params, signal);
   },
   renderCall(args, theme) {
-    return new Text(claudeToolCall("Search", quotePreview(args.query, 72), theme), 0, 0);
+    return new Text(claudeToolCall("WebSearch", quotePreview(args.query, 72), theme), 0, 0);
   },
   renderResult(result, options, theme, context) {
     if (context?.isError === true) {

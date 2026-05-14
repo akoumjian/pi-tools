@@ -58,7 +58,7 @@ test("searxng_search renders compactly without search snippets", () => {
   assert.equal(typeof tool.renderResult, "function");
 
   const callText = tool.renderCall?.({ query: "asteroid institute research" } as never, renderTheme as never, {} as never).render(200).join("\n") ?? "";
-  assert.match(callText, /⏺ Search\("asteroid institute research"\)/);
+  assert.match(callText, /⏺ WebSearch\("asteroid institute research"\)/);
 
   const resultText = tool.renderResult?.({
     content: [{ type: "text", text: "1. Verbose title\nhttps://example.com\nLong snippet that should not display" }],
