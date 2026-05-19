@@ -60,7 +60,7 @@ searxng_search({
 
 Writes three files under `~/.pi/agent/services/searxng/` (or `--dir <path>`):
 
-- `compose.yaml` — a `searxng` service bound to `127.0.0.1:${SEARXNG_PORT:-8080}` plus a `valkey` Redis backend, with explicit named volumes for cache and Redis state. Reads `SEARXNG_BASE_URL` and `SEARXNG_SECRET` from `.env`.
+- `compose.yaml` — a `searxng` service bound to `127.0.0.1:${SEARXNG_PORT:-18888}` plus a `valkey` Redis backend, with explicit named volumes for cache and Redis state. Reads `SEARXNG_BASE_URL` and `SEARXNG_SECRET` from `.env`.
 - `settings.yml` — SearXNG settings with a random 64-hex-character `secret_key`, `formats: [html, json]`, `safe_search: 1`, `autocomplete: ""`, no plugins enabled.
 - `.env` — `SEARXNG_PORT`, `SEARXNG_BASE_URL`, and the secret in plain text. Local-only; do not commit.
 

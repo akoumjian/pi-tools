@@ -19,7 +19,7 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { writeAgentExtensionConfig } from "../_shared/config.js";
 
 export const SEARXNG_AGENT_CONFIG_FILE = "searxng-settings.json";
-export const DEFAULT_SEARXNG_PORT = 8080;
+export const DEFAULT_SEARXNG_PORT = 18888;
 const EXAMPLE_SEARXNG_SECRET = "replace-with-a-random-secret";
 const LEGACY_SEARXNG_ENV_SECRET = "${SEARXNG_SECRET}";
 const SEARXNG_SERVICE_RELATIVE_PATH = [".pi", "agent", "services", "searxng"] as const;
@@ -262,9 +262,9 @@ export function searxngComposeYaml(): string {
     "    image: docker.io/searxng/searxng:latest",
     "    restart: unless-stopped",
     "    ports:",
-    '      - "127.0.0.1:${SEARXNG_PORT:-8080}:8080"',
+    '      - "127.0.0.1:${SEARXNG_PORT:-18888}:8080"',
     "    environment:",
-    "      - SEARXNG_BASE_URL=${SEARXNG_BASE_URL:-http://127.0.0.1:8080/}",
+    "      - SEARXNG_BASE_URL=${SEARXNG_BASE_URL:-http://127.0.0.1:18888/}",
     "      - SEARXNG_SECRET=${SEARXNG_SECRET:?set SEARXNG_SECRET in .env}",
     "    volumes:",
     "      - ./settings.yml:/etc/searxng/settings.yml:ro",

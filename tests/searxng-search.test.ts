@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import searxngSearchExtension, { buildSearxngStatusText } from "../extensions/searxng-search/index.js";
+import { DEFAULT_SEARXNG_PORT, runSearxngSetup, searxngComposeYaml } from "../extensions/searxng-search/setup.js";
 
 type FakeApi = ExtensionAPI & {
   registeredTools: ToolDefinition[];
@@ -66,6 +67,20 @@ test("searxng extension registers search tool and status command", () => {
   assert.ok(api.commands.has("searxng:status"));
   assert.ok(api.commands.has("searxng:setup"));
   assert.equal(api.commands.has("searxng-status"), false, "deprecated kebab alias removed");
+});
+
+test("searxng setup defaults to less common local port", () => {
+  const report = runSearxngSetup({
+    homeDir: "/tmp/pi-home",
+    dryRun: true,
+    runCommand: () => ({ status: 0, stdout: "", stderr: "" })
+  });
+
+  assert.equal(DEFAULT_SEARXNG_PORT, 18888);
+  assert.equal(report.port, 18888);
+  assert.equal(report.baseUrl, "http://127.0.0.1:18888");
+  assert.match(searxngComposeYaml(), /127\.0\.0\.1:\$\{SEARXNG_PORT:-18888\}:8080/);
+  assert.match(searxngComposeYaml(), /SEARXNG_BASE_URL=\$\{SEARXNG_BASE_URL:-http:\/\/127\.0\.0\.1:18888\/\}/);
 });
 
 test("searxng status reports reachable JSON endpoint", async () => {
