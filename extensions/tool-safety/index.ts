@@ -354,6 +354,16 @@ function evaluateToolCall(event: ToolCallEvent, context: ExtensionContext): Safe
     return evaluateDocumentParse(input, context);
   }
 
+  if (toolName === "hunk_session") {
+    return {
+      action: "allow",
+      risk: "low",
+      reason: `${toolName} runs only extension-constructed Hunk CLI commands and, on macOS, an iTerm2 AppleScript split with quoted arguments and no user-shell injection.`,
+      ruleId: "hunk-session",
+      tags: ["hunk", "local-ui"]
+    };
+  }
+
   if (toolName === "searxng_search") {
     return {
       action: "allow",

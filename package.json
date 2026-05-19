@@ -27,12 +27,16 @@
       "extensions/async-shell/index.ts",
       "extensions/native-tools/index.ts",
       "extensions/mutation-review/index.ts",
+      "extensions/live-diff/index.ts",
       "extensions/searxng-search/index.ts",
       "extensions/web-fetch/index.ts",
       "extensions/file-open/index.ts",
       "extensions/theme-preview/index.ts",
       "extensions/review-subagent/index.ts",
       "extensions/tool-display/index.ts"
+    ],
+    "skills": [
+      "skills/hunk-review/SKILL.md"
     ]
   },
   "dependencies": {
@@ -62,6 +66,7 @@
     "config/",
     "docs/",
     "extensions/",
+    "skills/",
     "scripts/dev-pi.mjs"
   ]
 }

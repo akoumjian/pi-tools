@@ -5,6 +5,7 @@ Reusable extensions for the [Pi coding agent](https://pi.dev/). The package focu
 - async shell jobs with batched completion notices
 - batch-native file and search tools that replace stock single-file/shell tools
 - safety review hooks (rule + model + human) and a mutation-review reviewer
+- Hunk-backed live diff tracking, side-by-side launch commands, and review skills
 - web research (SearXNG, web fetch with readability + document parse handoff)
 - a `/review` subagent workflow
 - TUI niceties: tmux/scrollback compatibility, theme preview, compact tool renderers, file-reference picker
@@ -56,6 +57,7 @@ Tools (LLM-callable):
 - `searxng_search` — search through a configured SearXNG instance
 - `web_fetch_many` — fetch + cache + readability-extract URLs, hand off non-HTML to `document_parse`
 - `document_parse` — parse PDFs, Office files, spreadsheets, images via LiteParse (opt-in display wrapper)
+- `hunk_session` — get/create this Pi session's repo-wide Hunk session, optionally opening the user-visible diff window and focusing a file/hunk
 
 Commands:
 
@@ -64,6 +66,7 @@ Commands:
 - `/async:status`
 - `/native:status`
 - `/mutation:setup`, `/mutation:status`, `/mutation:model`, `/mutation:toggle`, `/mutation:apply`
+- `/hunk:setup`, `/hunk:doctor`, `/hunk:status`, `/hunk:switch`, `/hunk:open`, `/hunk:close`, `/hunk:follow`, `/hunk:guidance`, `/hunk:focus`
 - `/searxng:setup`, `/searxng:status`
 - `/fetch:status`
 - `/file:open`
@@ -71,7 +74,7 @@ Commands:
 - `/review`, `/review:setup`, `/review:status`, `/review:cancel`, `/review:send-last`
 - `/docparser:doctor`
 
-The load order in `package.json#pi.extensions` is intentional: terminal patches first, safety before async shell, native batch tools before mutation-review, optional display overrides last.
+The load order in `package.json#pi.extensions` is intentional: terminal patches first, safety before async shell, native batch tools before mutation-review/live-diff tracking, optional display overrides last.
 
 ## Extensions
 
@@ -142,6 +145,18 @@ Each extension below documents what it does, what it provides, and how to set it
 **Provides.** `apply_reviewed_mutation` tool; `/mutation:setup`, `/mutation:status`, `/mutation:model`, `/mutation:toggle`, `/mutation:apply`; reviewer guidance in [`config/mutation-review-guidance.md`](config/mutation-review-guidance.md).
 
 **Setup.** `/mutation:setup provider/model[:thinking]`. When no reviewer model is configured, the extension stays out of the way and warns once.
+
+---
+
+### live-diff
+
+[Full docs](docs/extensions/live-diff.md).
+
+**Purpose.** Track successful file mutations by repo and control a Hunk side-by-side diff surface without suspending Pi. Supports agent-readable Hunk session ids scoped to the current Pi session, user-visible Hunk windows, Hunk setup diagnostics, active repo switching, `/hunk:open`/`/hunk:close`, debounced follow navigation, and focused navigation.
+
+**Provides.** `hunk_session`; `/hunk:setup`, `/hunk:doctor`, `/hunk:status`, `/hunk:switch`, `/hunk:open`, `/hunk:close`, `/hunk:follow`, `/hunk:guidance`, `/hunk:focus`; Hunk skill [`skills/hunk-review/SKILL.md`](skills/hunk-review/SKILL.md).
+
+**Setup.** Install Hunk separately (`npm i -g hunkdiff` or `brew install modem-dev/tap/hunk`), then run `/hunk:doctor`. Optional personal review guidance lives in [`config/live-diff-code-review-guidance.md`](config/live-diff-code-review-guidance.md) and can be installed with `/hunk:guidance install`. The first non-suspending launcher target is iTerm2; user-facing `/hunk:open` can fall back to a manual command when iTerm2 is not detectable.
 
 ---
 

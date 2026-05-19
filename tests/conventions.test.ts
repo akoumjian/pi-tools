@@ -10,6 +10,7 @@ type PackageJson = {
   files?: string[];
   pi?: {
     extensions?: string[];
+    skills?: string[];
     themes?: string[];
   };
 };
@@ -58,6 +59,8 @@ test("pi-tools registered extensions have shipping default config files where re
     "config/tool-safety-settings.json",
     "config/mutation-review-settings.json",
     "config/mutation-review-guidance.md",
+    "config/live-diff-settings.json",
+    "config/live-diff-code-review-guidance.md",
     "config/review-subagent-settings.json",
     "config/review-subagent-guidance.md",
     "config/tool-display-settings.json",
@@ -67,6 +70,7 @@ test("pi-tools registered extensions have shipping default config files where re
     "docs/extensions/file-open.md",
     "docs/extensions/mutation-review.md",
     "docs/extensions/native-tools.md",
+    "docs/extensions/live-diff.md",
     "docs/extensions/review-subagent.md",
     "docs/extensions/searxng-search.md",
     "docs/extensions/theme-preview.md",
@@ -114,6 +118,14 @@ test("pi-tools package defaults do not own personal profile model or trust choic
   assert.doesNotMatch(reviewGuidance, personalHomePattern);
 });
 
+test("pi-tools package registers Hunk skill", () => {
+  const manifest = packageJson();
+  assert.deepEqual(manifest.pi?.skills, ["skills/hunk-review/SKILL.md"]);
+  const skill = readText("skills/hunk-review/SKILL.md");
+  assert.match(skill, /name: hunk-review/);
+  assert.match(skill, /Show and annotate diffs for review to the user in an interactive window using hunk\./);
+});
+
 test("pi-tools package files whitelist excludes tests and local runtime artifacts", () => {
   const manifest = packageJson();
   assert.deepEqual(manifest.files, [
@@ -121,6 +133,7 @@ test("pi-tools package files whitelist excludes tests and local runtime artifact
     "config/",
     "docs/",
     "extensions/",
+    "skills/",
     "scripts/dev-pi.mjs"
   ]);
 });

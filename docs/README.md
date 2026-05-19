@@ -2,6 +2,10 @@
 
 Deep-dive documentation for each extension shipped by `@akoumjian/pi-tools`. The top-level [`README.md`](../README.md) has a short overview and quick reference; the files here go into purpose, schema, behavior, caps, result shape, rendering, and setup for each extension.
 
+Planning docs:
+
+- [Live diff workflow](plans/live-diff-workflow.md) — Hunk-backed side-by-side diff review plan/prototype notes.
+
 Index (extensions load in this order; see `package.json#pi.extensions`):
 
 1. [tui-scrollback](extensions/tui-scrollback.md) — preserve terminal scrollback across Pi redraws.
@@ -10,12 +14,13 @@ Index (extensions load in this order; see `package.json#pi.extensions`):
 4. [async-shell](extensions/async-shell.md) — durable async shell jobs with batched completion notices.
 5. [native-tools](extensions/native-tools.md) — batch-native `read_many`, `search_many`, `write_many`, `edit_many` and strict-replacement.
 6. [mutation-review](extensions/mutation-review.md) — file-mutation reuse reviewer with cached re-apply via `apply_reviewed_mutation`.
-7. [searxng-search](extensions/searxng-search.md) — `searxng_search` against a configured self-hosted SearXNG instance.
-8. [web-fetch](extensions/web-fetch.md) — `web_fetch_many` for safe HTTP(S) fetch + cache + readability extraction.
-9. [file-open](extensions/file-open.md) — `/file:open` picker for recent transcript file references.
-10. [theme-preview](extensions/theme-preview.md) — `/themes:preview` live theme showcase.
-11. [review-subagent](extensions/review-subagent.md) — `/review` tool-using review subagent workflow.
-12. [tool-display](extensions/tool-display.md) — opt-in display wrapper for `document_parse`.
+7. [live-diff](extensions/live-diff.md) — Hunk-backed live diff tracking, agent-opened review windows, repo switching, open/close controls, and follow mode.
+8. [searxng-search](extensions/searxng-search.md) — `searxng_search` against a configured self-hosted SearXNG instance.
+9. [web-fetch](extensions/web-fetch.md) — `web_fetch_many` for safe HTTP(S) fetch + cache + readability extraction.
+10. [file-open](extensions/file-open.md) — `/file:open` picker for recent transcript file references.
+11. [theme-preview](extensions/theme-preview.md) — `/themes:preview` live theme showcase.
+12. [review-subagent](extensions/review-subagent.md) — `/review` tool-using review subagent workflow.
+13. [tool-display](extensions/tool-display.md) — opt-in display wrapper for `document_parse`.
 
 ## Conventions used in these docs
 
