@@ -928,8 +928,8 @@ test("hunk-review saves and updates optional Hunk AGENTS guidance snippet", () =
   assert.match(snippet, /hunk_session/);
 
   const block = buildHunkAgentGuidanceBlock(snippet);
-  assert.match(block, /akoumjian-pi-tools:hunk-code-review-guidance:start/);
-  assert.match(block, /akoumjian-pi-tools:hunk-code-review-guidance:end/);
+  assert.doesNotMatch(block, /akoumjian-pi-tools:hunk-code-review-guidance:start/);
+  assert.doesNotMatch(block, /akoumjian-pi-tools:hunk-code-review-guidance:end/);
 
   const installed = upsertHunkAgentGuidanceText("# Existing Guidance\n", snippet);
   assert.equal(installed.changed, true);
@@ -941,15 +941,17 @@ test("hunk-review saves and updates optional Hunk AGENTS guidance snippet", () =
   assert.equal(unchanged.changed, false);
   assert.equal(unchanged.content, installed.content);
 
-  const modified = installed.content.replace("Use hunk related tools", "Use reviewed hunk related tools");
+  const legacyMarked = `# Existing Guidance\n\n<!-- akoumjian-pi-tools:hunk-code-review-guidance:start -->\n${snippet.trimEnd()}\n<!-- akoumjian-pi-tools:hunk-code-review-guidance:end -->\n`;
+  assert.equal(inspectHunkAgentGuidanceText(legacyMarked, "/tmp/AGENTS.md", snippet).state, "legacy-marked");
+  const legacyUpdate = upsertHunkAgentGuidanceText(legacyMarked, snippet);
+  assert.equal(legacyUpdate.changed, true);
+  assert.doesNotMatch(legacyUpdate.content, /akoumjian-pi-tools:hunk-code-review-guidance/);
+  assert.equal(inspectHunkAgentGuidanceText(legacyUpdate.content, "/tmp/AGENTS.md", snippet).state, "installed");
+
+  const modified = legacyMarked.replace("Use hunk related tools", "Use reviewed hunk related tools");
   assert.equal(inspectHunkAgentGuidanceText(modified, "/tmp/AGENTS.md", snippet).state, "modified");
 
-  const unmarked = `# Existing Guidance\n\n${snippet}`;
-  assert.equal(inspectHunkAgentGuidanceText(unmarked, "/tmp/AGENTS.md", snippet).state, "present-unmarked");
-  const unmarkedUpdate = upsertHunkAgentGuidanceText(unmarked, snippet);
-  assert.equal(unmarkedUpdate.changed, false);
-
-  const removed = removeHunkAgentGuidanceText(installed.content);
+  const removed = removeHunkAgentGuidanceText(installed.content, snippet);
   assert.equal(removed.changed, true);
   assert.doesNotMatch(removed.content, /akoumjian-pi-tools:hunk-code-review-guidance/);
   assert.equal(inspectHunkAgentGuidanceText(removed.content, "/tmp/AGENTS.md", snippet).state, "missing");
@@ -983,7 +985,7 @@ test("hunk-review guidance command installs and removes the global AGENTS snippe
 
     await command.handler("install", context);
     assert.match(readFileSync(agentsPath, "utf8"), /# Code Review Guidance/);
-    assert.match(readFileSync(agentsPath, "utf8"), /akoumjian-pi-tools:hunk-code-review-guidance:start/);
+    assert.doesNotMatch(readFileSync(agentsPath, "utf8"), /akoumjian-pi-tools:hunk-code-review-guidance:start/);
     assert.match(notifications.at(-1)?.text ?? "", /Installed Hunk Code Review Guidance/);
 
     await command.handler("status", context);
@@ -995,7 +997,7 @@ test("hunk-review guidance command installs and removes the global AGENTS snippe
 
     await command.handler("remove", context);
     assert.equal(readFileSync(agentsPath, "utf8"), "");
-    assert.match(notifications.at(-1)?.text ?? "", /Removed the marked Hunk Code Review Guidance block/);
+    assert.match(notifications.at(-1)?.text ?? "", /Removed the Hunk Code Review Guidance block/);
   } finally {
     if (previousAgentDir === undefined) {
       delete process.env.PI_CODING_AGENT_DIR;

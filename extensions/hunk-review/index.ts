@@ -208,7 +208,7 @@ type GuidanceArgs = {
   dryRun: boolean;
 };
 
-type HunkAgentGuidanceState = "missing" | "installed" | "modified" | "present-unmarked";
+type HunkAgentGuidanceState = "missing" | "installed" | "modified" | "present-unmarked" | "legacy-marked";
 
 type HunkAgentGuidanceInspection = {
   state: HunkAgentGuidanceState;
@@ -570,34 +570,34 @@ function handleGuidanceCommand(rawArgs: string, context: ExtensionCommandContext
 
     if (args.action === "status") {
       const inspection = inspectHunkAgentGuidanceText(currentContent, targetPath, snippet);
-      context.ui.notify(buildHunkAgentGuidanceStatusText(inspection), inspection.state === "modified" ? "warning" : "info");
+      context.ui.notify(buildHunkAgentGuidanceStatusText(inspection), inspection.state === "modified" || inspection.state === "legacy-marked" ? "warning" : "info");
       return;
     }
 
     if (args.action === "remove") {
       const update = removeHunkAgentGuidanceText(currentContent);
       if (!update.changed) {
-        context.ui.notify(`No marked Hunk Code Review Guidance block is installed in ${targetPath}.`, "info");
+        context.ui.notify(`No Hunk Code Review Guidance block is installed in ${targetPath}.`, "info");
         return;
       }
       if (args.dryRun) {
-        context.ui.notify(`Would remove the marked Hunk Code Review Guidance block from ${targetPath}.`, "info");
+        context.ui.notify(`Would remove the Hunk Code Review Guidance block from ${targetPath}.`, "info");
         return;
       }
       mkdirSync(path.dirname(targetPath), { recursive: true });
       writeFileSync(targetPath, update.content, "utf8");
-      context.ui.notify(`Removed the marked Hunk Code Review Guidance block from ${targetPath}. Run /reload or restart Pi to unload AGENTS.md changes.`, "info");
+      context.ui.notify(`Removed the Hunk Code Review Guidance block from ${targetPath}. Run /reload or restart Pi to unload AGENTS.md changes.`, "info");
       return;
     }
 
     const update = upsertHunkAgentGuidanceText(currentContent, snippet);
     if (!update.changed) {
-      const extra = update.state === "present-unmarked" ? " It is present without package markers, so Pi left it unchanged." : "";
+      const extra = update.state === "present-unmarked" ? " It is present without legacy package markers, so Pi left it unchanged." : "";
       context.ui.notify(`Hunk Code Review Guidance is already ${describeHunkAgentGuidanceState(update.state)} in ${targetPath}.${extra}`, update.state === "present-unmarked" ? "warning" : "info");
       return;
     }
     if (args.dryRun) {
-      context.ui.notify(`Would install/update this marked block in ${targetPath}:\n\n${buildHunkAgentGuidanceBlock(snippet).trimEnd()}`, "info");
+      context.ui.notify(`Would install/update this block in ${targetPath}:\n\n${buildHunkAgentGuidanceBlock(snippet).trimEnd()}`, "info");
       return;
     }
     mkdirSync(path.dirname(targetPath), { recursive: true });
@@ -617,40 +617,50 @@ export function readHunkAgentGuidanceSnippet(): string {
 }
 
 export function buildHunkAgentGuidanceBlock(snippet = readHunkAgentGuidanceSnippet()): string {
-  return `${HUNK_AGENT_GUIDANCE_START}\n${snippet.trimEnd()}\n${HUNK_AGENT_GUIDANCE_END}\n`;
+  return `${snippet.trimEnd()}\n`;
 }
 
 export function inspectHunkAgentGuidanceText(content: string, targetPath: string, snippet = readHunkAgentGuidanceSnippet()): HunkAgentGuidanceInspection {
-  const range = hunkAgentGuidanceBlockRange(content);
-  if (range === undefined) {
+  const legacyRange = legacyHunkAgentGuidanceBlockRange(content);
+  if (legacyRange !== undefined) {
+    const inner = content.slice(legacyRange.start + HUNK_AGENT_GUIDANCE_START.length, legacyRange.end - HUNK_AGENT_GUIDANCE_END.length);
     return {
-      state: containsHunkAgentGuidanceSnippet(content, snippet) ? "present-unmarked" : "missing",
+      state: normalizeGuidanceText(inner) === normalizeGuidanceText(snippet) ? "legacy-marked" : "modified",
       targetPath
     };
   }
 
-  const inner = content.slice(range.start + HUNK_AGENT_GUIDANCE_START.length, range.end - HUNK_AGENT_GUIDANCE_END.length);
+  const exactRange = exactHunkAgentGuidanceSnippetRange(content, snippet);
+  if (exactRange !== undefined) {
+    return { state: "installed", targetPath };
+  }
+
   return {
-    state: normalizeGuidanceText(inner) === normalizeGuidanceText(snippet) ? "installed" : "modified",
+    state: containsHunkAgentGuidanceSnippet(content, snippet) ? "present-unmarked" : "missing",
     targetPath
   };
 }
 
 export function upsertHunkAgentGuidanceText(content: string, snippet = readHunkAgentGuidanceSnippet()): HunkAgentGuidanceTextUpdate {
-  const range = hunkAgentGuidanceBlockRange(content);
-  if (range === undefined) {
-    if (containsHunkAgentGuidanceSnippet(content, snippet)) {
-      return { content, changed: false, state: "present-unmarked" };
-    }
-    return { content: appendGuidanceBlock(content, buildHunkAgentGuidanceBlock(snippet)), changed: true, state: "installed" };
+  const legacyRange = legacyHunkAgentGuidanceBlockRange(content);
+  if (legacyRange !== undefined) {
+    const updated = replaceGuidanceRange(content, legacyRange, buildHunkAgentGuidanceBlock(snippet));
+    return { content: updated, changed: updated !== content, state: "installed" };
   }
 
-  const updated = replaceGuidanceRange(content, range, buildHunkAgentGuidanceBlock(snippet));
-  return { content: updated, changed: updated !== content, state: "installed" };
+  const exactRange = exactHunkAgentGuidanceSnippetRange(content, snippet);
+  if (exactRange !== undefined) {
+    return { content, changed: false, state: "installed" };
+  }
+
+  if (containsHunkAgentGuidanceSnippet(content, snippet)) {
+    return { content, changed: false, state: "present-unmarked" };
+  }
+  return { content: appendGuidanceBlock(content, buildHunkAgentGuidanceBlock(snippet)), changed: true, state: "installed" };
 }
 
-export function removeHunkAgentGuidanceText(content: string): HunkAgentGuidanceTextUpdate {
-  const range = hunkAgentGuidanceBlockRange(content);
+export function removeHunkAgentGuidanceText(content: string, snippet = readHunkAgentGuidanceSnippet()): HunkAgentGuidanceTextUpdate {
+  const range = legacyHunkAgentGuidanceBlockRange(content) ?? exactHunkAgentGuidanceSnippetRange(content, snippet);
   if (range === undefined) {
     return { content, changed: false, state: "missing" };
   }
@@ -663,7 +673,7 @@ function hunkAgentGuidanceTargetPath(): string {
   return path.join(getAgentDir(), "AGENTS.md");
 }
 
-function hunkAgentGuidanceBlockRange(content: string): HunkAgentGuidanceBlockRange | undefined {
+function legacyHunkAgentGuidanceBlockRange(content: string): HunkAgentGuidanceBlockRange | undefined {
   const start = content.indexOf(HUNK_AGENT_GUIDANCE_START);
   const endMarker = content.indexOf(HUNK_AGENT_GUIDANCE_END);
   if (start === -1 && endMarker === -1) {
@@ -673,6 +683,20 @@ function hunkAgentGuidanceBlockRange(content: string): HunkAgentGuidanceBlockRan
     throw new Error("AGENTS.md contains an incomplete Hunk Code Review Guidance marker block.");
   }
   return { start, end: endMarker + HUNK_AGENT_GUIDANCE_END.length };
+}
+
+function exactHunkAgentGuidanceSnippetRange(content: string, snippet: string): HunkAgentGuidanceBlockRange | undefined {
+  const needle = snippet.trimEnd();
+  if (needle.length === 0) {
+    return undefined;
+  }
+
+  const start = content.indexOf(needle);
+  if (start === -1) {
+    return undefined;
+  }
+
+  return { start, end: start + needle.length };
 }
 
 function containsHunkAgentGuidanceSnippet(content: string, snippet: string): boolean {
@@ -704,7 +728,8 @@ function buildHunkAgentGuidanceStatusText(inspection: HunkAgentGuidanceInspectio
     `Target: ${inspection.targetPath}`,
     inspection.state === "missing" ? "Run /hunk:guidance install to append the package-managed block." : undefined,
     inspection.state === "modified" ? "Run /hunk:guidance install to replace the package-managed block, or edit AGENTS.md manually if the local changes are intentional." : undefined,
-    inspection.state === "present-unmarked" ? "The snippet is present without package markers; Pi will not rewrite it automatically." : undefined
+    inspection.state === "present-unmarked" ? "The snippet is present without legacy package markers; Pi will not rewrite it automatically." : undefined,
+    inspection.state === "legacy-marked" ? "Run /hunk:guidance install to remove the legacy marker comments while preserving the guidance." : undefined
   ].filter((line): line is string => line !== undefined).join("\n");
 }
 
@@ -717,7 +742,9 @@ function describeHunkAgentGuidanceState(state: HunkAgentGuidanceState): string {
     case "modified":
       return "installed with local edits";
     case "present-unmarked":
-      return "present without package markers";
+      return "present without legacy package markers";
+    case "legacy-marked":
+      return "installed with legacy marker comments";
   }
 }
 
