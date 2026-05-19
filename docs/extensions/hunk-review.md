@@ -1,8 +1,8 @@
-# live-diff
+# hunk-review
 
 ## Purpose
 
-`live-diff` keeps Pi usable while Hunk runs in a side window. Pi tracks tool-edited repos/files, opens or reuses the current Pi session's remembered Hunk view for the active repo, returns stable Hunk `sessionId`s, and can follow recent edits with debounced Hunk navigation.
+`hunk-review` keeps Pi usable while Hunk runs in a side window. Pi tracks tool-edited repos/files, opens or reuses the current Pi session's remembered Hunk view for the active repo, returns stable Hunk `sessionId`s, and can follow recent edits with debounced Hunk navigation.
 
 ## Tools
 
@@ -30,7 +30,7 @@ Use `hunk_session` when the purpose is to show the user meaningful diffs in a vi
 
 ## Behavior
 
-1. Successful `write_many`, `edit_many`, stock `write`/`edit`, and `apply_reviewed_mutation` results add touched paths to hidden live-diff session state.
+1. Successful `write_many`, `edit_many`, stock `write`/`edit`, and `apply_reviewed_mutation` results add touched paths to hidden hunk-review session state.
 2. Paths resolve to the nearest `.jj`, `.git`, or `.hg` repo root.
 3. `hunk_session` and `/hunk:open` use repo-wide `hunk diff --watch`. Pi reuses a Hunk session only when the current Pi session already remembers that exact `sessionId` and Hunk still reports it for the same repo; otherwise it creates a new session instead of silently claiming an old daemon-visible repo session. Reusing a remembered session refreshes the repo-wide source and may overwrite custom sources or pathspecs on that session. Tool focus params use `hunk session navigate`, never pathspec reloads.
 4. Successful agent tools require a discovered `sessionId`; if Pi cannot launch/discover one, the tool fails loudly rather than returning ambiguous state.
@@ -60,7 +60,7 @@ Optional local defaults:
 /hunk:setup --hunk-bin /absolute/path/to/hunk --launcher auto --follow-delay-ms 1200 --allow-agent-launch on
 ```
 
-Package defaults live in [`config/live-diff-settings.json`](../../config/live-diff-settings.json). The optional AGENTS snippet is saved separately in [`config/live-diff-code-review-guidance.md`](../../config/live-diff-code-review-guidance.md).
+Package defaults live in [`config/hunk-review-settings.json`](../../config/hunk-review-settings.json). The optional AGENTS snippet is saved separately in [`config/hunk-review-guidance.md`](../../config/hunk-review-guidance.md).
 
 To print or install that snippet into the global Pi `AGENTS.md` for the current agent dir:
 

@@ -4,12 +4,12 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import liveDiffExtension, {
+import hunkReviewExtension, {
   attachSessionToLaunch,
   buildFollowModeMessage,
   buildHunkAgentGuidanceBlock,
   buildHunkDiffArgs,
-  buildLiveDiffStatusText,
+  buildHunkReviewStatusText,
   buildHunkSessionNavigateArgs,
   buildHunkSessionReloadArgs,
   buildItermSplitAppleScript,
@@ -26,7 +26,7 @@ import liveDiffExtension, {
   findNearestRepoRoot,
   findNewHunkSession,
   readHunkAgentGuidanceSnippet,
-  readLiveDiffSettings,
+  readHunkReviewSettings,
   recordTouchedFiles,
   repoRelativePath,
   removeHunkAgentGuidanceText,
@@ -35,22 +35,22 @@ import liveDiffExtension, {
   snapshotState,
   splitCommandArgs,
   upsertHunkAgentGuidanceText,
-  type LiveDiffStateSnapshot
-} from "../extensions/live-diff/index.js";
+  type HunkReviewStateSnapshot
+} from "../extensions/hunk-review/index.js";
 
 type FakeRegisteredCommand = {
   description?: string;
   handler: (args: string, context: ExtensionCommandContext) => unknown | Promise<unknown>;
 };
 
-type FakeLiveDiffApi = ExtensionAPI & {
+type FakeHunkReviewApi = ExtensionAPI & {
   entries: Array<{ type: string; data: unknown }>;
   tools: ToolDefinition[];
   commands: Map<string, FakeRegisteredCommand>;
   handlers: Map<string, Function[]>;
 };
 
-function createFakeLiveDiffApi(): FakeLiveDiffApi {
+function createFakeHunkReviewApi(): FakeHunkReviewApi {
   const entries: Array<{ type: string; data: unknown }> = [];
   const tools: ToolDefinition[] = [];
   const commands = new Map<string, FakeRegisteredCommand>();
@@ -72,10 +72,10 @@ function createFakeLiveDiffApi(): FakeLiveDiffApi {
     appendEntry(type: string, data: unknown): void {
       entries.push({ type, data });
     }
-  } as unknown as FakeLiveDiffApi;
+  } as unknown as FakeHunkReviewApi;
 }
 
-function fakeLiveDiffContext(cwd: string): ExtensionContext {
+function fakeHunkReviewContext(cwd: string): ExtensionContext {
   return {
     cwd,
     ui: {
@@ -84,7 +84,7 @@ function fakeLiveDiffContext(cwd: string): ExtensionContext {
   } as unknown as ExtensionContext;
 }
 
-function fakeLiveDiffCommandContext(cwd: string, notifications: Array<{ text: string; level: string }>): ExtensionCommandContext {
+function fakeHunkReviewCommandContext(cwd: string, notifications: Array<{ text: string; level: string }>): ExtensionCommandContext {
   return {
     cwd,
     ui: {
@@ -96,9 +96,9 @@ function fakeLiveDiffCommandContext(cwd: string, notifications: Array<{ text: st
   } as unknown as ExtensionCommandContext;
 }
 
-function restoreLiveDiffState(api: FakeLiveDiffApi, cwd: string, entries: readonly unknown[]): void {
+function restoreHunkReviewState(api: FakeHunkReviewApi, cwd: string, entries: readonly unknown[]): void {
   const context = {
-    ...fakeLiveDiffContext(cwd),
+    ...fakeHunkReviewContext(cwd),
     sessionManager: { getBranch: () => entries }
   } as unknown as ExtensionContext;
   for (const handler of api.handlers.get("session_start") ?? []) {
@@ -106,11 +106,11 @@ function restoreLiveDiffState(api: FakeLiveDiffApi, cwd: string, entries: readon
   }
 }
 
-function liveDiffStateEntry(data: LiveDiffStateSnapshot): { type: "custom"; customType: "live-diff-state"; data: LiveDiffStateSnapshot } {
-  return { type: "custom", customType: "live-diff-state", data };
+function hunkReviewStateEntry(data: HunkReviewStateSnapshot): { type: "custom"; customType: "hunk-review-state"; data: HunkReviewStateSnapshot } {
+  return { type: "custom", customType: "hunk-review-state", data };
 }
 
-function rememberedHunkState(repo: string, sessionId: string): LiveDiffStateSnapshot {
+function rememberedHunkState(repo: string, sessionId: string): HunkReviewStateSnapshot {
   return {
     version: 1,
     updatedAt: "2026-01-01T00:00:00.000Z",
@@ -137,10 +137,10 @@ function rememberedHunkState(repo: string, sessionId: string): LiveDiffStateSnap
   };
 }
 
-test("live-diff settings use package defaults and validate overrides", () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "pi-live-diff-settings-"));
+test("hunk-review settings use package defaults and validate overrides", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "pi-hunk-review-settings-"));
   try {
-    const configPath = path.join(dir, "live-diff-settings.json");
+    const configPath = path.join(dir, "hunk-review-settings.json");
     writeFileSync(configPath, JSON.stringify({
       hunkBin: "/opt/bin/hunk",
       defaultLauncher: "iterm",
@@ -149,7 +149,7 @@ test("live-diff settings use package defaults and validate overrides", () => {
       allowAgentLaunch: true
     }), "utf8");
 
-    const settings = readLiveDiffSettings(configPath);
+    const settings = readHunkReviewSettings(configPath);
     assert.equal(settings.hunkBin, "/opt/bin/hunk");
     assert.equal(settings.defaultLauncher, "iterm");
     assert.equal(settings.followDebounceMs, 900);
@@ -158,13 +158,13 @@ test("live-diff settings use package defaults and validate overrides", () => {
 
     const badConfigPath = path.join(dir, "bad.json");
     writeFileSync(badConfigPath, JSON.stringify({ maxTouchedFiles: 0 }), "utf8");
-    assert.throws(() => readLiveDiffSettings(badConfigPath), /maxTouchedFiles/);
+    assert.throws(() => readHunkReviewSettings(badConfigPath), /maxTouchedFiles/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("live-diff extracts mutation paths from batch and reviewed-mutation results", () => {
+test("hunk-review extracts mutation paths from batch and reviewed-mutation results", () => {
   assert.deepEqual(extractTouchedPathsFromToolCall({
     toolName: "write_many",
     input: { writes: [{ path: "src/a.ts" }, { path: "src/b.ts" }] }
@@ -188,8 +188,8 @@ test("live-diff extracts mutation paths from batch and reviewed-mutation results
   }), [{ path: "src/f.ts", line: 12 }]);
 });
 
-test("live-diff resolves touched files to nearest child repository", () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "pi-live-diff-repos-"));
+test("hunk-review resolves touched files to nearest child repository", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "pi-hunk-review-repos-"));
   try {
     const repo = path.join(dir, "repo-one");
     const nested = path.join(repo, "src", "deep");
@@ -211,8 +211,8 @@ test("live-diff resolves touched files to nearest child repository", () => {
   }
 });
 
-test("live-diff follow target respects pinned active repo", () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "pi-live-diff-follow-"));
+test("hunk-review follow target respects pinned active repo", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "pi-hunk-review-follow-"));
   try {
     const repoOne = path.join(dir, "repo-one");
     const repoTwo = path.join(dir, "repo-two");
@@ -240,8 +240,8 @@ test("live-diff follow target respects pinned active repo", () => {
   }
 });
 
-test("live-diff treats git worktree .git files as repo roots", () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "pi-live-diff-worktree-"));
+test("hunk-review treats git worktree .git files as repo roots", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "pi-hunk-review-worktree-"));
   try {
     const repo = path.join(dir, "worktree");
     mkdirSync(path.join(repo, "src"), { recursive: true });
@@ -255,8 +255,8 @@ test("live-diff treats git worktree .git files as repo roots", () => {
   }
 });
 
-test("live-diff restores latest hidden state snapshot from session entries", () => {
-  const older: LiveDiffStateSnapshot = {
+test("hunk-review restores latest hidden state snapshot from session entries", () => {
+  const older: HunkReviewStateSnapshot = {
     version: 1,
     updatedAt: "2026-01-01T00:00:00Z",
     followEnabled: false,
@@ -267,7 +267,7 @@ test("live-diff restores latest hidden state snapshot from session entries", () 
     touchedFilesByRepo: {},
     sessionsByRepo: {}
   };
-  const newer: LiveDiffStateSnapshot = {
+  const newer: HunkReviewStateSnapshot = {
     version: 1,
     updatedAt: "2026-01-01T00:00:01Z",
     followEnabled: true,
@@ -282,16 +282,16 @@ test("live-diff restores latest hidden state snapshot from session entries", () 
   };
 
   const state = restoreStateFromEntries([
-    { type: "custom", customType: "live-diff-state", data: older },
+    { type: "custom", customType: "hunk-review-state", data: older },
     { type: "custom", customType: "other", data: newer },
-    { type: "custom", customType: "live-diff-state", data: newer }
+    { type: "custom", customType: "hunk-review-state", data: newer }
   ], "repo");
 
   assert.deepEqual(snapshotState(state), newer);
 });
 
-test("live-diff registers single Hunk session tool and returns session ids", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "pi-live-diff-open-tool-"));
+test("hunk-review registers single Hunk session tool and returns session ids", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "pi-hunk-review-open-tool-"));
   const previousHunkBin = process.env.HUNK_BIN;
   try {
     mkdirSync(path.join(dir, ".git"), { recursive: true });
@@ -323,8 +323,8 @@ console.log(JSON.stringify({ sessions: [
     chmodSync(hunkBin, 0o755);
     process.env.HUNK_BIN = hunkBin;
 
-    const api = createFakeLiveDiffApi();
-    liveDiffExtension(api);
+    const api = createFakeHunkReviewApi();
+    hunkReviewExtension(api);
 
     assert.equal(api.handlers.has("before_agent_start"), false);
     assert.equal(api.tools.some((item) => item.name === "hunk_open"), false);
@@ -348,14 +348,14 @@ console.log(JSON.stringify({ sessions: [
     assert.equal(Object.hasOwn(toolProperties, "file"), true);
     assert.equal(Object.hasOwn(toolProperties, "newLine"), true);
 
-    restoreLiveDiffState(api, dir, [liveDiffStateEntry(rememberedHunkState(realRepo, fullSessionId))]);
+    restoreHunkReviewState(api, dir, [hunkReviewStateEntry(rememberedHunkState(realRepo, fullSessionId))]);
 
     const sessionResult = await sessionTool.execute(
       "tool-call-id",
       { repo: dir },
       new AbortController().signal,
       undefined,
-      fakeLiveDiffContext(dir)
+      fakeHunkReviewContext(dir)
     );
 
     const sessionDetails = sessionResult.details as { repo: string; reused: boolean; reloaded: boolean; sessionId: string; command: string; reloadCommand: string; pathspecs: string[] };
@@ -376,7 +376,7 @@ console.log(JSON.stringify({ sessions: [
       { repo: dir },
       new AbortController().signal,
       undefined,
-      fakeLiveDiffContext(dir)
+      fakeHunkReviewContext(dir)
     );
     const secondDetails = secondResult.details as { reused: boolean; reloaded: boolean; sessionId: string; pathspecs: string[] };
     assert.equal(secondDetails.reused, true);
@@ -389,7 +389,7 @@ console.log(JSON.stringify({ sessions: [
       { repo: dir, file: "src/a.ts", newLine: 7 },
       new AbortController().signal,
       undefined,
-      fakeLiveDiffContext(dir)
+      fakeHunkReviewContext(dir)
     );
     const focusedDetails = focusedResult.details as { focused: boolean; focusCommand: string; reused: boolean; reloaded: boolean; pathspecs: string[] };
     assert.equal(focusedDetails.reused, true);
@@ -424,8 +424,8 @@ console.log(JSON.stringify({ sessions: [
   }
 });
 
-test("live-diff tool focus refreshes repo-wide source before retrying missing navigation", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "pi-live-diff-focus-refresh-"));
+test("hunk-review tool focus refreshes repo-wide source before retrying missing navigation", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "pi-hunk-review-focus-refresh-"));
   const previousHunkBin = process.env.HUNK_BIN;
   try {
     mkdirSync(path.join(dir, ".git"), { recursive: true });
@@ -461,9 +461,9 @@ console.log(JSON.stringify({ sessions: [{ sessionId: ${JSON.stringify(fullSessio
     chmodSync(hunkBin, 0o755);
     process.env.HUNK_BIN = hunkBin;
 
-    const api = createFakeLiveDiffApi();
-    liveDiffExtension(api);
-    restoreLiveDiffState(api, dir, [liveDiffStateEntry(rememberedHunkState(realRepo, fullSessionId))]);
+    const api = createFakeHunkReviewApi();
+    hunkReviewExtension(api);
+    restoreHunkReviewState(api, dir, [hunkReviewStateEntry(rememberedHunkState(realRepo, fullSessionId))]);
     const sessionTool = api.tools.find((item) => item.name === "hunk_session");
     assert.ok(sessionTool?.execute);
 
@@ -472,7 +472,7 @@ console.log(JSON.stringify({ sessions: [{ sessionId: ${JSON.stringify(fullSessio
       { repo: dir, file: "src/new.ts", newLine: 3 },
       new AbortController().signal,
       undefined,
-      fakeLiveDiffContext(dir)
+      fakeHunkReviewContext(dir)
     );
     const details = result.details as { focused: boolean; reloaded: boolean; reloadCommand: string; pathspecs: string[] };
     assert.equal(details.focused, true);
@@ -504,8 +504,8 @@ console.log(JSON.stringify({ sessions: [{ sessionId: ${JSON.stringify(fullSessio
   }
 });
 
-test("live-diff hunk_session launches a new session instead of claiming an unremembered daemon session", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "pi-live-diff-owned-launch-"));
+test("hunk-review hunk_session launches a new session instead of claiming an unremembered daemon session", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "pi-hunk-review-owned-launch-"));
   const previousHunkBin = process.env.HUNK_BIN;
   const previousPath = process.env.PATH;
   try {
@@ -555,9 +555,9 @@ process.exit(1);
     process.env.HUNK_BIN = hunkBin;
     process.env.PATH = `${fakeBinDir}${path.delimiter}${previousPath ?? ""}`;
 
-    const api = createFakeLiveDiffApi();
-    liveDiffExtension(api);
-    restoreLiveDiffState(api, dir, []);
+    const api = createFakeHunkReviewApi();
+    hunkReviewExtension(api);
+    restoreHunkReviewState(api, dir, []);
     const sessionTool = api.tools.find((item) => item.name === "hunk_session");
     assert.ok(sessionTool?.execute);
 
@@ -566,7 +566,7 @@ process.exit(1);
       { repo: dir, launcher: "iterm" },
       new AbortController().signal,
       undefined,
-      fakeLiveDiffContext(dir)
+      fakeHunkReviewContext(dir)
     );
     const details = result.details as { launched: boolean; reused: boolean; reloaded: boolean; sessionId: string };
     assert.equal(details.launched, true);
@@ -581,7 +581,7 @@ process.exit(1);
     assert.deepEqual(loggedArgs.filter((args) => args[0] === "session" && args[1] === "reload"), []);
     assert.equal(loggedArgs.filter((args) => args[0] === "session" && args[1] === "list").length, 2);
     assert.equal(api.entries.length, 1);
-    const snapshot = api.entries.at(-1)?.data as LiveDiffStateSnapshot;
+    const snapshot = api.entries.at(-1)?.data as HunkReviewStateSnapshot;
     assert.equal(snapshot.sessionsByRepo[realRepo]?.sessionId, createdSessionId);
   } finally {
     if (previousHunkBin === undefined) {
@@ -594,8 +594,8 @@ process.exit(1);
   }
 });
 
-test("live-diff hunk_session refuses unremembered daemon sessions when agent launches are disabled", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "pi-live-diff-owned-disabled-"));
+test("hunk-review hunk_session refuses unremembered daemon sessions when agent launches are disabled", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "pi-hunk-review-owned-disabled-"));
   const previousHunkBin = process.env.HUNK_BIN;
   const previousConfigDir = process.env.PI_TOOLS_CONFIG_DIR;
   try {
@@ -603,7 +603,7 @@ test("live-diff hunk_session refuses unremembered daemon sessions when agent lau
     const realRepo = realpathSync(dir);
     const configDir = path.join(dir, "config");
     mkdirSync(configDir, { recursive: true });
-    writeFileSync(path.join(configDir, "live-diff-settings.json"), JSON.stringify({ allowAgentLaunch: false }), "utf8");
+    writeFileSync(path.join(configDir, "hunk-review-settings.json"), JSON.stringify({ allowAgentLaunch: false }), "utf8");
     const hunkBin = path.join(dir, "hunk");
     const hunkLog = path.join(dir, "hunk-args.jsonl");
     const unownedSessionId = "11111111-2222-4333-8444-555555555555";
@@ -630,14 +630,14 @@ process.exit(1);
     process.env.HUNK_BIN = hunkBin;
     process.env.PI_TOOLS_CONFIG_DIR = configDir;
 
-    const api = createFakeLiveDiffApi();
-    liveDiffExtension(api);
-    restoreLiveDiffState(api, dir, []);
+    const api = createFakeHunkReviewApi();
+    hunkReviewExtension(api);
+    restoreHunkReviewState(api, dir, []);
     const sessionTool = api.tools.find((item) => item.name === "hunk_session");
     assert.ok(sessionTool?.execute);
 
     await assert.rejects(
-      () => sessionTool.execute("tool-call-id", { repo: dir }, new AbortController().signal, undefined, fakeLiveDiffContext(dir)),
+      () => sessionTool.execute("tool-call-id", { repo: dir }, new AbortController().signal, undefined, fakeHunkReviewContext(dir)),
       /No Hunk session is remembered.*agent Hunk launches are disabled/
     );
 
@@ -662,8 +662,8 @@ process.exit(1);
   }
 });
 
-test("live-diff hunk_session clears stale remembered sessions without claiming unowned sessions", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "pi-live-diff-owned-stale-"));
+test("hunk-review hunk_session clears stale remembered sessions without claiming unowned sessions", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "pi-hunk-review-owned-stale-"));
   const previousHunkBin = process.env.HUNK_BIN;
   const previousConfigDir = process.env.PI_TOOLS_CONFIG_DIR;
   try {
@@ -671,7 +671,7 @@ test("live-diff hunk_session clears stale remembered sessions without claiming u
     const realRepo = realpathSync(dir);
     const configDir = path.join(dir, "config");
     mkdirSync(configDir, { recursive: true });
-    writeFileSync(path.join(configDir, "live-diff-settings.json"), JSON.stringify({ allowAgentLaunch: false }), "utf8");
+    writeFileSync(path.join(configDir, "hunk-review-settings.json"), JSON.stringify({ allowAgentLaunch: false }), "utf8");
     const hunkBin = path.join(dir, "hunk");
     const hunkLog = path.join(dir, "hunk-args.jsonl");
     const staleSessionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
@@ -699,14 +699,14 @@ process.exit(1);
     process.env.HUNK_BIN = hunkBin;
     process.env.PI_TOOLS_CONFIG_DIR = configDir;
 
-    const api = createFakeLiveDiffApi();
-    liveDiffExtension(api);
-    restoreLiveDiffState(api, dir, [liveDiffStateEntry(rememberedHunkState(realRepo, staleSessionId))]);
+    const api = createFakeHunkReviewApi();
+    hunkReviewExtension(api);
+    restoreHunkReviewState(api, dir, [hunkReviewStateEntry(rememberedHunkState(realRepo, staleSessionId))]);
     const sessionTool = api.tools.find((item) => item.name === "hunk_session");
     assert.ok(sessionTool?.execute);
 
     await assert.rejects(
-      () => sessionTool.execute("tool-call-id", { repo: dir }, new AbortController().signal, undefined, fakeLiveDiffContext(dir)),
+      () => sessionTool.execute("tool-call-id", { repo: dir }, new AbortController().signal, undefined, fakeHunkReviewContext(dir)),
       new RegExp(`Remembered Hunk session ${staleSessionId} is no longer active`)
     );
 
@@ -716,7 +716,7 @@ process.exit(1);
       .map((line) => JSON.parse(line) as string[]);
     assert.equal(loggedArgs.some((args) => args[0] === "session" && args[1] === "reload"), false);
     assert.equal(api.entries.length, 1);
-    const snapshot = api.entries.at(-1)?.data as LiveDiffStateSnapshot;
+    const snapshot = api.entries.at(-1)?.data as HunkReviewStateSnapshot;
     assert.deepEqual(snapshot.sessionsByRepo, {});
   } finally {
     if (previousHunkBin === undefined) {
@@ -733,8 +733,8 @@ process.exit(1);
   }
 });
 
-test("live-diff slash focus discovers a full session id before navigating", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "pi-live-diff-slash-focus-session-"));
+test("hunk-review slash focus discovers a full session id before navigating", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "pi-hunk-review-slash-focus-session-"));
   const previousHunkBin = process.env.HUNK_BIN;
   try {
     mkdirSync(path.join(dir, ".git"), { recursive: true });
@@ -769,10 +769,10 @@ process.exit(1);
     chmodSync(hunkBin, 0o755);
     process.env.HUNK_BIN = hunkBin;
 
-    const api = createFakeLiveDiffApi();
-    liveDiffExtension(api);
+    const api = createFakeHunkReviewApi();
+    hunkReviewExtension(api);
     const startContext = {
-      ...fakeLiveDiffContext(dir),
+      ...fakeHunkReviewContext(dir),
       sessionManager: { getBranch: () => [] }
     } as unknown as ExtensionContext;
     for (const handler of api.handlers.get("session_start") ?? []) {
@@ -782,7 +782,7 @@ process.exit(1);
     const notifications: Array<{ text: string; level: string }> = [];
     const command = api.commands.get("hunk:focus");
     assert.ok(command);
-    await command.handler(`src/a.ts --repo ${dir} --new-line 7`, fakeLiveDiffCommandContext(dir, notifications));
+    await command.handler(`src/a.ts --repo ${dir} --new-line 7`, fakeHunkReviewCommandContext(dir, notifications));
     assert.match(notifications.at(-1)?.text ?? "", /Focused Hunk on src\/a\.ts new-line 7/);
 
     const loggedArgs = readFileSync(hunkLog, "utf8")
@@ -804,8 +804,8 @@ process.exit(1);
   }
 });
 
-test("live-diff slash focus discovers a session id after repo navigation cannot match an active session", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "pi-live-diff-slash-focus-retry-"));
+test("hunk-review slash focus discovers a session id after repo navigation cannot match an active session", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "pi-hunk-review-slash-focus-retry-"));
   const previousHunkBin = process.env.HUNK_BIN;
   try {
     mkdirSync(path.join(dir, ".git"), { recursive: true });
@@ -850,10 +850,10 @@ process.exit(1);
     chmodSync(hunkBin, 0o755);
     process.env.HUNK_BIN = hunkBin;
 
-    const api = createFakeLiveDiffApi();
-    liveDiffExtension(api);
+    const api = createFakeHunkReviewApi();
+    hunkReviewExtension(api);
     const startContext = {
-      ...fakeLiveDiffContext(dir),
+      ...fakeHunkReviewContext(dir),
       sessionManager: { getBranch: () => [] }
     } as unknown as ExtensionContext;
     for (const handler of api.handlers.get("session_start") ?? []) {
@@ -863,7 +863,7 @@ process.exit(1);
     const notifications: Array<{ text: string; level: string }> = [];
     const command = api.commands.get("hunk:focus");
     assert.ok(command);
-    await command.handler(`src/new.ts --repo ${dir} --new-line 3`, fakeLiveDiffCommandContext(dir, notifications));
+    await command.handler(`src/new.ts --repo ${dir} --new-line 3`, fakeHunkReviewCommandContext(dir, notifications));
     assert.match(notifications.at(-1)?.text ?? "", /Refreshed repo-wide Hunk source and focused Hunk on src\/new\.ts new-line 3/);
 
     const loggedArgs = readFileSync(hunkLog, "utf8")
@@ -888,9 +888,9 @@ process.exit(1);
   }
 });
 
-test("live-diff status text shows full Hunk session ids for CLI copy", () => {
+test("hunk-review status text shows full Hunk session ids for CLI copy", () => {
   const fullSessionId = "6a580f7a-e149-40a8-bda0-0ed46b1a0b3f";
-  const text = buildLiveDiffStatusText({
+  const text = buildHunkReviewStatusText({
     followEnabled: false,
     followDebounceMs: 1200,
     activeRepoPinned: false,
@@ -921,7 +921,7 @@ test("live-diff status text shows full Hunk session ids for CLI copy", () => {
   assert.doesNotMatch(text, /#6a580f7a/);
 });
 
-test("live-diff saves and updates optional Hunk AGENTS guidance snippet", () => {
+test("hunk-review saves and updates optional Hunk AGENTS guidance snippet", () => {
   const snippet = readHunkAgentGuidanceSnippet();
   assert.match(snippet, /# Code Review Guidance/);
   assert.equal(snippet.includes("hunk_window_open"), false);
@@ -960,18 +960,18 @@ test("live-diff saves and updates optional Hunk AGENTS guidance snippet", () => 
   );
 });
 
-test("live-diff guidance command installs and removes the global AGENTS snippet", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "pi-live-diff-guidance-command-"));
+test("hunk-review guidance command installs and removes the global AGENTS snippet", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "pi-hunk-review-guidance-command-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   try {
     process.env.PI_CODING_AGENT_DIR = dir;
-    const api = createFakeLiveDiffApi();
-    liveDiffExtension(api);
+    const api = createFakeHunkReviewApi();
+    hunkReviewExtension(api);
     const command = api.commands.get("hunk:guidance");
     assert.ok(command);
 
     const notifications: Array<{ text: string; level: string }> = [];
-    const context = fakeLiveDiffCommandContext(dir, notifications);
+    const context = fakeHunkReviewCommandContext(dir, notifications);
     const agentsPath = path.join(dir, "AGENTS.md");
 
     await command.handler("status", context);
@@ -1006,7 +1006,7 @@ test("live-diff guidance command installs and removes the global AGENTS snippet"
   }
 });
 
-test("live-diff builds Hunk commands for open and focus", () => {
+test("hunk-review builds Hunk commands for open and focus", () => {
   assert.deepEqual(buildHunkDiffArgs({ watch: true, pathspecs: ["src/a.ts", "README.md"] }), [
     "diff",
     "--watch",
@@ -1059,8 +1059,8 @@ test("live-diff builds Hunk commands for open and focus", () => {
   ]);
 });
 
-test("live-diff selects the newest reusable Hunk session for a repo", () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "pi-live-diff-hunk-session-"));
+test("hunk-review selects the newest reusable Hunk session for a repo", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "pi-hunk-review-hunk-session-"));
   try {
     const repo = path.join(dir, "repo");
     const other = path.join(dir, "other");
@@ -1086,8 +1086,8 @@ test("live-diff selects the newest reusable Hunk session for a repo", () => {
   }
 });
 
-test("live-diff discovers and attaches newly launched Hunk sessions", () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "pi-live-diff-hunk-discovery-"));
+test("hunk-review discovers and attaches newly launched Hunk sessions", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "pi-hunk-review-hunk-discovery-"));
   try {
     const repo = path.join(dir, "repo");
     mkdirSync(path.join(repo, ".git"), { recursive: true });
@@ -1119,7 +1119,7 @@ console.log(JSON.stringify({ sessions }));
   }
 });
 
-test("live-diff detects iTerm launcher only in iTerm on macOS", () => {
+test("hunk-review detects iTerm launcher only in iTerm on macOS", () => {
   const inIterm = detectLaunchers({ ITERM_SESSION_ID: "w0t0p0" }, "darwin");
   assert.equal(inIterm.find((launcher) => launcher.id === "iterm")?.available, true);
 
@@ -1128,14 +1128,14 @@ test("live-diff detects iTerm launcher only in iTerm on macOS", () => {
   assert.equal(notIterm.find((launcher) => launcher.id === "manual")?.available, true);
 });
 
-test("live-diff quotes iTerm shell commands inside AppleScript", () => {
+test("hunk-review quotes iTerm shell commands inside AppleScript", () => {
   const script = buildItermSplitAppleScript("cd '/tmp/repo with spaces' && exec 'hunk' 'diff' '--watch'");
   assert.match(script, /split vertically with default profile/);
   assert.match(script, /write text "/);
   assert.match(script, /repo with spaces/);
 });
 
-test("live-diff targets the originating iTerm session when available", () => {
+test("hunk-review targets the originating iTerm session when available", () => {
   const sessionId = "A07B6FCE-2E14-4598-9CF3-01223B82CDE1";
   assert.equal(itermSessionIdFromEnv({ ITERM_SESSION_ID: `w0t0p0:${sessionId}` }), sessionId);
   assert.equal(itermSessionIdFromEnv({ TERM_SESSION_ID: `w1t2p3:${sessionId.toLowerCase()}` }), sessionId);
@@ -1147,7 +1147,7 @@ test("live-diff targets the originating iTerm session when available", () => {
   assert.doesNotMatch(script, /tell current window/);
 });
 
-test("live-diff follow mode warns without a launched Hunk view", () => {
+test("hunk-review follow mode warns without a launched Hunk view", () => {
   assert.equal(buildFollowModeMessage(false, 1200, false), "Follow mode is off.");
   assert.equal(
     buildFollowModeMessage(true, 1200, true),
@@ -1156,7 +1156,7 @@ test("live-diff follow mode warns without a launched Hunk view", () => {
   assert.match(buildFollowModeMessage(true, 1200, false), /No launched Hunk view is remembered/);
 });
 
-test("live-diff command arg splitter handles simple quotes", () => {
+test("hunk-review command arg splitter handles simple quotes", () => {
   assert.deepEqual(splitCommandArgs("--repo '/tmp/repo one' --dry-run"), [
     "--repo",
     "/tmp/repo one",

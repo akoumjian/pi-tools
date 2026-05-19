@@ -20,9 +20,9 @@ import { resolveNativeToolPath } from "../native-tools/index.js";
 
 export type DiffScope = "repo" | "touched";
 export type DiffLauncherId = "auto" | "iterm" | "manual" | "external" | "ghostty" | "kitty" | "wezterm" | "tmux";
-export type LiveDiffMode = "open" | "repo" | "touched" | "review";
+export type HunkReviewMode = "open" | "repo" | "touched" | "review";
 
-export type LiveDiffSettings = {
+export type HunkReviewSettings = {
   hunkBin?: string;
   defaultLauncher: DiffLauncherId;
   followDebounceMs: number;
@@ -31,42 +31,42 @@ export type LiveDiffSettings = {
   configSource: string;
 };
 
-export type LiveDiffSessionRef = {
+export type HunkReviewSessionRef = {
   repo: string;
   launcher: DiffLauncherId;
   command: string;
-  mode: LiveDiffMode;
+  mode: HunkReviewMode;
   scope: DiffScope;
   startedAt: string;
   sessionId?: string;
   dryRun?: boolean;
 };
 
-export type LiveDiffStateSnapshot = {
+export type HunkReviewStateSnapshot = {
   version: 1;
   updatedAt: string;
   followEnabled?: boolean;
   followDebounceMs?: number;
   activeRepo?: string;
   activeRepoPinned?: boolean;
-  lastMode: LiveDiffMode;
+  lastMode: HunkReviewMode;
   lastScope: DiffScope;
   lastLauncher?: DiffLauncherId;
   touchedFilesByRepo: Record<string, string[]>;
-  sessionsByRepo: Record<string, LiveDiffSessionRef>;
+  sessionsByRepo: Record<string, HunkReviewSessionRef>;
 };
 
-export type LiveDiffState = {
+export type HunkReviewState = {
   updatedAt: string;
   followEnabled: boolean;
   followDebounceMs: number;
   activeRepo?: string;
   activeRepoPinned: boolean;
-  lastMode: LiveDiffMode;
+  lastMode: HunkReviewMode;
   lastScope: DiffScope;
   lastLauncher?: DiffLauncherId;
   touchedFilesByRepo: Map<string, Set<string>>;
-  sessionsByRepo: Map<string, LiveDiffSessionRef>;
+  sessionsByRepo: Map<string, HunkReviewSessionRef>;
 };
 
 export type HunkBinaryStatus = {
@@ -83,19 +83,19 @@ export type LauncherDetection = {
   reason: string;
 };
 
-export type LiveDiffStatusDetails = {
+export type HunkReviewStatusDetails = {
   followEnabled: boolean;
   followDebounceMs: number;
   activeRepo?: string;
   activeRepoPinned: boolean;
-  lastMode: LiveDiffMode;
+  lastMode: HunkReviewMode;
   lastScope: DiffScope;
   lastLauncher?: DiffLauncherId;
-  settings: LiveDiffSettings;
+  settings: HunkReviewSettings;
   hunk: HunkBinaryStatus;
   launchers: LauncherDetection[];
   touchedRepos: Array<{ repo: string; files: string[] }>;
-  sessions: LiveDiffSessionRef[];
+  sessions: HunkReviewSessionRef[];
   hunkSessions?: unknown;
   hunkSessionsError?: string;
 };
@@ -270,12 +270,12 @@ type RenderTheme = {
   bold(text: string): string;
 };
 
-const LIVE_DIFF_CONFIG_FILE = "live-diff-settings.json";
-const LIVE_DIFF_AGENT_GUIDANCE_FILE = "live-diff-code-review-guidance.md";
+const HUNK_REVIEW_CONFIG_FILE = "hunk-review-settings.json";
+const HUNK_REVIEW_AGENT_GUIDANCE_FILE = "hunk-review-guidance.md";
 const HUNK_AGENT_GUIDANCE_START = "<!-- akoumjian-pi-tools:hunk-code-review-guidance:start -->";
 const HUNK_AGENT_GUIDANCE_END = "<!-- akoumjian-pi-tools:hunk-code-review-guidance:end -->";
-const LIVE_DIFF_STATE_ENTRY_TYPE = "live-diff-state";
-const STATUS_KEY = "live-diff";
+const HUNK_REVIEW_STATE_ENTRY_TYPE = "hunk-review-state";
+const STATUS_KEY = "hunk-review";
 const DEFAULT_MAX_TOUCHED_FILES = 80;
 const MAX_TOUCHED_FILES_LIMIT = 500;
 const DEFAULT_FOLLOW_DEBOUNCE_MS = 1200;
@@ -290,18 +290,18 @@ let followTimer: NodeJS.Timeout | undefined;
 let pendingFollowTarget: FollowTarget | undefined;
 const warnedMissingFollowSessionRepos = new Set<string>();
 
-export default function liveDiffExtension(api: ExtensionAPI): void {
+export default function hunkReviewExtension(api: ExtensionAPI): void {
   registerDiffTools(api);
   registerDiffCommands(api);
 
   api.on("session_start", (_event, context) => {
     restoreRuntimeState(context);
-    updateLiveDiffStatus(context);
+    updateHunkReviewStatus(context);
   });
 
   api.on("session_tree", (_event, context) => {
     restoreRuntimeState(context);
-    updateLiveDiffStatus(context);
+    updateHunkReviewStatus(context);
   });
 
   api.on("tool_result", (event, context) => {
@@ -351,16 +351,16 @@ function registerDiffCommands(api: ExtensionAPI): void {
   }, []);
 
   registerCommandWithAliases(api, "hunk:doctor", {
-    description: "Diagnose Hunk binary availability, launcher detection, skill registration hints, and live-diff state.",
+    description: "Diagnose Hunk binary availability, launcher detection, skill registration hints, and Hunk review state.",
     handler: async (_args, context) => {
       context.ui.notify(buildDoctorText(context), "info");
     }
   }, []);
 
   registerCommandWithAliases(api, "hunk:status", {
-    description: "Show Hunk/live-diff status.",
+    description: "Show Hunk review status.",
     handler: async (_args, context) => {
-      context.ui.notify(buildLiveDiffStatusText(buildLiveDiffStatusDetails(context, { includeHunkSessions: false })), "info");
+      context.ui.notify(buildHunkReviewStatusText(buildHunkReviewStatusDetails(context, { includeHunkSessions: false })), "info");
     }
   }, []);
 
@@ -395,20 +395,20 @@ function registerDiffCommands(api: ExtensionAPI): void {
   }, []);
 }
 
-export function readLiveDiffSettings(settingsPath?: ConfigPath): LiveDiffSettings {
+export function readHunkReviewSettings(settingsPath?: ConfigPath): HunkReviewSettings {
   const parsed = settingsPath === undefined
-    ? readPiToolsJsonConfigSource(LIVE_DIFF_CONFIG_FILE, import.meta.url)
+    ? readPiToolsJsonConfigSource(HUNK_REVIEW_CONFIG_FILE, import.meta.url)
     : { path: settingsPath, source: "explicit" as const, data: JSON.parse(readConfigText(settingsPath)) as Record<string, unknown> };
 
   if (parsed === undefined) {
-    return defaultLiveDiffSettings("built-in defaults");
+    return defaultHunkReviewSettings("built-in defaults");
   }
 
   if (!isRecord(parsed.data)) {
     throw new Error(`${formatConfigPath(parsed.path)} must contain a JSON object.`);
   }
 
-  const settings = defaultLiveDiffSettings(`${parsed.source}:${formatConfigPath(parsed.path)}`);
+  const settings = defaultHunkReviewSettings(`${parsed.source}:${formatConfigPath(parsed.path)}`);
   const hunkBin = readOptionalString(parsed.data.hunkBin, parsed.path, "hunkBin");
   const defaultLauncher = readOptionalLauncher(parsed.data.defaultLauncher, parsed.path) ?? settings.defaultLauncher;
   const followDebounceMs = readOptionalFollowDebounceMs(parsed.data.followDebounceMs, parsed.path) ?? settings.followDebounceMs;
@@ -425,7 +425,7 @@ export function readLiveDiffSettings(settingsPath?: ConfigPath): LiveDiffSetting
   };
 }
 
-function defaultLiveDiffSettings(configSource: string): LiveDiffSettings {
+function defaultHunkReviewSettings(configSource: string): HunkReviewSettings {
   return {
     defaultLauncher: "auto",
     followDebounceMs: DEFAULT_FOLLOW_DEBOUNCE_MS,
@@ -449,7 +449,7 @@ function handleSetupCommand(rawArgs: string, context: ExtensionCommandContext): 
     return;
   }
 
-  const current = readLiveDiffSettings();
+  const current = readHunkReviewSettings();
   const value: Record<string, unknown> = {
     defaultLauncher: args.launcher ?? current.defaultLauncher,
     followDebounceMs: args.followDebounceMs ?? current.followDebounceMs,
@@ -460,7 +460,7 @@ function handleSetupCommand(rawArgs: string, context: ExtensionCommandContext): 
     value.hunkBin = args.hunkBin ?? current.hunkBin;
   }
 
-  const written = writeAgentExtensionConfig(LIVE_DIFF_CONFIG_FILE, value);
+  const written = writeAgentExtensionConfig(HUNK_REVIEW_CONFIG_FILE, value);
   context.ui.notify(`Wrote Hunk settings to ${written}. Run /hunk:doctor to verify.`, "info");
 }
 
@@ -483,7 +483,7 @@ function handleSwitchCommand(api: ExtensionAPI, rawArgs: string, context: Extens
     runtimeState.activeRepo = undefined;
     runtimeState.updatedAt = new Date().toISOString();
     persistRuntimeState(api);
-    updateLiveDiffStatus(context);
+    updateHunkReviewStatus(context);
     context.ui.notify("Hunk repo switching is automatic again.", "info");
     return;
   }
@@ -499,7 +499,7 @@ function handleSwitchCommand(api: ExtensionAPI, rawArgs: string, context: Extens
     runtimeState.activeRepoPinned = true;
     runtimeState.updatedAt = new Date().toISOString();
     persistRuntimeState(api);
-    updateLiveDiffStatus(context);
+    updateHunkReviewStatus(context);
     context.ui.notify(`Active Hunk repo: ${repo}. Use /hunk:switch --auto to resume automatic switching.`, "info");
   } catch (error) {
     context.ui.notify(errorMessage(error), "error");
@@ -536,7 +536,7 @@ function handleFollowCommand(api: ExtensionAPI, rawArgs: string, context: Extens
   }
   runtimeState.updatedAt = new Date().toISOString();
   persistRuntimeState(api);
-  updateLiveDiffStatus(context);
+  updateHunkReviewStatus(context);
   const hasHunkView = hasNavigableHunkSession(runtimeState);
   context.ui.notify(
     buildFollowModeMessage(runtimeState.followEnabled, runtimeState.followDebounceMs, hasHunkView),
@@ -609,9 +609,9 @@ function handleGuidanceCommand(rawArgs: string, context: ExtensionCommandContext
 }
 
 export function readHunkAgentGuidanceSnippet(): string {
-  const text = readPiToolsTextConfig(LIVE_DIFF_AGENT_GUIDANCE_FILE, import.meta.url);
+  const text = readPiToolsTextConfig(HUNK_REVIEW_AGENT_GUIDANCE_FILE, import.meta.url);
   if (text === undefined) {
-    throw new Error(`Missing Hunk Code Review Guidance file: ${LIVE_DIFF_AGENT_GUIDANCE_FILE}.`);
+    throw new Error(`Missing Hunk Code Review Guidance file: ${HUNK_REVIEW_AGENT_GUIDANCE_FILE}.`);
   }
   return `${text.trim()}\n`;
 }
@@ -776,7 +776,7 @@ function openHunkView(
     focus?: HunkFocusParams;
   }
 ): HunkOpenDetails {
-  const settings = readLiveDiffSettings();
+  const settings = readHunkReviewSettings();
   const repo = resolveRepoForCommand(context, options.repo);
   const scope: DiffScope = "repo";
   const pathspecs: string[] = [];
@@ -908,7 +908,7 @@ async function handleFocusCommand(api: ExtensionAPI, rawArgs: string, context: E
       side: args.oldLine !== undefined ? "old" : "new"
     });
     persistRuntimeState(api);
-    updateLiveDiffStatus(context);
+    updateHunkReviewStatus(context);
     context.ui.notify(result.message, "info");
   } catch (error) {
     context.ui.notify(errorMessage(error), "error");
@@ -946,9 +946,9 @@ function handleCloseCommand(api: ExtensionAPI, rawArgs: string, context: Extensi
     }
     runtimeState.updatedAt = new Date().toISOString();
     persistRuntimeState(api);
-    updateLiveDiffStatus(context);
+    updateHunkReviewStatus(context);
     context.ui.notify(hadSession
-      ? `Closed live-diff's remembered Hunk view for ${repo}. Close the Hunk terminal pane manually if it is still open.`
+      ? `Closed the Hunk review extension's remembered Hunk view for ${repo}. Close the Hunk terminal pane manually if it is still open.`
       : `No remembered Hunk view for ${repo}.`, "info");
   } catch (error) {
     context.ui.notify(errorMessage(error), "error");
@@ -971,7 +971,7 @@ type HunkSessionActionResult = {
 };
 
 function focusHunkSession(context: ExtensionContext, params: HunkFocusInput): HunkSessionActionResult {
-  const settings = readLiveDiffSettings();
+  const settings = readHunkReviewSettings();
   const repo = resolveRepoForCommand(context, params.repo);
   const file = normalizeHunkFilePath(repo, params.file);
   const selector = resolveFocusSelector(params);
@@ -1007,14 +1007,14 @@ function trackSuccessfulMutationResult(api: ExtensionAPI, event: ToolResultEvent
     return;
   }
 
-  const settings = readLiveDiffSettings();
+  const settings = readHunkReviewSettings();
   const tracked = recordTouchedFiles(runtimeState, context.cwd, targets.map((target) => target.path), settings.maxTouchedFiles);
   if (tracked.length === 0) {
     return;
   }
 
   persistRuntimeState(api);
-  updateLiveDiffStatus(context);
+  updateHunkReviewStatus(context);
   scheduleFollowTarget(api, context, targets);
 }
 
@@ -1090,7 +1090,7 @@ function mutationTargetLine(toolName: string, item: Record<string, unknown>): nu
   return toolName === "write_many" ? 1 : undefined;
 }
 
-export function recordTouchedFiles(state: LiveDiffState, cwd: string, rawPaths: readonly string[], maxFiles: number): TrackedFile[] {
+export function recordTouchedFiles(state: HunkReviewState, cwd: string, rawPaths: readonly string[], maxFiles: number): TrackedFile[] {
   const tracked = resolveTrackedFiles(cwd, rawPaths);
   const cap = clampMaxTouchedFiles(maxFiles);
   let changed = false;
@@ -1145,7 +1145,7 @@ export function resolveTrackedTargets(cwd: string, targets: readonly MutationTar
   return tracked;
 }
 
-export function selectFollowTarget(state: LiveDiffState, cwd: string, targets: readonly MutationTarget[]): FollowTarget | undefined {
+export function selectFollowTarget(state: HunkReviewState, cwd: string, targets: readonly MutationTarget[]): FollowTarget | undefined {
   const tracked = resolveTrackedTargets(cwd, targets);
   if (tracked.length === 0) {
     return undefined;
@@ -1171,7 +1171,7 @@ function scheduleFollowTarget(api: ExtensionAPI, context: ExtensionContext, targ
     flushFollowTarget(api, context);
   }, runtimeState.followDebounceMs);
   followTimer.unref?.();
-  updateLiveDiffStatus(context);
+  updateHunkReviewStatus(context);
 }
 
 function flushFollowTarget(api: ExtensionAPI, context: ExtensionContext): void {
@@ -1189,7 +1189,7 @@ function flushFollowTarget(api: ExtensionAPI, context: ExtensionContext): void {
   }
 
   try {
-    const settings = readLiveDiffSettings();
+    const settings = readHunkReviewSettings();
     const hunkBin = hunkBinaryOrThrow(settings, false);
     const selector = { label: "new-line" as const, value: target.line ?? 1 };
     const navigation = navigateHunkSessionWithRepoReload(hunkBin, target.repo, session.sessionId, target.repoPath, selector, "Hunk follow");
@@ -1201,7 +1201,7 @@ function flushFollowTarget(api: ExtensionAPI, context: ExtensionContext): void {
     }
     runtimeState.updatedAt = new Date().toISOString();
     persistRuntimeState(api);
-    updateLiveDiffStatus(context);
+    updateHunkReviewStatus(context);
   } catch (error) {
     context.ui.notify(`Hunk follow failed: ${errorMessage(error)}`, "warning");
   }
@@ -1215,7 +1215,7 @@ function clearFollowTimer(): void {
   pendingFollowTarget = undefined;
 }
 
-function hasNavigableHunkSession(state: LiveDiffState): boolean {
+function hasNavigableHunkSession(state: HunkReviewState): boolean {
   return Array.from(state.sessionsByRepo.values()).some((session) => !session.dryRun);
 }
 
@@ -1272,7 +1272,7 @@ export function repoRelativePath(repo: string, resolvedPath: string): string | u
   return toPosixPath(relative);
 }
 
-export function snapshotState(state: LiveDiffState = runtimeState): LiveDiffStateSnapshot {
+export function snapshotState(state: HunkReviewState = runtimeState): HunkReviewStateSnapshot {
   return {
     version: 1,
     updatedAt: state.updatedAt,
@@ -1288,34 +1288,34 @@ export function snapshotState(state: LiveDiffState = runtimeState): LiveDiffStat
   };
 }
 
-export function restoreStateFromEntries(entries: readonly unknown[], fallbackScope: DiffScope = "repo", fallbackFollowDebounceMs: number = DEFAULT_FOLLOW_DEBOUNCE_MS): LiveDiffState {
+export function restoreStateFromEntries(entries: readonly unknown[], fallbackScope: DiffScope = "repo", fallbackFollowDebounceMs: number = DEFAULT_FOLLOW_DEBOUNCE_MS): HunkReviewState {
   const snapshot = latestStateSnapshot(entries);
   return snapshot === undefined ? createInitialState(fallbackScope, fallbackFollowDebounceMs) : stateFromSnapshot(snapshot, fallbackScope, fallbackFollowDebounceMs);
 }
 
 function restoreRuntimeState(context: ExtensionContext): void {
-  const settings = readLiveDiffSettings();
+  const settings = readHunkReviewSettings();
   runtimeState = restoreStateFromEntries(context.sessionManager.getBranch(), "repo", settings.followDebounceMs);
 }
 
 function persistRuntimeState(api: Pick<ExtensionAPI, "appendEntry">): void {
-  api.appendEntry(LIVE_DIFF_STATE_ENTRY_TYPE, snapshotState(runtimeState));
+  api.appendEntry(HUNK_REVIEW_STATE_ENTRY_TYPE, snapshotState(runtimeState));
 }
 
-function latestStateSnapshot(entries: readonly unknown[]): LiveDiffStateSnapshot | undefined {
+function latestStateSnapshot(entries: readonly unknown[]): HunkReviewStateSnapshot | undefined {
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index];
-    if (!isRecord(entry) || entry.type !== "custom" || entry.customType !== LIVE_DIFF_STATE_ENTRY_TYPE) {
+    if (!isRecord(entry) || entry.type !== "custom" || entry.customType !== HUNK_REVIEW_STATE_ENTRY_TYPE) {
       continue;
     }
-    if (isLiveDiffStateSnapshot(entry.data)) {
+    if (isHunkReviewStateSnapshot(entry.data)) {
       return entry.data;
     }
   }
   return undefined;
 }
 
-function stateFromSnapshot(snapshot: LiveDiffStateSnapshot, fallbackScope: DiffScope, fallbackFollowDebounceMs: number): LiveDiffState {
+function stateFromSnapshot(snapshot: HunkReviewStateSnapshot, fallbackScope: DiffScope, fallbackFollowDebounceMs: number): HunkReviewState {
   return {
     updatedAt: snapshot.updatedAt,
     followEnabled: snapshot.followEnabled ?? false,
@@ -1330,7 +1330,7 @@ function stateFromSnapshot(snapshot: LiveDiffStateSnapshot, fallbackScope: DiffS
   };
 }
 
-function createInitialState(lastScope: DiffScope = "repo", followDebounceMs: number = DEFAULT_FOLLOW_DEBOUNCE_MS): LiveDiffState {
+function createInitialState(lastScope: DiffScope = "repo", followDebounceMs: number = DEFAULT_FOLLOW_DEBOUNCE_MS): HunkReviewState {
   return {
     updatedAt: new Date().toISOString(),
     followEnabled: false,
@@ -1442,7 +1442,7 @@ export function detectLaunchers(env: NodeJS.ProcessEnv = process.env, platform: 
   ];
 }
 
-export function buildHunkBinaryStatus(settings: LiveDiffSettings, env: NodeJS.ProcessEnv = process.env): HunkBinaryStatus {
+export function buildHunkBinaryStatus(settings: HunkReviewSettings, env: NodeJS.ProcessEnv = process.env): HunkBinaryStatus {
   const requested = firstNonEmpty(env.HUNK_BIN, settings.hunkBin);
   const resolved = resolveHunkExecutable(requested, env);
   if (resolved === undefined) {
@@ -1739,7 +1739,7 @@ function forgetRememberedHunkSession(api: ExtensionAPI, context: ExtensionContex
   warnedMissingFollowSessionRepos.delete(repo);
   runtimeState.updatedAt = new Date().toISOString();
   persistRuntimeState(api);
-  updateLiveDiffStatus(context);
+  updateHunkReviewStatus(context);
 }
 
 function rememberDiscoveredHunkSession(repo: string, hunkBin: string, sessionId: string): void {
@@ -1772,7 +1772,7 @@ function rememberRepoWideSourceCommand(repo: string, hunkBin: string): void {
   session.scope = "repo";
 }
 
-function hunkBinaryOrThrow(settings: LiveDiffSettings, dryRun: boolean): string {
+function hunkBinaryOrThrow(settings: HunkReviewSettings, dryRun: boolean): string {
   const status = buildHunkBinaryStatus(settings);
   if (status.available && status.resolved) {
     return status.resolved;
@@ -1783,10 +1783,10 @@ function hunkBinaryOrThrow(settings: LiveDiffSettings, dryRun: boolean): string 
   throw new Error(status.error ?? "Hunk is not available. Install hunk or configure /hunk:setup --hunk-bin <path>.");
 }
 
-function buildLiveDiffStatusDetails(context: ExtensionContext, options: { includeHunkSessions: boolean }): LiveDiffStatusDetails {
-  const settings = readLiveDiffSettings();
+function buildHunkReviewStatusDetails(context: ExtensionContext, options: { includeHunkSessions: boolean }): HunkReviewStatusDetails {
+  const settings = readHunkReviewSettings();
   const hunk = buildHunkBinaryStatus(settings);
-  const details: LiveDiffStatusDetails = {
+  const details: HunkReviewStatusDetails = {
     followEnabled: runtimeState.followEnabled,
     followDebounceMs: runtimeState.followDebounceMs,
     activeRepo: runtimeState.activeRepo,
@@ -1813,7 +1813,7 @@ function buildLiveDiffStatusDetails(context: ExtensionContext, options: { includ
   return details;
 }
 
-export function buildLiveDiffStatusText(details: LiveDiffStatusDetails): string {
+export function buildHunkReviewStatusText(details: HunkReviewStatusDetails): string {
   const touched = details.touchedRepos.length === 0
     ? ["Touched repos: none"]
     : ["Touched repos:", ...details.touchedRepos.map((repo) => `- ${repo.repo}: ${repo.files.length} file${repo.files.length === 1 ? "" : "s"}${repo.files.length > 0 ? ` (${repo.files.slice(0, 5).join(", ")}${repo.files.length > 5 ? ", ..." : ""})` : ""}`)];
@@ -1843,10 +1843,10 @@ export function buildLiveDiffStatusText(details: LiveDiffStatusDetails): string 
 }
 
 function buildDoctorText(context: ExtensionContext): string {
-  const details = buildLiveDiffStatusDetails(context, { includeHunkSessions: true });
+  const details = buildHunkReviewStatusDetails(context, { includeHunkSessions: true });
   const skillPath = fileURLToPath(new URL("../../skills/hunk-review/SKILL.md", import.meta.url));
   return [
-    buildLiveDiffStatusText(details),
+    buildHunkReviewStatusText(details),
     "",
     "Doctor checks",
     `- Hunk skill file: ${existsSync(skillPath) ? skillPath : `missing at ${skillPath}`}`,
@@ -1857,7 +1857,7 @@ function buildDoctorText(context: ExtensionContext): string {
   ].join("\n");
 }
 
-function updateLiveDiffStatus(context: ExtensionContext): void {
+function updateHunkReviewStatus(context: ExtensionContext): void {
   const repo = runtimeState.activeRepo === undefined ? "none" : formatRepoLabel(runtimeState.activeRepo);
   const hasOpenView = runtimeState.sessionsByRepo.size > 0;
   if (!runtimeState.followEnabled && !hasOpenView && runtimeState.activeRepo === undefined) {
@@ -1873,7 +1873,7 @@ function rememberLaunchedSession(
   context: ExtensionContext,
   repo: string,
   launch: LaunchResult,
-  mode: LiveDiffMode,
+  mode: HunkReviewMode,
   scope: DiffScope,
   dryRun: boolean
 ): void {
@@ -1896,7 +1896,7 @@ function rememberLaunchedSession(
     warnedMissingFollowSessionRepos.delete(repo);
   }
   persistRuntimeState(api);
-  updateLiveDiffStatus(context);
+  updateHunkReviewStatus(context);
 }
 
 function resolveRepoForCommand(context: ExtensionContext, rawRepo: string | undefined): string {
@@ -2334,14 +2334,14 @@ function realpathMaybe(value: string): string {
   }
 }
 
-function isLiveDiffStateSnapshot(value: unknown): value is LiveDiffStateSnapshot {
+function isHunkReviewStateSnapshot(value: unknown): value is HunkReviewStateSnapshot {
   return isRecord(value)
     && value.version === 1
     && typeof value.updatedAt === "string"
     && (value.followEnabled === undefined || typeof value.followEnabled === "boolean")
     && (value.followDebounceMs === undefined || typeof value.followDebounceMs === "number")
     && (value.activeRepoPinned === undefined || typeof value.activeRepoPinned === "boolean")
-    && isLiveDiffMode(value.lastMode)
+    && isHunkReviewMode(value.lastMode)
     && isDiffScope(value.lastScope)
     && isRecord(value.touchedFilesByRepo)
     && isRecord(value.sessionsByRepo);
@@ -2422,7 +2422,7 @@ function isDiffScope(value: unknown): value is DiffScope {
   return value === "repo" || value === "touched";
 }
 
-function isLiveDiffMode(value: unknown): value is LiveDiffMode {
+function isHunkReviewMode(value: unknown): value is HunkReviewMode {
   return value === "open" || value === "repo" || value === "touched" || value === "review";
 }
 

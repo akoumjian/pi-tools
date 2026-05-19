@@ -1,8 +1,8 @@
-# Live diff workflow plan
+# Hunk review workflow plan
 
 ## Status
 
-Prototype in progress. `extensions/live-diff` tracks Pi tool edits by repo, opens Hunk in a side window, supports active repo switching, and has a debounced follow mode that navigates an existing Hunk session toward recently edited files.
+Prototype in progress. `extensions/hunk-review` tracks Pi tool edits by repo, opens Hunk in a side window, supports active repo switching, and has a debounced follow mode that navigates an existing Hunk session toward recently edited files.
 
 ## Current command surface
 
@@ -22,7 +22,7 @@ Slash commands are user-facing controls. The agent-facing tool is `hunk_session`
 
 ## Product direction
 
-Build Hunk-backed `live-diff` as orchestration around Hunk, not a replacement diff UI:
+Build Hunk-backed `hunk-review` as orchestration around Hunk, not a replacement diff UI:
 
 1. Keep Pi usable while Hunk runs elsewhere.
 2. Infer touched child repos from Pi mutation tools when Pi starts from a parent directory.
@@ -82,7 +82,7 @@ Validation targets:
 
 ```bash
 npm run check
-npm test -- --test-name-pattern live-diff
+npm test -- --test-name-pattern hunk-review
 npm test -- --test-name-pattern conventions
 git diff --check
 npm run validate

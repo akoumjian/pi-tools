@@ -27,7 +27,7 @@
       "extensions/async-shell/index.ts",
       "extensions/native-tools/index.ts",
       "extensions/mutation-review/index.ts",
-      "extensions/live-diff/index.ts",
+      "extensions/hunk-review/index.ts",
       "extensions/searxng-search/index.ts",
       "extensions/web-fetch/index.ts",
       "extensions/file-open/index.ts",

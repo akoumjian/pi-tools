@@ -74,7 +74,7 @@ Commands:
 - `/review`, `/review:setup`, `/review:status`, `/review:cancel`, `/review:send-last`
 - `/docparser:doctor`
 
-The load order in `package.json#pi.extensions` is intentional: terminal patches first, safety before async shell, native batch tools before mutation-review/live-diff tracking, optional display overrides last.
+The load order in `package.json#pi.extensions` is intentional: terminal patches first, safety before async shell, native batch tools before mutation-review/hunk-review tracking, optional display overrides last.
 
 ## Extensions
 
@@ -148,15 +148,15 @@ Each extension below documents what it does, what it provides, and how to set it
 
 ---
 
-### live-diff
+### hunk-review
 
-[Full docs](docs/extensions/live-diff.md).
+[Full docs](docs/extensions/hunk-review.md).
 
 **Purpose.** Track successful file mutations by repo and control a Hunk side-by-side diff surface without suspending Pi. Supports agent-readable Hunk session ids scoped to the current Pi session, user-visible Hunk windows, Hunk setup diagnostics, active repo switching, `/hunk:open`/`/hunk:close`, debounced follow navigation, and focused navigation.
 
 **Provides.** `hunk_session`; `/hunk:setup`, `/hunk:doctor`, `/hunk:status`, `/hunk:switch`, `/hunk:open`, `/hunk:close`, `/hunk:follow`, `/hunk:guidance`, `/hunk:focus`; Hunk skill [`skills/hunk-review/SKILL.md`](skills/hunk-review/SKILL.md).
 
-**Setup.** Install Hunk separately (`npm i -g hunkdiff` or `brew install modem-dev/tap/hunk`), then run `/hunk:doctor`. Optional personal review guidance lives in [`config/live-diff-code-review-guidance.md`](config/live-diff-code-review-guidance.md) and can be installed with `/hunk:guidance install`. The first non-suspending launcher target is iTerm2; user-facing `/hunk:open` can fall back to a manual command when iTerm2 is not detectable.
+**Setup.** Install Hunk separately (`npm i -g hunkdiff` or `brew install modem-dev/tap/hunk`), then run `/hunk:doctor`. Optional personal review guidance lives in [`config/hunk-review-guidance.md`](config/hunk-review-guidance.md) and can be installed with `/hunk:guidance install`. The first non-suspending launcher target is iTerm2; user-facing `/hunk:open` can fall back to a manual command when iTerm2 is not detectable.
 
 ---
 
