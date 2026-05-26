@@ -7,6 +7,7 @@ Reusable extensions for the [Pi coding agent](https://pi.dev/). The package focu
 - safety review hooks (rule + model + human) and a mutation-review reviewer
 - Hunk-backed live diff tracking, side-by-side launch commands, and review skills
 - web research (SearXNG, web fetch with readability + document parse handoff)
+- robust chunked context compaction via `/compacter`
 - a `/review` subagent workflow
 - TUI niceties: tmux/scrollback compatibility, theme preview, compact tool renderers, file-reference picker
 
@@ -65,6 +66,7 @@ Commands:
 - `/safety:setup`, `/safety:status`, `/safety:model`, `/safety:toggle`
 - `/async:status`
 - `/native:status`
+- `/compacter [--model provider/model] [instructions]`, `/compacter status|on|off|toggle`
 - `/mutation:setup`, `/mutation:status`, `/mutation:model`, `/mutation:toggle`, `/mutation:apply`
 - `/hunk:setup`, `/hunk:doctor`, `/hunk:status`, `/hunk:switch`, `/hunk:open`, `/hunk:close`, `/hunk:follow`, `/hunk:guidance`, `/hunk:focus`
 - `/searxng:setup`, `/searxng:status`
@@ -74,7 +76,7 @@ Commands:
 - `/review`, `/review:setup`, `/review:status`, `/review:cancel`, `/review:send-last`
 - `/docparser:doctor`
 
-The load order in `package.json#pi.extensions` is intentional: terminal patches first, safety before async shell, native batch tools before mutation-review/hunk-review tracking, optional display overrides last.
+The load order in `package.json#pi.extensions` is intentional: terminal patches first, safety before async shell, native batch tools before compacter/mutation-review/hunk-review tracking, optional display overrides last.
 
 ## Extensions
 
@@ -133,6 +135,18 @@ Each extension below documents what it does, what it provides, and how to set it
 **Provides.** `read_many`, `search_many`, `write_many`, `edit_many`; disabled `bash` stub redirecting to `shell_start`; `/native:status`; compact renderers with `⎿ error: …` fallback on validation/exec errors.
 
 **Setup.** None. Automatic on load.
+
+---
+
+### compacter
+
+[Full docs](docs/extensions/compacter.md).
+
+**Purpose.** Replace Pi's single-shot compaction summarizer with chunked recursive summarization through `session_before_compact`, preserving normal `CompactionEntry` behavior while avoiding over-large summarizer prompts.
+
+**Provides.** `/compacter [--model provider/model] [instructions]` for manual chunked compaction; `/compacter status|on|off|toggle` for the runtime hook. No LLM tools, no default dedicated model.
+
+**Setup.** None. Uses the active model by default; `--model` applies to one manual run only.
 
 ---
 
