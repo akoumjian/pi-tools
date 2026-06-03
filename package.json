@@ -43,7 +43,7 @@
   "dependencies": {
     "@mozilla/readability": "^0.6.0",
     "jsdom": "^27.0.1",
-    "pi-docparser": "2.0.0",
+    "pi-docparser": "github:akoumjian/pi-docparser#pi-0.78-peer-range",
     "turndown": "^7.2.4"
   },
   "peerDependencies": {
