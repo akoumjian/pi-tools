@@ -11,13 +11,14 @@ The current experimental slice supports read-only `reader`/`planner` tasks plus 
 LLM-callable tool:
 
 - `orchestrate` — run one or more independent child tasks: readers/planners with bounded concurrency, writers serialized in confined worktrees.
+- `reconcile` — deterministically fold kept `orch/*` writer branches into one integration branch and merge it into the current branch behind a single human confirmation.
 
 Commands:
 
 - `/orchestrator:setup --worker provider/model[:thinking] --reviewer provider/model[:thinking] [--reviewer ...] [--reader ...] [--planner ...] [--guidance "..."]`
 - `/orchestrator:status`
 
-The extension is not yet registered in `package.json#pi.extensions`; load it with `-e extensions/orchestrator/index.ts` or use `scripts/orchestrator-sandbox.mjs` during development.
+The extension is registered in `package.json#pi.extensions`; `scripts/orchestrator-sandbox.mjs` remains available for isolated development against a scratch clone.
 
 ## Tool schema
 
@@ -126,7 +127,8 @@ Human yes/no interactions are handled deterministically at exactly one place per
 - `writesEnabled` defaults false and `dryRun` defaults true, so writers are off until both are explicitly flipped.
 - Writer-shaped `orchestrate` calls route to human review in tool-safety; only the read-only shape is auto-allowed.
 - Deterministic `worktree.ts`, `confine.ts`, and `reconcile.ts` components are exercised against throwaway git/path fixtures: clean worktrees/branches/run directories are removed, dirty ones are kept, dirty parents are rejected, traversal/symlink escapes are blocked, merges are probed against pinned commits, validation failures roll back, and focused in-place conflict resolutions complete as merge commits.
-- Reconciliation (fold/merge of kept writer branches) is implemented and fixture-tested but not yet invoked by the tool.
+- Reconciliation is wired as the `reconcile` tool: overlap report, fewest-files-first deterministic order, commit-pinned probes, per-fold validation with rollback (`validation` settings command; folds are marked UNVALIDATED when unconfigured), conflicts skipped and reported rather than force-merged, and a structural human merge gate — `ui.confirm` inside the tool — before anything reaches the parent branch. Approval merges and removes folded writer branches/worktrees; declining keeps the integration branch for manual review. Dirty parents, non-`orch/*` branches, and parent-HEAD movement during the gate all abort deterministically.
+- The `reconcile` tool shape is not auto-allowed by tool-safety; calls route through the judge/policy like any mutating action, and the in-tool confirmation is interactive-only (non-interactive runs fail closed and keep the integration branch).
 - The tool validates configured tool names before launching children.
 - Output is bounded before being returned to parent context.
 - Child extension loading omits the orchestrator itself, preventing recursive orchestration.

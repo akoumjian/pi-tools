@@ -198,7 +198,7 @@ test("setup writes machine-local config and rejects same-provider reviewer", asy
   orchestratorExtension(api);
   assert.ok(commands.has("orchestrator:setup"));
   assert.ok(commands.has("orchestrator:status"));
-  assert.equal(tools.length, 1);
+  assert.equal(tools.length, 2, "orchestrate and reconcile tools are registered");
   const notifications: Array<{ message: string; type: string }> = [];
   const context = {
     cwd: root,

@@ -310,9 +310,12 @@ After the `pi-tools` extension is validated and released/installed:
 
 7. Agents + prompts; xhigh/model commands via `setThinkingLevel`/`setModel`
    with deterministic restore.
-8. Reconcile invocation + human merge gate: fold approved branches into an
-   integration branch with the tested reducer, surface overlap/probe reports,
-   and require one human approval before integration reaches the parent branch.
+8. **Implemented and fixture-tested:** `reconcile` tool + human merge gate:
+   folds kept `orch/*` branches into an integration branch with the tested
+   reducer, reports overlaps/skips/validation, requires one `ui.confirm`
+   before merging to the parent branch, cleans folded branches/worktrees on
+   approval, keeps the integration branch on decline, and aborts on dirty
+   parents or parent-HEAD movement.
 9. Promote/register the pi-tools extension, update the consumer profile, then
    remove dormant Fleet in a separate profile change. Test model resolution,
    distinctness refusal, GC-on-clean, merge-tree probes, and in-place gates.

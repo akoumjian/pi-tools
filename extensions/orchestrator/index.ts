@@ -25,6 +25,7 @@ import {
   type OrchestratorModelSettings,
   type OrchestratorSettings
 } from "./settings.js";
+import { buildMergeGateMessage, runReconcile, type ReconcileReport } from "./integrate.js";
 import { reviewWriterBranch, type WriterReviewReport } from "./review.js";
 import { spawnOrchestratedAgent, type SpawnOrchestratedAgentResult } from "./spawn.js";
 import { runWriterTask, type WriterWorktreeReport } from "./writer.js";
@@ -45,6 +46,14 @@ const TaskParams = Type.Object({
 
 const OrchestrateParams = Type.Object({
   tasks: Type.Array(TaskParams, { minItems: 1, maxItems: 8, description: "Independent tasks to execute; reads run with bounded concurrency, writers run serialized in listed order." })
+}, { additionalProperties: false });
+
+const ReconcileParams = Type.Object({
+  branches: Type.Array(Type.String({ minLength: 1, pattern: "^orch/" }), {
+    minItems: 1,
+    maxItems: 8,
+    description: "Kept orchestrator writer branches (orch/*) from prior orchestrate results to fold into one integration branch."
+  })
 }, { additionalProperties: false });
 
 type OrchestratedTaskRoleInput = "reader" | "planner" | "writer";
@@ -220,6 +229,43 @@ export default function orchestratorExtension(api: ExtensionAPI): void {
       };
     }
   }));
+
+  api.registerTool(defineTool({
+    name: "reconcile",
+    label: "Reconcile",
+    description: [
+      "Deterministically fold kept orchestrator writer branches (orch/*) into one integration branch:",
+      "changed-file overlap report, stable fewest-files-first order, commit-pinned merge-tree probes, per-fold validation with rollback.",
+      "Conflicting or failing branches are skipped and reported, never force-merged.",
+      "Ends with one human confirmation showing folds, skips, overlaps, and validation status; only on approval does the integration branch merge into the current branch, after which folded writer branches/worktrees are removed.",
+      "Declining keeps the integration branch for manual review. Requires writesEnabled=true, dryRun=false, and a clean parent checkout."
+    ].join(" "),
+    parameters: ReconcileParams,
+    executionMode: "sequential",
+    async execute(_toolCallId, params, _signal, _onUpdate, context): Promise<AgentToolResult<ReconcileReport>> {
+      const settings = readOrchestratorSettings();
+      const report = await runReconcile({
+        parentCwd: context.cwd,
+        branches: params.branches as string[],
+        settings,
+        confirm: (title, message) => context.ui.confirm(title, message)
+      });
+      return {
+        content: [{ type: "text", text: formatReconcileReport(report) }],
+        details: report,
+        ...(report.status === "nothing_merged" && report.folded.length === 0 && report.skipped.length > 0 ? { isError: true } : {})
+      };
+    }
+  }));
+}
+
+function formatReconcileReport(report: ReconcileReport): string {
+  const header = report.status === "merged"
+    ? `Reconcile: merged ${report.folded.length} branch${report.folded.length === 1 ? "" : "es"} into the current branch (merge commit ${report.mergeCommit?.slice(0, 12)}); cleaned ${report.cleanedBranches.join(", ") || "nothing"}.`
+    : report.status === "declined"
+      ? `Reconcile: user declined the merge gate; integration branch ${report.integrationBranch} kept at ${report.integrationPath} for manual review.`
+      : "Reconcile: nothing merged.";
+  return `${header}\n\n${buildMergeGateMessage(report.integrationBranch ?? "(no integration branch)", report.folded, report.skipped, report.overlaps, report.validation === "passed-per-fold")}`;
 }
 
 async function handleSetup(rawArgs: string, context: ExtensionContext): Promise<void> {

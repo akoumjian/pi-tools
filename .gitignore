@@ -25,3 +25,4 @@ dist/
 # Local grounding files per repository AGENTS instructions.
 decisions.md
 journal.md
+node_modules

@@ -34,7 +34,8 @@
       "extensions/file-open/index.ts",
       "extensions/theme-preview/index.ts",
       "extensions/review-subagent/index.ts",
-      "extensions/tool-display/index.ts"
+      "extensions/tool-display/index.ts",
+      "extensions/orchestrator/index.ts"
     ],
     "skills": [
       "skills/hunk-review/SKILL.md"
