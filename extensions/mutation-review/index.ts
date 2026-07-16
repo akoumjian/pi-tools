@@ -7,11 +7,7 @@ import { Type, type Api, type AssistantMessage, type Model, type Static, type Te
 import {
   buildSessionContext,
   convertToLlm,
-  createAgentSessionFromServices,
-  createAgentSessionServices,
   defineTool,
-  getAgentDir,
-  SessionManager,
   withFileMutationQueue,
   type AgentToolResult,
   type ExtensionAPI,
@@ -40,6 +36,7 @@ import {
   type ExtensionModelRegistry,
   type ResolvedExtensionModel
 } from "../_shared/model-spec.js";
+import { withChildAgentSession } from "../_shared/child-agent-session.js";
 import { formatConfigPath, readPiToolsJsonConfigSource, readPiToolsReferencedTextConfig, writeAgentExtensionConfig, type PiToolsJsonConfig } from "../_shared/config.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 import { guidedModelSetupUsage, parseGuidedModelSetupArgs, readSetupGuidance } from "../_shared/setup-command.js";
@@ -846,53 +843,28 @@ export async function runMutationReviewSubagent(
   let toolCallCount = 0;
   const decisionToolState = createDecisionTool();
   const childToolNames = uniqueStrings([...settings.tools, DECISION_TOOL_NAME]);
-  const services = await createAgentSessionServices({
+  const { model, thinkingLevel } = selectMutationReviewModel(context.modelRegistry, settings.defaultModel, context.model, settings.thinkingLevel);
+
+  return withChildAgentSession(context, {
     cwd: context.cwd,
-    agentDir: getAgentDir(),
-    modelRegistry: context.modelRegistry,
-    resourceLoaderOptions: {
-      appendSystemPromptOverride: (base) => [...base, reviewerSystemPrompt],
-      extensionsOverride: omitMutationReviewExtension,
-      extensionFactories: [
-        createMutationReviewToolAllowlistExtension(childToolNames),
-        createMutationReviewToolBudgetExtension()
-      ]
-    }
-  });
-  assertNoServiceErrors(services.diagnostics);
-
-  const { model, thinkingLevel } = selectMutationReviewModel(services.modelRegistry, settings.defaultModel, context.model, settings.thinkingLevel);
-
-  const { session } = await createAgentSessionFromServices({
-    services,
-    sessionManager: SessionManager.inMemory(context.cwd),
     model,
     thinkingLevel,
     tools: childToolNames,
-    customTools: [decisionToolState.tool]
-  });
-
-  const unsubscribe = session.subscribe((event) => {
-    if (event.type === "tool_execution_start") {
-      toolCallCount += 1;
-      context.ui.setStatus(STATUS_KEY, `mutation review running · ${toolCallCount} tool call${toolCallCount === 1 ? "" : "s"} · ${event.toolName}`);
+    customTools: [decisionToolState.tool],
+    systemPrompts: [reviewerSystemPrompt],
+    extensionsOverride: omitMutationReviewExtension,
+    extensionFactories: [createMutationReviewToolBudgetExtension()],
+    onError: (error) => context.ui.notify(`Mutation review child extension error: ${error.error}`, "warning"),
+    onEvent: (event) => {
+      if (event.type === "tool_execution_start") {
+        toolCallCount += 1;
+        context.ui.setStatus(STATUS_KEY, `mutation review running · ${toolCallCount} tool call${toolCallCount === 1 ? "" : "s"} · ${event.toolName}`);
+      }
+      if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+        context.ui.setStatus(STATUS_KEY, `mutation review deciding · ${toolCallCount} tool call${toolCallCount === 1 ? "" : "s"}`);
+      }
     }
-    if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-      context.ui.setStatus(STATUS_KEY, `mutation review deciding · ${toolCallCount} tool call${toolCallCount === 1 ? "" : "s"}`);
-    }
-  });
-
-  await session.bindExtensions({
-    uiContext: context.ui,
-    shutdownHandler: () => {
-      void session.abort();
-    },
-    onError: (error) => {
-      context.ui.notify(`Mutation review child extension error: ${error.error}`, "warning");
-    }
-  });
-
-  try {
+  }, async (session) => {
     await session.prompt(buildMutationReviewTask(context, proposal, settings), { source: "extension" });
     let finalAssistant = getFinalAssistant(session.messages);
     throwIfStoppedWithError(finalAssistant);
@@ -921,19 +893,7 @@ export async function runMutationReviewSubagent(
       toolCallCount,
       durationMs: Date.now() - startedAt
     };
-  } finally {
-    unsubscribe();
-    session.dispose();
-  }
-}
-
-function createMutationReviewToolAllowlistExtension(toolNames: string[]): (api: ExtensionAPI) => void {
-  const allowedToolNames = uniqueStrings(toolNames);
-  return (api: ExtensionAPI) => {
-    api.on("before_agent_start", () => {
-      api.setActiveTools(allowedToolNames);
-    });
-  };
+  });
 }
 
 export function createMutationReviewToolBudgetExtension(): (api: ExtensionAPI) => void {
@@ -1907,13 +1867,6 @@ function omitMutationReviewExtension(result: LoadExtensionsResult): LoadExtensio
     ...result,
     extensions: result.extensions.filter((extension) => !MUTATION_REVIEW_EXTENSION_PATH_PATTERN.test(extension.resolvedPath))
   };
-}
-
-function assertNoServiceErrors(diagnostics: Array<{ type: "info" | "warning" | "error"; message: string }>): void {
-  const errors = diagnostics.filter((diagnostic) => diagnostic.type === "error");
-  if (errors.length > 0) {
-    throw new Error(`Mutation review child session failed to load resources: ${errors.map((diagnostic) => diagnostic.message).join("; ")}`);
-  }
 }
 
 export function fingerprintProposal(proposal: Omit<FileMutationProposal, "fingerprint">): string {

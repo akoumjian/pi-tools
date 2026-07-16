@@ -4,6 +4,7 @@ Deep-dive documentation for each extension shipped by `@akoumjian/pi-tools`. The
 
 Planning docs:
 
+- [Orchestrator](plans/orchestrator.md) — ultracode-style, model-routed orchestration with deterministic worktree/reconciliation design.
 - [Hunk review workflow](plans/hunk-review-workflow.md) — Hunk-backed side-by-side diff review plan/prototype notes.
 
 Index (extensions load in this order; see `package.json#pi.extensions`):

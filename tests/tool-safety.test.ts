@@ -17,6 +17,7 @@ import toolSafetyExtension, {
   evaluateBash,
   evaluatePathMutations,
   evaluatePathReads,
+  evaluateReadOnlyOrchestrate,
   evaluateWebFetchMany,
   parseApprovalModelPreference,
   resolveApprovalModelPreference,
@@ -707,6 +708,17 @@ test("web_fetch_many private or credentialed URLs require review", () => {
   assert.equal(credentialUrl.action, "review");
   assert.equal(credentialUrl.risk, "high");
   assert.equal(credentialUrl.ruleId, "web-fetch-credential-url");
+});
+
+test("read-only orchestrate tasks are allowed but future writer shapes require review", () => {
+  assert.deepEqual(evaluateReadOnlyOrchestrate({
+    tasks: [
+      { id: "read", task: "Inspect package metadata", role: "reader", model: "openai-codex/gpt-5.6-sol", thinkingLevel: "xhigh" },
+      { id: "plan", task: "Plan validation", role: "planner" }
+    ]
+  }).action, "allow");
+  assert.equal(evaluateReadOnlyOrchestrate({ tasks: [{ task: "Implement it", role: "worker" }] }).action, "review");
+  assert.equal(evaluateReadOnlyOrchestrate({ tasks: [{ task: "Inspect", role: "reader", cwd: "/tmp" }] }).action, "review");
 });
 
 test("document_parse is treated as project-local read access", () => {

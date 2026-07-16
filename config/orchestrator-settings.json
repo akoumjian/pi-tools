@@ -1,0 +1,14 @@
+{
+  "models": {
+    "reviewers": []
+  },
+  "maxConcurrency": 4,
+  "maxTasksPerRun": 8,
+  "maxOutputCharsPerTask": 50000,
+  "readOnlyTools": [
+    "search_many",
+    "read_many"
+  ],
+  "writesEnabled": false,
+  "dryRun": true
+}

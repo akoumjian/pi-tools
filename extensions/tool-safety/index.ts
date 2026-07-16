@@ -354,6 +354,10 @@ function evaluateToolCall(event: ToolCallEvent, context: ExtensionContext): Safe
     return evaluateDocumentParse(input, context);
   }
 
+  if (toolName === "orchestrate") {
+    return evaluateReadOnlyOrchestrate(input);
+  }
+
   if (toolName === "hunk_session") {
     return {
       action: "allow",
@@ -394,6 +398,42 @@ function evaluateToolCall(event: ToolCallEvent, context: ExtensionContext): Safe
     reason: `Unknown or third-party tool '${toolName}' requires review.`,
     ruleId: "unknown-tool",
     tags: ["unknown-tool"]
+  };
+}
+
+export function evaluateReadOnlyOrchestrate(input: unknown): SafetyDecision {
+  if (!isRecord(input) || !Array.isArray(input.tasks) || input.tasks.length === 0 || input.tasks.length > 8) {
+    return {
+      action: "review",
+      risk: "medium",
+      reason: "Malformed or out-of-bounds orchestrate input requires review.",
+      ruleId: "orchestrate-shape-review",
+      tags: ["orchestrate"]
+    };
+  }
+
+  const allowedKeys = new Set(["id", "task", "role", "model", "thinkingLevel"]);
+  const readOnly = input.tasks.every((task) => {
+    if (!isRecord(task) || typeof task.task !== "string" || !task.task.trim()) return false;
+    if (task.role !== undefined && task.role !== "reader" && task.role !== "planner") return false;
+    return Object.keys(task).every((key) => allowedKeys.has(key));
+  });
+  if (!readOnly) {
+    return {
+      action: "review",
+      risk: "medium",
+      reason: "Orchestrate input requests an unsupported or potentially mutating mode.",
+      ruleId: "orchestrate-non-read-only-review",
+      tags: ["orchestrate"]
+    };
+  }
+
+  return {
+    action: "allow",
+    risk: "low",
+    reason: "Orchestrate is restricted to bounded reader/planner children with a deterministic read-only tool allowlist.",
+    ruleId: "orchestrate-read-only",
+    tags: ["orchestrate", "read-only", "subagent"]
   };
 }
 

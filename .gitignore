@@ -18,6 +18,7 @@ dist/
 .pi/debug-export/
 .pi/eval-build/
 .pi/mutation-review-evals/
+.pi/orchestrator/
 .pi/test-build/
 .pi/dev-agent/
 

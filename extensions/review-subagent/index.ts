@@ -3,16 +3,11 @@ import type { Api, AssistantMessage, ImageContent, Message, Model, TextContent, 
 import {
   buildSessionContext,
   convertToLlm,
-  createAgentSessionFromServices,
-  createAgentSessionServices,
-  getAgentDir,
   getMarkdownTheme,
-  SessionManager,
   type AgentSessionEvent,
   type ExtensionAPI,
   type ExtensionCommandContext,
   type ExtensionContext,
-  type ExtensionError,
   type ExtensionFactory,
   type LoadExtensionsResult
 } from "@earendil-works/pi-coding-agent";
@@ -24,6 +19,11 @@ import {
   type ExtensionModelRegistry,
   type ResolvedExtensionModel
 } from "../_shared/model-spec.js";
+import {
+  createChildToolAllowlistExtension,
+  validateChildToolAllowlist,
+  withChildAgentSession
+} from "../_shared/child-agent-session.js";
 import { formatConfigPath, readPiToolsJsonConfigSource, readPiToolsReferencedTextConfig, writeAgentExtensionConfig, type PiToolsJsonConfig } from "../_shared/config.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 import { guidedModelSetupUsage, parseGuidedModelSetupArgs, readSetupGuidance } from "../_shared/setup-command.js";
@@ -470,108 +470,73 @@ async function runReviewSubagent(
   const events: ReviewEventRecord[] = [];
   let toolCallCount = 0;
 
-  const services = await createAgentSessionServices({
-    cwd: context.cwd,
-    agentDir: getAgentDir(),
-    modelRegistry: context.modelRegistry,
-    resourceLoaderOptions: {
-      appendSystemPromptOverride: (base) => [...base, reviewerSystemPrompt],
-      extensionFactories: [createReviewToolAllowlistExtension(settings.tools)],
-      extensionsOverride: omitReviewSubagentExtension
-    }
-  });
-
-  reportServiceDiagnostics(context, services.diagnostics);
-
-  const { model, thinkingLevel } = selectReviewModel(services.modelRegistry, commandArgs.model ?? settings.defaultModel, context.model, settings.thinkingLevel);
+  const { model, thinkingLevel } = selectReviewModel(context.modelRegistry, commandArgs.model ?? settings.defaultModel, context.model, settings.thinkingLevel);
   activeRun.model = formatModelName(model);
   activeRun.thinkingLevel = thinkingLevel;
 
-  const { session } = await createAgentSessionFromServices({
-    services,
-    sessionManager: SessionManager.inMemory(context.cwd),
+  return withChildAgentSession(context, {
+    cwd: context.cwd,
     model,
     thinkingLevel,
-    tools: settings.tools
-  });
-  activeRun.abortChild = async () => {
-    await session.abort();
-  };
-
-  const unsubscribe = session.subscribe((event) => {
-    recordReviewEvent(events, event);
-    if (activeRun.cancelRequested) {
-      return;
-    }
-    if (event.type === "tool_execution_start") {
-      toolCallCount += 1;
-      activeRun.toolCallCount = toolCallCount;
-      context.ui.setStatus(REVIEW_STATUS_KEY, `review running · ${toolCallCount} tool call${toolCallCount === 1 ? "" : "s"} · ${event.toolName}`);
-    }
-    if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-      context.ui.setStatus(REVIEW_STATUS_KEY, `review writing · ${toolCallCount} tool call${toolCallCount === 1 ? "" : "s"}`);
-    }
-  });
-
-  await session.bindExtensions({
-    uiContext: context.ui,
-    shutdownHandler: () => {
-      void session.abort();
-    },
+    tools: settings.tools,
+    systemPrompts: [reviewerSystemPrompt],
+    extensionsOverride: omitReviewSubagentExtension,
+    onWarning: (message) => context.ui.notify(`Review child session warning: ${message}`, "warning"),
     onError: (error) => {
       events.push({
         type: "error",
         timestamp: Date.now(),
-        text: formatExtensionError(error)
+        text: `${error.extensionPath} ${error.event}: ${error.error}`
       });
       context.ui.notify(`Review subagent extension error: ${error.error}`, "warning");
+    },
+    onEvent: (event) => {
+      recordReviewEvent(events, event);
+      if (activeRun.cancelRequested) return;
+      if (event.type === "tool_execution_start") {
+        toolCallCount += 1;
+        activeRun.toolCallCount = toolCallCount;
+        context.ui.setStatus(REVIEW_STATUS_KEY, `review running · ${toolCallCount} tool call${toolCallCount === 1 ? "" : "s"} · ${event.toolName}`);
+      }
+      if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+        context.ui.setStatus(REVIEW_STATUS_KEY, `review writing · ${toolCallCount} tool call${toolCallCount === 1 ? "" : "s"}`);
+      }
+    }
+  }, async (session) => {
+    activeRun.abortChild = async () => session.abort();
+    try {
+      if (activeRun.cancelRequested) throw new Error("Review cancelled before reviewer prompt started.");
+      context.ui.setStatus(REVIEW_STATUS_KEY, `review running · ${formatModelName(model)}`);
+      await session.prompt(buildReviewTask(parentContext, gitContext, commandArgs.focus, settings), { source: "extension" });
+      if (activeRun.cancelRequested) throw new Error("Review cancelled while reviewer was running.");
+      const finalMessages = session.messages;
+      const critique = getFinalAssistantText(finalMessages).trim();
+      const finalAssistant = getFinalAssistant(finalMessages);
+      const completedAt = new Date();
+      const isError = finalAssistant?.stopReason === "error" || finalAssistant?.stopReason === "aborted";
+      if (isError) throw new Error(finalAssistant?.errorMessage ?? `Reviewer stopped with ${finalAssistant?.stopReason}`);
+      if (!critique) throw new Error("Reviewer finished without a text critique.");
+      return {
+        finalMessages,
+        details: {
+          status: "completed" as const,
+          cwd: context.cwd,
+          model: formatModelName(model),
+          thinkingLevel,
+          focus: commandArgs.focus,
+          startedAt: startedAt.toISOString(),
+          completedAt: completedAt.toISOString(),
+          durationMs: completedAt.getTime() - startedAt.getTime(),
+          critique,
+          sentBack: false,
+          events,
+          toolCallCount
+        }
+      };
+    } finally {
+      activeRun.abortChild = undefined;
     }
   });
-
-  try {
-    if (activeRun.cancelRequested) {
-      throw new Error("Review cancelled before reviewer prompt started.");
-    }
-
-    context.ui.setStatus(REVIEW_STATUS_KEY, `review running · ${formatModelName(model)}`);
-    await session.prompt(buildReviewTask(parentContext, gitContext, commandArgs.focus, settings), { source: "extension" });
-    if (activeRun.cancelRequested) {
-      throw new Error("Review cancelled while reviewer was running.");
-    }
-    const finalMessages = session.messages;
-    const critique = getFinalAssistantText(finalMessages).trim();
-    const finalAssistant = getFinalAssistant(finalMessages);
-    const completedAt = new Date();
-    const isError = finalAssistant?.stopReason === "error" || finalAssistant?.stopReason === "aborted";
-    if (isError) {
-      throw new Error(finalAssistant?.errorMessage ?? `Reviewer stopped with ${finalAssistant?.stopReason}`);
-    }
-    if (!critique) {
-      throw new Error("Reviewer finished without a text critique.");
-    }
-
-    return {
-      finalMessages,
-      details: {
-        status: "completed",
-        cwd: context.cwd,
-        model: formatModelName(model),
-        thinkingLevel,
-        focus: commandArgs.focus,
-        startedAt: startedAt.toISOString(),
-        completedAt: completedAt.toISOString(),
-        durationMs: completedAt.getTime() - startedAt.getTime(),
-        critique,
-        sentBack: false,
-        events,
-        toolCallCount
-      }
-    };
-  } finally {
-    activeRun.abortChild = undefined;
-    unsubscribe();
-    session.dispose();
-  }
 }
 
 export function getReviewStateKey(context: Pick<ExtensionContext, "cwd" | "sessionManager">): string {
@@ -741,41 +706,11 @@ function formatReviewPhase(phase: ReviewPhase): string {
 }
 
 export function createReviewToolAllowlistExtension(toolNames: string[]): ExtensionFactory {
-  const allowedToolNames = uniqueStrings(toolNames);
-  return (api: ExtensionAPI) => {
-    const enforceAllowlist = () => {
-      api.setActiveTools(allowedToolNames);
-    };
-
-    api.on("session_start", enforceAllowlist);
-    api.on("session_tree", enforceAllowlist);
-    api.on("before_agent_start", enforceAllowlist);
-  };
+  return createChildToolAllowlistExtension(toolNames);
 }
 
 export function validateReviewToolAllowlist(api: Pick<ExtensionAPI, "getAllTools">, toolNames: string[], configSource = "review-subagent settings"): void {
-  const available = new Set(api.getAllTools().map((tool) => tool.name));
-  const missing = uniqueStrings(toolNames).filter((toolName) => !available.has(toolName));
-  if (missing.length === 0) {
-    return;
-  }
-
-  throw new Error([
-    `Review-subagent configured tools are unavailable: ${missing.join(", ")}.`,
-    `Config source: ${configSource}.`,
-    "Adjust review-subagent-settings.json, package filters, or loaded extensions, then run /reload."
-  ].join(" "));
-}
-
-function reportServiceDiagnostics(context: ExtensionCommandContext, diagnostics: Array<{ type: "info" | "warning" | "error"; message: string }>): void {
-  const errors = diagnostics.filter((diagnostic) => diagnostic.type === "error");
-  if (errors.length > 0) {
-    throw new Error(`Review child session failed to load resources: ${errors.map((diagnostic) => diagnostic.message).join("; ")}`);
-  }
-
-  for (const warning of diagnostics.filter((diagnostic) => diagnostic.type === "warning")) {
-    context.ui.notify(`Review child session warning: ${warning.message}`, "warning");
-  }
+  validateChildToolAllowlist(api.getAllTools(), toolNames, "Review-subagent", configSource);
 }
 
 function omitReviewSubagentExtension(result: LoadExtensionsResult): LoadExtensionsResult {
@@ -1441,10 +1376,6 @@ function assistantText(message: AssistantMessage): string {
     .map((item) => item.text)
     .join("\n")
     .trim();
-}
-
-function formatExtensionError(error: ExtensionError): string {
-  return `${error.extensionPath} ${error.event}: ${error.error}`;
 }
 
 
