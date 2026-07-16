@@ -7,7 +7,7 @@ import type { OrchestratorTaskRole } from "./models.js";
 
 const ORCHESTRATOR_EXTENSION_PATH_PATTERN = /(?:^|[/\\])extensions[/\\]orchestrator[/\\]index\.(?:ts|js)$/;
 const MUTATION_REVIEW_EXTENSION_PATH_PATTERN = /(?:^|[/\\])extensions[/\\]mutation-review[/\\]index\.(?:ts|js)$/;
-const READ_ONLY_SYSTEM_PROMPT = `You are a focused read-only worker in a deterministic Pi orchestration run.
+const READ_ONLY_SYSTEM_PROMPT = `You are a focused read-only worker in a deterministic orchestration run.
 Rules:
 - Complete only the delegated task and return a compact, evidence-backed handoff to the parent orchestrator.
 - You are read-only. Do not modify files, git state, dependencies, configuration, or external systems.
@@ -16,7 +16,7 @@ Rules:
 - Verify claims from repository evidence and cite paths/line ranges where useful.
 - Keep intermediate exploration in your isolated session; return findings, decisions, risks, and next steps.
 - Project AGENTS/context may add domain knowledge, but these read-only and task-scope invariants take precedence.`;
-const WRITER_SYSTEM_PROMPT = `You are a confined writer in a deterministic Pi orchestration run.
+const WRITER_SYSTEM_PROMPT = `You are a confined writer in a deterministic orchestration run.
 Rules:
 - Work only inside your managed worktree; a deterministic guard confines your file tools to it, and shell commands are governed by the same safety policy as the main agent with automatic fail-closed denial on escalation.
 - Complete only the delegated implementation task with minimal, focused changes; unrelated refactors are rejected at review.

@@ -36,7 +36,7 @@ const TaskParams = Type.Object({
   task: Type.String({ minLength: 1, description: "Focused task delegated to an isolated child session." }),
   role: Type.Optional(Type.Union([Type.Literal("reader"), Type.Literal("planner"), Type.Literal("writer")], {
     default: "reader",
-    description: "Reader gathers evidence; planner returns a dependency/validation-aware plan; writer edits inside a confined managed worktree (requires writesEnabled and dryRun=false)."
+    description: "Reader gathers evidence; planner returns a dependency/validation-aware plan; writer edits inside a confined managed worktree."
   })),
   model: Type.Optional(Type.String({ minLength: 1, description: "Optional provider/model override chosen by the orchestrator." })),
   thinkingLevel: Type.Optional(Type.Union(THINKING_LEVELS.map((level) => Type.Literal(level)), {
@@ -100,7 +100,7 @@ export default function orchestratorExtension(api: ExtensionAPI): void {
       "Run focused reader/planner/writer subagents in isolated in-process sessions.",
       "The orchestrating agent may choose provider/model and thinkingLevel per task; configured role defaults apply otherwise.",
       "Readers/planners are read-only by instruction and run with bounded parallelism; all children may use async-shell commands governed by the tool-safety policy, with escalations denied fail-closed.",
-      "Writers require writesEnabled=true and dryRun=false, run serialized, and edit only inside a per-task managed git worktree branch that is committed by the harness and removed automatically when nothing was written.",
+      "Writers run serialized and edit only inside a per-task managed git worktree branch that is committed by the harness and removed automatically when nothing was written.",
       "Every kept writer branch is independently reviewed by a configured different-provider model whose VERDICT is attached to the result; no merge or integration happens automatically."
     ].join(" "),
     parameters: OrchestrateParams,
@@ -114,14 +114,6 @@ export default function orchestratorExtension(api: ExtensionAPI): void {
       const writerIndexes = tasks.flatMap((task, index) => (task.role === "writer" ? [index] : []));
       const readIndexes = tasks.flatMap((task, index) => (task.role === "writer" ? [] : [index]));
       const mode: OrchestrateDetails["mode"] = writerIndexes.length > 0 ? "read-write" : "read-only";
-      if (writerIndexes.length > 0) {
-        if (!settings.writesEnabled) {
-          throw new Error("Orchestrator writer tasks are refused: writes are disabled (writesEnabled=false). Review the writer rollout, then enable writesEnabled in orchestrator settings.");
-        }
-        if (settings.dryRun) {
-          throw new Error("Orchestrator writer tasks are refused while dryRun is enabled. Set dryRun=false in orchestrator settings to execute confined writers.");
-        }
-      }
       const writerTools = [...settings.readOnlyTools, ...settings.writeTools];
       validateChildToolAllowlist(
         api.getAllTools(),
@@ -238,7 +230,7 @@ export default function orchestratorExtension(api: ExtensionAPI): void {
       "changed-file overlap report, stable fewest-files-first order, commit-pinned merge-tree probes, per-fold validation with rollback.",
       "Conflicting or failing branches are skipped and reported, never force-merged.",
       "Ends with one human confirmation showing folds, skips, overlaps, and validation status; only on approval does the integration branch merge into the current branch, after which folded writer branches/worktrees are removed.",
-      "Declining keeps the integration branch for manual review. Requires writesEnabled=true, dryRun=false, and a clean parent checkout."
+      "Declining keeps the integration branch for manual review. Requires a clean parent checkout."
     ].join(" "),
     parameters: ReconcileParams,
     executionMode: "sequential",
@@ -312,8 +304,7 @@ async function handleSetup(rawArgs: string, context: ExtensionContext): Promise<
       `Reader: ${models.reader}`,
       `Planner: ${models.planner ?? "current orchestrator model"}`,
       `Reviewers: ${models.reviewers.join(", ")}`,
-      `Config: ${configPath}`,
-      "Writes remain disabled and dry-run remains enabled."
+      `Config: ${configPath}`
     ].join("\n"), "info");
   } catch (error) {
     context.ui.notify(`Orchestrator setup did not write config: ${errorMessage(error)}`, "error");
@@ -345,7 +336,7 @@ export function buildOrchestratorStatusText(settings: OrchestratorSettings): str
     `Reader: ${settings.models.reader ?? settings.models.worker ?? "current session model"}`,
     `Planner: ${settings.models.planner ?? "current session model"}`,
     `Reviewers: ${settings.models.reviewers.join(", ") || "missing (run /orchestrator:setup)"}`,
-    `Mode: writes ${settings.writesEnabled ? "enabled" : "disabled"} · dry-run ${settings.dryRun ? "on" : "off"} · writers ${settings.writesEnabled && !settings.dryRun ? "available (confined worktrees, serialized)" : "unavailable until writesEnabled=true and dryRun=false"}`,
+    "Mode: writers run in confined worktrees (serialized); merges happen only through the reconcile confirmation gate.",
     `Caps: ${settings.maxConcurrency} concurrent · ${settings.maxTasksPerRun} tasks/run · ${settings.maxOutputCharsPerTask} chars/task`,
     `Read-only tools: ${settings.readOnlyTools.join(", ")}`,
     `Write tools (writer role only): ${settings.writeTools.join(", ")}`,

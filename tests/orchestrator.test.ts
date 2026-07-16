@@ -81,8 +81,6 @@ test("orchestrator settings load extension-owned guidance without AGENTS depende
       assert.deepEqual(settings.writeTools, ["edit_many", "write_many"]);
       assert.deepEqual(settings.shellTools, ["shell_start", "shell_status", "shell_read", "shell_cancel"]);
       assert.deepEqual(settings.validation, { command: "npm", args: ["run", "validate"], timeoutMs: 600_000, maxRunsPerTask: 5 });
-      assert.equal(settings.writesEnabled, false);
-      assert.equal(settings.dryRun, true);
       assert.match(buildOrchestratorStatusText(settings), /AGENTS\.md dependency: none/);
     });
   } finally {
@@ -114,39 +112,40 @@ test("task model routing honors per-task override and configured fallback", () =
   assert.equal(canonicalModelSpec(resolveTaskModel(registry, settings, { role: "writer" }, worker)), "openai-codex/gpt-5.6-sol:xhigh");
 });
 
-test("writer tasks are refused unless writesEnabled is on and dryRun is off", async () => {
+test("writer tasks without an independent reviewer fail before spending writer tokens", async () => {
   const tools: Array<{ execute: (id: string, params: unknown, signal: undefined, onUpdate: undefined, context: ExtensionContext) => Promise<unknown> }> = [];
   const api = {
     registerCommand(): void {},
     registerTool(tool: unknown): void { tools.push(tool as (typeof tools)[number]); },
-    getAllTools: () => [{ name: "search_many" }, { name: "read_many" }, { name: "edit_many" }, { name: "write_many" }]
+    getAllTools: () => [
+      { name: "search_many" }, { name: "read_many" }, { name: "edit_many" }, { name: "write_many" },
+      { name: "shell_start" }, { name: "shell_status" }, { name: "shell_read" }, { name: "shell_cancel" }
+    ]
   } as unknown as ExtensionAPI;
   orchestratorExtension(api);
   const tool = tools[0];
+  const worker = fakeModel("openai-codex", "gpt-5.6-sol");
+  const sameProvider = fakeModel("openai-codex", "codex-auto-review");
   const context = {
     cwd: tmpdir(),
-    modelRegistry: fakeRegistry([]),
+    model: worker,
+    modelRegistry: fakeRegistry([worker, sameProvider]),
     ui: { notify(): void {} }
   } as unknown as ExtensionContext;
   const params = { tasks: [{ task: "apply the focused fix", role: "writer" }] };
 
-  const disabledRoot = await mkdtemp(path.join(tmpdir(), "pi-orchestrator-writer-disabled-"));
-  const dryRunRoot = await mkdtemp(path.join(tmpdir(), "pi-orchestrator-writer-dryrun-"));
+  const root = await mkdtemp(path.join(tmpdir(), "pi-orchestrator-writer-reviewerless-"));
   try {
-    await withEnv("PI_TOOLS_CONFIG_DIR", disabledRoot, async () => {
-      await assert.rejects(() => tool.execute("t1", params, undefined, undefined, context), /writes are disabled/);
-    });
-    await writeFile(path.join(dryRunRoot, "orchestrator-settings.json"), JSON.stringify({
-      models: { worker: "openai-codex/gpt-5.6-sol:xhigh", reviewers: ["anthropic/claude-opus-4-8:xhigh"] },
-      writesEnabled: true,
-      dryRun: true
+    await writeFile(path.join(root, "orchestrator-settings.json"), JSON.stringify({
+      models: { worker: "openai-codex/gpt-5.6-sol:xhigh", reviewers: ["openai-codex/codex-auto-review:xhigh"] }
     }), "utf8");
-    await withEnv("PI_TOOLS_CONFIG_DIR", dryRunRoot, async () => {
-      await assert.rejects(() => tool.execute("t2", params, undefined, undefined, context), /dryRun is enabled/);
+    await withEnv("PI_TOOLS_CONFIG_DIR", root, async () => {
+      const result = await tool.execute("t1", params, undefined, undefined, context) as { isError?: boolean; content: Array<{ text: string }> };
+      assert.equal(result.isError, true);
+      assert.match(result.content[0].text, /No independent reviewer/);
     });
   } finally {
-    await rm(disabledRoot, { recursive: true, force: true });
-    await rm(dryRunRoot, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -222,9 +221,7 @@ test("setup writes machine-local config and rejects same-provider reviewer", asy
     assert.equal(config.models.reader, "openai-codex/gpt-5.6-sol:xhigh");
     assert.equal(config.models.planner, "anthropic/claude-fable-5:xhigh");
     assert.deepEqual(config.models.reviewers, ["anthropic/claude-opus-4-8:xhigh"]);
-    assert.equal(config.dryRun, true);
-    assert.equal(config.writesEnabled, false);
-    assert.match(notifications[0].message, /Writes remain disabled/);
+    assert.match(notifications[0].message, /Orchestrator setup saved worker/);
 
     await withEnv("PI_CODING_AGENT_DIR", path.join(root, "rejected-agent"), async () => {
       await withEnv("PI_TOOLS_CONFIG_DIR", undefined, async () => {

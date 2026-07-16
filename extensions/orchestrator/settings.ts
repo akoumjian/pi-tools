@@ -34,8 +34,6 @@ export type OrchestratorSettings = {
   writeTools: string[];
   shellTools: string[];
   validation?: OrchestratorValidationSettings;
-  writesEnabled: boolean;
-  dryRun: boolean;
   configSource: string;
 };
 
@@ -66,8 +64,6 @@ export function readOrchestratorSettings(): OrchestratorSettings {
     writeTools: [...DEFAULT_WRITE_TOOLS],
     shellTools: [...DEFAULT_SHELL_TOOLS],
     validation: undefined,
-    writesEnabled: false,
-    dryRun: true,
     configSource: "built-in defaults"
   };
   const parsed = readPiToolsJsonConfigSource(ORCHESTRATOR_CONFIG_FILE, import.meta.url);
@@ -103,9 +99,7 @@ export function serializeOrchestratorSettings(
     readOnlyTools: settings.readOnlyTools,
     writeTools: settings.writeTools,
     shellTools: settings.shellTools,
-    ...(settings.validation ? { validation: settings.validation } : {}),
-    writesEnabled: settings.writesEnabled,
-    dryRun: settings.dryRun
+    ...(settings.validation ? { validation: settings.validation } : {})
   };
 }
 
@@ -164,8 +158,6 @@ function normalizeSettings(settings: OrchestratorSettings): OrchestratorSettings
     // An explicit empty array disables child shell; absence uses the default.
     shellTools: Array.isArray(settings.shellTools) ? uniqueStrings(settings.shellTools) : [...DEFAULT_SHELL_TOOLS],
     validation: settings.validation,
-    writesEnabled: settings.writesEnabled === true,
-    dryRun: settings.dryRun !== false,
     configSource: settings.configSource
   };
 }

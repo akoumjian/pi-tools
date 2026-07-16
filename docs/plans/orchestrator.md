@@ -289,9 +289,10 @@ After the `pi-tools` extension is validated and released/installed:
    dirty-parent rejection, collision checks, lock/create/inspect, harness
    commits with orchestrator identity, committed or uncommitted write
    detection, clean-worktree branch removal, and empty-run-dir GC. The
-   `orchestrate` tool now accepts serialized `writer` tasks behind
-   `writesEnabled=true` plus `dryRun=false`, with writer-shaped calls excluded
-   from the tool-safety auto-allow rule.
+   `orchestrate` tool accepts serialized `writer` tasks, with writer-shaped
+   calls excluded from the tool-safety auto-allow rule. The interim
+   `writesEnabled`/`dryRun` rollout flags were removed after live validation;
+   judged boundaries, confinement, review, and the merge gate are the controls.
 4. **Implemented and fixture-tested, not yet model-facing:** `reconcile.ts`
    changed-file overlap, stable ordering, commit-pinned `merge-tree` probes,
    fold-one-at-a-time, rollback on validation failure, conflict materialization,

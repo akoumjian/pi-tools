@@ -16,7 +16,7 @@ const PI_STATE_EXCLUDE = ["--", ".", ":(exclude).pi"];
 export type ReconcileInput = {
   parentCwd: string;
   branches: string[];
-  settings: Pick<OrchestratorSettings, "writesEnabled" | "dryRun" | "validation">;
+  settings: Pick<OrchestratorSettings, "validation">;
   confirm: (title: string, message: string) => Promise<boolean>;
   runId?: string;
 };
@@ -41,12 +41,6 @@ export type ReconcileReport = {
 
 export async function runReconcile(input: ReconcileInput): Promise<ReconcileReport> {
   const { settings } = input;
-  if (!settings.writesEnabled) {
-    throw new Error("Reconcile is refused: writes are disabled (writesEnabled=false).");
-  }
-  if (settings.dryRun) {
-    throw new Error("Reconcile is refused while dryRun is enabled.");
-  }
   const branches = [...new Set(input.branches.map((branch) => branch.trim()).filter(Boolean))];
   if (branches.length === 0) throw new Error("Reconcile requires at least one orch/* branch.");
   for (const branch of branches) {

@@ -8,7 +8,5 @@
   "readOnlyTools": [
     "search_many",
     "read_many"
-  ],
-  "writesEnabled": false,
-  "dryRun": true
+  ]
 }

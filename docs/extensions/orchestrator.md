@@ -4,7 +4,7 @@
 
 Run bounded, model-routed subagents in fresh in-process Pi sessions, keeping their intermediate context out of the parent session. The orchestrating agent may choose the provider/model and thinking level for each task. Harness code enforces task caps, tool allowlists, and reviewer-provider independence.
 
-The current experimental slice supports read-only `reader`/`planner` tasks plus an opt-in `writer` role. Writers execute only when `writesEnabled=true` **and** `dryRun=false`, run serialized, and are confined to per-task managed git worktree branches. Machine fan-in review and reconciliation wiring are still disabled pending their own rollout.
+Roles are `reader`/`planner` (read-only, parallel) and `writer` (serialized, confined to per-task managed git worktree branches with independent cross-provider review). Integration happens only through the `reconcile` tool's human confirmation gate. There are no enable/disable behavior flags: safety comes from tool-safety review at the call boundary, worktree confinement, mandatory distinct-provider review, and the merge gate.
 
 ## Provides
 
@@ -93,7 +93,7 @@ Children use the same async-shell tools as the main agent, governed by the same 
 
 Each writer task follows a deterministic harness pipeline:
 
-1. refuse unless `writesEnabled=true` and `dryRun=false`;
+1. refuse when no configured reviewer has a provider distinct from the writer's model (before spending writer tokens);
 2. refuse when the parent checkout is dirty; create a locked managed worktree and `orch/<run>-<task>` branch under `.pi/orchestrator/worktrees/` (or `ORCHESTRATOR_WORKTREE_ROOT`);
 3. spawn the child with `cwd` set to the worktree plus an allowed-root confinement extension that blocks path traversal, symlink escapes, and unsupported tools for the file-tool surface, while configured shell tools pass through to tool-safety's judged policy;
 4. after the child finishes (or fails), the harness commits all changes on the task branch with an orchestrator identity;
@@ -124,8 +124,7 @@ Human yes/no interactions are handled deterministically at exactly one place per
 
 ## Safety and current limitations
 
-- `writesEnabled` defaults false and `dryRun` defaults true, so writers are off until both are explicitly flipped.
-- Writer-shaped `orchestrate` calls route to human review in tool-safety; only the read-only shape is auto-allowed.
+- There are no `writesEnabled`/`dryRun` behavior flags; strong defaults apply. The mutation gates are: tool-safety review of writer-shaped calls (only the read-only shape is auto-allowed), scratch-branch confinement, mandatory distinct-provider review, and the reconcile confirmation before anything reaches a real branch.
 - Deterministic `worktree.ts`, `confine.ts`, and `reconcile.ts` components are exercised against throwaway git/path fixtures: clean worktrees/branches/run directories are removed, dirty ones are kept, dirty parents are rejected, traversal/symlink escapes are blocked, merges are probed against pinned commits, validation failures roll back, and focused in-place conflict resolutions complete as merge commits.
 - Reconciliation is wired as the `reconcile` tool: overlap report, fewest-files-first deterministic order, commit-pinned probes, per-fold validation with rollback (`validation` settings command; folds are marked UNVALIDATED when unconfigured), conflicts skipped and reported rather than force-merged, and a structural human merge gate — `ui.confirm` inside the tool — before anything reaches the parent branch. Approval merges and removes folded writer branches/worktrees; declining keeps the integration branch for manual review. Dirty parents, non-`orch/*` branches, and parent-HEAD movement during the gate all abort deterministically.
 - The `reconcile` tool shape is not auto-allowed by tool-safety; calls route through the judge/policy like any mutating action, and the in-tool confirmation is interactive-only (non-interactive runs fail closed and keep the integration branch).

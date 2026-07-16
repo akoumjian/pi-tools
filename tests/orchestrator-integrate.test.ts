@@ -8,7 +8,7 @@ import test from "node:test";
 import { findWorktreeForBranch, runReconcile } from "../extensions/orchestrator/integrate.js";
 import { createManagedWorktree } from "../extensions/orchestrator/worktree.js";
 
-const SETTINGS = { writesEnabled: true, dryRun: false, validation: undefined };
+const SETTINGS = { validation: undefined };
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
@@ -137,14 +137,6 @@ test("reconcile guards: gating, branch names, dirty parent, missing branches, va
       await createBranch(repo, "orch/g-one", "a.txt", "guarded change\n");
       const confirm = async () => true;
 
-      await assert.rejects(
-        () => runReconcile({ parentCwd: repo, branches: ["orch/g-one"], settings: { ...SETTINGS, writesEnabled: false }, confirm }),
-        /writes are disabled/
-      );
-      await assert.rejects(
-        () => runReconcile({ parentCwd: repo, branches: ["orch/g-one"], settings: { ...SETTINGS, dryRun: true }, confirm }),
-        /dryRun/
-      );
       await assert.rejects(
         () => runReconcile({ parentCwd: repo, branches: ["main"], settings: SETTINGS, confirm }),
         /only integrates orchestrator branches/
