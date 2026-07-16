@@ -125,7 +125,21 @@ function cloneRepo(source) {
     process.stderr.write("git clone failed\n");
     process.exit(res.status ?? 1);
   }
+  ensureScratchAgentsContext();
   process.stdout.write(`Cloned ${src} -> ${scratchRepo}\n`);
+}
+
+/**
+ * Anthropic's subscription-OAuth gate rejects requests whose system prompt has
+ * no project-context block (they get billed as "third-party app" extra usage
+ * and 400 when that pool is empty). Real workspaces always carry AGENTS.md;
+ * give the isolated scratch repo one too so sandbox Anthropic calls behave
+ * like real ones. Verified empirically 2026-07-16.
+ */
+function ensureScratchAgentsContext() {
+  const agentsPath = join(scratchRepo, "AGENTS.md");
+  if (existsSync(agentsPath)) return;
+  writeFileSync(agentsPath, "# Sandbox scratch repository\n\nThrowaway clone used by orchestrator sandbox smokes. No special rules.\n");
 }
 
 function resolveCloneSource(source) {
