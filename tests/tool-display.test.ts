@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import searxngSearchExtension from "../extensions/searxng-search/index.js";
-import toolDisplayExtension, { createDocumentParseTool, readToolDisplaySettings } from "../extensions/tool-display/index.js";
+import toolDisplayExtension, { adaptDocumentParseResultHandoff, createDocumentParseTool, readToolDisplaySettings } from "../extensions/tool-display/index.js";
 
 type FakeHandler = (event: unknown, context: unknown) => void;
 
@@ -119,6 +119,25 @@ test("document_parse display override is available as an explicit opt-in", () =>
   } as never, { expanded: false, isPartial: false }, renderTheme as never, {} as never).render(200).join("\n") ?? "";
   assert.match(resultText, /⎿ 12 pages · text · .*parsed\.txt/);
   assert.doesNotMatch(resultText, /Very long parsed document text|Preview:/);
+});
+
+test("document_parse wrapper replaces the disabled stock-read truncation handoff", () => {
+  const result = adaptDocumentParseResultHandoff({
+    content: [{ type: "text", text: "Preview truncated. Use read on /tmp/parsed.txt for the full parsed output." }],
+    details: {
+      sourcePath: "input.pdf",
+      resolvedPath: "/tmp/input.pdf",
+      outputFormat: "text",
+      outputPath: "/tmp/parsed.txt",
+      outputDir: "/tmp",
+      pageCount: 1,
+      screenshotCount: 0
+    }
+  });
+
+  const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+  assert.match(text, /Use read_many with files: \[\{ path: "\/tmp\/parsed\.txt" \}\]/);
+  assert.doesNotMatch(text, /Use read on/);
 });
 
 test("tool display extension defaults display overrides off and leaves hidden thinking labels to Pi defaults", () => {

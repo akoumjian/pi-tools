@@ -357,8 +357,8 @@ function registerBatchTools(api: ExtensionAPI): void {
     promptSnippet: "Read known text file paths and ranges in one batched files:[...] call; returns grouped content and continuation offsets.",
     promptGuidelines: [
       "read_many use: Use read_many for known text file paths or ranges; use search_many first for repository, file, symbol, definition, reference, call-site, or likely edit-location discovery.",
-      "read_many input: Pass { files: [{ path, offset?, limit? }] }, including for one file. Batch independent known files/ranges together. Offsets are 1-indexed; omit limit only when the complete remainder is actually needed.",
-      "read_many output: Model-visible results group content by file, identify returned and total line ranges, and provide nextOffset when truncated; continue huge files with that offset.",
+      "read_many input: Schema: closed { files: closed { path: string(minLength=1), offset?: number(min=1), limit?: number(min=1) }[1..24] }. Batch independent known files/ranges together. Offsets are 1-indexed; omit limit only when the complete remainder is actually needed.",
+      "read_many output: Schema: { content: text(file count plus, per file, path, returned start-end/total lines, requested text, and nextOffset? when truncated), details: { files: [{ path, resolvedPath, offset, requestedLimit?, truncation: { truncated, truncatedBy: \"lines\" | \"bytes\" | null, totalLines, outputLines, totalBytes, outputBytes, nextOffset? }, previewLines }] }, isError?: boolean }. Only content is provider-visible.",
       "read_many constraints: Do not speculatively scan or load many large files, and do not make serial single-file read_many calls when one batched call can cover independent reads."
     ],
     parameters: ReadManyParams,
@@ -387,8 +387,8 @@ function registerBatchTools(api: ExtensionAPI): void {
     promptSnippet: "Discover files and search repository content with one batched searches:[...] ripgrep call; returns grouped matches and truncation notices.",
     promptGuidelines: [
       "search_many use: Prefer search_many before read_many when discovering files, symbols, definitions, references, call sites, or likely edit locations; inspect the narrowed known paths/ranges with read_many afterward.",
-      "search_many input: Pass { searches: [...] }, including for one search, and batch independent searches. Use kind='files' for rg --files discovery and kind='content' with a required pattern for line/column text matches; path defaults to '.'.",
-      "search_many output: Model-visible results are grouped per search with matching lines plus explicit truncation notices; narrow the query or raise maxResults up to 1000 before reading identified paths/ranges.",
+      "search_many input: Schema: closed { searches: closed { kind: \"content\" | \"files\", pattern?: string(minLength=1), path?: string(minLength=1), glob?: string(minLength=1), context?: number(0..10, default=0), maxResults?: number(1..1000, default=100), ignoreCase?: boolean(default=false), literal?: boolean(default=false) }[1..24] }; pattern is required for content and omitted for files, and path defaults to \".\" at execution. Batch independent searches.",
+      "search_many output: Schema: { content: text(search count plus grouped index/kind/pattern/path/glob?/returned-line-count/rg-output-or-no-matches and explicit truncation notice), details: { searches: [{ kind, path, resolvedPath, pattern?, glob?, context, maxResults, outputLines, truncated, exitCode, signal?, previewLines }] }, isError?: boolean }. Only content is provider-visible; narrow or raise maxResults before reading identified ranges.",
       "search_many constraints: Use structured search_many for normal discovery instead of serial shell searches; use shell_start only when custom rg/find/git-grep inspection is actually needed."
     ],
     parameters: SearchManyParams,
@@ -416,8 +416,8 @@ function registerBatchTools(api: ExtensionAPI): void {
     promptSnippet: "Create or completely overwrite files with one batched writes:[...] call; returns mutation ids, paths, byte counts, and line counts.",
     promptGuidelines: [
       "write_many use: Use write_many for new files or intentional complete-file overwrites; use edit_many for small or precise changes to existing files.",
-      "write_many input: Pass { writes: [{ path, content }] }, including for one file, and batch independent complete-file writes. content is the entire resulting file and parent directories are created.",
-      "write_many output: Model-visible results identify each mutation id and written path with byte/line counts; partial mutation-review blocks include the pending review id and exact apply/revise guidance.",
+      "write_many input: Schema: closed { writes: closed { path: string(minLength=1), content: string }[1..24] }. Batch independent complete-file writes; content is the entire resulting file and parent directories are created.",
+      "write_many output: Schema: { content: text(written file count plus each mutation id/path/byte count, or partial-review blocked ids/paths/kinds, reviewer summary, pending id/fingerprint, and apply-or-revise guidance), details: { files: [{ id, scopedId?, path, resolvedPath, bytes, lines }], mutationReview?: { pendingId, blocked: [{ id, path, kind }], summary } }, isError?: boolean }. Only content is provider-visible; line counts/resolved paths remain internal.",
       "write_many constraints: Do not use write_many for a small edit to an existing file, and do not repeat a blocked large mutation when apply_reviewed_mutation can use its pending id."
     ],
     parameters: WriteManyParams,
@@ -445,8 +445,8 @@ function registerBatchTools(api: ExtensionAPI): void {
     promptSnippet: "Apply exact text replacements across existing files with one batched files:[...] call; returns mutation ids, paths, replacement counts, and ranges.",
     promptGuidelines: [
       "edit_many use: Use edit_many for precise exact-text changes to existing files; use write_many only for new files or complete overwrites.",
-      "edit_many input: Pass { files: [{ path, edits: [{ oldText, newText }] }] }, including for one file. Batch independent files; each oldText must occur exactly once in the original file and same-file replacements must not overlap.",
-      "edit_many output: Model-visible results identify each mutation id and updated path with replacement counts/ranges; partial mutation-review blocks include the pending review id and exact apply/revise guidance.",
+      "edit_many input: Schema: closed { files: closed { path: string(minLength=1), edits: closed { oldText: string(minLength=1), newText: string }[1..50] }[1..24] }. Batch independent files; each oldText must occur exactly once in the original file and same-file replacements must not overlap.",
+      "edit_many output: Schema: { content: text(edited file count plus each mutation id/path/replacement count, or partial-review blocked ids/paths/kinds, reviewer summary, pending id/fingerprint, and apply-or-revise guidance), details: { files: [{ id, scopedId?, path, resolvedPath, replacements, ranges: [{ startLine, endLine }], bytesBefore, bytesAfter }], mutationReview?: { pendingId, blocked: [{ id, path, kind }], summary } }, isError?: boolean }. Only content is provider-visible; ranges/byte counts/resolved paths remain internal.",
       "edit_many constraints: Keep replacements exact and non-overlapping, and do not repeat a blocked large mutation when apply_reviewed_mutation can use its pending id."
     ],
     parameters: EditManyParams,

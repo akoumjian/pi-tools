@@ -128,18 +128,18 @@ const resultContracts = {
     content: "query identity, matches, explicit truncation, and narrow/raise-cap next action"
   },
   write_many: {
-    success: "content identifies every mutation id/path/byte/line count",
+    success: "content identifies every mutation id/path/byte count; line counts remain internal details",
     progress: "not applicable: queued file mutations return after the batch settles",
     error: "validation/path/write and mutation-review block failures expose ids/reasons/apply-or-revise action",
     details: "internal mutation entries and review annotations",
-    content: "all model-needed mutation ids, paths, counts, blocked ids, and next action"
+    content: "all model-needed mutation ids, paths, byte counts, blocked ids, and next action"
   },
   edit_many: {
-    success: "content identifies every mutation id/path/replacement count/range",
+    success: "content identifies every mutation id/path/replacement count; ranges remain internal details",
     progress: "not applicable: exact replacements return after the queued batch settles",
     error: "missing/non-unique/overlapping edits and mutation-review blocks expose paths/ids/reasons",
     details: "internal mutation entries, ranges, and review annotations",
-    content: "all model-needed ids, paths, ranges, blocked ids, and apply-or-revise action"
+    content: "all model-needed ids, paths, replacement counts, blocked ids, and apply-or-revise action"
   },
   apply_reviewed_mutation: {
     success: "content identifies reviewed id and every applied mutation id/path/kind/byte count",
@@ -149,10 +149,10 @@ const resultContracts = {
     content: "review id, mutation ids/paths, validation failure, and next action"
   },
   searxng_search: {
-    success: "content lists ranked title/URL/snippet/engine/score results",
+    success: "content lists ranked title/URL/snippet/engine results",
     progress: "not applicable: one bounded search request",
     error: "configuration/network/HTTP/parse errors identify /searxng:setup or SEARXNG_URL action",
-    details: "internal normalized result metadata",
+    details: "internal query, result-count, page, and base-URL metadata",
     content: "source candidates and web_fetch_many next action"
   },
   web_fetch_many: {
@@ -163,25 +163,25 @@ const resultContracts = {
     content: "all citation paths, truncation/errors, and read_many/document_parse next actions"
   },
   document_parse: {
-    success: "content reports outputPath/format/page and screenshot counts/screenshot paths/warnings",
+    success: "content reports outputPath/format/page count and optional nonzero screenshot count/paths/warnings",
     progress: "parser progress is host-controlled; no stable model-visible partial contract",
     error: "missing dependency/input/parse/OCR failures identify /docparser:doctor when applicable",
     details: "internal LiteParse output metadata used by display rendering",
     content: "saved output/screenshot paths and read_many/visual-inspection next actions"
   },
   orchestrate: {
-    success: "content reports every task id/role/status/route/model/thinking/duration/tool calls/output and writer worktree/review data",
+    success: "content reports every task id/role/status/routes; completed tasks add model/thinking/duration/tool calls/output and writer worktree/review data",
     progress: "partial content reports completed/total tasks and bounded writer/provider/git-setup status",
     error: "per-task preflight/provider/task/worktree/reviewer failures include route classifications and actionable disposition",
     details: "internal structured run/config/results mirror; providers must rely on content",
     content: "all route attempts, errors, branch/path/commit/files, review attempts/verdicts, and reconcile next action"
   },
   reconcile: {
-    success: "content reports integration branch/path, folds/skips/overlaps/validation, merge commit and cleanup",
+    success: "content reports integration branch, folds/skips/overlaps/validation, optional merge commit/cleanup, and declined integration path",
     progress: "not applicable: deterministic folds culminate in one human gate and final report",
     error: "dirty parent, invalid/moved branches, conflicts and validation failures are reported without force merge",
     details: "internal structured reconciliation report",
-    content: "all branch ids/paths, skip reasons, validation state, user decision, and manual-review next action"
+    content: "all branch ids, skip reasons, validation state, user decision, and declined/manual-review integration path"
   }
 };
 const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
@@ -308,8 +308,26 @@ function auditValue(value, absentReason) {
   return { status: "reviewed", representation: "serialized in this activeTools entry" };
 }
 
+const renderedProjectContext = extractRenderedSection(
+  systemPrompt,
+  /<project_context>[\s\S]*?<\/project_context>/g,
+  "rendered project/AGENTS context"
+);
+const renderedSkillCatalog = extractRenderedSection(
+  systemPrompt,
+  /The following skills provide specialized instructions[\s\S]*?<\/available_skills>/g,
+  "rendered skill catalog"
+);
+function extractRenderedSection(prompt, pattern, label) {
+  const matches = [...prompt.matchAll(pattern)].map((match) => match[0]);
+  if (matches.length === 0) throw new Error(`Could not locate ${label} in rendered system prompt`);
+  return matches.join("\n\n");
+}
+
 const artifact = normalize({
   generatedBy: "npm run review:provider-context",
+  renderedProjectContext,
+  renderedSkillCatalog,
   systemPrompt,
   activeTools: normalizedTools,
   providerPayloads: {
@@ -326,6 +344,18 @@ const markdown = [
   "# Provider context review",
   "",
   "Generated by `npm run review:provider-context`. All context is synthetic and the clock is fixed; no auth, real AGENTS, or session content is included. Provider payload hooks are captured before network I/O.",
+  "",
+  "## Rendered project context",
+  "",
+  "```text",
+  artifact.renderedProjectContext,
+  "```",
+  "",
+  "## Rendered skill catalog",
+  "",
+  "```text",
+  artifact.renderedSkillCatalog,
+  "```",
   "",
   "## Rendered system prompt",
   "",

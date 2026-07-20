@@ -308,8 +308,8 @@ function registerApplyReviewedMutationTool(api: ExtensionAPI): void {
     promptSnippet: "Apply the exact cached mutation from a prior mutation-review block by pending id after before-hash validation; returns applied mutation ids and paths.",
     promptGuidelines: [
       `apply_reviewed_mutation use: Use ${APPLY_REVIEWED_MUTATION_TOOL_NAME} only when mutation-review blocked an exact edit/write and you intentionally choose to apply that cached original mutation without repeating its large arguments.`,
-      "apply_reviewed_mutation input: Pass { id } using the pending mr_* id printed in the block result; do not pass a mutation entry m_* id or invent an id.",
-      "apply_reviewed_mutation output: Success identifies the reviewed id and every applied mutation id/path/kind/byte count; missing, stale, or before-hash-mismatched ids fail visibly without writing.",
+      "apply_reviewed_mutation input: Schema: closed { id: string(minLength=1) }, where id is the pending mr_* review id printed in the block result, not a mutation entry m_* id.",
+      "apply_reviewed_mutation output: Schema: { content: text(reviewed id, file count, before-hash confirmation, and each mutation id/path/kind/byte count), details: { id, fingerprint, toolName, toolCallId, files: [{ id, path, resolvedPath, kind: \"create\" | \"overwrite\" | \"replace\", bytes, lines, beforeHash?, afterHash }] }, isError?: boolean }. Only content is provider-visible; missing, stale, or hash-mismatched ids throw visible errors without writing.",
       "apply_reviewed_mutation constraints: To change course, reuse existing code or submit revised edit/write arguments for a new review; never use this tool for an unrelated mutation."
     ],
     parameters: ApplyReviewedMutationParams,

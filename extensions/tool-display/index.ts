@@ -112,15 +112,16 @@ export function createDocumentParseTool(settings: ToolDisplaySettings): ToolDefi
       "Parse a local document path to saved text or JSON with page/OCR/layout options and optional PDF screenshots; returns outputPath and screenshot handoffs for read_many.",
     promptGuidelines: [
       "document_parse use: Use document_parse instead of composing LiteParse CLI commands when local PDF, DOCX, PPTX, XLSX, CSV, image OCR, layout, bounding-box, or screenshot extraction is needed.",
-      "document_parse input: Pass path plus optional text/json format, targetPages, PDF screenshotPages, OCR language/server/workers, maxPages, dpi, preciseBoundingBox, preserveSmallText, and cross-page layout-alignment controls.",
-      "document_parse output: Model-visible results report outputPath, output format, page and screenshot counts, screenshot paths, and warnings; use read_many on outputPath or screenshots when full parsed content or visual output is needed.",
+      "document_parse input: Schema: closed { path: string, format?: \"text\" | \"json\", targetPages?: string, screenshotPages?: string, ocr?: \"auto\" | \"off\", ocrLanguage?: string, ocrLanguages?: string[1..], ocrServerUrl?: string, numWorkers?: integer(min=1), maxPages?: integer(min=1), dpi?: integer(min=72), preciseBoundingBox?: boolean, preserveSmallText?: boolean, preserveLayoutAlignmentAcrossPages?: boolean }. Omitted format behaves as \"text\" at execution.",
+      "document_parse output: Schema: { content: text(source/resolved paths, output format, page count, outputPath, optional nonzero screenshot directory/count and up to ten paths, warnings?, parsed preview, and truncation handoff?), details: { sourcePath, resolvedPath, outputFormat, outputPath, outputDir, pageCount, screenshotCount, screenshotDir?, screenshotPathsPreview?, warnings? }, isError?: boolean }. Only content is provider-visible; use read_many on outputPath or screenshots for complete content.",
       "document_parse constraints: Use document_parse for local image inspection in the current text-file-only read_many profile. If host parser dependencies are missing, direct the user to /docparser:doctor."
     ],
     parameters: DocumentParseSchema,
     executionMode: "parallel",
     async execute(toolCallId, params, signal, onUpdate, context): Promise<AgentToolResult<DocumentParseDetails>> {
       const original = await getOriginalDocumentParseTool();
-      return original.execute(toolCallId, params, signal, onUpdate as never, context) as Promise<AgentToolResult<DocumentParseDetails>>;
+      const result = await original.execute(toolCallId, params, signal, onUpdate as never, context) as AgentToolResult<DocumentParseDetails>;
+      return adaptDocumentParseResultHandoff(result);
     }
   };
 
@@ -137,6 +138,21 @@ export function createDocumentParseTool(settings: ToolDisplaySettings): ToolDefi
     renderResult(result, options, theme, context) {
       return renderDocumentParseResult(result as AgentToolResult<DocumentParseDetails>, options as RenderOptions, theme, context as { isError?: boolean } | undefined);
     }
+  };
+}
+
+export function adaptDocumentParseResultHandoff(result: AgentToolResult<DocumentParseDetails>): AgentToolResult<DocumentParseDetails> {
+  return {
+    ...result,
+    content: result.content.map((part) => part.type === "text"
+      ? {
+          ...part,
+          text: part.text.replace(
+            /Preview truncated\. Use read on (.+) for the full parsed output\./g,
+            'Preview truncated. Use read_many with files: [{ path: "$1" }] for the full parsed output.'
+          )
+        }
+      : part)
   };
 }
 
