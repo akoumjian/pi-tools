@@ -22,6 +22,7 @@ type FakeApi = ExtensionAPI & {
   registeredTools: ToolDefinition[];
   messageRenderers: Map<string, MessageRenderer>;
   commands: Map<string, { description: string; handler: Function }>;
+  handlers: Map<string, Function[]>;
 };
 
 type SchemaNode = {
@@ -47,11 +48,13 @@ function createFakeApi(activeTools: string[], allToolNames: string[]): FakeApi {
   const registeredTools: ToolDefinition[] = [];
   const messageRenderers = new Map<string, MessageRenderer>();
   const commands = new Map<string, { description: string; handler: Function }>();
+  const handlers = new Map<string, Function[]>();
   const fake = {
     activeTools: [...activeTools],
     registeredTools,
     messageRenderers,
     commands,
+    handlers,
     registerCommand(name: string, command: { description: string; handler: Function }): void {
       commands.set(name, command);
     },
@@ -61,7 +64,9 @@ function createFakeApi(activeTools: string[], allToolNames: string[]): FakeApi {
     registerMessageRenderer(customType: string, renderer: MessageRenderer): void {
       messageRenderers.set(customType, renderer);
     },
-    on(): void {},
+    on(event: string, handler: Function): void {
+      handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+    },
     getActiveTools(): string[] {
       return [...fake.activeTools];
     },
@@ -133,6 +138,11 @@ test("native extension registers batch file tools but not single read/edit/write
   assert.equal(typeof readManyTool.renderCall, "function");
   assert.equal(typeof readManyTool.renderResult, "function");
   assert.equal(readManyTool.renderShell, "self");
+  assert.match(readManyTool.promptSnippet ?? "", /files:\[\.\.\.\]/);
+  assert.ok(readManyTool.promptGuidelines?.some((line) => line.startsWith("read_many use:")));
+  assert.ok(readManyTool.promptGuidelines?.some((line) => line.startsWith("read_many input:")));
+  assert.ok(readManyTool.promptGuidelines?.some((line) => line.startsWith("read_many output:")));
+  assert.ok(readManyTool.promptGuidelines?.some((line) => line.startsWith("read_many constraints:")));
   assert.match(readManyTool.description, /Use search_many first/);
   assert.match(readManyTool.description, /Batch independent file reads/);
   assert.match(readManyTool.description, /offset/);
@@ -147,6 +157,11 @@ test("native extension registers batch file tools but not single read/edit/write
   assert.equal(typeof searchManyTool.renderCall, "function");
   assert.equal(typeof searchManyTool.renderResult, "function");
   assert.equal(searchManyTool.renderShell, "self");
+  assert.match(searchManyTool.promptSnippet ?? "", /searches:\[\.\.\.\]/);
+  assert.ok(searchManyTool.promptGuidelines?.some((line) => line.startsWith("search_many use:")));
+  assert.ok(searchManyTool.promptGuidelines?.some((line) => line.startsWith("search_many input:")));
+  assert.ok(searchManyTool.promptGuidelines?.some((line) => line.startsWith("search_many output:")));
+  assert.ok(searchManyTool.promptGuidelines?.some((line) => line.startsWith("search_many constraints:")));
   assert.match(searchManyTool.description, /rg text search/);
   assert.match(searchManyTool.description, /one searches array/);
   assert.match(searchManyTool.description, /rg --files/);
@@ -159,9 +174,13 @@ test("native extension registers batch file tools but not single read/edit/write
   assert.equal(typeof writeManyTool?.renderCall, "function");
   assert.equal(typeof writeManyTool?.renderResult, "function");
   assert.equal(writeManyTool?.renderShell, "self");
+  assert.match(writeManyTool?.promptSnippet ?? "", /writes:\[\.\.\.\]/);
+  assert.deepEqual(writeManyTool?.promptGuidelines?.map((line) => line.split(":", 1)[0]), ["write_many use", "write_many input", "write_many output", "write_many constraints"]);
   assert.equal(typeof editManyTool?.renderCall, "function");
   assert.equal(typeof editManyTool?.renderResult, "function");
   assert.equal(editManyTool?.renderShell, "self");
+  assert.match(editManyTool?.promptSnippet ?? "", /files:\[\.\.\.\]/);
+  assert.deepEqual(editManyTool?.promptGuidelines?.map((line) => line.split(":", 1)[0]), ["edit_many use", "edit_many input", "edit_many output", "edit_many constraints"]);
 });
 
 test("native file tool renderers show blocked errors instead of empty success summaries", () => {
@@ -910,31 +929,26 @@ test("edit_many rejects non-unique, missing, duplicate-path, and overlapping edi
   });
 });
 
-test("buildNativeToolsSystemPrompt removes default Pi tool prose and injects read_many skill guidance", () => {
+test("buildNativeToolsSystemPrompt preserves the assembled prompt opaquely and appends only owned skill guidance", () => {
   const prompt = [
     "You are an expert coding assistant operating inside pi.",
     "",
     "Available tools:",
-    "- read: Read file contents",
-    "",
-    "In addition to the tools above, you may have access to other custom tools depending on the project.",
+    "- sentinel_tool: SENTINEL_TOOL_SNIPPET",
     "",
     "Guidelines:",
-    "- Be concise",
+    "- SENTINEL_TOOL_GUIDELINE",
     "",
-    "Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):",
-    "- Main documentation: /docs/README.md",
-    "- Always read pi .md files completely",
+    "Pi documentation: SENTINEL_PI_DOCS",
     "",
-    "# Project Context",
+    "<project_context>",
+    "<project_instructions path=\"/repo/AGENTS.md\">",
+    "SENTINEL_AGENTS Available tools: Guidelines: Current date:",
+    "</project_instructions>",
+    "</project_context>",
     "",
-    "Project-specific instructions and guidelines:",
-    "",
-    "The following skills provide specialized instructions for specific tasks.",
-    "Use the read tool to load a skill's file when the task matches its description.",
-    "<available_skills>",
-    "</available_skills>",
-    "Current date: 2026-04-27",
+    "SENTINEL_CHILD_APPEND_ROLE_AND_CONFINEMENT",
+    "Current date: 2026-07-20",
     "Current working directory: /repo"
   ].join("\n");
   const skills: Skill[] = [
@@ -950,31 +964,45 @@ test("buildNativeToolsSystemPrompt removes default Pi tool prose and injects rea
 
   const result = buildNativeToolsSystemPrompt(prompt, skills);
 
-  assert.doesNotMatch(result, /Available tools:/);
-  assert.doesNotMatch(result, /Guidelines:/);
-  assert.doesNotMatch(result, /Pi documentation/);
-  assert.doesNotMatch(result, /Use the read tool/);
+  assert.equal(result.slice(0, prompt.length), prompt);
+  assert.match(result, /SENTINEL_TOOL_SNIPPET/);
+  assert.match(result, /SENTINEL_TOOL_GUIDELINE/);
+  assert.match(result, /SENTINEL_PI_DOCS/);
+  assert.match(result, /SENTINEL_AGENTS Available tools: Guidelines: Current date:/);
+  assert.match(result, /SENTINEL_CHILD_APPEND_ROLE_AND_CONFINEMENT/);
+  assert.doesNotMatch(result, /Batch-native tool usage:/);
   assert.match(result, /Use read_many with files/);
-  assert.match(result, /Batch-native tool usage:/);
-  assert.match(result, /Use search_many for discovery/);
-  assert.match(result, /Use read_many directly for known paths\/ranges/);
-  assert.match(result, /one search_many\.searches array/);
-  assert.match(result, /one read_many\.files array/);
-  assert.match(result, /Use edit_many for precise exact-text changes/);
-  assert.match(result, /use shell_start with commands/);
-  assert.match(result, /Start independent shell work together/);
-  assert.match(result, /Each shell_start command item must include its own command and cwd/);
-  assert.match(result, /fixed 6s grace period/);
-  assert.match(result, /Leave per-command notifyOnExit at its true default/);
-  assert.match(result, /completion notices are batched into history\/TUI and then Pi resumes once for the flushed batch/);
-  assert.match(result, /Async-shell completion notices and shell_start results are short status\/log-path summaries/);
-  assert.match(result, /shell_read mode='tail' for recent output/);
-  assert.match(result, /shell_read mode='range' for exact line ranges/);
-  assert.match(result, /search_many\/read_many on stdout_log or stderr_log paths/);
-  assert.match(result, /For online research, use searxng_search for discovery/);
-  assert.match(result, /use document_parse on downloadedPath\/path/);
-  assert.match(result, /Do not paste raw shell output unless explicitly requested/);
   assert.match(result, /<name>pi-agent<\/name>/);
   assert.match(result, /Use for Pi &lt;agent&gt; &amp; config/);
-  assert.ok(result.indexOf("<available_skills>") < result.indexOf("Current date:"));
+});
+
+test("native tool policy reconciles before prompt construction and blocks stock tool execution", () => {
+  const api = createFakeApi(
+    ["read", "bash", "edit", "write", "searxng_search"],
+    ["read", "bash", "edit", "write", "searxng_search", "read_many", "search_many", "write_many", "edit_many", "web_fetch_many", "shell_start", "shell_status", "shell_read", "shell_cancel"]
+  );
+  nativeToolsExtension(api);
+
+  const input = required(api.handlers.get("input")?.[0], "input policy handler");
+  input({ type: "input", text: "hello", source: "interactive" }, createContext("/repo"));
+  assert.deepEqual(api.getActiveTools(), [
+    "searxng_search",
+    "read_many",
+    "search_many",
+    "write_many",
+    "edit_many",
+    "web_fetch_many",
+    "shell_start",
+    "shell_status",
+    "shell_read",
+    "shell_cancel"
+  ]);
+
+  const guard = required(api.handlers.get("tool_call")?.[0], "stock tool guard");
+  for (const toolName of ["bash", "read", "write", "edit"]) {
+    const result = guard({ type: "tool_call", toolName, toolCallId: "tc1", input: {} }, createContext("/repo"));
+    assert.equal(result.block, true);
+    assert.match(result.reason, new RegExp(`stock ${toolName} tool is disabled`));
+  }
+  assert.equal(guard({ type: "tool_call", toolName: "read_many", toolCallId: "tc2", input: {} }, createContext("/repo")), undefined);
 });

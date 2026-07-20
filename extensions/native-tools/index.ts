@@ -327,7 +327,8 @@ export default function nativeToolsExtension(api: ExtensionAPI): void {
   registerBatchTools(api);
   registerNativeToolsStatusCommand(api);
   registerDefaultToolPolicy(api);
-  registerPromptSlimmer(api);
+  registerStockToolGuard(api);
+  registerPromptAdapter(api);
 }
 
 function registerDisabledBashTool(api: ExtensionAPI): void {
@@ -353,6 +354,13 @@ function registerBatchTools(api: ExtensionAPI): void {
       "Each item accepts { path, offset?, limit? }. Omit limit when full remaining file contents are actually needed. Output is grouped by file. Result details shape: { files: [{ path, resolvedPath, offset, requestedLimit?, truncation: { truncated, truncatedBy, totalLines, outputLines, totalBytes, outputBytes, nextOffset? } }] }.",
       "Use offset as a 1-indexed starting line and limit as the maximum lines for that file. For huge files, continue with the returned nextOffset."
     ].join(" "),
+    promptSnippet: "Read known text file paths and ranges in one batched files:[...] call; returns grouped content and continuation offsets.",
+    promptGuidelines: [
+      "read_many use: Use read_many for known text file paths or ranges; use search_many first for repository, file, symbol, definition, reference, call-site, or likely edit-location discovery.",
+      "read_many input: Pass { files: [{ path, offset?, limit? }] }, including for one file. Batch independent known files/ranges together. Offsets are 1-indexed; omit limit only when the complete remainder is actually needed.",
+      "read_many output: Model-visible results group content by file, identify returned and total line ranges, and provide nextOffset when truncated; continue huge files with that offset.",
+      "read_many constraints: Do not speculatively scan or load many large files, and do not make serial single-file read_many calls when one batched call can cover independent reads."
+    ],
     parameters: ReadManyParams,
     executionMode: "parallel",
     renderShell: "self",
@@ -376,6 +384,13 @@ function registerBatchTools(api: ExtensionAPI): void {
       "Examples: { kind: 'files', path: '.', glob: '*.ts', maxResults: 200 }; { kind: 'content', pattern: 'evaluateAsyncShellStart', path: 'extensions', glob: '*.ts', context: 2, maxResults: 80 }.",
       "Result details shape: { searches: [{ kind, path, resolvedPath, pattern?, glob?, context, maxResults, outputLines, truncated, exitCode, signal? }] }. After search_many identifies specific paths and line ranges, use read_many with offset/limit to inspect only the needed regions."
     ].join(" "),
+    promptSnippet: "Discover files and search repository content with one batched searches:[...] ripgrep call; returns grouped matches and truncation notices.",
+    promptGuidelines: [
+      "search_many use: Prefer search_many before read_many when discovering files, symbols, definitions, references, call sites, or likely edit locations; inspect the narrowed known paths/ranges with read_many afterward.",
+      "search_many input: Pass { searches: [...] }, including for one search, and batch independent searches. Use kind='files' for rg --files discovery and kind='content' with a required pattern for line/column text matches; path defaults to '.'.",
+      "search_many output: Model-visible results are grouped per search with matching lines plus explicit truncation notices; narrow the query or raise maxResults up to 1000 before reading identified paths/ranges.",
+      "search_many constraints: Use structured search_many for normal discovery instead of serial shell searches; use shell_start only when custom rg/find/git-grep inspection is actually needed."
+    ],
     parameters: SearchManyParams,
     executionMode: "parallel",
     renderShell: "self",
@@ -398,6 +413,13 @@ function registerBatchTools(api: ExtensionAPI): void {
       "Each item accepts { path, content }. Parent directories are created. Do not use this for small edits to existing files; use edit_many.",
       "Result details shape: { files: [{ id, scopedId?, path, resolvedPath, bytes, lines }] }, where id is a short content-derived mutation entry id."
     ].join(" "),
+    promptSnippet: "Create or completely overwrite files with one batched writes:[...] call; returns mutation ids, paths, byte counts, and line counts.",
+    promptGuidelines: [
+      "write_many use: Use write_many for new files or intentional complete-file overwrites; use edit_many for small or precise changes to existing files.",
+      "write_many input: Pass { writes: [{ path, content }] }, including for one file, and batch independent complete-file writes. content is the entire resulting file and parent directories are created.",
+      "write_many output: Model-visible results identify each mutation id and written path with byte/line counts; partial mutation-review blocks include the pending review id and exact apply/revise guidance.",
+      "write_many constraints: Do not use write_many for a small edit to an existing file, and do not repeat a blocked large mutation when apply_reviewed_mutation can use its pending id."
+    ],
     parameters: WriteManyParams,
     executionMode: "parallel",
     renderShell: "self",
@@ -420,6 +442,13 @@ function registerBatchTools(api: ExtensionAPI): void {
       "Each file item accepts { path, edits: [{ oldText, newText }] }. Every oldText must occur exactly once in that file's original content; replacements in the same file must not overlap.",
       "Use for precise changes across files. Result details shape: { files: [{ id, scopedId?, path, resolvedPath, replacements, ranges: [{ startLine, endLine }], bytesBefore, bytesAfter }] }, where id is a short content-derived mutation entry id."
     ].join(" "),
+    promptSnippet: "Apply exact text replacements across existing files with one batched files:[...] call; returns mutation ids, paths, replacement counts, and ranges.",
+    promptGuidelines: [
+      "edit_many use: Use edit_many for precise exact-text changes to existing files; use write_many only for new files or complete overwrites.",
+      "edit_many input: Pass { files: [{ path, edits: [{ oldText, newText }] }] }, including for one file. Batch independent files; each oldText must occur exactly once in the original file and same-file replacements must not overlap.",
+      "edit_many output: Model-visible results identify each mutation id and updated path with replacement counts/ranges; partial mutation-review blocks include the pending review id and exact apply/revise guidance.",
+      "edit_many constraints: Keep replacements exact and non-overlapping, and do not repeat a blocked large mutation when apply_reviewed_mutation can use its pending id."
+    ],
     parameters: EditManyParams,
     executionMode: "parallel",
     renderShell: "self",
@@ -458,12 +487,38 @@ function registerDefaultToolPolicy(api: ExtensionAPI): void {
   api.on("session_tree", (_event, context) => {
     enforceDefaultTools(api, { strict: true, notifyWhenChanged: true, context });
   });
+
+  // input runs before Pi expands skills/templates and snapshots the base prompt.
+  // Reconcile here so selectedTools, snippets, guidelines, and provider tools agree
+  // for the same turn rather than mutating the tool set in before_agent_start.
+  api.on("input", (_event, context) => {
+    enforceDefaultTools(api, { strict: true, notifyWhenChanged: true, context });
+  });
 }
 
-function registerPromptSlimmer(api: ExtensionAPI): void {
-  api.on("before_agent_start", (event, context) => {
-    enforceDefaultTools(api, { strict: true, notifyWhenChanged: true, context });
-    return { systemPrompt: buildNativeToolsSystemPrompt(event.systemPrompt, event.systemPromptOptions.skills ?? []) };
+function registerStockToolGuard(api: ExtensionAPI): void {
+  const replacements: Record<string, string> = {
+    bash: "shell_start",
+    read: "search_many or read_many",
+    write: "write_many",
+    edit: "edit_many"
+  };
+  api.on("tool_call", (event) => {
+    const replacement = replacements[event.toolName];
+    if (replacement === undefined) {
+      return undefined;
+    }
+    return {
+      block: true,
+      reason: `The stock ${event.toolName} tool is disabled in this setup. Use ${replacement} instead.`
+    };
+  });
+}
+
+function registerPromptAdapter(api: ExtensionAPI): void {
+  api.on("before_agent_start", (event) => {
+    const systemPrompt = buildNativeToolsSystemPrompt(event.systemPrompt, event.systemPromptOptions.skills ?? []);
+    return systemPrompt === event.systemPrompt ? undefined : { systemPrompt };
   });
 }
 
@@ -581,44 +636,7 @@ function formatToolList(toolNames: string[]): string {
 }
 
 export function buildNativeToolsSystemPrompt(prompt: string, skills: Skill[]): string {
-  return addSkillsForReadMany(addBatchNativeToolGuidance(stripDefaultToolSections(prompt)), skills);
-}
-
-export function addBatchNativeToolGuidance(prompt: string): string {
-  const guidance = [
-    "",
-    "Batch-native tool usage:",
-    "- Use search_many for discovery: files, symbols, definitions, references, call sites, or likely edit locations. Use read_many directly for known paths/ranges. Put independent searches into one search_many.searches array.",
-    "- When several known files or ranges are needed, read them in one read_many.files array instead of serial read calls.",
-    "- Use edit_many for precise exact-text changes to existing files. Use write_many for new files or complete overwrites, not small edits.",
-    "- For shell work, use shell_start with commands: [...]. Start independent shell work together in one commands list instead of making serial shell_start calls; split only when commands depend on previous output, must run in order, or are not safe to run concurrently. Each shell_start command item must include its own command and cwd.",
-    "- shell_start briefly waits only for quick commands using a fixed 6s grace period. There is no wait parameter; unfinished jobs continue in the background and append per-job completion notices by default.",
-    "- While shell commands run in the background, do other useful work. Leave per-command notifyOnExit at its true default when you want a completion notice. Set notifyOnExit:false only when the result is unimportant. Do not poll or wait; completion notices are batched into history/TUI and then Pi resumes once for the flushed batch.",
-    "- Async-shell completion notices and shell_start results are short status/log-path summaries. Use shell_read mode='tail' for recent output, shell_read mode='range' for exact line ranges/nextOffset continuation, and search_many/read_many on stdout_log or stderr_log paths for targeted log inspection. Do not paste raw shell output unless explicitly requested.",
-    "- Use shell_status for inspection, shell_read for output (tail mode for recent output; range mode for exact lines), and shell_cancel to stop jobs.",
-    "- For online research, use searxng_search for discovery, then web_fetch_many for promising sources; read web_fetch_many textPath results with read_many when previews are insufficient.",
-    "- For fetched PDFs, Office documents, spreadsheets, images, or other local documents, use document_parse on downloadedPath/path, then read_many on outputPath when full parsed content is needed.",
-    "- Do not perform a sequence of single-item search_many/read_many/shell_start calls when one multi-item tool call can cover the independent work.",
-    ""
-  ].join("\n");
-
-  const projectMarker = "\n# Project Context";
-  const projectIndex = prompt.indexOf(projectMarker);
-  if (projectIndex === -1) {
-    return `${prompt}${guidance}`;
-  }
-
-  return `${prompt.slice(0, projectIndex)}${guidance}${prompt.slice(projectIndex)}`;
-}
-
-export function stripDefaultToolSections(prompt: string): string {
-  return prompt
-    .replace(/\n?Available tools:\n[\s\S]*?\n\nIn addition to the tools above, you may have access to other custom tools depending on the project\.\n\n/g, "\n\n")
-    .replace(/\n?Guidelines:\n[\s\S]*?\n\nPi documentation/g, "\n\nPi documentation")
-    .replace(/\n?Pi documentation \(read only when[\s\S]*?\n\n(?=# Project Context|The following skills|Current date:)/g, "\n\n")
-    .replace(/\n\nThe following skills provide specialized instructions[\s\S]*?<\/available_skills>/g, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trimStart();
+  return addSkillsForReadMany(prompt, skills);
 }
 
 function addSkillsForReadMany(prompt: string, skills: Skill[]): string {
@@ -627,13 +645,7 @@ function addSkillsForReadMany(prompt: string, skills: Skill[]): string {
     return prompt;
   }
 
-  const dateMarker = "\nCurrent date:";
-  const dateIndex = prompt.lastIndexOf(dateMarker);
-  if (dateIndex === -1) {
-    return `${prompt}${skillsPrompt}`;
-  }
-
-  return `${prompt.slice(0, dateIndex)}${skillsPrompt}${prompt.slice(dateIndex)}`;
+  return `${prompt}${skillsPrompt}`;
 }
 
 export function formatSkillsForReadManyPrompt(skills: Skill[]): string {

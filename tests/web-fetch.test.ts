@@ -195,8 +195,15 @@ test("web_fetch_many registers compact Pi renderers and status command", () => {
   assert.equal(typeof tool.renderCall, "function");
   assert.equal(typeof tool.renderResult, "function");
   assert.equal(tool.renderShell, "self");
-  assert.match(tool.promptSnippet ?? "", /^Fetch URLs/);
-  assert.match(tool.promptGuidelines?.join("\n") ?? "", /After web_fetch_many fetches HTML/);
+  assert.match(tool.promptSnippet ?? "", /^Fetch and cache one or more urls/);
+  assert.deepEqual(tool.promptGuidelines?.map((line) => line.split(":", 1)[0]), [
+    "web_fetch_many use",
+    "web_fetch_many input",
+    "web_fetch_many output",
+    "web_fetch_many constraints"
+  ]);
+  assert.match(tool.promptGuidelines?.join("\n") ?? "", /textPath/);
+  assert.match(tool.promptGuidelines?.join("\n") ?? "", /downloadedPath/);
   assert.match(JSON.stringify(tool.parameters), /auto extracts readable HTML/);
 
   const callText = tool.renderCall?.({

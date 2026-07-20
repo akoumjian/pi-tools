@@ -153,6 +153,14 @@ test("mutation review extension registers a tool_call hook and cached apply surf
   mutationReviewExtension(api);
   assert.equal(api.handlers.get("tool_call")?.length, 1);
   assert.ok(api.tools.has("apply_reviewed_mutation"));
+  const applyTool = api.tools.get("apply_reviewed_mutation")!;
+  assert.deepEqual(applyTool.promptGuidelines?.map((line) => line.split(":", 1)[0]), [
+    "apply_reviewed_mutation use",
+    "apply_reviewed_mutation input",
+    "apply_reviewed_mutation output",
+    "apply_reviewed_mutation constraints"
+  ]);
+  assert.match(applyTool.description, /Model-visible success output/);
   assert.ok(api.commands.has("mutation:apply"));
   assert.ok(api.commands.has("mutation:setup"));
   assert.ok(api.commands.has("mutation:status"));

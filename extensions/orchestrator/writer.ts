@@ -11,6 +11,8 @@ import {
   type ManagedWorktree
 } from "./worktree.js";
 
+export type AsyncTaskGate = <T>(run: () => Promise<T>) => Promise<T>;
+
 export type WriterTaskInput = {
   parentCwd: string;
   runId: string;
@@ -22,6 +24,7 @@ export type WriterTaskInput = {
   shellTools: string[];
   guidance?: string;
   maxOutputChars: number;
+  setupGate?: AsyncTaskGate;
   signal?: AbortSignal;
 };
 
@@ -42,11 +45,12 @@ export async function runWriterTask(
   context: Pick<ExtensionContext, "modelRegistry" | "ui">,
   input: WriterTaskInput
 ): Promise<WriterTaskOutcome> {
-  const worktree = await createManagedWorktree({
+  const create = () => createManagedWorktree({
     cwd: input.parentCwd,
     runId: input.runId,
     taskId: input.taskId
   });
+  const worktree = input.setupGate ? await input.setupGate(create) : await create();
 
   const confinementDenials: string[] = [];
   let result: SpawnOrchestratedAgentResult;
@@ -88,6 +92,21 @@ export async function runWriterTask(
       path: worktree.path,
       baseCommit: worktree.baseCommit,
       action: finalized.action
+    }
+  };
+}
+
+export function createSerialTaskGate(): AsyncTaskGate {
+  let tail: Promise<void> = Promise.resolve();
+  return async <T>(run: () => Promise<T>): Promise<T> => {
+    const previous = tail;
+    let release!: () => void;
+    tail = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      return await run();
+    } finally {
+      release();
     }
   };
 }

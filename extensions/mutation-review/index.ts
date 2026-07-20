@@ -304,10 +304,13 @@ function registerApplyReviewedMutationTool(api: ExtensionAPI): void {
   api.registerTool(defineTool({
     name: APPLY_REVIEWED_MUTATION_TOOL_NAME,
     label: "Apply Reviewed Mutation",
-    description: "Apply a previously blocked mutation-review edit/write by id after validating the files still match their before-review hashes.",
-    promptSnippet: "Apply a blocked mutation-review edit/write by id after hash validation.",
+    description: "Apply a previously blocked mutation-review edit/write by pending id after validating every target still matches its reviewed before-file hash. Model-visible success output identifies the review id and each applied mutation id/path/kind/byte count; internal details include id, fingerprint, original toolName/toolCallId, and files. Missing, stale, or changed-state ids fail without writing and explain the mismatch.",
+    promptSnippet: "Apply the exact cached mutation from a prior mutation-review block by pending id after before-hash validation; returns applied mutation ids and paths.",
     promptGuidelines: [
-      `Use ${APPLY_REVIEWED_MUTATION_TOOL_NAME} only when mutation-review blocked an edit/write and you decide to apply that exact original mutation. Pass the id from the block message.`
+      `apply_reviewed_mutation use: Use ${APPLY_REVIEWED_MUTATION_TOOL_NAME} only when mutation-review blocked an exact edit/write and you intentionally choose to apply that cached original mutation without repeating its large arguments.`,
+      "apply_reviewed_mutation input: Pass { id } using the pending mr_* id printed in the block result; do not pass a mutation entry m_* id or invent an id.",
+      "apply_reviewed_mutation output: Success identifies the reviewed id and every applied mutation id/path/kind/byte count; missing, stale, or before-hash-mismatched ids fail visibly without writing.",
+      "apply_reviewed_mutation constraints: To change course, reuse existing code or submit revised edit/write arguments for a new review; never use this tool for an unrelated mutation."
     ],
     parameters: ApplyReviewedMutationParams,
     executionMode: "sequential",

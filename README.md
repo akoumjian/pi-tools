@@ -5,10 +5,10 @@ Reusable extensions for the [Pi coding agent](https://pi.dev/). The package focu
 - async shell jobs with batched completion notices
 - batch-native file and search tools that replace stock single-file/shell tools
 - safety review hooks (rule + model + human) and a mutation-review reviewer
-- Hunk-backed live diff tracking, side-by-side launch commands, and review skills
 - web research (SearXNG, web fetch with readability + document parse handoff)
 - robust chunked context compaction via `/compacter`
 - a `/review` subagent workflow
+- bounded reader/planner/writer orchestration with isolated worktrees and deterministic reconciliation
 - TUI niceties: tmux/scrollback compatibility, theme preview, compact tool renderers, file-reference picker
 
 Profile-specific assets (personal AGENTS context, auth, model defaults, themes) live in a separate consumer package or local Pi profile, not in this repository.
@@ -47,6 +47,7 @@ Do not use `npm install @akoumjian/pi-tools@<git+ssh url>`: that form rewrites `
 - [`docs/README.md`](docs/README.md) is the index for deep-dive per-extension documentation.
 - Each extension has its own file under `docs/extensions/`. Use those when you need exact tool schemas, behaviors, caps, result shapes, or rendering details.
 - The sections below in this README are short overviews and pointers; the doc files are the source of truth for details.
+- Run `npm run review:provider-context` to regenerate sanitized review artifacts under `docs/generated/provider-context-review/`. They show the rendered Pi system prompt, each active tool's description/input schema/snippet/guidelines, an explicit reviewed-or-not-applicable audit for host tool fields, success/progress/error/content/details result contracts, exact OpenAI Codex Responses and Anthropic Messages request payloads captured before network I/O, and provider-visible tool-result content versus internal-only details.
 
 ## Quick reference
 
@@ -58,7 +59,8 @@ Tools (LLM-callable):
 - `searxng_search` — search through a configured SearXNG instance
 - `web_fetch_many` — fetch + cache + readability-extract URLs, hand off non-HTML to `document_parse`
 - `document_parse` — parse PDFs, Office files, spreadsheets, images via LiteParse (opt-in display wrapper)
-- `hunk_session` — get/create this Pi session's repo-wide Hunk session, optionally opening the user-visible diff window and focusing a file/hunk
+- `orchestrate` — run bounded reader/planner tasks and provider-aware confined writer tasks with explicit fallback/review attempts
+- `reconcile` — deterministically fold reviewed `orch/*` branches and ask once before merging into the clean parent
 
 Commands:
 
@@ -68,15 +70,15 @@ Commands:
 - `/native:status`
 - `/compacter [--model provider/model] [instructions]`, `/compacter status|on|off|toggle`
 - `/mutation:setup`, `/mutation:status`, `/mutation:model`, `/mutation:toggle`, `/mutation:apply`
-- `/hunk:setup`, `/hunk:doctor`, `/hunk:status`, `/hunk:switch`, `/hunk:open`, `/hunk:close`, `/hunk:follow`, `/hunk:guidance`, `/hunk:focus`
 - `/searxng:setup`, `/searxng:status`
 - `/fetch:status`
 - `/file:open`
 - `/themes:preview [theme-name]`
 - `/review`, `/review:setup`, `/review:status`, `/review:cancel`, `/review:send-last`
 - `/docparser:doctor`
+- `/orchestrator:setup`, `/orchestrator:status`
 
-The load order in `package.json#pi.extensions` is intentional: terminal patches first, safety before async shell, native batch tools before compacter/mutation-review/hunk-review tracking, optional display overrides last.
+The load order in `package.json#pi.extensions` is intentional: terminal patches first, safety before async shell, native batch tools before compacter/mutation-review, optional display overrides last.
 
 ## Extensions
 
@@ -162,18 +164,6 @@ Each extension below documents what it does, what it provides, and how to set it
 
 ---
 
-### hunk-review
-
-[Full docs](docs/extensions/hunk-review.md).
-
-**Purpose.** Track successful file mutations by repo and control a Hunk side-by-side diff surface without suspending Pi. Supports agent-readable Hunk session ids scoped to the current Pi session, user-visible Hunk windows, Hunk setup diagnostics, active repo switching, `/hunk:open`/`/hunk:close`, debounced follow navigation, and focused navigation.
-
-**Provides.** `hunk_session`; `/hunk:setup`, `/hunk:doctor`, `/hunk:status`, `/hunk:switch`, `/hunk:open`, `/hunk:close`, `/hunk:follow`, `/hunk:guidance`, `/hunk:focus`; Hunk skill [`skills/hunk-review/SKILL.md`](skills/hunk-review/SKILL.md).
-
-**Setup.** Install Hunk separately (`npm i -g hunkdiff` or `brew install modem-dev/tap/hunk`), then run `/hunk:doctor`. Optional personal review guidance lives in [`config/hunk-review-guidance.md`](config/hunk-review-guidance.md) and can be installed with `/hunk:guidance install`. The first non-suspending launcher target is iTerm2; user-facing `/hunk:open` can fall back to a manual command when iTerm2 is not detectable.
-
----
-
 ### searxng-search
 
 [Full docs](docs/extensions/searxng-search.md).
@@ -234,6 +224,18 @@ Each extension below documents what it does, what it provides, and how to set it
 
 ---
 
+### orchestrator
+
+[Full docs](docs/extensions/orchestrator.md).
+
+**Purpose.** Delegate focused readers/planners and confined writers to isolated in-process sessions. Readers use bounded parallelism; writers use bounded provider-aware concurrency while git setup/reconciliation remain serial. Explicit fallback routes, independent reviewer attempts, worktree branches, commits, files, errors, and next actions are returned model-visibly.
+
+**Provides.** `orchestrate`, `reconcile`; `/orchestrator:setup`, `/orchestrator:status`; managed `orch/*` worktrees, distinct-provider review, deterministic fold validation, and a final human merge gate.
+
+**Setup.** Run `/orchestrator:setup --worker provider/model[:thinking] --reviewer other-provider/model[:thinking]` once per machine. `/orchestrator:status` shows routes, concurrency caps, fallback policy, tools, guidance, and validation.
+
+---
+
 ### tool-display
 
 [Full docs](docs/extensions/tool-display.md).
@@ -253,6 +255,7 @@ Reusable defaults live under `config/`:
 - `tool-safety-settings.json` → `tool-safety-policy.md`
 - `mutation-review-settings.json` → `mutation-review-guidance.md`
 - `review-subagent-settings.json` → `review-subagent-guidance.md`
+- `orchestrator-settings.json`
 - `tool-display-settings.json`
 - `file-open-settings.json`
 - `searxng.env.example`

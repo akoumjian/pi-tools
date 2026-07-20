@@ -79,8 +79,14 @@ test("document_parse display override is available as an explicit opt-in", () =>
   assert.equal(tool.renderShell, "self");
   assert.equal(typeof tool.renderCall, "function");
   assert.equal(typeof tool.renderResult, "function");
-  assert.match(tool.promptGuidelines?.join("\n") ?? "", /document_parse/);
+  assert.deepEqual(tool.promptGuidelines?.map((line) => line.split(":", 1)[0]), [
+    "document_parse use",
+    "document_parse input",
+    "document_parse output",
+    "document_parse constraints"
+  ]);
   assert.match(tool.promptGuidelines?.join("\n") ?? "", /read_many/);
+  assert.match(tool.promptGuidelines?.join("\n") ?? "", /outputPath/);
   assert.match(tool.promptGuidelines?.join("\n") ?? "", /\/docparser:doctor/);
   assert.doesNotMatch(tool.promptGuidelines?.join("\n") ?? "", /this tool/i);
 

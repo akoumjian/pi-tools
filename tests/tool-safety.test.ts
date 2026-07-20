@@ -731,25 +731,6 @@ test("document_parse is treated as project-local read access", () => {
   assert.equal(decision.ruleId, "read-only-path");
 });
 
-test("Hunk session tool is allowed as an extension-managed local UI/session operation", async () => {
-  const api = createToolSafetyApi();
-  const root = await mkdtemp(path.join(tmpdir(), "pi-tool-safety-hunk-open-"));
-  toolSafetyExtension(api);
-  const handler = api.handlers.get("tool_call")?.at(0);
-  assert.ok(handler);
-
-  try {
-    const result: unknown = await handler(
-      toolCall("hunk_session", { repo: ".", launcher: "auto" }),
-      context(root)
-    );
-
-    assert.equal(result, undefined);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
 test("tool-safety setup writes approval model config and natural-language policy guidance", async () => {
   setRuntimeApprovalModelPreference(undefined);
   setRuntimeToolSafetyEnabled(true);

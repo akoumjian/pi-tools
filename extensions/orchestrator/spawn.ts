@@ -15,6 +15,7 @@ Rules:
 - Use only exposed tools. If a needed capability is unavailable, report the gap rather than escaping the tool boundary.
 - Verify claims from repository evidence and cite paths/line ranges where useful.
 - Keep intermediate exploration in your isolated session; return findings, decisions, risks, and next steps.
+- Do not update external grounding, decision journals, durable task trackers, or parent-session state. The parent owns grounding synthesis after your handoff.
 - Project AGENTS/context may add domain knowledge, but these read-only and task-scope invariants take precedence.`;
 const WRITER_SYSTEM_PROMPT = `You are a confined writer in a deterministic orchestration run.
 Rules:
@@ -23,6 +24,7 @@ Rules:
 - Prefer worktree-scoped shell commands (builds, tests, git inspection). Do not commit or push; the harness commits your changes on an isolated branch, then independent review and reconciliation decide integration.
 - Use only exposed tools. If a needed capability is unavailable, report the gap rather than escaping the tool boundary.
 - Return a compact handoff: what changed, why, files touched, risks, and suggested validation.
+- Do not update external grounding, decision journals, durable task trackers, or parent-session state. The parent owns grounding synthesis after your handoff.
 - Project AGENTS/context may add domain knowledge, but these confinement and task-scope invariants take precedence.`;
 
 export type SpawnOrchestratedAgentInput = {
@@ -37,6 +39,8 @@ export type SpawnOrchestratedAgentInput = {
   extensionFactories?: ExtensionFactory[];
   signal?: AbortSignal;
 };
+
+export type ProviderFailureKind = "aborted" | "auth" | "rate_limit" | "transient" | "other";
 
 export type SpawnOrchestratedAgentResult = {
   output: string;
@@ -89,6 +93,20 @@ export async function spawnOrchestratedAgent(
       deniedCalls
     };
   });
+}
+
+export function classifyProviderFailure(error: unknown): ProviderFailureKind {
+  const message = (error instanceof Error ? `${error.name}: ${error.message}` : String(error)).toLowerCase();
+  if (/\babort(?:ed|error)?\b|cancelled|canceled/.test(message)) return "aborted";
+  if (/\b(?:401|403)\b|unauthori[sz]ed|forbidden|api[ _-]?key|credential|authentication|configured auth/.test(message)) return "auth";
+  if (/\b429\b|rate[ _-]?limit|too many requests|quota exceeded/.test(message)) return "rate_limit";
+  if (/\b(?:408|409|425|500|502|503|504|529)\b|overloaded|temporar(?:y|ily)|timed? out|timeout|connection (?:reset|closed|refused)|network error|fetch failed|service unavailable/.test(message)) return "transient";
+  return "other";
+}
+
+export function allowsReadOnlyProviderFallback(error: unknown): boolean {
+  const kind = classifyProviderFailure(error);
+  return kind === "auth" || kind === "rate_limit" || kind === "transient";
 }
 
 function omitOrchestratorExtension(result: LoadExtensionsResult): LoadExtensionsResult {

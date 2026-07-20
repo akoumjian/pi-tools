@@ -59,8 +59,14 @@ test("searxng extension registers search tool and status command", () => {
 
   const tool = required(api.registeredTools.find((registeredTool) => registeredTool.name === "searxng_search"), "searxng_search tool");
   assert.match(tool.description, /if it is unconfigured or unreachable/);
-  assert.match(tool.promptSnippet ?? "", /^Search the configured SearXNG instance/);
-  assert.match(tool.promptGuidelines?.join("\n") ?? "", /Use searxng_search for web discovery before web_fetch_many/);
+  assert.match(tool.promptSnippet ?? "", /^Discover current web sources/);
+  assert.deepEqual(tool.promptGuidelines?.map((line) => line.split(":", 1)[0]), [
+    "searxng_search use",
+    "searxng_search input",
+    "searxng_search output",
+    "searxng_search constraints"
+  ]);
+  assert.match(tool.promptGuidelines?.join("\n") ?? "", /before web_fetch_many/);
   const schemaText = JSON.stringify(tool.parameters);
   assert.match(schemaText, /Maximum number of search results/);
   assert.match(schemaText, /Optional freshness filter/);

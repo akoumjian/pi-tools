@@ -2,15 +2,15 @@
 
 ## Purpose
 
-Run bounded, model-routed subagents in fresh in-process Pi sessions, keeping their intermediate context out of the parent session. The orchestrating agent may choose the provider/model and thinking level for each task. Harness code enforces task caps, tool allowlists, and reviewer-provider independence.
+Run bounded, model-routed subagents in fresh in-process Pi sessions, keeping their intermediate context out of the parent session. The orchestrating agent may choose a primary provider/model, explicit ordered fallbacks, and thinking level for each task. Harness code enforces task caps, tool allowlists, provider-aware writer concurrency, and reviewer-provider independence.
 
-Roles are `reader`/`planner` (read-only, parallel) and `writer` (serialized, confined to per-task managed git worktree branches with independent cross-provider review). Integration happens only through the `reconcile` tool's human confirmation gate. There are no enable/disable behavior flags: safety comes from tool-safety review at the call boundary, worktree confinement, mandatory distinct-provider review, and the merge gate.
+Roles are `reader`/`planner` (read-only, parallel) and `writer` (bounded parallel execution, confined to per-task managed git worktree branches with independent cross-provider review). Writer git setup and all reconciliation remain serialized. Integration happens only through the `reconcile` tool's human confirmation gate. There are no enable/disable behavior flags: safety comes from tool-safety review at the call boundary, worktree confinement, mandatory distinct-provider review, and the merge gate.
 
 ## Provides
 
 LLM-callable tool:
 
-- `orchestrate` — run one or more independent child tasks: readers/planners with bounded concurrency, writers serialized in confined worktrees.
+- `orchestrate` — run one or more independent child tasks: readers/planners with bounded concurrency and provider-aware bounded writers in confined worktrees.
 - `reconcile` — deterministically fold kept `orch/*` writer branches into one integration branch and merge it into the current branch behind a single human confirmation.
 
 Commands:
@@ -28,23 +28,33 @@ The extension is registered in `package.json#pi.extensions`; `scripts/orchestrat
     id?: string;
     task: string;
     role?: "reader" | "planner" | "writer"; // default reader
-    model?: string;               // provider/model override
+    model?: string;               // primary provider/model override
+    fallbackModels?: string[];    // up to 4 explicit provider/model[:thinking] routes
     thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
   }>;
 }
 ```
 
-Caps come from `orchestrator-settings.json`; package defaults are 8 tasks, 4 concurrent, and 50,000 returned characters per child. Optional `validation: { command, args, timeoutMs, maxRunsPerTask }` is reserved for reconcile fold-time validation.
+Caps come from `orchestrator-settings.json`; package defaults are 8 tasks, 4 concurrent readers/planners, 2 concurrent writers globally, 1 concurrent writer per provider, and 50,000 returned characters per child. Optional `validation: { command, args, timeoutMs, maxRunsPerTask }` is reserved for reconcile fold-time validation.
 
 ## Model routing
 
 Resolution order is:
 
-1. per-task `model` / `thinkingLevel` chosen by the parent orchestrator;
-2. configured role model;
-3. current parent model when the role has no configured route.
+1. per-task primary `model` / `thinkingLevel` chosen by the parent orchestrator;
+2. configured role model when no per-task primary is supplied;
+3. current parent model when the role has no configured route;
+4. only the explicit ordered per-task `fallbackModels` supplied by the parent.
 
-`reader` falls back to the configured worker. `planner` falls back to the current parent model. `writer` always routes to the configured worker unless overridden per task. Reviewer models are configured as a pool, and runtime selection must choose a provider different from the implementation provider. Setup rejects reviewer entries using the configured worker provider.
+`reader` uses the configured reader or worker route. `planner` uses its configured route or the current parent model. `writer` uses the configured worker unless overridden. Missing models and missing auth are rejected during preflight and reported in `routeAttempts`. A read-only task advances to its next usable explicit fallback only after auth, rate-limit/429, or transient provider failure; aborts and task/tool errors do not trigger cross-provider replay. A writer may select a fallback during preflight, including when the primary has no independent reviewer, but never replays on another model after its worktree session has started.
+
+Reviewer models are an explicit pool. Every candidate must use a provider different from the implementation provider. Runtime review advances to the next usable pool entry after a provider failure or unparseable verdict; every rejected/failed/completed attempt is reported. Setup rejects reviewer entries using the configured worker provider.
+
+## Result contracts
+
+`orchestrate` model-visible text always reports the success count and one section per task. Each section includes the stable id/role, status or actionable error, every model route (`rejected`/`failed`/`completed`, failure classification, and reason), resolved model/thinking, duration/tool-call count, denied calls, and child output. Writer sections additionally expose worktree branch/path/base, commit, changed files, cleanup disposition, and every reviewer route/error/final verdict. The same structured records are retained in internal `details`; callers must not rely on `details` because Pi does not send it to providers.
+
+`reconcile` model-visible text reports the integration branch/path, folded/skipped branches and reasons, changed-file overlaps, per-fold validation status, merge/decline outcome, merge commit, and cleanup. Internal `details` mirrors the report. Neither tool hides model-needed ids, paths, failures, or next actions in `details` alone.
 
 No public/package default assumes access to GPT-5.6, Opus, or Fable. Those are machine/profile choices installed by `/orchestrator:setup` into the normal pi-tools per-machine config directory.
 
@@ -65,7 +75,7 @@ Lookup uses the standard pi-tools precedence: `PI_TOOLS_CONFIG_DIR`, per-agent m
 
 Package defaults: [`config/orchestrator-settings.json`](../../config/orchestrator-settings.json). `/orchestrator:setup` writes a complete machine-local `orchestrator-settings.json`, preserving safety caps and writing optional guidance inline.
 
-The child system prompt contains the required orchestration/read-only invariants. The extension does **not** require global `AGENTS.md`. Project AGENTS/context may still provide domain knowledge, but cannot replace or loosen the extension-owned invariants. Use `--guidance` or `--guidance-file` for organization/machine-specific orchestration guidance.
+The child system prompt contains the required orchestration/read-only invariants. The extension does **not** require global `AGENTS.md`. Project AGENTS/context may still provide domain knowledge, but cannot replace or loosen the extension-owned invariants. The parent reads canonical grounding before delegation, passes task-relevant evidence, synthesizes child handoffs, and performs durable decisions/journal/task-tracker updates afterward; children are explicitly forbidden from external grounding writes. Use `--guidance` or `--guidance-file` for organization/machine-specific orchestration guidance.
 
 ## Child-session behavior
 
@@ -93,12 +103,14 @@ Children use the same async-shell tools as the main agent, governed by the same 
 
 Each writer task follows a deterministic harness pipeline:
 
-1. refuse when no configured reviewer has a provider distinct from the writer's model (before spending writer tokens);
-2. refuse when the parent checkout is dirty; create a locked managed worktree and `orch/<run>-<task>` branch under `.pi/orchestrator/worktrees/` (or `ORCHESTRATOR_WORKTREE_ROOT`);
+1. resolve the primary/explicit fallback route and refuse when no usable route has a configured reviewer whose provider differs from the writer (before spending writer tokens);
+2. through a serial setup gate, refuse when the parent checkout is dirty and create a locked managed worktree and `orch/<run>-<task>` branch under `.pi/orchestrator/worktrees/` (or `ORCHESTRATOR_WORKTREE_ROOT`);
 3. spawn the child with `cwd` set to the worktree plus an allowed-root confinement extension that blocks path traversal, symlink escapes, and unsupported tools for the file-tool surface, while configured shell tools pass through to tool-safety's judged policy;
 4. after the child finishes (or fails), the harness commits all changes on the task branch with an orchestrator identity;
 5. worktrees with no writes are removed together with their branch; worktrees with writes are kept and reported (`branch`, `path`, `commit`, changed files);
-6. every kept branch is independently reviewed: the harness computes the diff deterministically, selects a reviewer from the configured pool whose provider differs from the writer's actual model (refusing before the writer even spawns when impossible), and runs a read-only reviewer child inside the kept worktree. The reviewer must end with a `VERDICT: approve` or `VERDICT: request_changes` line, parsed deterministically; a missing verdict is recorded as `unparseable`, never as approval. Verdicts are report-only — nothing merges automatically.
+6. every kept branch is independently reviewed: the harness computes the diff deterministically, selects reviewers from the configured pool whose providers differ from the writer's actual model (refusing before the writer spawns when impossible), and runs a read-only reviewer child inside the kept worktree. Failure or an unparseable verdict advances to the next explicit reviewer. A reviewer must end with a `VERDICT: approve` or `VERDICT: request_changes` line, parsed deterministically; a missing verdict is never approval. Verdicts and all attempts are report-only — nothing merges automatically.
+
+Writer sessions are scheduled with `maxWriterConcurrency` globally and `maxWriterConcurrencyPerProvider` per provider. Package defaults (`2` and `1`) allow two providers to make progress concurrently without stacking writer traffic on one provider. Worktree creation itself is serialized; separate worktrees may then run, commit, finalize, and review independently.
 
 Writer children omit only the `mutation-review` extension: their branch can never reach the parent checkout without the fan-in gate, so the per-edit gate is replaced by worktree confinement plus deterministic commit/report. `tool-safety` stays loaded in every child as a uniform layer. False-positive escalations are managed through the shared judge policy ([`config/tool-safety-policy.md`](../../config/tool-safety-policy.md)), which treats workspace/worktree-scoped work — including credential-pattern paths — as allow-by-default and reserves review for destructive scope and shared/production effects. Anything the judge still escalates inside a child fails closed and is harness-recorded. Writer-shaped `orchestrate` calls remain excluded from the tool-safety auto-allow rule at the parent boundary.
 
@@ -109,7 +121,7 @@ The two invariants this design protects, and where each is enforced:
 | Invariant | Enforcement |
 | --- | --- |
 | No destructive actions without approval | The same tuned tool-safety policy runs in the parent and every child: destructive-scope commands route to the judge, and child escalations are denied fail-closed and recorded. Writer file tools are additionally hard-confined to a disposable worktree branch, and the harness itself never touches the parent checkout. |
-| No production-deployment changes without approval | Deploys, pushes, and cloud/infra mutations route to review under the shared policy in parent and children alike; child escalations are denied fail-closed. Nothing lands on a real branch without fan-in review and the (planned) human merge gate. |
+| No production-deployment changes without approval | Deploys, pushes, and cloud/infra mutations route to review under the shared policy in parent and children alike; child escalations are denied fail-closed. Nothing lands on a real branch without fan-in review and the reconcile tool's human merge gate. |
 
 Secrets-adjacent false positives that were previously escalated to a human are addressed in the judge policy itself, not by weakening enforcement: local, workspace/worktree-scoped credential-pattern access is allow-by-default, while off-machine exposure, destructive scope, and shared/production effects remain review cases. Escalations that still occur inside children fail closed and appear in `deniedCalls`.
 
@@ -120,7 +132,7 @@ Human yes/no interactions are handled deterministically at exactly one place per
 - **Parent boundary.** Read-only orchestrate shapes are auto-allowed by tool-safety; writer-shaped calls raise one human confirmation in the parent session. When no human is available (`pi -p`, batch), the confirmation fails and tool-safety denies — writers are fail-closed and interactive-only.
 - **Child sessions never prompt.** All child sessions (orchestrator, review-subagent, mutation-review) run with a fail-closed UI: `confirm` resolves to `false` and `select`/`input`/`editor` resolve to `undefined`, each with a parent warning notification. A child that trips a review rule (for example a reader touching a credential-looking path) fails fast with a reportable reason instead of stacking mid-run dialogs or hanging a non-interactive run.
 - **Denials are harness-recorded.** Every fail-closed interactive denial and every confinement block is collected deterministically and attached to the task result as `deniedCalls`, so refusals are always visible in the orchestrate output regardless of whether the child mentions them.
-- **Planned merge gate.** Once fan-in review and reconciliation are wired, the meaningful human decision moves to the integration→parent merge with the independent reviewer's verdict attached. Auto-allowing confined writer spawns will be reconsidered only at that point, as an explicit decision.
+- **Merge gate.** `reconcile` folds branches into an integration branch with overlap/probe/validation reporting, then asks once before the integration→parent merge. Declining keeps the integration branch for manual review.
 
 ## Safety and current limitations
 
@@ -131,7 +143,7 @@ Human yes/no interactions are handled deterministically at exactly one place per
 - The tool validates configured tool names before launching children.
 - Output is bounded before being returned to parent context.
 - Child extension loading omits the orchestrator itself, preventing recursive orchestration.
-- Independent fan-in review is wired and report-only: verdicts and findings attach to writer results; reconciliation and merging remain manual.
+- Independent fan-in review is report-only: verdicts, route attempts, and findings attach to writer results. Reconciliation is deterministic but still requires the in-tool human merge confirmation.
 
 See [`docs/plans/orchestrator.md`](../plans/orchestrator.md) for worktree, confinement, review, conflict-resolution, and promotion phases.
 

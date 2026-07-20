@@ -16,7 +16,7 @@ const SearchParams = Type.Object({
     Type.Literal("month"),
     Type.Literal("year")
   ], { description: "Optional freshness filter for SearXNG results." }))
-});
+}, { additionalProperties: false });
 
 type SearchInput = Static<typeof SearchParams>;
 
@@ -50,10 +50,13 @@ type SearxngEndpoint = {
 const searxngSearchTool = defineTool({
   name: "searxng_search",
   label: "SearXNG Search",
-  description: "Search the web through a configured self-hosted SearXNG instance. Use for web discovery when SearXNG is configured; if it is unconfigured or unreachable, report that /searxng:setup or SEARXNG_URL is needed.",
-  promptSnippet: "Search the configured SearXNG instance for web discovery.",
+  description: "Search the web through a configured self-hosted SearXNG instance. Use for web discovery when SearXNG is configured; if it is unconfigured or unreachable, report that /searxng:setup or SEARXNG_URL is needed. Input supports query, result count, one-indexed page, language, categories, and optional day/month/year freshness. Model-visible output lists ranked titles, URLs, snippets, engines, and scores; internal details record query, resultCount, page, and baseUrl.",
+  promptSnippet: "Discover current web sources with a configured SearXNG query; returns ranked titles, URLs, snippets, engines, and scores for follow-up fetching.",
   promptGuidelines: [
-    "Use searxng_search for web discovery before web_fetch_many when the user needs current online information or source candidates."
+    "searxng_search use: Use searxng_search for current web discovery and source candidates before web_fetch_many; it searches but does not retrieve complete source content.",
+    "searxng_search input: Pass a non-empty query plus optional results (1-20, default 8), one-indexed page, language, categories, and day/month/year timeRange.",
+    "searxng_search output: Model-visible results list each title, URL, snippet, engine, and score; use promising URLs with web_fetch_many for complete source retrieval.",
+    "searxng_search constraints: If SearXNG is unconfigured or unreachable, report the failure and direct the user to /searxng:setup or SEARXNG_URL instead of silently substituting another search path."
   ],
   parameters: SearchParams,
   executionMode: "parallel",

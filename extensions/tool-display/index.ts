@@ -51,7 +51,7 @@ const DocumentParseSchema = Type.Object({
   preserveLayoutAlignmentAcrossPages: Type.Optional(Type.Boolean({
     description: "Whether to preserve text alignment consistently across page boundaries"
   }))
-});
+}, { additionalProperties: false });
 
 type DocumentParseInput = Static<typeof DocumentParseSchema>;
 
@@ -107,13 +107,14 @@ export function createDocumentParseTool(settings: ToolDisplaySettings): ToolDefi
     name: "document_parse",
     label: "Document Parse",
     description:
-      "Parse local documents with bundled LiteParse support. Supports PDF, DOCX, PPTX, XLSX, CSV, and common images. Returns parsed output saved to temp files plus metadata and optional PDF screenshots.",
+      "Parse local documents with bundled LiteParse support. Supports PDF, DOCX, PPTX, XLSX, CSV, and common images, with text/JSON output, page selection, OCR controls, bounding boxes, layout preservation, and optional PDF screenshots. Model-visible output reports the saved outputPath, format, page/screenshot counts, screenshot paths, and warnings; internal details include sourcePath, resolvedPath, outputDir, and the same handoff metadata.",
     promptSnippet:
-      "Parse local documents to text or JSON with OCR, bounding boxes, page ranges, and optional PDF screenshots. Full results are saved to temp files for follow-up inspection with read_many.",
+      "Parse a local document path to saved text or JSON with page/OCR/layout options and optional PDF screenshots; returns outputPath and screenshot handoffs for read_many.",
     promptGuidelines: [
-      "Use document_parse instead of composing LiteParse CLI commands manually when the user wants local document parsing.",
-      "After document_parse returns outputPath or screenshot paths, use read_many on those files when full parsed content or screenshot metadata is needed.",
-      "If document_parse reports missing host parser dependencies, run /docparser:doctor for guided setup."
+      "document_parse use: Use document_parse instead of composing LiteParse CLI commands when local PDF, DOCX, PPTX, XLSX, CSV, image OCR, layout, bounding-box, or screenshot extraction is needed.",
+      "document_parse input: Pass path plus optional text/json format, targetPages, PDF screenshotPages, OCR language/server/workers, maxPages, dpi, preciseBoundingBox, preserveSmallText, and cross-page layout-alignment controls.",
+      "document_parse output: Model-visible results report outputPath, output format, page and screenshot counts, screenshot paths, and warnings; use read_many on outputPath or screenshots when full parsed content or visual output is needed.",
+      "document_parse constraints: Use document_parse for local image inspection in the current text-file-only read_many profile. If host parser dependencies are missing, direct the user to /docparser:doctor."
     ],
     parameters: DocumentParseSchema,
     executionMode: "parallel",

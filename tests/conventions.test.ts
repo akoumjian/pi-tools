@@ -59,8 +59,6 @@ test("pi-tools registered extensions have shipping default config files where re
     "config/tool-safety-settings.json",
     "config/mutation-review-settings.json",
     "config/mutation-review-guidance.md",
-    "config/hunk-review-settings.json",
-    "config/hunk-review-guidance.md",
     "config/review-subagent-settings.json",
     "config/review-subagent-guidance.md",
     "config/tool-display-settings.json",
@@ -70,7 +68,6 @@ test("pi-tools registered extensions have shipping default config files where re
     "docs/extensions/file-open.md",
     "docs/extensions/mutation-review.md",
     "docs/extensions/native-tools.md",
-    "docs/extensions/hunk-review.md",
     "docs/extensions/review-subagent.md",
     "docs/extensions/searxng-search.md",
     "docs/extensions/theme-preview.md",
@@ -118,12 +115,12 @@ test("pi-tools package defaults do not own personal profile model or trust choic
   assert.doesNotMatch(reviewGuidance, personalHomePattern);
 });
 
-test("pi-tools package registers Hunk skill", () => {
+test("pi-tools package does not register removed Hunk resources", () => {
   const manifest = packageJson();
-  assert.deepEqual(manifest.pi?.skills, ["skills/hunk-review/SKILL.md"]);
-  const skill = readText("skills/hunk-review/SKILL.md");
-  assert.match(skill, /name: hunk-review/);
-  assert.match(skill, /Show and annotate diffs for review to the user in an interactive window using hunk\./);
+  assert.equal(manifest.pi?.skills, undefined);
+  assert.equal(manifest.pi?.extensions?.some((entry: string) => entry.includes("hunk-review")), false);
+  assert.equal(existsSync(path.join(packageRoot, "extensions", "hunk-review")), false);
+  assert.equal(existsSync(path.join(packageRoot, "skills", "hunk-review")), false);
 });
 
 test("pi-tools package files whitelist excludes tests and local runtime artifacts", () => {
@@ -134,6 +131,7 @@ test("pi-tools package files whitelist excludes tests and local runtime artifact
     "docs/",
     "extensions/",
     "skills/",
-    "scripts/dev-pi.mjs"
+    "scripts/dev-pi.mjs",
+    "scripts/review-provider-context.mjs"
   ]);
 });

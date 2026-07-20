@@ -237,14 +237,10 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     ].join(" "),
     promptSnippet: "Run shell commands as durable async jobs. Start independent shell work together in one commands list, keep doing useful work, and rely on per-job completion notices instead of polling.",
     promptGuidelines: [
-      "Use shell_start for shell commands instead of bash.",
-      "Start independent shell work together in one commands list instead of making serial shell_start calls; split into separate calls only when commands depend on previous output, must run in order, or are not safe to run concurrently.",
-      "Each command item must include its own command and cwd. Use optional job_name only when a short human-readable name helps distinguish concurrent jobs. Standard input is ignored, so avoid interactive commands.",
-      "Prefer search_many for code/file discovery. If using shell_start for custom search, start with rg --files, rg -n, git grep -n, or bounded find before reading file contents.",
-      `shell_start waits only for a fixed ${START_WAIT_FOR_COMPLETION_SECONDS}s grace period; there is no wait parameter. Jobs that do not finish in-band continue in the background and append per-job completion notices by default.`,
-      "Set per-command notifyOnExit:false only when the result is unimportant.",
-      "Async-shell completion notices and shell_start results are short status/log-path summaries without stdout/stderr samples. Use shell_read mode='tail' for recent output, shell_read mode='range' for exact lines/continuation, and search_many/read_many on log paths for targeted file inspection. Do not paste raw shell output unless explicitly requested.",
-      "Continue useful work while jobs run; if there is no useful work, stop after reporting that jobs are running and let the completion batch resume the agent. Do not poll or wait. Use shell_status and shell_read only after a result/notification or when necessary for a specific active job."
+      "shell_start use: Use shell_start for shell commands instead of bash. Prefer search_many for normal code/file discovery; use custom rg --files, rg -n, git grep -n, or bounded find shell inspection only when needed.",
+      "shell_start input: Pass { commands: [{ command, cwd, job_name?, shell?, notifyOnExit? }] }, including for one command, with at most 12 items. Batch independent commands together; split only for dependencies, required ordering, or unsafe concurrency. Every item requires its own cwd; stdin is ignored, so avoid interactive commands.",
+      `shell_start output: Every command becomes a durable job with jobId, status, cwd, stdout_log, stderr_log, and output byte counts. The call returns metadata/log paths without stdout/stderr samples after a fixed ${START_WAIT_FOR_COMPLETION_SECONDS}s grace; unfinished jobs continue and notify by default. Use shell_read tail/range or search_many/read_many on log paths for output.`,
+      "shell_start constraints: Continue useful work while jobs run; otherwise report that they are running and let the completion batch resume the agent. Do not poll or wait, do not repeatedly call status/read, and do not paste raw shell output unless explicitly requested. Set notifyOnExit:false only when completion is unimportant."
     ],
     parameters: StartParams,
     executionMode: "parallel",
@@ -264,7 +260,13 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     name: "shell_status",
     label: "Async Shell Status",
     description: "Get async shell job status. Pass jobId for one job; omit jobId to list active and recent jobs. Use shell_status for job metadata/health, not routine output reading. Single-job results include job metadata, stdout_log/stderr_log paths, and a small diagnostic tail; prefer shell_read mode='tail' for recent stdout/stderr, shell_read mode='range' for exact line ranges/nextOffset continuation, or search_many/read_many on log paths for targeted file inspection. List result details shape: { jobs: JobMeta[] }.",
-    promptSnippet: "Check one async shell job by jobId, or omit jobId to list active/recent jobs.",
+    promptSnippet: "Inspect async job metadata/health by jobId or list active/recent jobs; use shell_read, not shell_status, for output.",
+    promptGuidelines: [
+      "shell_status use: Use shell_status for specific async job metadata/health or to list active/recent jobs; use shell_read for stdout/stderr content.",
+      "shell_status input: Pass { jobId, tailLines? } for one job or omit jobId and pass optional limit to list recent jobs.",
+      "shell_status output: Single-job results include explicit job metadata, log paths, output byte counts, and a bounded diagnostic tail; list mode returns jobs in recency order.",
+      "shell_status constraints: Do not poll shell_status. Call it only after a result/notification or when inspection of a specific active job is necessary."
+    ],
     parameters: StatusParams,
     executionMode: "parallel",
     renderShell: "self",
@@ -295,7 +297,13 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     name: "shell_read",
     label: "Async Shell Read",
     description: "Read async shell stdout/stderr logs by jobId. Use mode='tail' (default) for recent output after shell_start results or completion notices. Use mode='range' for exact read_many-style line ranges, when continuing with nextOffset, or after search_many finds log matches. Choose stream='stdout' or 'stderr', or omit stream to read both selected streams. Tail mode accepts lines/maxChars; range mode accepts offset/limit. Result details shape: { job: JobMeta, streams: [{ stream, logPath, mode, offset?, requestedLimit?, requestedLines?, requestedMaxChars?, truncation?, previewLines }] }.",
-    promptSnippet: "Read async shell stdout/stderr by jobId: mode='tail' for recent output, mode='range' for exact line ranges.",
+    promptSnippet: "Read async stdout/stderr by jobId with tail mode for recent output or range mode for exact lines and continuation.",
+    promptGuidelines: [
+      "shell_read use: Use shell_read for async job stdout/stderr after a start result, completion notice, targeted log search, or when specific active-job output is necessary; use shell_status only for metadata/health.",
+      "shell_read input: Pass jobId plus optional stream. mode='tail' is the default and accepts lines/maxChars; mode='range' accepts 1-indexed offset/limit for exact lines and continuation.",
+      "shell_read output: Results identify each selected stream and log path with the requested window, previewLines, truncation metadata, and nextOffset when more exact lines remain.",
+      "shell_read constraints: Do not poll or repeatedly reread unchanged output. Use search_many/read_many on stdout_log/stderr_log first when targeted inspection is more efficient."
+    ],
     parameters: ReadParams,
     executionMode: "parallel",
     renderShell: "self",
@@ -316,7 +324,13 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     name: "shell_cancel",
     label: "Async Shell Cancel",
     description: "Cancel one async shell job by jobId using SIGTERM, SIGINT, or SIGKILL. Result details shape: { job: JobMeta, output: { stdout: string, stderr: string } }.",
-    promptSnippet: "Terminate an async shell job started by Pi.",
+    promptSnippet: "Stop an active Pi async job by jobId with SIGTERM, SIGINT, or SIGKILL and return its updated job summary.",
+    promptGuidelines: [
+      "shell_cancel use: Use shell_cancel only to stop an active async job started by Pi.",
+      "shell_cancel input: Pass { jobId, signal? }; signal defaults to SIGTERM and may be SIGTERM, SIGINT, or SIGKILL.",
+      "shell_cancel output: The model-visible result identifies the job, requested cancellation state, log paths, output access instructions, and any final bounded output.",
+      "shell_cancel constraints: Prefer SIGTERM unless a stronger signal is necessary; do not call shell_cancel for jobs that already exited."
+    ],
     parameters: CancelParams,
     executionMode: "parallel",
     renderShell: "self",
@@ -557,10 +571,21 @@ function flushCompletionNotificationBatch(api: ExtensionAPI, context: Completion
 }
 
 function createCompletionDeliveryContext(context: Partial<Pick<ExtensionContext, "isIdle">> | undefined): CompletionDeliveryContext {
-  const isIdle = typeof context?.isIdle === "function"
-    ? () => context.isIdle?.() === true
-    : () => true;
-  return { isIdle };
+  if (typeof context?.isIdle !== "function") {
+    return { isIdle: () => true };
+  }
+
+  return {
+    isIdle: () => {
+      try {
+        return context.isIdle?.() === true;
+      } catch {
+        // Session replacement and reload deliberately make captured contexts
+        // stale. Keep the completion queued for a fresh lifecycle event.
+        return false;
+      }
+    }
+  };
 }
 
 function formatCompletionMessage(job: JobMeta): string {

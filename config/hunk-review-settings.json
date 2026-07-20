@@ -1,6 +1,0 @@
-{
-  "defaultLauncher": "auto",
-  "followDebounceMs": 1200,
-  "maxTouchedFiles": 80,
-  "allowAgentLaunch": true
-}

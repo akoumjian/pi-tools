@@ -28,6 +28,8 @@ export type OrchestratorSettings = {
   guidance?: string;
   guidanceFile?: string;
   maxConcurrency: number;
+  maxWriterConcurrency: number;
+  maxWriterConcurrencyPerProvider: number;
   maxTasksPerRun: number;
   maxOutputCharsPerTask: number;
   readOnlyTools: string[];
@@ -58,6 +60,8 @@ export function readOrchestratorSettings(): OrchestratorSettings {
     guidance: undefined,
     guidanceFile: undefined,
     maxConcurrency: 4,
+    maxWriterConcurrency: 2,
+    maxWriterConcurrencyPerProvider: 1,
     maxTasksPerRun: 8,
     maxOutputCharsPerTask: 50_000,
     readOnlyTools: [...DEFAULT_READ_ONLY_TOOLS],
@@ -94,6 +98,8 @@ export function serializeOrchestratorSettings(
     },
     ...(effectiveGuidance ? { guidance: effectiveGuidance } : {}),
     maxConcurrency: settings.maxConcurrency,
+    maxWriterConcurrency: settings.maxWriterConcurrency,
+    maxWriterConcurrencyPerProvider: settings.maxWriterConcurrencyPerProvider,
     maxTasksPerRun: settings.maxTasksPerRun,
     maxOutputCharsPerTask: settings.maxOutputCharsPerTask,
     readOnlyTools: settings.readOnlyTools,
@@ -151,6 +157,8 @@ function normalizeSettings(settings: OrchestratorSettings): OrchestratorSettings
     guidance: normalizeGuidance(settings.guidance),
     guidanceFile: optionalString(settings.guidanceFile),
     maxConcurrency: positiveInteger(settings.maxConcurrency, 4),
+    maxWriterConcurrency: positiveInteger(settings.maxWriterConcurrency, 2),
+    maxWriterConcurrencyPerProvider: positiveInteger(settings.maxWriterConcurrencyPerProvider, 1),
     maxTasksPerRun: positiveInteger(settings.maxTasksPerRun, 8),
     maxOutputCharsPerTask: positiveInteger(settings.maxOutputCharsPerTask, 50_000),
     readOnlyTools: uniqueStrings(settings.readOnlyTools.length > 0 ? settings.readOnlyTools : DEFAULT_READ_ONLY_TOOLS),

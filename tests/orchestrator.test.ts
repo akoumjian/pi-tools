@@ -5,8 +5,9 @@ import path from "node:path";
 import test from "node:test";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import orchestratorExtension, { buildOrchestratorStatusText, mapWithConcurrencyLimit } from "../extensions/orchestrator/index.js";
-import { canonicalModelSpec, resolveTaskModel, selectDistinctReviewer } from "../extensions/orchestrator/models.js";
+import orchestratorExtension, { buildOrchestratorStatusText, mapWithConcurrencyLimit, mapWithKeyConcurrencyLimit } from "../extensions/orchestrator/index.js";
+import { canonicalModelSpec, resolveTaskModel, resolveTaskModelCandidates, selectDistinctReviewer } from "../extensions/orchestrator/models.js";
+import { classifyProviderFailure } from "../extensions/orchestrator/spawn.js";
 import { parseOrchestratorSetupArgs, readOrchestratorSettings } from "../extensions/orchestrator/settings.js";
 
 function fakeModel(provider: string, id: string, reasoning = true): Model<Api> {
@@ -78,6 +79,9 @@ test("orchestrator settings load extension-owned guidance without AGENTS depende
       assert.equal(settings.models.worker, "openai-codex/gpt-5.6-sol:xhigh");
       assert.match(settings.guidance ?? "", /Avoid broad speculative tasks/);
       assert.equal(settings.maxConcurrency, 2);
+      assert.equal(settings.maxWriterConcurrency, 2);
+      assert.equal(settings.maxWriterConcurrencyPerProvider, 1);
+      assert.match(buildOrchestratorStatusText(settings), /2 concurrent writers · 1 writer\/provider/);
       assert.deepEqual(settings.writeTools, ["edit_many", "write_many"]);
       assert.deepEqual(settings.shellTools, ["shell_start", "shell_status", "shell_read", "shell_cancel"]);
       assert.deepEqual(settings.validation, { command: "npm", args: ["run", "validate"], timeoutMs: 600_000, maxRunsPerTask: 5 });
@@ -110,6 +114,33 @@ test("task model routing honors per-task override and configured fallback", () =
   }, worker)), "openai-codex/gpt-5.6-sol:xhigh");
   assert.equal(canonicalModelSpec(resolveTaskModel(registry, settings, { role: "planner" }, worker)), "anthropic/claude-fable-5:xhigh");
   assert.equal(canonicalModelSpec(resolveTaskModel(registry, settings, { role: "writer" }, worker)), "openai-codex/gpt-5.6-sol:xhigh");
+});
+
+test("explicit model fallbacks skip unavailable auth routes without silently inventing providers", () => {
+  const primary = fakeModel("openai-codex", "primary");
+  const fallback = fakeModel("anthropic", "fallback");
+  const registry = fakeRegistry([primary, fallback], new Set(["anthropic/fallback"]));
+  const settings = {
+    ...readOrchestratorSettings(),
+    models: { worker: "openai-codex/primary:xhigh", reviewers: [] }
+  };
+  const plan = resolveTaskModelCandidates(registry, settings, {
+    role: "reader",
+    model: "openai-codex/primary",
+    fallbackModels: ["anthropic/fallback"],
+    thinkingLevel: "high"
+  }, primary);
+  assert.deepEqual(plan.candidates.map(canonicalModelSpec), ["anthropic/fallback:high"]);
+  assert.equal(plan.rejected.length, 1);
+  assert.match(plan.rejected[0].error, /no configured auth/);
+});
+
+test("provider failure classification distinguishes actionable fallback conditions", () => {
+  assert.equal(classifyProviderFailure(new Error("HTTP 429 too many requests")), "rate_limit");
+  assert.equal(classifyProviderFailure(new Error("401 unauthorized API key")), "auth");
+  assert.equal(classifyProviderFailure(new Error("service overloaded (529)")), "transient");
+  assert.equal(classifyProviderFailure(new Error("tool input was invalid")), "other");
+  assert.equal(classifyProviderFailure(new Error("request aborted")), "aborted");
 });
 
 test("writer tasks without an independent reviewer fail before spending writer tokens", async () => {
@@ -176,6 +207,30 @@ test("bounded map preserves input order and never exceeds concurrency", async ()
     return value * 2;
   });
   assert.deepEqual(values, [2, 4, 6, 8, 10]);
+  assert.equal(maxActive, 2);
+});
+
+test("keyed bounded map allows cross-provider writers while serializing each provider", async () => {
+  const items = [
+    { id: "a1", provider: "a" },
+    { id: "a2", provider: "a" },
+    { id: "b1", provider: "b" },
+    { id: "b2", provider: "b" }
+  ];
+  let active = 0;
+  let maxActive = 0;
+  const activeByProvider = new Map<string, number>();
+  const values = await mapWithKeyConcurrencyLimit(items, 2, 1, (item) => item.provider, async (item) => {
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    activeByProvider.set(item.provider, (activeByProvider.get(item.provider) ?? 0) + 1);
+    assert.equal(activeByProvider.get(item.provider), 1);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    activeByProvider.set(item.provider, (activeByProvider.get(item.provider) ?? 1) - 1);
+    active -= 1;
+    return item.id;
+  });
+  assert.deepEqual(values, ["a1", "a2", "b1", "b2"]);
   assert.equal(maxActive, 2);
 });
 

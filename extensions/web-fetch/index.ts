@@ -138,12 +138,12 @@ export default function webFetchExtension(api: ExtensionAPI): void {
       "Result details shape: { cacheRoot, results: [{ url, finalUrl, status, kind, httpStatus, contentType, title?, sourcePath?, textPath?, downloadedPath?, documentParseHint?, preview?, truncated?, error? }] }.",
       "This tool refuses non-HTTP(S), localhost, and private-network URLs. Use shell_start only when the user explicitly asks for a special network fetch that should go through safety review."
     ].join(" "),
-    promptSnippet: "Fetch URLs, cache artifacts, extract readable HTML, and save non-HTML files for document_parse.",
+    promptSnippet: "Fetch and cache one or more urls:[...], extracting readable HTML or saving non-HTML files; returns citations, previews, saved paths, and document-parse handoffs.",
     promptGuidelines: [
-      "Use searxng_search for discovery, then web_fetch_many for in-depth source retrieval.",
-      "After web_fetch_many fetches HTML, use read_many on textPath when the preview is not enough.",
-      "After web_fetch_many fetches PDFs, Office documents, spreadsheets, or images, call document_parse on downloadedPath when source content must be inspected.",
-      "Use a urls list even for one URL. Fetch several independent URLs in one call when comparing sources."
+      "web_fetch_many use: Use searxng_search for discovery, then web_fetch_many for complete retrieval of promising public HTTP(S) sources.",
+      "web_fetch_many input: Pass { urls: [{ url, label?, mode?, maxBytes?, timeoutSeconds? }], concurrency? }, including for one URL. Batch independent URLs; auto extracts HTML and downloads non-HTML, html forces extraction, and download saves without extraction.",
+      "web_fetch_many output: Each model-visible result reports URL/final URL, status, HTTP/content metadata, citation title, sourcePath, textPath or downloadedPath, preview/truncation, errors, and a document_parse handoff when appropriate. Read textPath when a preview is insufficient; parse downloadedPath for PDFs, Office files, spreadsheets, or images.",
+      "web_fetch_many constraints: The tool refuses non-HTTP(S), localhost, and private-network URLs. Use shell_start for a special network fetch only when the user explicitly requests it and safety review permits it."
     ],
     parameters: WebFetchManyParams,
     executionMode: "parallel",

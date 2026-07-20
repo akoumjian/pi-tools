@@ -3,6 +3,8 @@
     "reviewers": []
   },
   "maxConcurrency": 4,
+  "maxWriterConcurrency": 2,
+  "maxWriterConcurrencyPerProvider": 1,
   "maxTasksPerRun": 8,
   "maxOutputCharsPerTask": 50000,
   "readOnlyTools": [

@@ -100,6 +100,24 @@ async function writeJobMeta(contextDir: string, jobId: string, meta: Record<stri
   }, null, 2)}\n`);
 }
 
+test("async-shell tools expose complete system-prompt contracts", () => {
+  const api = createFakeApi();
+  asyncShellExtension(api);
+
+  for (const name of ["shell_start", "shell_status", "shell_read", "shell_cancel"]) {
+    const tool = required(api.registeredTools.find((candidate) => candidate.name === name), `${name} tool`);
+    assert.ok(tool.description.length > 100, `${name} keeps a detailed provider description`);
+    assert.ok((tool.promptSnippet ?? "").length > 40, `${name} has an Available tools snippet`);
+    assert.deepEqual(tool.promptGuidelines?.map((line) => line.split(":", 1)[0]), [
+      `${name} use`,
+      `${name} input`,
+      `${name} output`,
+      `${name} constraints`
+    ]);
+    assert.ok((tool.parameters as { additionalProperties?: boolean }).additionalProperties === false);
+  }
+});
+
 test("async-shell-status reports job root and recent jobs", async () => {
   await withTempDir(async (dir) => {
     const api = createFakeApi();
@@ -286,14 +304,19 @@ test("shell_start sends one deferred completion batch for notified completed job
   });
 });
 
-test("shell_start queues active completions until the current turn can flush one batch", async () => {
+test("shell_start keeps completions queued when its captured context becomes stale", async () => {
   await withTempDir(async (dir) => {
     const api = createFakeApi();
     asyncShellExtension(api);
     const shellStart = required(api.registeredTools.find((tool) => tool.name === "shell_start"), "shell_start tool");
     assert.ok(shellStart.execute);
-    let idle = false;
-    const context = createContext(dir, () => idle);
+    let stale = false;
+    const context = createContext(dir, () => {
+      if (stale) {
+        throw new Error("This extension ctx is stale after session replacement or reload.");
+      }
+      return false;
+    });
 
     await shellStart.execute(
       "tool-call-id",
@@ -308,17 +331,18 @@ test("shell_start queues active completions until the current turn can flush one
       context
     );
 
+    stale = true;
     await delay(1200);
     assert.equal(api.sentMessages.length, 0);
 
-    await api.emit("turn_end", { type: "turn_end", turnIndex: 0, timestamp: Date.now(), message: {}, toolResults: [] }, context);
+    const replacementContext = createContext(dir);
+    await api.emit("turn_end", { type: "turn_end", turnIndex: 0, timestamp: Date.now(), message: {}, toolResults: [] }, replacementContext);
     assert.equal(api.sentMessages.length, 1);
     assert.deepEqual(api.sentMessages[0].options, { triggerTurn: true, deliverAs: "steer" });
     const message = api.sentMessages[0].message as { content?: string; details?: { jobs?: Array<{ job_name?: string }> } };
     assert.match(message.content ?? "", /^async shell results: 2 jobs completed/);
     assert.deepEqual((message.details?.jobs ?? []).map((job) => job.job_name).sort(), ["one", "two"]);
 
-    idle = true;
     await delay(50);
     assert.equal(api.sentMessages.length, 1);
   });

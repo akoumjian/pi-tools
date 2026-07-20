@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -53,6 +57,60 @@ test("review task includes task, handoff, diff sections and truncates large diff
   assert.match(task, /\[Diff truncated: 60 characters omitted/);
   assert.match(task, /VERDICT: approve` or `VERDICT: request_changes`/);
   assert.equal(task.includes("x".repeat(41)), false);
+});
+
+test("reviewer pool advances after provider failure and records every attempt", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-orchestrator-review-fallback-"));
+  try {
+    execFileSync("git", ["init", "-b", "main"], { cwd: root });
+    execFileSync("git", ["config", "user.name", "Review Test"], { cwd: root });
+    execFileSync("git", ["config", "user.email", "review@example.invalid"], { cwd: root });
+    await writeFile(path.join(root, "file.txt"), "before\n", "utf8");
+    execFileSync("git", ["add", "file.txt"], { cwd: root });
+    execFileSync("git", ["commit", "-m", "base"], { cwd: root });
+    const baseCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
+    await writeFile(path.join(root, "file.txt"), "after\n", "utf8");
+    execFileSync("git", ["commit", "-am", "change"], { cwd: root });
+
+    const writer = fakeModel("openai-codex", "writer");
+    const reviewerOne = fakeModel("anthropic", "reviewer-one");
+    const reviewerTwo = fakeModel("google", "reviewer-two");
+    let calls = 0;
+    const context = {
+      modelRegistry: fakeRegistry([writer, reviewerOne, reviewerTwo]),
+      ui: { notify(): void {} }
+    } as unknown as Pick<ExtensionContext, "modelRegistry" | "ui">;
+    const report = await reviewWriterBranch(context, {
+      worktreePath: root,
+      branch: "orch/run-task",
+      baseCommit,
+      task: "change the fixture",
+      writerOutput: "changed file.txt",
+      writerModel: writer,
+      reviewerSpecs: ["anthropic/reviewer-one:xhigh", "google/reviewer-two:xhigh"],
+      tools: ["search_many", "read_many"],
+      shellTools: [],
+      maxOutputChars: 10_000,
+      spawn: async (_childContext, input) => {
+        calls += 1;
+        if (calls === 1) throw new Error("HTTP 429 rate limit");
+        return {
+          output: "Reviewed the diff.\nVERDICT: approve",
+          model: `${input.model.provider}/${input.model.id}`,
+          thinkingLevel: input.thinkingLevel,
+          toolCallCount: 0,
+          durationMs: 1,
+          deniedCalls: []
+        };
+      }
+    });
+    assert.equal(report.status, "approve");
+    assert.equal(calls, 2);
+    assert.deepEqual(report.attempts.map((attempt) => attempt.status), ["failed", "approve"]);
+    assert.match(report.attempts[0].error ?? "", /429/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("review fails closed before spawning when no independent provider exists", async () => {
