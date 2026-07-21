@@ -5,22 +5,46 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 
-const literalContractFragments: Record<string, { input: string[]; output: string[] }> = {
-  shell_start: { input: ["commands:", "command: string", "cwd: string", "[1..12]"], output: ["content: text", "details: { jobs:", "no stdout/stderr samples"] },
-  shell_status: { input: ["jobId?: string", "limit?: number", "tailLines?: number"], output: ["{ job: JobMeta", "{ jobs: JobMeta[] }"] },
-  shell_read: { input: ["mode?: \"tail\" | \"range\"", "lines?: number", "offset?: number"], output: ["streams:", "range mode also includes total lines and nextOffset?"] },
-  shell_cancel: { input: ["jobId: string", "\"SIGTERM\" | \"SIGINT\" | \"SIGKILL\""], output: ["job: JobMeta", "output: { stdout: string, stderr: string }"] },
-  read_many: { input: ["files:", "path: string", "offset?: number", "[1..24]"], output: ["truncatedBy: \"lines\" | \"bytes\" | null", "nextOffset?"] },
-  search_many: { input: ["kind: \"content\" | \"files\"", "path?: string(minLength=1)", "path defaults to \".\" at execution", "context?: number", "maxResults?: number"], output: ["searches:", "outputLines", "exitCode"] },
-  write_many: { input: ["writes:", "path: string", "content: string", "[1..24]"], output: ["bytes, lines", "mutationReview?", "line counts/resolved paths remain internal"] },
-  edit_many: { input: ["oldText: string", "newText: string", "[1..50]"], output: ["ranges: [{ startLine, endLine }]", "ranges/byte counts/resolved paths remain internal"] },
-  apply_reviewed_mutation: { input: ["id: string", "mr_*"], output: ["fingerprint", "beforeHash?", "afterHash"] },
-  searxng_search: { input: ["query: string", "results?: number", "timeRange?: \"day\" | \"month\" | \"year\""], output: ["title/engine?/URL/normalized-snippet", "resultCount", "baseUrl"] },
-  web_fetch_many: { input: ["mode?: \"auto\" | \"html\" | \"download\"", "Omitted mode behaves as \"auto\" at execution", "maxBytes?: number", "concurrency?: number"], output: ["cacheRoot", "documentParseHint?", "preview?"] },
-  document_parse: { input: ["format?: \"text\" | \"json\"", "Omitted format behaves as \"text\" at execution", "ocr?: \"auto\" | \"off\"", "dpi?: integer"], output: ["outputPath", "optional nonzero screenshot", "warnings?"] },
-  orchestrate: { input: ["role?: \"reader\" | \"planner\" | \"writer\"", "fallbackModels?", "[1..8]"], output: ["failed tasks include actionable error", "routeAttempts", "review?"] },
-  reconcile: { input: ["pattern=\"^orch/\"", "[1..8]"], output: ["integration path when declined", "folded:", "overlaps:"] }
+const retainedToolNames = [
+  "shell_start",
+  "shell_status",
+  "shell_read",
+  "shell_cancel",
+  "read_many",
+  "search_many",
+  "write_many",
+  "edit_many",
+  "apply_reviewed_mutation",
+  "searxng_search",
+  "web_fetch_many",
+  "document_parse",
+  "orchestrate",
+  "reconcile"
+] as const;
+
+const outputContractFragments: Record<string, string[]> = {
+  shell_start: ["content: text", "details: { jobs:", "no stdout/stderr samples"],
+  shell_status: ["{ job: JobMeta", "{ jobs: JobMeta[] }"],
+  shell_read: ["streams:", "range mode also includes total lines and nextOffset?"],
+  shell_cancel: ["job: JobMeta", "output: { stdout: string, stderr: string }"],
+  read_many: ["truncatedBy: \"lines\" | \"bytes\" | null", "nextOffset?"],
+  search_many: ["searches:", "outputLines", "exitCode"],
+  write_many: ["bytes, lines", "mutationReview?", "line counts/resolved paths remain internal"],
+  edit_many: ["ranges: [{ startLine, endLine }]", "ranges/byte counts/resolved paths remain internal"],
+  apply_reviewed_mutation: ["fingerprint", "beforeHash?", "afterHash"],
+  searxng_search: ["title/engine?/URL/normalized-snippet", "resultCount", "baseUrl"],
+  web_fetch_many: ["cacheRoot", "documentParseHint?", "preview?"],
+  document_parse: ["outputPath", "optional nonzero screenshot", "warnings?"],
+  orchestrate: ["failed tasks include actionable error", "routeAttempts", "review?"],
+  reconcile: ["integration path when declined", "folded:", "overlaps:"]
 };
+
+function anthropicWireSchema(parameters: unknown): unknown {
+  const schema = structuredClone(parameters) as Record<string, unknown>;
+  delete schema.additionalProperties;
+  schema.required ??= [];
+  return schema;
+}
 
 type ReviewArtifact = {
   renderedProjectContext: string;
@@ -98,9 +122,9 @@ test("provider context review command renders sanitized prompt, tool declaration
     assert.doesNotMatch(artifact.systemPrompt, /hunk_session/);
 
     const names = artifact.activeTools.map((tool) => tool.name);
-    assert.ok(names.includes("read_many"));
-    assert.ok(names.includes("orchestrate"));
-    assert.ok(names.includes("reconcile"));
+    const sortedRetainedToolNames = [...retainedToolNames].sort();
+    assert.deepEqual([...names].sort(), sortedRetainedToolNames, "review covers exactly the 14 retained custom tools");
+    assert.deepEqual(Object.keys(outputContractFragments).sort(), sortedRetainedToolNames, "output contract fixtures cover every retained tool");
     assert.equal(names.includes("hunk_session"), false);
     assert.equal(names.includes("bash"), false);
     for (const tool of artifact.activeTools) {
@@ -108,16 +132,22 @@ test("provider context review command renders sanitized prompt, tool declaration
       assert.ok((tool.promptSnippet ?? "").length > 20, `${tool.name} system snippet`);
       assert.ok((tool.promptGuidelines ?? []).length > 0, `${tool.name} system guidelines`);
       const guidelines = (tool.promptGuidelines ?? []).join("\n");
-      assert.match(guidelines, new RegExp(`${tool.name} input: Schema:`), `${tool.name} literal input schema guideline`);
+      assert.match(guidelines, new RegExp(`${tool.name} input: JSON Schema:`), `${tool.name} minified JSON Schema guideline`);
       assert.match(guidelines, new RegExp(`${tool.name} output: Schema:`), `${tool.name} literal output schema guideline`);
-      assert.match(guidelines, /\{[^}]+\}/, `${tool.name} schema shape`);
       assert.match(guidelines, /Only content is provider-visible/, `${tool.name} provider-visible output boundary`);
-      const literalFragments = literalContractFragments[tool.name];
-      assert.ok(literalFragments, `${tool.name} has an audited literal contract fixture`);
       const inputGuideline = (tool.promptGuidelines ?? []).find((line) => line.startsWith(`${tool.name} input:`)) ?? "";
+      const inputPrefix = `${tool.name} input: JSON Schema: `;
+      assert.ok(inputGuideline.startsWith(inputPrefix), `${tool.name} input guideline uses the JSON Schema boundary`);
+      const schemaText = inputGuideline.slice(inputPrefix.length);
+      const promptedSchema = JSON.parse(schemaText) as unknown;
+      assert.equal(schemaText, JSON.stringify(promptedSchema), `${tool.name} input schema is minified JSON`);
+      assert.deepEqual(promptedSchema, tool.parameters, `${tool.name} prompted input schema exactly matches its provider declaration`);
+      assert.ok(artifact.systemPrompt.includes(inputGuideline), `${tool.name} complete input schema reaches the effective system prompt`);
+      assert.doesNotMatch(inputGuideline, /Schema: closed/, `${tool.name} does not use informal schema shorthand`);
+      const outputFragments = outputContractFragments[tool.name];
+      assert.ok(outputFragments, `${tool.name} has an audited literal output contract fixture`);
       const outputGuideline = (tool.promptGuidelines ?? []).find((line) => line.startsWith(`${tool.name} output:`)) ?? "";
-      for (const fragment of literalFragments.input) assert.ok(inputGuideline.includes(fragment), `${tool.name} input schema includes ${fragment}`);
-      for (const fragment of literalFragments.output) assert.ok(outputGuideline.includes(fragment), `${tool.name} output schema includes ${fragment}`);
+      for (const fragment of outputFragments) assert.ok(outputGuideline.includes(fragment), `${tool.name} output schema includes ${fragment}`);
       assert.match(JSON.stringify(tool.parameters), /properties/);
       assert.deepEqual(Object.keys(tool.resultContract).sort(), ["content", "details", "error", "progress", "success"]);
       assert.ok(Object.values(tool.resultContract).every((entry) => entry.length > 20), `${tool.name} result contract`);
@@ -135,6 +165,18 @@ test("provider context review command renders sanitized prompt, tool declaration
     assert.deepEqual(openaiTools.map((tool) => tool.name), names);
     assert.deepEqual(anthropicTools.map((tool) => tool.name), names);
     assert.match(openaiTools.find((tool) => tool.name === "read_many")?.description ?? "", /known text file ranges/);
+    for (const tool of artifact.activeTools) {
+      assert.deepEqual(
+        openaiTools.find((candidate) => candidate.name === tool.name)?.parameters,
+        tool.parameters,
+        `${tool.name} complete input schema reaches the OpenAI provider declaration`
+      );
+      assert.deepEqual(
+        anthropicTools.find((candidate) => candidate.name === tool.name)?.input_schema,
+        anthropicWireSchema(tool.parameters),
+        `${tool.name} input schema reaches Anthropic with only Pi's expected top-level normalization`
+      );
+    }
     assert.match(JSON.stringify(openaiTools.find((tool) => tool.name === "read_many")?.parameters), /1-indexed line number/);
     assert.match(JSON.stringify(anthropicTools.find((tool) => tool.name === "read_many")?.input_schema), /1-indexed line number/);
 

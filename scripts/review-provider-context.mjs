@@ -248,9 +248,6 @@ const anthropicPayload = await capturePayload(
   "fixture-api-key"
 );
 
-function normalizeText(text) {
-  return text.replaceAll("\\", "/");
-}
 function installFixedClock() {
   const NativeDate = globalThis.Date;
   const fixedEpochMs = NativeDate.parse(fixedNow);
@@ -265,7 +262,7 @@ function installFixedClock() {
 }
 
 function normalize(value) {
-  if (typeof value === "string") return normalizeText(value);
+  if (typeof value === "string") return value;
   if (Array.isArray(value)) return value.map(normalize);
   if (value && typeof value === "object") {
     return Object.fromEntries(Object.keys(value).sort().map((key) => [key, normalize(value[key])]));

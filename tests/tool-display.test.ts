@@ -89,6 +89,7 @@ test("document_parse display override is available as an explicit opt-in", () =>
   assert.match(tool.promptGuidelines?.join("\n") ?? "", /outputPath/);
   assert.match(tool.promptGuidelines?.join("\n") ?? "", /\/docparser:doctor/);
   assert.doesNotMatch(tool.promptGuidelines?.join("\n") ?? "", /this tool/i);
+  assert.match(JSON.stringify(tool.parameters), /"default":"text"/);
 
   const callText = tool.renderCall?.({
     path: "/var/folders/example/report.pdf",

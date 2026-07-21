@@ -161,6 +161,7 @@ test("mutation review extension registers a tool_call hook and cached apply surf
     "apply_reviewed_mutation constraints"
   ]);
   assert.match(applyTool.description, /Model-visible success output/);
+  assert.match(JSON.stringify(applyTool.parameters), /not a mutation entry id/);
   assert.ok(api.commands.has("mutation:apply"));
   assert.ok(api.commands.has("mutation:setup"));
   assert.ok(api.commands.has("mutation:status"));

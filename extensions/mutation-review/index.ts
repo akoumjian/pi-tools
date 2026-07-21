@@ -40,6 +40,7 @@ import { withChildAgentSession } from "../_shared/child-agent-session.js";
 import { formatConfigPath, readPiToolsJsonConfigSource, readPiToolsReferencedTextConfig, writeAgentExtensionConfig, type PiToolsJsonConfig } from "../_shared/config.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 import { guidedModelSetupUsage, parseGuidedModelSetupArgs, readSetupGuidance } from "../_shared/setup-command.js";
+import { inputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 
 const STATUS_KEY = "mutation-review";
 const DECISION_TOOL_NAME = "submit_mutation_review";
@@ -179,7 +180,7 @@ const SubmitMutationReviewParams = Type.Object({
 }, { additionalProperties: false });
 
 const ApplyReviewedMutationParams = Type.Object({
-  id: Type.String({ minLength: 1, description: "Pending mutation-review id, for example mr_ab12cd34." })
+  id: Type.String({ minLength: 1, description: "Pending mutation-review id, for example mr_ab12cd34; this is not a mutation entry id such as m_ab12cd34ef56." })
 }, { additionalProperties: false });
 
 type SubmitMutationReviewInput = Static<typeof SubmitMutationReviewParams>;
@@ -308,7 +309,7 @@ function registerApplyReviewedMutationTool(api: ExtensionAPI): void {
     promptSnippet: "Apply the exact cached mutation from a prior mutation-review block by pending id after before-hash validation; returns applied mutation ids and paths.",
     promptGuidelines: [
       `apply_reviewed_mutation use: Use ${APPLY_REVIEWED_MUTATION_TOOL_NAME} only when mutation-review blocked an exact edit/write and you intentionally choose to apply that cached original mutation without repeating its large arguments.`,
-      "apply_reviewed_mutation input: Schema: closed { id: string(minLength=1) }, where id is the pending mr_* review id printed in the block result, not a mutation entry m_* id.",
+      inputJsonSchemaGuideline(APPLY_REVIEWED_MUTATION_TOOL_NAME, ApplyReviewedMutationParams),
       "apply_reviewed_mutation output: Schema: { content: text(reviewed id, file count, before-hash confirmation, and each mutation id/path/kind/byte count), details: { id, fingerprint, toolName, toolCallId, files: [{ id, path, resolvedPath, kind: \"create\" | \"overwrite\" | \"replace\", bytes, lines, beforeHash?, afterHash }] }, isError?: boolean }. Only content is provider-visible; missing, stale, or hash-mismatched ids throw visible errors without writing.",
       "apply_reviewed_mutation constraints: To change course, reuse existing code or submit revised edit/write arguments for a new review; never use this tool for an unrelated mutation."
     ],

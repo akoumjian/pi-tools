@@ -48,6 +48,7 @@ Do not use `npm install @akoumjian/pi-tools@<git+ssh url>`: that form rewrites `
 - Each extension has its own file under `docs/extensions/`. Use those when you need exact tool schemas, behaviors, caps, result shapes, or rendering details.
 - The sections below in this README are short overviews and pointers; the doc files are the source of truth for details.
 - Run `npm run review:provider-context` to regenerate sanitized review artifacts under `docs/generated/provider-context-review/`. They show the rendered Pi system prompt, each active tool's description/input schema/snippet/guidelines, an explicit reviewed-or-not-applicable audit for host tool fields, success/progress/error/content/details result contracts, exact OpenAI Codex Responses and Anthropic Messages request payloads captured before network I/O, and provider-visible tool-result content versus internal-only details.
+- Every retained tool's system-prompt input contract is the complete minified JSON Schema serialized from the same authoritative `parameters` object used for provider tool declarations. Review tests prove prompt equality to the active declaration and provider payload presence; OpenAI preserves the schema exactly, while Pi's Anthropic serializer removes only top-level `additionalProperties` and adds an empty `required` array when needed (nested closure constraints remain).
 
 ## Quick reference
 

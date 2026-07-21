@@ -11,6 +11,7 @@ import { JSDOM } from "jsdom";
 import TurndownService from "turndown";
 import { describePathAccess } from "../async-shell/index.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
+import { inputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 
 const DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
 const MAX_MAX_BYTES = 50 * 1024 * 1024;
@@ -35,7 +36,8 @@ const FetchUrlItem = Type.Object({
     Type.Literal("html"),
     Type.Literal("download")
   ], {
-    description: "Fetch mode. auto extracts readable HTML when possible and downloads non-HTML; html forces HTML extraction; download saves the response without readability extraction."
+    default: "auto",
+    description: "Fetch mode. Defaults to auto, which extracts readable HTML when possible and downloads non-HTML; html forces HTML extraction; download saves the response without readability extraction."
   })),
   maxBytes: Type.Optional(Type.Number({
     minimum: 1024,
@@ -141,7 +143,7 @@ export default function webFetchExtension(api: ExtensionAPI): void {
     promptSnippet: "Fetch and cache one or more urls:[...], extracting readable HTML or saving non-HTML files; returns citations, previews, saved paths, and document-parse handoffs.",
     promptGuidelines: [
       "web_fetch_many use: Use searxng_search for discovery, then web_fetch_many for complete retrieval of promising public HTTP(S) sources.",
-      "web_fetch_many input: Schema: closed { urls: closed { url: string(minLength=1), label?: string, mode?: \"auto\" | \"html\" | \"download\", maxBytes?: number(1024..52428800, default=10485760), timeoutSeconds?: number(1..120, default=20) }[1..12], concurrency?: number(1..8, default=4) }. Omitted mode behaves as \"auto\" at execution. Batch independent URLs.",
+      inputJsonSchemaGuideline("web_fetch_many", WebFetchManyParams),
       "web_fetch_many output: Schema: { content: text(URL count plus per-result OK/ERROR, url/finalUrl?, label?, HTTP/content metadata, title?, sourcePath?, textPath?/downloadedPath?, document_parse handoff?, error?, preview?, and truncation notice?), details: { cacheRoot, results: [{ url, label?, finalUrl?, fetchedAt, status, kind?, httpStatus?, contentType?, title?, description?, bytes?, sourcePath?, textPath?, downloadedPath?, documentParseHint?: { tool, path, reason }, preview?, truncated?, error? }] }, isError?: boolean }. Only content is provider-visible; read textPath or parse downloadedPath when needed.",
       "web_fetch_many constraints: The tool refuses non-HTTP(S), localhost, and private-network URLs. Use shell_start for a special network fetch only when the user explicitly requests it and safety review permits it."
     ],

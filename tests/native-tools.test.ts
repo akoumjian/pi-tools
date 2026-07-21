@@ -32,6 +32,7 @@ type SchemaNode = {
   maximum?: number;
   minItems?: number;
   additionalProperties?: boolean;
+  default?: unknown;
   description?: string;
 };
 
@@ -167,7 +168,9 @@ test("native extension registers batch file tools but not single read/edit/write
   assert.match(searchManyTool.description, /rg --files/);
   const searchesSchema = required(schemaFor(searchManyTool).properties?.searches, "search_many searches schema");
   const searchItemSchema = required(searchesSchema.items, "search_many search item schema");
+  assert.equal(searchItemSchema.properties?.path.default, ".");
   assert.equal(searchItemSchema.properties?.maxResults.maximum, 1000);
+  assert.match(searchManyTool.promptGuidelines?.join("\n") ?? "", /literal:true for exact text/);
 
   const writeManyTool = api.registeredTools.find((tool) => tool.name === "write_many");
   const editManyTool = api.registeredTools.find((tool) => tool.name === "edit_many");

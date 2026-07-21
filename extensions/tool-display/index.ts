@@ -3,12 +3,14 @@ import { Type, type Static } from "@earendil-works/pi-ai";
 import type { AgentToolResult, ExtensionAPI, ExtensionCommandContext, RegisteredCommand, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { findPiToolsConfigFile, readPiToolsJsonConfig } from "../_shared/config.js";
+import { inputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 
 const DocumentParseSchema = Type.Object({
   path: Type.String({
     description: "Path to the document file to parse (PDF, DOCX, PPTX, XLSX, CSV, PNG, JPG, TIFF, WebP, etc.)"
   }),
   format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")], {
+    default: "text",
     description: "Output format for the parsed document (default: text)"
   })),
   targetPages: Type.Optional(Type.String({
@@ -112,7 +114,7 @@ export function createDocumentParseTool(settings: ToolDisplaySettings): ToolDefi
       "Parse a local document path to saved text or JSON with page/OCR/layout options and optional PDF screenshots; returns outputPath and screenshot handoffs for read_many.",
     promptGuidelines: [
       "document_parse use: Use document_parse instead of composing LiteParse CLI commands when local PDF, DOCX, PPTX, XLSX, CSV, image OCR, layout, bounding-box, or screenshot extraction is needed.",
-      "document_parse input: Schema: closed { path: string, format?: \"text\" | \"json\", targetPages?: string, screenshotPages?: string, ocr?: \"auto\" | \"off\", ocrLanguage?: string, ocrLanguages?: string[1..], ocrServerUrl?: string, numWorkers?: integer(min=1), maxPages?: integer(min=1), dpi?: integer(min=72), preciseBoundingBox?: boolean, preserveSmallText?: boolean, preserveLayoutAlignmentAcrossPages?: boolean }. Omitted format behaves as \"text\" at execution.",
+      inputJsonSchemaGuideline("document_parse", DocumentParseSchema),
       "document_parse output: Schema: { content: text(source/resolved paths, output format, page count, outputPath, optional nonzero screenshot directory/count and up to ten paths, warnings?, parsed preview, and truncation handoff?), details: { sourcePath, resolvedPath, outputFormat, outputPath, outputDir, pageCount, screenshotCount, screenshotDir?, screenshotPathsPreview?, warnings? }, isError?: boolean }. Only content is provider-visible; use read_many on outputPath or screenshots for complete content.",
       "document_parse constraints: Use document_parse for local image inspection in the current text-file-only read_many profile. If host parser dependencies are missing, direct the user to /docparser:doctor."
     ],

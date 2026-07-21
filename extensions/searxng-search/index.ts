@@ -3,6 +3,7 @@ import { defineTool, type AgentToolResult, type ExtensionAPI } from "@earendil-w
 import { Text } from "@earendil-works/pi-tui";
 import { formatConfigPath, readPiToolsJsonConfigSource } from "../_shared/config.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
+import { inputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 import { handleSearxngSetupCommand, SEARXNG_AGENT_CONFIG_FILE } from "./setup.js";
 
 const SearchParams = Type.Object({
@@ -54,7 +55,7 @@ const searxngSearchTool = defineTool({
   promptSnippet: "Discover current web sources with a configured SearXNG query; returns ranked titles, URLs, snippets, and engines for follow-up fetching.",
   promptGuidelines: [
     "searxng_search use: Use searxng_search for current web discovery and source candidates before web_fetch_many; it searches but does not retrieve complete source content.",
-    "searxng_search input: Schema: closed { query: string(minLength=1), results?: number(1..20, default=8), page?: number(min=1, default=1), language?: string(default=\"en-US\"), categories?: string(default=\"general\"), timeRange?: \"day\" | \"month\" | \"year\" }.",
+    inputJsonSchemaGuideline("searxng_search", SearchParams),
     "searxng_search output: Schema: { content: text(no-results notice or numbered title/engine?/URL/normalized-snippet entries), details: { query, resultCount, page, baseUrl }, isError?: boolean }. Only content is provider-visible; use promising URLs with web_fetch_many for complete source retrieval.",
     "searxng_search constraints: If SearXNG is unconfigured or unreachable, report the failure and direct the user to /searxng:setup or SEARXNG_URL instead of silently substituting another search path."
   ],

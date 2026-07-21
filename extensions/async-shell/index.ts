@@ -7,6 +7,7 @@ import { Type, type Static } from "@earendil-works/pi-ai";
 import { defineTool, type AgentToolResult, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
+import { inputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 
 type JobStatus = "running" | "exited" | "failed" | "cancelled" | "unknown";
 type OutputStreamName = "stdout" | "stderr";
@@ -238,7 +239,7 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     promptSnippet: "Run shell commands as durable async jobs. Start independent shell work together in one commands list, keep doing useful work, and rely on per-job completion notices instead of polling.",
     promptGuidelines: [
       "shell_start use: Use shell_start for shell commands instead of bash. Prefer search_many for normal code/file discovery; use custom rg --files, rg -n, git grep -n, or bounded find shell inspection only when needed.",
-      "shell_start input: Schema: closed { commands: closed { command: string(minLength=1), cwd: string(minLength=1), job_name?: string(minLength=1), shell?: string, notifyOnExit?: boolean(default=true) }[1..12] }. Batch independent commands together; split only for dependencies, required ordering, or unsafe concurrency. stdin is ignored, so avoid interactive commands.",
+      inputJsonSchemaGuideline("shell_start", StartParams),
       `shell_start output: Schema: { content: text(one block per job with jobId, job_name?, status, exitCode?, signal?, durationMs?, error?, cwd, command, stdout_log, stderr_log, outputBytes, and shell_read handoff; no stdout/stderr samples), details: { jobs: [{ jobId, job_name?, command, cwd, status, durationMs?, exitCode?, signal?, error?, stdoutLog, stderrLog, outputBytes: { stdout, stderr } }] }, isError?: boolean }. Only content is provider-visible. After the fixed ${START_WAIT_FOR_COMPLETION_SECONDS}s grace, unfinished jobs continue and notify by default.`,
       "shell_start constraints: Continue useful work while jobs run; otherwise report that they are running and let the completion batch resume the agent. Do not poll or wait, do not repeatedly call status/read, and do not paste raw shell output unless explicitly requested. Set notifyOnExit:false only when completion is unimportant."
     ],
@@ -263,7 +264,7 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     promptSnippet: "Inspect async job metadata/health by jobId or list active/recent jobs; use shell_read, not shell_status, for output.",
     promptGuidelines: [
       "shell_status use: Use shell_status for specific async job metadata/health or to list active/recent jobs; use shell_read for stdout/stderr content.",
-      "shell_status input: Schema: closed { jobId?: string(minLength=1), limit?: number(1..100, default=20), tailLines?: number(1..500, default=40) }; limit applies when jobId is omitted and tailLines applies when jobId is present.",
+      inputJsonSchemaGuideline("shell_status", StatusParams),
       "shell_status output: Schema: { content: text(jobId mode: job metadata, both log paths, access instructions, bounded stdout/stderr tails; list mode: recency-ordered job id/name/status/exit/command/cwd entries), details: { job: JobMeta, output: { stdout: string, stderr: string } } | { jobs: JobMeta[] }, isError?: boolean }. Only content is provider-visible; JobMeta details additionally retain shell, pid/timestamps, notification state, logDir, and raw byte counts.",
       "shell_status constraints: Do not poll shell_status. Call it only after a result/notification or when inspection of a specific active job is necessary."
     ],
@@ -300,7 +301,7 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     promptSnippet: "Read async stdout/stderr by jobId with tail mode for recent output or range mode for exact lines and continuation.",
     promptGuidelines: [
       "shell_read use: Use shell_read for async job stdout/stderr after a start result, completion notice, targeted log search, or when specific active-job output is necessary; use shell_status only for metadata/health.",
-      "shell_read input: Schema: closed { jobId: string(minLength=1), mode?: \"tail\" | \"range\"(default=\"tail\"), stream?: \"stdout\" | \"stderr\", lines?: number(1..500, default=80), maxChars?: number(1000..120000, default=20000), offset?: number(min=1), limit?: number(min=1) }; tail accepts lines/maxChars and range accepts offset/limit.",
+      inputJsonSchemaGuideline("shell_read", ReadParams),
       "shell_read output: Schema: { content: text(job identity plus each selected stream's logPath, requested tail/exact range and actual log text; range mode also includes total lines and nextOffset?), details: { job: JobMeta, streams: [{ stream, logPath, mode, offset?, requestedLimit?, requestedLines?, requestedMaxChars?, truncation?, previewLines }] }, isError?: boolean }. Only content is provider-visible; stream content is omitted from details.",
       "shell_read constraints: Do not poll or repeatedly reread unchanged output. Use search_many/read_many on stdout_log/stderr_log first when targeted inspection is more efficient."
     ],
@@ -327,7 +328,7 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     promptSnippet: "Stop an active Pi async job by jobId with SIGTERM, SIGINT, or SIGKILL and return its updated job summary.",
     promptGuidelines: [
       "shell_cancel use: Use shell_cancel only to stop an active async job started by Pi.",
-      "shell_cancel input: Schema: closed { jobId: string(minLength=1), signal?: \"SIGTERM\" | \"SIGINT\" | \"SIGKILL\"(default=\"SIGTERM\") }.",
+      inputJsonSchemaGuideline("shell_cancel", CancelParams),
       "shell_cancel output: Schema: { content: text(immediate post-signal job metadata, log paths, output access instructions, and bounded stdout/stderr tails), details: { job: JobMeta, output: { stdout: string, stderr: string } }, isError?: boolean }. Only content is provider-visible; status may still be running immediately after dispatch.",
       "shell_cancel constraints: Prefer SIGTERM unless a stronger signal is necessary; do not call shell_cancel for jobs that already exited."
     ],

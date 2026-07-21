@@ -204,7 +204,8 @@ test("web_fetch_many registers compact Pi renderers and status command", () => {
   ]);
   assert.match(tool.promptGuidelines?.join("\n") ?? "", /textPath/);
   assert.match(tool.promptGuidelines?.join("\n") ?? "", /downloadedPath/);
-  assert.match(JSON.stringify(tool.parameters), /auto extracts readable HTML/);
+  assert.match(JSON.stringify(tool.parameters), /"default":"auto"/);
+  assert.match(JSON.stringify(tool.parameters), /Defaults to auto/);
 
   const callText = tool.renderCall?.({
     urls: [

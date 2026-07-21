@@ -10,6 +10,7 @@ import { readSetupGuidance } from "../_shared/setup-command.js";
 import { validateChildToolAllowlist } from "../_shared/child-agent-session.js";
 import { formatModelName, resolveExtensionModel } from "../_shared/model-spec.js";
 import { writeAgentExtensionConfig } from "../_shared/config.js";
+import { inputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 import {
   canonicalModelSpec,
   resolveTaskModelCandidates,
@@ -125,7 +126,7 @@ export default function orchestratorExtension(api: ExtensionAPI): void {
     promptSnippet: "Delegate independent reader, planner, or isolated writer tasks through tasks:[...], with explicit fallbackModels when needed; returns route attempts, output/errors, worktree/commit, and independent review attempts.",
     promptGuidelines: [
       "orchestrate use: Use orchestrate for substantive work that decomposes into focused independent reader/planner tasks or isolated writer tasks; keep trivial or tightly sequential work in the parent session.",
-      "orchestrate input: Schema: closed { tasks: closed { id?: string(minLength=1), task: string(minLength=1), role?: \"reader\" | \"planner\" | \"writer\"(default=\"reader\"), model?: string(minLength=1), fallbackModels?: string(minLength=1)[0..4], thinkingLevel?: \"off\" | \"minimal\" | \"low\" | \"medium\" | \"high\" | \"xhigh\" }[1..8] }. State a narrow deliverable per task and batch independent tasks; fallbacks must be explicit and ordered.",
+      inputJsonSchemaGuideline("orchestrate", OrchestrateParams),
       "orchestrate output: Schema: { content: text(success count plus per-task id/role/status and route attempts; completed tasks also include resolved model/thinking, duration/tool calls, output, and writer worktree/commit/changed-files/review attempts/verdict; failed tasks include actionable error), details: { mode, configSource, results: [{ id, role, status, error?, output, model, thinkingLevel, toolCallCount, durationMs, deniedCalls, routeAttempts, worktree?, commit?, changedFiles?, review? }] }, isError?: boolean }. Only content is provider-visible; no branch is merged automatically.",
       "orchestrate constraints: Before delegation, the parent reads canonical grounding and passes the relevant evidence; afterward it synthesizes results and updates external decisions/journal itself. Children are read-only or worktree-confined and must not be tasked with external grounding writes. Automatic fallback is limited to explicit fallbackModels and provider availability failures for read-only roles; writer runtime failures retain/remove their worktree safely and fail closed. Use /orchestrator:status for configured caps/routes and reconcile only for kept orch/* writer branches after review."
     ],
@@ -341,7 +342,7 @@ export default function orchestratorExtension(api: ExtensionAPI): void {
     promptSnippet: "Safely fold reviewed kept orch/* writer branches into a validated integration branch, then ask once before merging it into the clean parent checkout.",
     promptGuidelines: [
       "reconcile use: Use reconcile only after orchestrate returns kept reviewed writer branches that should be combined; pass all intended branches together for deterministic overlap and validation handling.",
-      "reconcile input: Schema: closed { branches: string(minLength=1, pattern=\"^orch/\")[1..8] }. Branches must be existing kept orchestrator branches; the parent checkout must be clean and every branch must remain commit-pinned.",
+      inputJsonSchemaGuideline("reconcile", ReconcileParams),
       "reconcile output: Schema: { content: text(status, integration branch, validation, folded branches/files, skipped branches/reasons, overlaps, optional merge commit/cleanup, and integration path when declined for manual review), details: { status, integrationBranch?, integrationPath?, mergeCommit?, folded: [{ branch, changedFiles }], skipped: [{ branch, status, reason }], overlaps: [{ left, right, files }], validation: \"passed-per-fold\" | \"unvalidated\", cleanedBranches }, isError?: boolean }. Only content is provider-visible; declining keeps the integration branch for manual review.",
       "reconcile constraints: Never force-merge conflicts or validation failures. Reconciliation and the final human gate remain serial; only approved validated integration is merged into the parent, after which folded branches/worktrees are removed."
     ],
