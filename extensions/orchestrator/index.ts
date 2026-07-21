@@ -129,7 +129,7 @@ export default function orchestratorExtension(api: ExtensionAPI): void {
       "orchestrate use: Use orchestrate for substantive work that decomposes into focused independent reader/planner tasks or isolated writer tasks; keep trivial or tightly sequential work in the parent session.",
       inputJsonSchemaGuideline("orchestrate", OrchestrateParams),
       outputJsonSchemaGuideline("orchestrate", RetainedToolOutputSchemas.orchestrate),
-      "orchestrate constraints: Before delegation, the parent reads canonical grounding and passes the relevant evidence; afterward it synthesizes results and updates external decisions/journal itself. Children are read-only or worktree-confined and must not be tasked with external grounding writes. Automatic fallback is limited to explicit fallbackModels and provider availability failures for read-only roles; writer runtime failures retain/remove their worktree safely and fail closed. Use /orchestrator:status for configured caps/routes and reconcile only for kept orch/* writer branches after review; no branch is merged automatically. Only result content is provider-visible; details are internal, and thrown errors use Pi's out-of-band error result."
+      "orchestrate constraints: Before delegation, the parent reads canonical grounding and passes the relevant evidence; afterward it synthesizes results and updates external decisions/journal itself. Children are read-only or worktree-confined and must not be tasked with external grounding writes. Automatic fallback is limited to explicit fallbackModels and provider availability failures for read-only roles; writer runtime failures retain/remove their worktree safely and fail closed. Use /orchestrator:status for configured caps/routes and reconcile only for kept orch/* writer branches after review; no branch is merged automatically. Only result content is provider-visible; details are internal, and thrown errors use the host's out-of-band error result."
     ],
     parameters: OrchestrateParams,
     executionMode: "sequential",
@@ -344,7 +344,7 @@ export default function orchestratorExtension(api: ExtensionAPI): void {
       "reconcile use: Use reconcile only after orchestrate returns kept reviewed writer branches that should be combined; pass all intended branches together for deterministic overlap and validation handling.",
       inputJsonSchemaGuideline("reconcile", ReconcileParams),
       outputJsonSchemaGuideline("reconcile", RetainedToolOutputSchemas.reconcile),
-      "reconcile constraints: Never force-merge conflicts or validation failures. Declining keeps the integration branch for manual review. Reconciliation and the final human gate remain serial; only approved validated integration is merged into the parent, after which folded branches/worktrees are removed. Only result content is provider-visible; details are internal, and thrown errors use Pi's out-of-band error result."
+      "reconcile constraints: Never force-merge conflicts or validation failures. Declining keeps the integration branch for manual review. Reconciliation and the final human gate remain serial; only approved validated integration is merged into the parent, after which folded branches/worktrees are removed. Only result content is provider-visible; details are internal, and thrown errors use the host's out-of-band error result."
     ],
     parameters: ReconcileParams,
     executionMode: "sequential",

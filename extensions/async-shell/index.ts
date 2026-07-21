@@ -232,7 +232,7 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
       "Each command item must include its own command and cwd, and starts as a durable async job with its own jobId, status, cwd, stdout_log, stderr_log, and output byte counts. Standard input is ignored, so do not use shell_start for interactive commands.",
       "Results are grouped per job; shell_start does not return stdout/stderr samples. A single shell_start call accepts at most 12 commands.",
       `shell_start waits only for a fixed ${START_WAIT_FOR_COMPLETION_SECONDS}s grace period: jobs that finish quickly return status/log metadata in-band; unfinished jobs continue in the background and, by default, append completion notices when they exit.`,
-      "In-band shell_start results include compact job fields plus stdout_log/stderr_log paths only. Completion notices are short result notices with log paths, batched into history/TUI, then Pi triggers one assistant turn for each flushed batch; use shell_read mode='tail' for recent output, shell_read mode='range' for exact line ranges, or search_many/read_many on log paths for targeted output.",
+      "In-band shell_start results include compact job fields plus stdout_log/stderr_log paths only. Completion notices are short result notices with log paths, batched into history/TUI, then the host triggers one assistant turn for each flushed batch; use shell_read mode='tail' for recent output, shell_read mode='range' for exact line ranges, or search_many/read_many on log paths for targeted output.",
       "Continue useful work while jobs run. If there is no useful work, stop after reporting that jobs are running; completion notices will appear in history and resume the agent. Do not poll or wait.",
       "Set per-command notifyOnExit:false only when the result is unimportant.",
       "Use shell_status to inspect jobs and shell_read to read stdout/stderr. Prefer shell_read mode='tail' after a result/notification or for progress/failure summaries; use shell_read mode='range' only when you know line numbers, are continuing nextOffset, or searched log paths first. Use search_many/read_many on stdout_log/stderr_log for targeted file inspection. Do not use status/read for polling."
@@ -242,7 +242,7 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
       "shell_start use: Use shell_start for shell commands instead of bash. Prefer search_many for normal code/file discovery; use custom rg --files, rg -n, git grep -n, or bounded find shell inspection only when needed.",
       inputJsonSchemaGuideline("shell_start", StartParams),
       outputJsonSchemaGuideline("shell_start", RetainedToolOutputSchemas.shell_start),
-      `shell_start constraints: Continue useful work while jobs run; otherwise report that they are running and let the completion batch resume the agent. Do not poll or wait, do not repeatedly call status/read, and do not paste raw shell output unless explicitly requested. Set notifyOnExit:false only when completion is unimportant. After the fixed ${START_WAIT_FOR_COMPLETION_SECONDS}s grace, unfinished jobs continue and notify by default. Only result content is provider-visible; details are internal, and thrown errors use Pi's out-of-band error result.`
+      `shell_start constraints: Continue useful work while jobs run; otherwise report that they are running and let the completion batch resume the agent. Do not poll or wait, do not repeatedly call status/read, and do not paste raw shell output unless explicitly requested. Set notifyOnExit:false only when completion is unimportant. After the fixed ${START_WAIT_FOR_COMPLETION_SECONDS}s grace, unfinished jobs continue and notify by default. Only result content is provider-visible; details are internal, and thrown errors use the host's out-of-band error result.`
     ],
     parameters: StartParams,
     executionMode: "parallel",
@@ -267,7 +267,7 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
       "shell_status use: Use shell_status for specific async job metadata/health or to list active/recent jobs; use shell_read for stdout/stderr content.",
       inputJsonSchemaGuideline("shell_status", StatusParams),
       outputJsonSchemaGuideline("shell_status", RetainedToolOutputSchemas.shell_status),
-      "shell_status constraints: Do not poll shell_status. Call it only after a result/notification or when inspection of a specific active job is necessary. Only result content is provider-visible; details are internal, and thrown errors use Pi's out-of-band error result."
+      "shell_status constraints: Do not poll shell_status. Call it only after a result/notification or when inspection of a specific active job is necessary. Only result content is provider-visible; details are internal, and thrown errors use the host's out-of-band error result."
     ],
     parameters: StatusParams,
     executionMode: "parallel",
@@ -304,7 +304,7 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
       "shell_read use: Use shell_read for async job stdout/stderr after a start result, completion notice, targeted log search, or when specific active-job output is necessary; use shell_status only for metadata/health.",
       inputJsonSchemaGuideline("shell_read", ReadParams),
       outputJsonSchemaGuideline("shell_read", RetainedToolOutputSchemas.shell_read),
-      "shell_read constraints: Do not poll or repeatedly reread unchanged output. Use search_many/read_many on stdout_log/stderr_log first when targeted inspection is more efficient. Stream text is provider-visible in content and omitted from internal details; thrown errors use Pi's out-of-band error result."
+      "shell_read constraints: Do not poll or repeatedly reread unchanged output. Use search_many/read_many on stdout_log/stderr_log first when targeted inspection is more efficient. Stream text is provider-visible in content and omitted from internal details; thrown errors use the host's out-of-band error result."
     ],
     parameters: ReadParams,
     executionMode: "parallel",
@@ -326,12 +326,12 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     name: "shell_cancel",
     label: "Async Shell Cancel",
     description: "Cancel one async shell job by jobId using SIGTERM, SIGINT, or SIGKILL. The immediate result includes the updated job metadata and bounded stdout/stderr tails.",
-    promptSnippet: "Stop an active Pi async job by jobId with SIGTERM, SIGINT, or SIGKILL and return its updated job summary.",
+    promptSnippet: "Stop an active async job by jobId with SIGTERM, SIGINT, or SIGKILL and return its updated job summary.",
     promptGuidelines: [
-      "shell_cancel use: Use shell_cancel only to stop an active async job started by Pi.",
+      "shell_cancel use: Use shell_cancel only to stop an active async job started by shell_start.",
       inputJsonSchemaGuideline("shell_cancel", CancelParams),
       outputJsonSchemaGuideline("shell_cancel", RetainedToolOutputSchemas.shell_cancel),
-      "shell_cancel constraints: Prefer SIGTERM unless a stronger signal is necessary; do not call shell_cancel for jobs that already exited. The immediate result may still report running. Only result content is provider-visible; details are internal, and thrown errors use Pi's out-of-band error result."
+      "shell_cancel constraints: Prefer SIGTERM unless a stronger signal is necessary; do not call shell_cancel for jobs that already exited. The immediate result may still report running. Only result content is provider-visible; details are internal, and thrown errors use the host's out-of-band error result."
     ],
     parameters: CancelParams,
     executionMode: "parallel",

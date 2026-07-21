@@ -58,7 +58,7 @@ const searxngSearchTool = defineTool({
     "searxng_search use: Use searxng_search for current web discovery and source candidates before web_fetch_many; it searches but does not retrieve complete source content.",
     inputJsonSchemaGuideline("searxng_search", SearchParams),
     outputJsonSchemaGuideline("searxng_search", RetainedToolOutputSchemas.searxng_search),
-    "searxng_search constraints: Use promising URLs with web_fetch_many for complete retrieval. If SearXNG is unconfigured or unreachable, report the failure and direct the user to /searxng:setup or SEARXNG_URL instead of silently substituting another search path. Only result content is provider-visible; details are internal, and thrown errors use Pi's out-of-band error result."
+    "searxng_search constraints: Use promising URLs with web_fetch_many for complete retrieval. If SearXNG is unconfigured or unreachable, report the failure and direct the user to /searxng:setup or SEARXNG_URL instead of silently substituting another search path. Only result content is provider-visible; details are internal, and thrown errors use the host's out-of-band error result."
   ],
   parameters: SearchParams,
   executionMode: "parallel",

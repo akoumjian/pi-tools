@@ -146,7 +146,7 @@ export default function webFetchExtension(api: ExtensionAPI): void {
       "web_fetch_many use: Use searxng_search for discovery, then web_fetch_many for complete retrieval of promising public HTTP(S) sources.",
       inputJsonSchemaGuideline("web_fetch_many", WebFetchManyParams),
       outputJsonSchemaGuideline("web_fetch_many", RetainedToolOutputSchemas.web_fetch_many),
-      "web_fetch_many constraints: Read textPath or parse downloadedPath when complete content is needed. The tool refuses non-HTTP(S), localhost, and private-network URLs. Use shell_start for a special network fetch only when the user explicitly requests it and safety review permits it. Only result content is provider-visible; details are internal, and thrown errors use Pi's out-of-band error result."
+      "web_fetch_many constraints: Read textPath or parse downloadedPath when complete content is needed. The tool refuses non-HTTP(S), localhost, and private-network URLs. Use shell_start for a special network fetch only when the user explicitly requests it and safety review permits it. Only result content is provider-visible; details are internal, and thrown errors use the host's out-of-band error result."
     ],
     parameters: WebFetchManyParams,
     executionMode: "parallel",

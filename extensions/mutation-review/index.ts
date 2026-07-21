@@ -312,7 +312,7 @@ function registerApplyReviewedMutationTool(api: ExtensionAPI): void {
       `apply_reviewed_mutation use: Use ${APPLY_REVIEWED_MUTATION_TOOL_NAME} only when mutation-review blocked an exact edit/write and you intentionally choose to apply that cached original mutation without repeating its large arguments.`,
       inputJsonSchemaGuideline(APPLY_REVIEWED_MUTATION_TOOL_NAME, ApplyReviewedMutationParams),
       outputJsonSchemaGuideline(APPLY_REVIEWED_MUTATION_TOOL_NAME, RetainedToolOutputSchemas.apply_reviewed_mutation),
-      "apply_reviewed_mutation constraints: Missing, stale, or hash-mismatched ids throw visible errors without writing. To change course, reuse existing code or submit revised edit/write arguments for a new review; never use this tool for an unrelated mutation. Only result content is provider-visible; details are internal, and thrown errors use Pi's out-of-band error result."
+      "apply_reviewed_mutation constraints: Missing, stale, or hash-mismatched ids throw visible errors without writing. To change course, reuse existing code or submit revised edit/write arguments for a new review; never use this tool for an unrelated mutation. Only result content is provider-visible; details are internal, and thrown errors use the host's out-of-band error result."
     ],
     parameters: ApplyReviewedMutationParams,
     executionMode: "sequential",

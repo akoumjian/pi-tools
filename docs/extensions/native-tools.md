@@ -228,6 +228,7 @@ None. The extension is automatic at load. Run `/native:status` to confirm strict
 
 ## Notes
 
-- `read_many`, `search_many`, `write_many`, `edit_many` are designed to encourage batching. Pi's prompt steering tells the agent to prefer one call with a list over multiple single-item calls.
+- `read_many`, `search_many`, `write_many`, `edit_many` are designed to encourage batching. Active-tool prompt steering tells the agent to prefer one call with a list over multiple single-item calls.
+- When a supported custom base system prompt is active, the adapter appends the structured active-tool snippets and guidelines that the core custom-prompt branch omits while preserving the assembled prompt as an opaque prefix.
 - For repository-scale discovery, `search_many` is the right entry point; `read_many` should be reserved for reading specific ranges discovered via search.
-- Tests cover schemas, strict replacement, batch behavior, renderers (call/result/error), and integration with `mutation-review` (`tests/native-tools.test.ts`).
+- Tests cover schemas, strict replacement, custom-prompt guidance, batch behavior, renderers (call/result/error), and integration with `mutation-review` (`tests/native-tools.test.ts`).

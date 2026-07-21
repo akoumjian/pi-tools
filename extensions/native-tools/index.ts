@@ -7,6 +7,7 @@ import { Type, type Static } from "@earendil-works/pi-ai";
 import {
   defineTool,
   type AgentToolResult,
+  type BuildSystemPromptOptions,
   type ExtensionAPI,
   type ExtensionContext,
   type Skill,
@@ -144,7 +145,7 @@ const MAX_BATCH_ITEMS = 24;
 const ReadItem = Type.Object({
   path: Type.String({
     minLength: 1,
-    description: "File path to read, relative to the active Pi cwd or absolute."
+    description: "File path to read, relative to the active session cwd or absolute."
   }),
   offset: Type.Optional(Type.Number({
     minimum: 1,
@@ -175,7 +176,7 @@ const SearchItem = Type.Object({
   path: Type.Optional(Type.String({
     minLength: 1,
     default: ".",
-    description: "Directory or file to search, relative to the active Pi cwd or absolute. Defaults to '.'."
+    description: "Directory or file to search, relative to the active session cwd or absolute. Defaults to '.'."
   })),
   glob: Type.Optional(Type.String({
     minLength: 1,
@@ -214,7 +215,7 @@ const SearchManyParams = Type.Object({
 const WriteItem = Type.Object({
   path: Type.String({
     minLength: 1,
-    description: "File path to create or overwrite, relative to the active Pi cwd or absolute."
+    description: "File path to create or overwrite, relative to the active session cwd or absolute."
   }),
   content: Type.String({
     description: "Complete file contents to write."
@@ -242,7 +243,7 @@ const ReplacementItem = Type.Object({
 const EditFileItem = Type.Object({
   path: Type.String({
     minLength: 1,
-    description: "Existing file path to edit, relative to the active Pi cwd or absolute."
+    description: "Existing file path to edit, relative to the active session cwd or absolute."
   }),
   edits: Type.Array(ReplacementItem, {
     minItems: 1,
@@ -362,7 +363,7 @@ function registerBatchTools(api: ExtensionAPI): void {
       "read_many use: Use read_many for known text file paths or ranges; use search_many first for repository, file, symbol, definition, reference, call-site, or likely edit-location discovery.",
       inputJsonSchemaGuideline("read_many", ReadManyParams),
       outputJsonSchemaGuideline("read_many", RetainedToolOutputSchemas.read_many),
-      "read_many constraints: Do not speculatively scan or load many large files, and do not make serial single-file read_many calls when one batched call can cover independent reads. Only result content is provider-visible; details are internal, and thrown errors use Pi's out-of-band error result."
+      "read_many constraints: Do not speculatively scan or load many large files, and do not make serial single-file read_many calls when one batched call can cover independent reads. Only result content is provider-visible; details are internal, and thrown errors use the host's out-of-band error result."
     ],
     parameters: ReadManyParams,
     executionMode: "parallel",
@@ -392,7 +393,7 @@ function registerBatchTools(api: ExtensionAPI): void {
       "search_many use: Prefer search_many before read_many when discovering files, symbols, definitions, references, call sites, or likely edit locations; inspect the narrowed known paths/ranges with read_many afterward.",
       inputJsonSchemaGuideline("search_many", SearchManyParams),
       outputJsonSchemaGuideline("search_many", RetainedToolOutputSchemas.search_many),
-      "search_many constraints: Use literal:true for exact text when regex semantics are unnecessary; otherwise provide a valid ripgrep regex. Narrow or raise maxResults before reading identified ranges. Use structured search_many for normal discovery instead of serial shell searches; use shell_start only when custom rg/find/git-grep inspection is actually needed. Only result content is provider-visible; details are internal, and thrown errors use Pi's out-of-band error result."
+      "search_many constraints: Use literal:true for exact text when regex semantics are unnecessary; otherwise provide a valid ripgrep regex. Narrow or raise maxResults before reading identified ranges. Use structured search_many for normal discovery instead of serial shell searches; use shell_start only when custom rg/find/git-grep inspection is actually needed. Only result content is provider-visible; details are internal, and thrown errors use the host's out-of-band error result."
     ],
     parameters: SearchManyParams,
     executionMode: "parallel",
@@ -421,7 +422,7 @@ function registerBatchTools(api: ExtensionAPI): void {
       "write_many use: Use write_many for new files or intentional complete-file overwrites; use edit_many for small or precise changes to existing files.",
       inputJsonSchemaGuideline("write_many", WriteManyParams),
       outputJsonSchemaGuideline("write_many", RetainedToolOutputSchemas.write_many),
-      "write_many constraints: Do not use write_many for a small edit to an existing file, and do not repeat a blocked large mutation when apply_reviewed_mutation can use its pending id. Only result content is provider-visible; details are internal, and thrown errors use Pi's out-of-band error result."
+      "write_many constraints: Do not use write_many for a small edit to an existing file, and do not repeat a blocked large mutation when apply_reviewed_mutation can use its pending id. Only result content is provider-visible; details are internal, and thrown errors use the host's out-of-band error result."
     ],
     parameters: WriteManyParams,
     executionMode: "parallel",
@@ -450,7 +451,7 @@ function registerBatchTools(api: ExtensionAPI): void {
       "edit_many use: Use edit_many for precise exact-text changes to existing files; use write_many only for new files or complete overwrites.",
       inputJsonSchemaGuideline("edit_many", EditManyParams),
       outputJsonSchemaGuideline("edit_many", RetainedToolOutputSchemas.edit_many),
-      "edit_many constraints: Keep replacements exact and non-overlapping, and do not repeat a blocked large mutation when apply_reviewed_mutation can use its pending id. Only result content is provider-visible; details are internal, and thrown errors use Pi's out-of-band error result."
+      "edit_many constraints: Keep replacements exact and non-overlapping, and do not repeat a blocked large mutation when apply_reviewed_mutation can use its pending id. Only result content is provider-visible; details are internal, and thrown errors use the host's out-of-band error result."
     ],
     parameters: EditManyParams,
     executionMode: "parallel",
@@ -520,7 +521,7 @@ function registerStockToolGuard(api: ExtensionAPI): void {
 
 function registerPromptAdapter(api: ExtensionAPI): void {
   api.on("before_agent_start", (event) => {
-    const systemPrompt = buildNativeToolsSystemPrompt(event.systemPrompt, event.systemPromptOptions.skills ?? []);
+    const systemPrompt = buildNativeToolsSystemPrompt(event.systemPrompt, event.systemPromptOptions);
     return systemPrompt === event.systemPrompt ? undefined : { systemPrompt };
   });
 }
@@ -638,8 +639,51 @@ function formatToolList(toolNames: string[]): string {
   return toolNames.length === 0 ? "none" : toolNames.join(", ");
 }
 
-export function buildNativeToolsSystemPrompt(prompt: string, skills: Skill[]): string {
-  return addSkillsForReadMany(prompt, skills);
+type NativeToolsPromptOptions = Pick<
+  BuildSystemPromptOptions,
+  "customPrompt" | "selectedTools" | "toolSnippets" | "promptGuidelines" | "skills"
+>;
+
+export function buildNativeToolsSystemPrompt(prompt: string, options: NativeToolsPromptOptions): string {
+  const promptWithToolGuidance = addCustomPromptToolGuidance(prompt, options);
+  return addSkillsForReadMany(promptWithToolGuidance, options.skills ?? []);
+}
+
+function addCustomPromptToolGuidance(prompt: string, options: NativeToolsPromptOptions): string {
+  if (!options.customPrompt) {
+    return prompt;
+  }
+
+  const selectedTools = options.selectedTools ?? [];
+  const toolLines = selectedTools.flatMap((toolName) => {
+    const snippet = options.toolSnippets?.[toolName];
+    return snippet ? [`- ${toolName}: ${snippet}`] : [];
+  });
+  const guidelines = uniquePromptGuidelines([
+    ...(options.promptGuidelines ?? []),
+    "Be concise in your responses",
+    "Show file paths clearly when working with files"
+  ]);
+  const section = [
+    "Available tools:",
+    toolLines.length > 0 ? toolLines.join("\n") : "(none)",
+    "",
+    "In addition to the tools above, you may have access to other custom tools depending on the project.",
+    "",
+    "Guidelines:",
+    ...guidelines.map((guideline) => `- ${guideline}`)
+  ].join("\n");
+
+  return `${prompt}\n\n${section}`;
+}
+
+function uniquePromptGuidelines(guidelines: string[]): string[] {
+  const unique = new Set<string>();
+  for (const guideline of guidelines) {
+    const normalized = guideline.trim();
+    if (normalized) unique.add(normalized);
+  }
+  return [...unique];
 }
 
 function addSkillsForReadMany(prompt: string, skills: Skill[]): string {

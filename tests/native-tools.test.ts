@@ -965,7 +965,7 @@ test("buildNativeToolsSystemPrompt preserves the assembled prompt opaquely and a
     }
   ];
 
-  const result = buildNativeToolsSystemPrompt(prompt, skills);
+  const result = buildNativeToolsSystemPrompt(prompt, { skills });
 
   assert.equal(result.slice(0, prompt.length), prompt);
   assert.match(result, /SENTINEL_TOOL_SNIPPET/);
@@ -977,6 +977,31 @@ test("buildNativeToolsSystemPrompt preserves the assembled prompt opaquely and a
   assert.match(result, /Use read_many with files/);
   assert.match(result, /<name>pi-agent<\/name>/);
   assert.match(result, /Use for Pi &lt;agent&gt; &amp; config/);
+});
+
+test("buildNativeToolsSystemPrompt restores structured tool guidance for a custom base prompt", () => {
+  const prompt = "SENTINEL_CUSTOM_BASE\nSENTINEL_CONTEXT_AND_APPEND";
+  const result = buildNativeToolsSystemPrompt(prompt, {
+    customPrompt: "SENTINEL_CUSTOM_BASE",
+    selectedTools: ["shell_start", "hidden_tool"],
+    toolSnippets: {
+      shell_start: "SENTINEL_SHELL_SNIPPET",
+      unselected_tool: "MUST_NOT_APPEAR"
+    },
+    promptGuidelines: [
+      "shell_start use: SENTINEL_SHELL_GUIDELINE",
+      " shell_start use: SENTINEL_SHELL_GUIDELINE "
+    ],
+    skills: []
+  });
+
+  assert.equal(result.slice(0, prompt.length), prompt);
+  assert.match(result, /Available tools:\n- shell_start: SENTINEL_SHELL_SNIPPET/);
+  assert.doesNotMatch(result, /hidden_tool:/);
+  assert.doesNotMatch(result, /MUST_NOT_APPEAR/);
+  assert.equal(result.match(/shell_start use: SENTINEL_SHELL_GUIDELINE/g)?.length, 1);
+  assert.match(result, /- Be concise in your responses/);
+  assert.match(result, /- Show file paths clearly when working with files/);
 });
 
 test("native tool policy reconciles before prompt construction and blocks stock tool execution", () => {

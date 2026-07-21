@@ -114,9 +114,13 @@ test("provider context review command renders sanitized prompt, tool declaration
     for (const tool of artifact.activeTools) {
       assert.ok(tool.description.length > 20, `${tool.name} provider description`);
       assert.doesNotMatch(tool.description, /result details shape:/i, `${tool.name} provider description does not retain informal output-shape notation`);
+      assert.doesNotMatch(tool.description, /(?<![A-Za-z0-9_./-])pi(?![A-Za-z0-9_/-])/i, `${tool.name} provider description is platform-neutral`);
       assert.ok((tool.promptSnippet ?? "").length > 20, `${tool.name} system snippet`);
+      assert.doesNotMatch(tool.promptSnippet ?? "", /(?<![A-Za-z0-9_./-])pi(?![A-Za-z0-9_/-])/i, `${tool.name} system snippet is platform-neutral`);
       assert.ok((tool.promptGuidelines ?? []).length > 0, `${tool.name} system guidelines`);
       const guidelines = (tool.promptGuidelines ?? []).join("\n");
+      assert.doesNotMatch(guidelines, /(?<![A-Za-z0-9_./-])pi(?![A-Za-z0-9_/-])/i, `${tool.name} system guidelines are platform-neutral`);
+      assert.doesNotMatch(JSON.stringify(tool.parameters), /(?<![A-Za-z0-9_./-])pi(?![A-Za-z0-9_/-])/i, `${tool.name} input schema descriptions are platform-neutral`);
       assert.match(guidelines, new RegExp(`${tool.name} input: JSON Schema:`), `${tool.name} minified input JSON Schema guideline`);
       assert.match(guidelines, new RegExp(`${tool.name} output: JSON Schema:`), `${tool.name} minified output JSON Schema guideline`);
       assert.match(guidelines, /Only result content is provider-visible|Stream text is provider-visible in content/, `${tool.name} provider-visible output boundary`);

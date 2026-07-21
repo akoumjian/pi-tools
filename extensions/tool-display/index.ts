@@ -117,7 +117,7 @@ export function createDocumentParseTool(settings: ToolDisplaySettings): ToolDefi
       "document_parse use: Use document_parse instead of composing LiteParse CLI commands when local PDF, DOCX, PPTX, XLSX, CSV, image OCR, layout, bounding-box, or screenshot extraction is needed.",
       inputJsonSchemaGuideline("document_parse", DocumentParseSchema),
       outputJsonSchemaGuideline("document_parse", RetainedToolOutputSchemas.document_parse),
-      "document_parse constraints: Use read_many on outputPath or screenshots for complete content. Use document_parse for local image inspection in the current text-file-only read_many profile. If host parser dependencies are missing, direct the user to /docparser:doctor. Only result content is provider-visible; details are internal; progress and early cancellation may use empty details, and thrown errors use Pi's out-of-band error result."
+      "document_parse constraints: Use read_many on outputPath or screenshots for complete content. Use document_parse for local image inspection in the current text-file-only read_many profile. If host parser dependencies are missing, direct the user to /docparser:doctor. Only result content is provider-visible; details are internal; progress and early cancellation may use empty details, and thrown errors use the host's out-of-band error result."
     ],
     parameters: DocumentParseSchema,
     executionMode: "parallel",
