@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import type { Api, AssistantMessage, Model } from "@earendil-works/pi-ai";
-import { SessionManager, type ExtensionAPI, type ExtensionContext, type ToolCallEvent, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Check } from "typebox/value";
+import { SessionManager, type ExtensionAPI, type ExtensionContext, type ToolCallEvent, type ToolDefinition, type ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import mutationReviewExtension, {
   applyReviewedMutation,
   blockedOperationsForDecision,
@@ -16,6 +17,7 @@ import mutationReviewExtension, {
   recoverMutationReviewDecisionFromAssistant,
   recoverMutationReviewDecisionFromText,
   readMutationReviewSettings,
+  rememberPartialMutationReviewResult,
   rememberPendingReviewedMutation,
   retainAllowedMutationEntries,
   selectMutationReviewModel,
@@ -25,6 +27,7 @@ import mutationReviewExtension, {
   type MutationReviewRunResult
 } from "../extensions/mutation-review/index.js";
 import { nativeEditMutationEntryId, nativeWriteMutationEntryId } from "../extensions/native-tools/index.js";
+import { RetainedToolOutputSchemas } from "../extensions/_shared/tool-output.js";
 
 type FakeCommandOptions = {
   handler: (args: string, context: ExtensionContext) => Promise<void> | void;
@@ -152,6 +155,7 @@ test("mutation review extension registers a tool_call hook and cached apply surf
   const api = createFakeApi();
   mutationReviewExtension(api);
   assert.equal(api.handlers.get("tool_call")?.length, 1);
+  assert.equal(api.handlers.get("tool_result")?.length, 1);
   assert.ok(api.tools.has("apply_reviewed_mutation"));
   const applyTool = api.tools.get("apply_reviewed_mutation")!;
   assert.deepEqual(applyTool.promptGuidelines?.map((line) => line.split(":", 1)[0]), [
@@ -171,6 +175,51 @@ test("mutation review extension registers a tool_call hook and cached apply surf
   assert.equal(api.commands.has("mutation-review-status"), false, "deprecated kebab alias removed");
   assert.equal(api.commands.has("mutation-review-model"), false, "deprecated kebab alias removed");
   assert.equal(api.commands.has("mutation-review-toggle"), false, "deprecated kebab alias removed");
+});
+
+test("tool_result middleware decorates partial-review execution errors with strict schema-compatible details", () => {
+  const api = createFakeApi();
+  mutationReviewExtension(api);
+  const handler = api.handlers.get("tool_result")?.[0];
+  assert.ok(handler);
+  const context = createContext("/repo");
+  const operation = {
+    id: "m_0123456789ab",
+    kind: "replace" as const,
+    path: "src/blocked.ts",
+    resolvedPath: "/repo/src/blocked.ts",
+    after: "replacement\n",
+    diff: "+replacement",
+    afterHash: "a".repeat(64)
+  };
+  rememberPartialMutationReviewResult(context, "call-partial-error", {
+    pendingId: "mr_01234567",
+    fingerprint: "a".repeat(64),
+    review: fakeReviewResult(),
+    blockedOperations: [operation],
+    allowedOperations: [{ ...operation, id: "m_abcdef012345", path: "src/allowed.ts", resolvedPath: "/repo/src/allowed.ts" }]
+  });
+
+  const result = handler({
+    type: "tool_result",
+    toolName: "write_many",
+    toolCallId: "call-partial-error",
+    input: {},
+    content: [{ type: "text", text: "Tool failed" }],
+    details: {},
+    isError: true
+  } as ToolResultEvent, context) as { content: Array<{ type: string; text: string }>; details: { mutationReview: { pendingId: string; blocked: Array<{ id: string }> } }; isError?: boolean };
+
+  assert.equal(result.content.length, 2);
+  assert.match(result.content[1]?.text ?? "", /Mutation review skipped 1 blocked mutation/);
+  assert.equal(result.details.mutationReview.pendingId, "mr_01234567");
+  assert.deepEqual(result.details.mutationReview.blocked.map((entry) => entry.id), ["m_0123456789ab"]);
+  assert.equal("isError" in result, false, "middleware edits result content/details without inventing a raw execute-result field");
+  assert.equal(Check(RetainedToolOutputSchemas.write_many, result), true, "actual middleware result matches the authoritative output contract");
+  assert.equal(Check(RetainedToolOutputSchemas.write_many, {
+    ...result,
+    details: { ...result.details, unexpected: true }
+  }), false, "mutation-only details remain closed to unknown fields");
 });
 
 test("mutation-review status reports runtime model override and enforcement state", () => {

@@ -14,7 +14,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
-import { inputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
+import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
+import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 
 type TruncationDetails = {
   truncated: boolean;
@@ -353,15 +354,15 @@ function registerBatchTools(api: ExtensionAPI): void {
     description: [
       "Read known text file ranges in one parallel-capable tool call. Always pass files: [...]; use a one-item list for a single text file when batch shape is convenient. Batch independent file reads together instead of making serial read_many calls.",
       "Do not use read_many to discover files, scan a repository, or load many large files speculatively. Use search_many first for structured rg-backed file discovery/content search, or shell_start with rg/rg --files/find/git grep when custom shell inspection is needed.",
-      "Each item accepts { path, offset?, limit? }. Omit limit when full remaining file contents are actually needed. Output is grouped by file. Result details shape: { files: [{ path, resolvedPath, offset, requestedLimit?, truncation: { truncated, truncatedBy, totalLines, outputLines, totalBytes, outputBytes, nextOffset? } }] }.",
+      "Each item accepts { path, offset?, limit? }. Omit limit when full remaining file contents are actually needed. Output is grouped by file, with internal details recording resolved paths, request bounds, previews, and truncation metadata.",
       "Use offset as a 1-indexed starting line and limit as the maximum lines for that file. For huge files, continue with the returned nextOffset."
     ].join(" "),
     promptSnippet: "Read known text file paths and ranges in one batched files:[...] call; returns grouped content and continuation offsets.",
     promptGuidelines: [
       "read_many use: Use read_many for known text file paths or ranges; use search_many first for repository, file, symbol, definition, reference, call-site, or likely edit-location discovery.",
       inputJsonSchemaGuideline("read_many", ReadManyParams),
-      "read_many output: Schema: { content: text(file count plus, per file, path, returned start-end/total lines, requested text, and nextOffset? when truncated), details: { files: [{ path, resolvedPath, offset, requestedLimit?, truncation: { truncated, truncatedBy: \"lines\" | \"bytes\" | null, totalLines, outputLines, totalBytes, outputBytes, nextOffset? }, previewLines }] }, isError?: boolean }. Only content is provider-visible.",
-      "read_many constraints: Do not speculatively scan or load many large files, and do not make serial single-file read_many calls when one batched call can cover independent reads."
+      outputJsonSchemaGuideline("read_many", RetainedToolOutputSchemas.read_many),
+      "read_many constraints: Do not speculatively scan or load many large files, and do not make serial single-file read_many calls when one batched call can cover independent reads. Only result content is provider-visible; details are internal, and thrown errors use Pi's out-of-band error result."
     ],
     parameters: ReadManyParams,
     executionMode: "parallel",
@@ -384,14 +385,14 @@ function registerBatchTools(api: ExtensionAPI): void {
       "Run structured ripgrep searches in one parallel-capable tool call. Prefer this before read_many when discovering files, symbols, definitions, references, call sites, or likely edit locations. Put independent searches in one searches array instead of making serial search_many calls.",
       "Each item accepts { kind, pattern?, path?, glob?, context?, maxResults?, ignoreCase?, literal? }. Use kind='content' for rg text search with line/column numbers; use kind='files' for rg --files file discovery. path defaults to '.'.",
       "Examples: { kind: 'files', path: '.', glob: '*.ts', maxResults: 200 }; { kind: 'content', pattern: 'evaluateAsyncShellStart', path: 'extensions', glob: '*.ts', context: 2, maxResults: 80 }.",
-      "Result details shape: { searches: [{ kind, path, resolvedPath, pattern?, glob?, context, maxResults, outputLines, truncated, exitCode, signal? }] }. After search_many identifies specific paths and line ranges, use read_many with offset/limit to inspect only the needed regions."
+      "Internal details record each search's resolved path, bounds, output size, truncation state, exit status, and preview. After search_many identifies specific paths and line ranges, use read_many with offset/limit to inspect only the needed regions."
     ].join(" "),
     promptSnippet: "Discover files and search repository content with one batched searches:[...] ripgrep call; returns grouped matches and truncation notices.",
     promptGuidelines: [
       "search_many use: Prefer search_many before read_many when discovering files, symbols, definitions, references, call sites, or likely edit locations; inspect the narrowed known paths/ranges with read_many afterward.",
       inputJsonSchemaGuideline("search_many", SearchManyParams),
-      "search_many output: Schema: { content: text(search count plus grouped index/kind/pattern/path/glob?/returned-line-count/rg-output-or-no-matches and explicit truncation notice), details: { searches: [{ kind, path, resolvedPath, pattern?, glob?, context, maxResults, outputLines, truncated, exitCode, signal?, previewLines }] }, isError?: boolean }. Only content is provider-visible; narrow or raise maxResults before reading identified ranges.",
-      "search_many constraints: Use literal:true for exact text when regex semantics are unnecessary; otherwise provide a valid ripgrep regex. Use structured search_many for normal discovery instead of serial shell searches; use shell_start only when custom rg/find/git-grep inspection is actually needed."
+      outputJsonSchemaGuideline("search_many", RetainedToolOutputSchemas.search_many),
+      "search_many constraints: Use literal:true for exact text when regex semantics are unnecessary; otherwise provide a valid ripgrep regex. Narrow or raise maxResults before reading identified ranges. Use structured search_many for normal discovery instead of serial shell searches; use shell_start only when custom rg/find/git-grep inspection is actually needed. Only result content is provider-visible; details are internal, and thrown errors use Pi's out-of-band error result."
     ],
     parameters: SearchManyParams,
     executionMode: "parallel",
@@ -413,14 +414,14 @@ function registerBatchTools(api: ExtensionAPI): void {
     description: [
       "Create or completely overwrite multiple files in one parallel-capable tool call. Always pass writes: [...]; use a one-item list for a single full-file write.",
       "Each item accepts { path, content }. Parent directories are created. Do not use this for small edits to existing files; use edit_many.",
-      "Result details shape: { files: [{ id, scopedId?, path, resolvedPath, bytes, lines }] }, where id is a short content-derived mutation entry id."
+      "Results identify each written path, byte and line counts, and a short content-derived mutation entry id."
     ].join(" "),
     promptSnippet: "Create or completely overwrite files with one batched writes:[...] call; returns mutation ids, paths, byte counts, and line counts.",
     promptGuidelines: [
       "write_many use: Use write_many for new files or intentional complete-file overwrites; use edit_many for small or precise changes to existing files.",
       inputJsonSchemaGuideline("write_many", WriteManyParams),
-      "write_many output: Schema: { content: text(written file count plus each mutation id/path/byte count, or partial-review blocked ids/paths/kinds, reviewer summary, pending id/fingerprint, and apply-or-revise guidance), details: { files: [{ id, scopedId?, path, resolvedPath, bytes, lines }], mutationReview?: { pendingId, blocked: [{ id, path, kind }], summary } }, isError?: boolean }. Only content is provider-visible; line counts/resolved paths remain internal.",
-      "write_many constraints: Do not use write_many for a small edit to an existing file, and do not repeat a blocked large mutation when apply_reviewed_mutation can use its pending id."
+      outputJsonSchemaGuideline("write_many", RetainedToolOutputSchemas.write_many),
+      "write_many constraints: Do not use write_many for a small edit to an existing file, and do not repeat a blocked large mutation when apply_reviewed_mutation can use its pending id. Only result content is provider-visible; details are internal, and thrown errors use Pi's out-of-band error result."
     ],
     parameters: WriteManyParams,
     executionMode: "parallel",
@@ -442,14 +443,14 @@ function registerBatchTools(api: ExtensionAPI): void {
     description: [
       "Edit multiple existing files in one parallel-capable tool call. Always pass files: [...]; use a one-item list for a single file when batch shape is convenient.",
       "Each file item accepts { path, edits: [{ oldText, newText }] }. Every oldText must occur exactly once in that file's original content; replacements in the same file must not overlap.",
-      "Use for precise changes across files. Result details shape: { files: [{ id, scopedId?, path, resolvedPath, replacements, ranges: [{ startLine, endLine }], bytesBefore, bytesAfter }] }, where id is a short content-derived mutation entry id."
+      "Use for precise changes across files. Results identify each edited path, replacement ranges, before/after byte counts, and a short content-derived mutation entry id."
     ].join(" "),
     promptSnippet: "Apply exact text replacements across existing files with one batched files:[...] call; returns mutation ids, paths, replacement counts, and ranges.",
     promptGuidelines: [
       "edit_many use: Use edit_many for precise exact-text changes to existing files; use write_many only for new files or complete overwrites.",
       inputJsonSchemaGuideline("edit_many", EditManyParams),
-      "edit_many output: Schema: { content: text(edited file count plus each mutation id/path/replacement count, or partial-review blocked ids/paths/kinds, reviewer summary, pending id/fingerprint, and apply-or-revise guidance), details: { files: [{ id, scopedId?, path, resolvedPath, replacements, ranges: [{ startLine, endLine }], bytesBefore, bytesAfter }], mutationReview?: { pendingId, blocked: [{ id, path, kind }], summary } }, isError?: boolean }. Only content is provider-visible; ranges/byte counts/resolved paths remain internal.",
-      "edit_many constraints: Keep replacements exact and non-overlapping, and do not repeat a blocked large mutation when apply_reviewed_mutation can use its pending id."
+      outputJsonSchemaGuideline("edit_many", RetainedToolOutputSchemas.edit_many),
+      "edit_many constraints: Keep replacements exact and non-overlapping, and do not repeat a blocked large mutation when apply_reviewed_mutation can use its pending id. Only result content is provider-visible; details are internal, and thrown errors use Pi's out-of-band error result."
     ],
     parameters: EditManyParams,
     executionMode: "parallel",

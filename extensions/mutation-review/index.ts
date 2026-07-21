@@ -40,7 +40,8 @@ import { withChildAgentSession } from "../_shared/child-agent-session.js";
 import { formatConfigPath, readPiToolsJsonConfigSource, readPiToolsReferencedTextConfig, writeAgentExtensionConfig, type PiToolsJsonConfig } from "../_shared/config.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 import { guidedModelSetupUsage, parseGuidedModelSetupArgs, readSetupGuidance } from "../_shared/setup-command.js";
-import { inputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
+import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
+import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 
 const STATUS_KEY = "mutation-review";
 const DECISION_TOOL_NAME = "submit_mutation_review";
@@ -197,7 +198,7 @@ Rules:
 - Judge only reuse/duplication. Do not block for correctness, behavior-change, dead-code, style, naming, or architecture concerns unless concrete duplicate existing code is the reason to reuse.
 - Never answer with plain text like "Decision: block"; the final action must be exactly one ${DECISION_TOOL_NAME} call.`;
 
-type PartialMutationReviewToolResult = {
+export type PartialMutationReviewToolResult = {
   pendingId: string;
   fingerprint: string;
   review: MutationReviewRunResult;
@@ -310,8 +311,8 @@ function registerApplyReviewedMutationTool(api: ExtensionAPI): void {
     promptGuidelines: [
       `apply_reviewed_mutation use: Use ${APPLY_REVIEWED_MUTATION_TOOL_NAME} only when mutation-review blocked an exact edit/write and you intentionally choose to apply that cached original mutation without repeating its large arguments.`,
       inputJsonSchemaGuideline(APPLY_REVIEWED_MUTATION_TOOL_NAME, ApplyReviewedMutationParams),
-      "apply_reviewed_mutation output: Schema: { content: text(reviewed id, file count, before-hash confirmation, and each mutation id/path/kind/byte count), details: { id, fingerprint, toolName, toolCallId, files: [{ id, path, resolvedPath, kind: \"create\" | \"overwrite\" | \"replace\", bytes, lines, beforeHash?, afterHash }] }, isError?: boolean }. Only content is provider-visible; missing, stale, or hash-mismatched ids throw visible errors without writing.",
-      "apply_reviewed_mutation constraints: To change course, reuse existing code or submit revised edit/write arguments for a new review; never use this tool for an unrelated mutation."
+      outputJsonSchemaGuideline(APPLY_REVIEWED_MUTATION_TOOL_NAME, RetainedToolOutputSchemas.apply_reviewed_mutation),
+      "apply_reviewed_mutation constraints: Missing, stale, or hash-mismatched ids throw visible errors without writing. To change course, reuse existing code or submit revised edit/write arguments for a new review; never use this tool for an unrelated mutation. Only result content is provider-visible; details are internal, and thrown errors use Pi's out-of-band error result."
     ],
     parameters: ApplyReviewedMutationParams,
     executionMode: "sequential",
@@ -697,7 +698,7 @@ function clearMutationReviewStateForContext(context: ExtensionContext): void {
   partialMutationReviewResultsByScope.delete(scopeId);
 }
 
-function rememberPartialMutationReviewResult(context: ExtensionContext, toolCallId: string, result: PartialMutationReviewToolResult): void {
+export function rememberPartialMutationReviewResult(context: ExtensionContext, toolCallId: string, result: PartialMutationReviewToolResult): void {
   const scopeId = mutationReviewScopeId(context);
   const scope = partialMutationReviewResultsByScope.get(scopeId) ?? new Map<string, PartialMutationReviewToolResult>();
   scope.set(toolCallId, result);

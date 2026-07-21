@@ -3,7 +3,8 @@ import { Type, type Static } from "@earendil-works/pi-ai";
 import type { AgentToolResult, ExtensionAPI, ExtensionCommandContext, RegisteredCommand, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { findPiToolsConfigFile, readPiToolsJsonConfig } from "../_shared/config.js";
-import { inputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
+import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
+import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 
 const DocumentParseSchema = Type.Object({
   path: Type.String({
@@ -115,8 +116,8 @@ export function createDocumentParseTool(settings: ToolDisplaySettings): ToolDefi
     promptGuidelines: [
       "document_parse use: Use document_parse instead of composing LiteParse CLI commands when local PDF, DOCX, PPTX, XLSX, CSV, image OCR, layout, bounding-box, or screenshot extraction is needed.",
       inputJsonSchemaGuideline("document_parse", DocumentParseSchema),
-      "document_parse output: Schema: { content: text(source/resolved paths, output format, page count, outputPath, optional nonzero screenshot directory/count and up to ten paths, warnings?, parsed preview, and truncation handoff?), details: { sourcePath, resolvedPath, outputFormat, outputPath, outputDir, pageCount, screenshotCount, screenshotDir?, screenshotPathsPreview?, warnings? }, isError?: boolean }. Only content is provider-visible; use read_many on outputPath or screenshots for complete content.",
-      "document_parse constraints: Use document_parse for local image inspection in the current text-file-only read_many profile. If host parser dependencies are missing, direct the user to /docparser:doctor."
+      outputJsonSchemaGuideline("document_parse", RetainedToolOutputSchemas.document_parse),
+      "document_parse constraints: Use read_many on outputPath or screenshots for complete content. Use document_parse for local image inspection in the current text-file-only read_many profile. If host parser dependencies are missing, direct the user to /docparser:doctor. Only result content is provider-visible; details are internal; progress and early cancellation may use empty details, and thrown errors use Pi's out-of-band error result."
     ],
     parameters: DocumentParseSchema,
     executionMode: "parallel",

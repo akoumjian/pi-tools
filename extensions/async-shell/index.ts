@@ -7,7 +7,8 @@ import { Type, type Static } from "@earendil-works/pi-ai";
 import { defineTool, type AgentToolResult, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
-import { inputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
+import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
+import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 
 type JobStatus = "running" | "exited" | "failed" | "cancelled" | "unknown";
 type OutputStreamName = "stdout" | "stderr";
@@ -229,7 +230,7 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
       "Use shell_start for shell commands. Pass inputs as commands: [...].",
       "Start independent shell work together in one commands list instead of making serial shell_start calls; split into separate calls only when commands depend on previous output, must run in order, or are not safe to run concurrently.",
       "Each command item must include its own command and cwd, and starts as a durable async job with its own jobId, status, cwd, stdout_log, stderr_log, and output byte counts. Standard input is ignored, so do not use shell_start for interactive commands.",
-      "Results are grouped per job as { jobs: Array<JobStartDetails> }; shell_start does not return stdout/stderr samples. A single shell_start call accepts at most 12 commands.",
+      "Results are grouped per job; shell_start does not return stdout/stderr samples. A single shell_start call accepts at most 12 commands.",
       `shell_start waits only for a fixed ${START_WAIT_FOR_COMPLETION_SECONDS}s grace period: jobs that finish quickly return status/log metadata in-band; unfinished jobs continue in the background and, by default, append completion notices when they exit.`,
       "In-band shell_start results include compact job fields plus stdout_log/stderr_log paths only. Completion notices are short result notices with log paths, batched into history/TUI, then Pi triggers one assistant turn for each flushed batch; use shell_read mode='tail' for recent output, shell_read mode='range' for exact line ranges, or search_many/read_many on log paths for targeted output.",
       "Continue useful work while jobs run. If there is no useful work, stop after reporting that jobs are running; completion notices will appear in history and resume the agent. Do not poll or wait.",
@@ -240,8 +241,8 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     promptGuidelines: [
       "shell_start use: Use shell_start for shell commands instead of bash. Prefer search_many for normal code/file discovery; use custom rg --files, rg -n, git grep -n, or bounded find shell inspection only when needed.",
       inputJsonSchemaGuideline("shell_start", StartParams),
-      `shell_start output: Schema: { content: text(one block per job with jobId, job_name?, status, exitCode?, signal?, durationMs?, error?, cwd, command, stdout_log, stderr_log, outputBytes, and shell_read handoff; no stdout/stderr samples), details: { jobs: [{ jobId, job_name?, command, cwd, status, durationMs?, exitCode?, signal?, error?, stdoutLog, stderrLog, outputBytes: { stdout, stderr } }] }, isError?: boolean }. Only content is provider-visible. After the fixed ${START_WAIT_FOR_COMPLETION_SECONDS}s grace, unfinished jobs continue and notify by default.`,
-      "shell_start constraints: Continue useful work while jobs run; otherwise report that they are running and let the completion batch resume the agent. Do not poll or wait, do not repeatedly call status/read, and do not paste raw shell output unless explicitly requested. Set notifyOnExit:false only when completion is unimportant."
+      outputJsonSchemaGuideline("shell_start", RetainedToolOutputSchemas.shell_start),
+      `shell_start constraints: Continue useful work while jobs run; otherwise report that they are running and let the completion batch resume the agent. Do not poll or wait, do not repeatedly call status/read, and do not paste raw shell output unless explicitly requested. Set notifyOnExit:false only when completion is unimportant. After the fixed ${START_WAIT_FOR_COMPLETION_SECONDS}s grace, unfinished jobs continue and notify by default. Only result content is provider-visible; details are internal, and thrown errors use Pi's out-of-band error result.`
     ],
     parameters: StartParams,
     executionMode: "parallel",
@@ -260,13 +261,13 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
   api.registerTool(defineTool({
     name: "shell_status",
     label: "Async Shell Status",
-    description: "Get async shell job status. Pass jobId for one job; omit jobId to list active and recent jobs. Use shell_status for job metadata/health, not routine output reading. Single-job results include job metadata, stdout_log/stderr_log paths, and a small diagnostic tail; prefer shell_read mode='tail' for recent stdout/stderr, shell_read mode='range' for exact line ranges/nextOffset continuation, or search_many/read_many on log paths for targeted file inspection. List result details shape: { jobs: JobMeta[] }.",
+    description: "Get async shell job status. Pass jobId for one job; omit jobId to list active and recent jobs. Use shell_status for job metadata/health, not routine output reading. Single-job results include job metadata, stdout_log/stderr_log paths, and a small diagnostic tail; prefer shell_read mode='tail' for recent stdout/stderr, shell_read mode='range' for exact line ranges/nextOffset continuation, or search_many/read_many on log paths for targeted file inspection.",
     promptSnippet: "Inspect async job metadata/health by jobId or list active/recent jobs; use shell_read, not shell_status, for output.",
     promptGuidelines: [
       "shell_status use: Use shell_status for specific async job metadata/health or to list active/recent jobs; use shell_read for stdout/stderr content.",
       inputJsonSchemaGuideline("shell_status", StatusParams),
-      "shell_status output: Schema: { content: text(jobId mode: job metadata, both log paths, access instructions, bounded stdout/stderr tails; list mode: recency-ordered job id/name/status/exit/command/cwd entries), details: { job: JobMeta, output: { stdout: string, stderr: string } } | { jobs: JobMeta[] }, isError?: boolean }. Only content is provider-visible; JobMeta details additionally retain shell, pid/timestamps, notification state, logDir, and raw byte counts.",
-      "shell_status constraints: Do not poll shell_status. Call it only after a result/notification or when inspection of a specific active job is necessary."
+      outputJsonSchemaGuideline("shell_status", RetainedToolOutputSchemas.shell_status),
+      "shell_status constraints: Do not poll shell_status. Call it only after a result/notification or when inspection of a specific active job is necessary. Only result content is provider-visible; details are internal, and thrown errors use Pi's out-of-band error result."
     ],
     parameters: StatusParams,
     executionMode: "parallel",
@@ -297,13 +298,13 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
   api.registerTool(defineTool({
     name: "shell_read",
     label: "Async Shell Read",
-    description: "Read async shell stdout/stderr logs by jobId. Use mode='tail' (default) for recent output after shell_start results or completion notices. Use mode='range' for exact read_many-style line ranges, when continuing with nextOffset, or after search_many finds log matches. Choose stream='stdout' or 'stderr', or omit stream to read both selected streams. Tail mode accepts lines/maxChars; range mode accepts offset/limit. Result details shape: { job: JobMeta, streams: [{ stream, logPath, mode, offset?, requestedLimit?, requestedLines?, requestedMaxChars?, truncation?, previewLines }] }.",
+    description: "Read async shell stdout/stderr logs by jobId. Use mode='tail' (default) for recent output after shell_start results or completion notices. Use mode='range' for exact read_many-style line ranges, when continuing with nextOffset, or after search_many finds log matches. Choose stream='stdout' or 'stderr', or omit stream to read both selected streams. Tail mode accepts lines/maxChars; range mode accepts offset/limit. Internal details identify the job, selected streams, log paths, mode, request bounds, and previews.",
     promptSnippet: "Read async stdout/stderr by jobId with tail mode for recent output or range mode for exact lines and continuation.",
     promptGuidelines: [
       "shell_read use: Use shell_read for async job stdout/stderr after a start result, completion notice, targeted log search, or when specific active-job output is necessary; use shell_status only for metadata/health.",
       inputJsonSchemaGuideline("shell_read", ReadParams),
-      "shell_read output: Schema: { content: text(job identity plus each selected stream's logPath, requested tail/exact range and actual log text; range mode also includes total lines and nextOffset?), details: { job: JobMeta, streams: [{ stream, logPath, mode, offset?, requestedLimit?, requestedLines?, requestedMaxChars?, truncation?, previewLines }] }, isError?: boolean }. Only content is provider-visible; stream content is omitted from details.",
-      "shell_read constraints: Do not poll or repeatedly reread unchanged output. Use search_many/read_many on stdout_log/stderr_log first when targeted inspection is more efficient."
+      outputJsonSchemaGuideline("shell_read", RetainedToolOutputSchemas.shell_read),
+      "shell_read constraints: Do not poll or repeatedly reread unchanged output. Use search_many/read_many on stdout_log/stderr_log first when targeted inspection is more efficient. Stream text is provider-visible in content and omitted from internal details; thrown errors use Pi's out-of-band error result."
     ],
     parameters: ReadParams,
     executionMode: "parallel",
@@ -324,13 +325,13 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
   api.registerTool(defineTool({
     name: "shell_cancel",
     label: "Async Shell Cancel",
-    description: "Cancel one async shell job by jobId using SIGTERM, SIGINT, or SIGKILL. Result details shape: { job: JobMeta, output: { stdout: string, stderr: string } }.",
+    description: "Cancel one async shell job by jobId using SIGTERM, SIGINT, or SIGKILL. The immediate result includes the updated job metadata and bounded stdout/stderr tails.",
     promptSnippet: "Stop an active Pi async job by jobId with SIGTERM, SIGINT, or SIGKILL and return its updated job summary.",
     promptGuidelines: [
       "shell_cancel use: Use shell_cancel only to stop an active async job started by Pi.",
       inputJsonSchemaGuideline("shell_cancel", CancelParams),
-      "shell_cancel output: Schema: { content: text(immediate post-signal job metadata, log paths, output access instructions, and bounded stdout/stderr tails), details: { job: JobMeta, output: { stdout: string, stderr: string } }, isError?: boolean }. Only content is provider-visible; status may still be running immediately after dispatch.",
-      "shell_cancel constraints: Prefer SIGTERM unless a stronger signal is necessary; do not call shell_cancel for jobs that already exited."
+      outputJsonSchemaGuideline("shell_cancel", RetainedToolOutputSchemas.shell_cancel),
+      "shell_cancel constraints: Prefer SIGTERM unless a stronger signal is necessary; do not call shell_cancel for jobs that already exited. The immediate result may still report running. Only result content is provider-visible; details are internal, and thrown errors use Pi's out-of-band error result."
     ],
     parameters: CancelParams,
     executionMode: "parallel",
@@ -977,10 +978,10 @@ function readMetaFile(metaPath: string): JobMeta | undefined {
   const legacyName = raw.job_name === undefined && typeof raw.label === "string" && raw.label.trim() !== ""
     ? raw.label
     : undefined;
-  return {
+  return publicJob({
     ...raw,
     job_name: raw.job_name ?? legacyName
-  } as JobMeta;
+  } as JobMeta);
 }
 
 function writeMeta(job: JobMeta): void {

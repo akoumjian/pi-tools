@@ -3,7 +3,8 @@ import { defineTool, type AgentToolResult, type ExtensionAPI } from "@earendil-w
 import { Text } from "@earendil-works/pi-tui";
 import { formatConfigPath, readPiToolsJsonConfigSource } from "../_shared/config.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
-import { inputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
+import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
+import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 import { handleSearxngSetupCommand, SEARXNG_AGENT_CONFIG_FILE } from "./setup.js";
 
 const SearchParams = Type.Object({
@@ -56,8 +57,8 @@ const searxngSearchTool = defineTool({
   promptGuidelines: [
     "searxng_search use: Use searxng_search for current web discovery and source candidates before web_fetch_many; it searches but does not retrieve complete source content.",
     inputJsonSchemaGuideline("searxng_search", SearchParams),
-    "searxng_search output: Schema: { content: text(no-results notice or numbered title/engine?/URL/normalized-snippet entries), details: { query, resultCount, page, baseUrl }, isError?: boolean }. Only content is provider-visible; use promising URLs with web_fetch_many for complete source retrieval.",
-    "searxng_search constraints: If SearXNG is unconfigured or unreachable, report the failure and direct the user to /searxng:setup or SEARXNG_URL instead of silently substituting another search path."
+    outputJsonSchemaGuideline("searxng_search", RetainedToolOutputSchemas.searxng_search),
+    "searxng_search constraints: Use promising URLs with web_fetch_many for complete retrieval. If SearXNG is unconfigured or unreachable, report the failure and direct the user to /searxng:setup or SEARXNG_URL instead of silently substituting another search path. Only result content is provider-visible; details are internal, and thrown errors use Pi's out-of-band error result."
   ],
   parameters: SearchParams,
   executionMode: "parallel",

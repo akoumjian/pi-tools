@@ -116,28 +116,28 @@ const resultContracts = {
   read_many: {
     success: "content groups exact text ranges by file with returned/total lines and truncation",
     progress: "not applicable: independent file reads complete as one batch",
-    error: "per-file path/range/read failures stay visible without hiding successful siblings",
+    error: "any path/range/read failure rejects the batch as a model-visible error; no sibling success result is delivered",
     details: "internal per-file range/truncation metadata",
     content: "known path, range, full requested text, and nextOffset when continuation is needed"
   },
   search_many: {
     success: "content groups rg-backed file/content matches with line/column context and caps",
     progress: "not applicable: bounded searches complete as one batch",
-    error: "per-search validation/rg failures and successful siblings are model-visible",
+    error: "any search validation/rg failure rejects the batch as a model-visible error; no sibling success result is delivered",
     details: "internal query metadata, exit status, and truncation",
     content: "query identity, matches, explicit truncation, and narrow/raise-cap next action"
   },
   write_many: {
     success: "content identifies every mutation id/path/byte count; line counts remain internal details",
     progress: "not applicable: queued file mutations return after the batch settles",
-    error: "validation/path/write and mutation-review block failures expose ids/reasons/apply-or-revise action",
+    error: "validation/path/write failure rejects the batch even if an earlier queued write already applied; mutation-review blocks expose ids/reasons/apply-or-revise action",
     details: "internal mutation entries and review annotations",
     content: "all model-needed mutation ids, paths, byte counts, blocked ids, and next action"
   },
   edit_many: {
     success: "content identifies every mutation id/path/replacement count; ranges remain internal details",
     progress: "not applicable: exact replacements return after the queued batch settles",
-    error: "missing/non-unique/overlapping edits and mutation-review blocks expose paths/ids/reasons",
+    error: "missing/non-unique/overlapping edit failure rejects the batch even if an earlier queued file edit already applied; mutation-review blocks expose paths/ids/reasons",
     details: "internal mutation entries, ranges, and review annotations",
     content: "all model-needed ids, paths, replacement counts, blocked ids, and apply-or-revise action"
   },
@@ -270,9 +270,20 @@ function normalize(value) {
   return value;
 }
 
+function promptSchema(tool, boundary) {
+  const prefix = `${tool.name} ${boundary}: JSON Schema: `;
+  const matches = (tool.promptGuidelines ?? []).filter((line) => line.startsWith(prefix));
+  if (matches.length !== 1) throw new Error(`${tool.name} must have exactly one ${boundary} JSON Schema guideline`);
+  const schemaText = matches[0].slice(prefix.length);
+  const schema = JSON.parse(schemaText);
+  if (schemaText !== JSON.stringify(schema)) throw new Error(`${tool.name} ${boundary} schema guideline is not minified JSON`);
+  return schema;
+}
+
 const normalizedTools = tools.map((tool) => {
   const resultContract = resultContracts[tool.name];
   if (!resultContract) throw new Error(`Review artifact has no explicit result contract for ${tool.name}`);
+  promptSchema(tool, "output");
   return normalize({
     name: tool.name,
     label: tool.label,

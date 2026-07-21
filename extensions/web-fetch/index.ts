@@ -11,7 +11,8 @@ import { JSDOM } from "jsdom";
 import TurndownService from "turndown";
 import { describePathAccess } from "../async-shell/index.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
-import { inputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
+import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
+import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 
 const DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
 const MAX_MAX_BYTES = 50 * 1024 * 1024;
@@ -137,15 +138,15 @@ export default function webFetchExtension(api: ExtensionAPI): void {
       "Fetch and cache web URLs for online research. Always pass urls: [...]; use a one-item list for one URL and multiple items for independent URLs that can be fetched concurrently.",
       "Use searxng_search first to discover candidate URLs, then use web_fetch_many for the promising sources. The tool follows redirects, records final URLs, saves source artifacts under .pi/web-fetch/, and returns citation metadata.",
       "For HTML pages, mode='auto' extracts readable Markdown/text using a readability parser and saves both raw HTML and extracted text. For PDFs, Office files, spreadsheets, images, and other non-HTML files, it saves the file and returns a document_parse handoff hint when appropriate.",
-      "Result details shape: { cacheRoot, results: [{ url, finalUrl, status, kind, httpStatus, contentType, title?, sourcePath?, textPath?, downloadedPath?, documentParseHint?, preview?, truncated?, error? }] }.",
+      "Internal details record the cache root plus each URL's status, metadata, saved paths, preview, truncation state, and optional document-parser handoff.",
       "This tool refuses non-HTTP(S), localhost, and private-network URLs. Use shell_start only when the user explicitly asks for a special network fetch that should go through safety review."
     ].join(" "),
     promptSnippet: "Fetch and cache one or more urls:[...], extracting readable HTML or saving non-HTML files; returns citations, previews, saved paths, and document-parse handoffs.",
     promptGuidelines: [
       "web_fetch_many use: Use searxng_search for discovery, then web_fetch_many for complete retrieval of promising public HTTP(S) sources.",
       inputJsonSchemaGuideline("web_fetch_many", WebFetchManyParams),
-      "web_fetch_many output: Schema: { content: text(URL count plus per-result OK/ERROR, url/finalUrl?, label?, HTTP/content metadata, title?, sourcePath?, textPath?/downloadedPath?, document_parse handoff?, error?, preview?, and truncation notice?), details: { cacheRoot, results: [{ url, label?, finalUrl?, fetchedAt, status, kind?, httpStatus?, contentType?, title?, description?, bytes?, sourcePath?, textPath?, downloadedPath?, documentParseHint?: { tool, path, reason }, preview?, truncated?, error? }] }, isError?: boolean }. Only content is provider-visible; read textPath or parse downloadedPath when needed.",
-      "web_fetch_many constraints: The tool refuses non-HTTP(S), localhost, and private-network URLs. Use shell_start for a special network fetch only when the user explicitly requests it and safety review permits it."
+      outputJsonSchemaGuideline("web_fetch_many", RetainedToolOutputSchemas.web_fetch_many),
+      "web_fetch_many constraints: Read textPath or parse downloadedPath when complete content is needed. The tool refuses non-HTTP(S), localhost, and private-network URLs. Use shell_start for a special network fetch only when the user explicitly requests it and safety review permits it. Only result content is provider-visible; details are internal, and thrown errors use Pi's out-of-band error result."
     ],
     parameters: WebFetchManyParams,
     executionMode: "parallel",

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -171,12 +172,55 @@ test("writer tasks without an independent reviewer fail before spending writer t
       models: { worker: "openai-codex/gpt-5.6-sol:xhigh", reviewers: ["openai-codex/codex-auto-review:xhigh"] }
     }), "utf8");
     await withEnv("PI_TOOLS_CONFIG_DIR", root, async () => {
-      const result = await tool.execute("t1", params, undefined, undefined, context) as { isError?: boolean; content: Array<{ text: string }> };
-      assert.equal(result.isError, true);
+      const result = await tool.execute("t1", params, undefined, undefined, context) as { content: Array<{ text: string }>; details: { results: Array<{ status: string; error?: string }> } };
+      assert.equal("isError" in result, false, "registered orchestrate execution omits raw execute-result isError");
+      assert.equal(result.details.results[0]?.status, "failed");
+      assert.match(result.details.results[0]?.error ?? "", /No usable writer route|No independent reviewer/);
       assert.match(result.content[0].text, /No independent reviewer/);
     });
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("registered reconcile execution omits raw execute-result isError", async () => {
+  const tools: Array<{ name: string; execute: (id: string, params: unknown, signal: undefined, onUpdate: undefined, context: ExtensionContext) => Promise<unknown> }> = [];
+  const api = {
+    registerCommand(): void {},
+    registerTool(tool: unknown): void { tools.push(tool as (typeof tools)[number]); },
+    getAllTools: () => []
+  } as unknown as ExtensionAPI;
+  orchestratorExtension(api);
+  const reconcile = tools.find((tool) => tool.name === "reconcile");
+  assert.ok(reconcile);
+
+  const repo = await mkdtemp(path.join(tmpdir(), "pi-orchestrator-reconcile-result-"));
+  const configDir = await mkdtemp(path.join(tmpdir(), "pi-orchestrator-reconcile-config-"));
+  try {
+    execFileSync("git", ["init", "-q", repo]);
+    await writeFile(path.join(repo, "README.md"), "fixture\n", "utf8");
+    execFileSync("git", ["-C", repo, "add", "README.md"]);
+    execFileSync("git", ["-C", repo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture"]);
+    await writeFile(path.join(configDir, "orchestrator-settings.json"), JSON.stringify({
+      models: { worker: "openai-codex/gpt-5.6-sol:xhigh", reviewers: ["anthropic/claude-opus-4-8:xhigh"] }
+    }), "utf8");
+    const context = {
+      cwd: repo,
+      ui: { confirm: async (): Promise<boolean> => false }
+    } as unknown as ExtensionContext;
+
+    await withEnv("PI_TOOLS_CONFIG_DIR", configDir, async () => {
+      const result = await reconcile.execute("r1", { branches: ["orch/missing"] }, undefined, undefined, context) as {
+        content: Array<{ text: string }>;
+        details: { status: string; skipped: Array<{ branch: string }> };
+      };
+      assert.equal("isError" in result, false);
+      assert.equal(result.details.status, "nothing_merged");
+      assert.deepEqual(result.details.skipped.map((entry) => entry.branch), ["orch/missing"]);
+    });
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+    await rm(configDir, { recursive: true, force: true });
   }
 });
 

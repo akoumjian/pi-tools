@@ -10,7 +10,8 @@ import { readSetupGuidance } from "../_shared/setup-command.js";
 import { validateChildToolAllowlist } from "../_shared/child-agent-session.js";
 import { formatModelName, resolveExtensionModel } from "../_shared/model-spec.js";
 import { writeAgentExtensionConfig } from "../_shared/config.js";
-import { inputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
+import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
+import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 import {
   canonicalModelSpec,
   resolveTaskModelCandidates,
@@ -127,8 +128,8 @@ export default function orchestratorExtension(api: ExtensionAPI): void {
     promptGuidelines: [
       "orchestrate use: Use orchestrate for substantive work that decomposes into focused independent reader/planner tasks or isolated writer tasks; keep trivial or tightly sequential work in the parent session.",
       inputJsonSchemaGuideline("orchestrate", OrchestrateParams),
-      "orchestrate output: Schema: { content: text(success count plus per-task id/role/status and route attempts; completed tasks also include resolved model/thinking, duration/tool calls, output, and writer worktree/commit/changed-files/review attempts/verdict; failed tasks include actionable error), details: { mode, configSource, results: [{ id, role, status, error?, output, model, thinkingLevel, toolCallCount, durationMs, deniedCalls, routeAttempts, worktree?, commit?, changedFiles?, review? }] }, isError?: boolean }. Only content is provider-visible; no branch is merged automatically.",
-      "orchestrate constraints: Before delegation, the parent reads canonical grounding and passes the relevant evidence; afterward it synthesizes results and updates external decisions/journal itself. Children are read-only or worktree-confined and must not be tasked with external grounding writes. Automatic fallback is limited to explicit fallbackModels and provider availability failures for read-only roles; writer runtime failures retain/remove their worktree safely and fail closed. Use /orchestrator:status for configured caps/routes and reconcile only for kept orch/* writer branches after review."
+      outputJsonSchemaGuideline("orchestrate", RetainedToolOutputSchemas.orchestrate),
+      "orchestrate constraints: Before delegation, the parent reads canonical grounding and passes the relevant evidence; afterward it synthesizes results and updates external decisions/journal itself. Children are read-only or worktree-confined and must not be tasked with external grounding writes. Automatic fallback is limited to explicit fallbackModels and provider availability failures for read-only roles; writer runtime failures retain/remove their worktree safely and fail closed. Use /orchestrator:status for configured caps/routes and reconcile only for kept orch/* writer branches after review; no branch is merged automatically. Only result content is provider-visible; details are internal, and thrown errors use Pi's out-of-band error result."
     ],
     parameters: OrchestrateParams,
     executionMode: "sequential",
@@ -323,8 +324,7 @@ export default function orchestratorExtension(api: ExtensionAPI): void {
       const failed = results.filter((result) => result.status === "failed").length;
       return {
         content: [{ type: "text", text: `Orchestrate: ${results.length - failed}/${results.length} tasks succeeded\n\n${text}` }],
-        details: { mode, configSource: settings.configSource, results },
-        ...(failed === results.length ? { isError: true } : {})
+        details: { mode, configSource: settings.configSource, results }
       };
     }
   }));
@@ -343,8 +343,8 @@ export default function orchestratorExtension(api: ExtensionAPI): void {
     promptGuidelines: [
       "reconcile use: Use reconcile only after orchestrate returns kept reviewed writer branches that should be combined; pass all intended branches together for deterministic overlap and validation handling.",
       inputJsonSchemaGuideline("reconcile", ReconcileParams),
-      "reconcile output: Schema: { content: text(status, integration branch, validation, folded branches/files, skipped branches/reasons, overlaps, optional merge commit/cleanup, and integration path when declined for manual review), details: { status, integrationBranch?, integrationPath?, mergeCommit?, folded: [{ branch, changedFiles }], skipped: [{ branch, status, reason }], overlaps: [{ left, right, files }], validation: \"passed-per-fold\" | \"unvalidated\", cleanedBranches }, isError?: boolean }. Only content is provider-visible; declining keeps the integration branch for manual review.",
-      "reconcile constraints: Never force-merge conflicts or validation failures. Reconciliation and the final human gate remain serial; only approved validated integration is merged into the parent, after which folded branches/worktrees are removed."
+      outputJsonSchemaGuideline("reconcile", RetainedToolOutputSchemas.reconcile),
+      "reconcile constraints: Never force-merge conflicts or validation failures. Declining keeps the integration branch for manual review. Reconciliation and the final human gate remain serial; only approved validated integration is merged into the parent, after which folded branches/worktrees are removed. Only result content is provider-visible; details are internal, and thrown errors use Pi's out-of-band error result."
     ],
     parameters: ReconcileParams,
     executionMode: "sequential",
@@ -358,8 +358,7 @@ export default function orchestratorExtension(api: ExtensionAPI): void {
       });
       return {
         content: [{ type: "text", text: formatReconcileReport(report) }],
-        details: report,
-        ...(report.status === "nothing_merged" && report.folded.length === 0 && report.skipped.length > 0 ? { isError: true } : {})
+        details: report
       };
     }
   }));
