@@ -1,5 +1,6 @@
 {
   "policyFile": "tool-safety-policy.md",
+  "reviewCriteria": "conservative",
   "approvalMaxTokens": 600,
   "currentUserMaxChars": 2400,
   "recentUserMessages": 3,

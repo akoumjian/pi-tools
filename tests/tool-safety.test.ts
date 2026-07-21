@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -7,10 +7,12 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@earendil-works/pi-coding-agent";
 import toolSafetyExtension, {
   applyModelApproval,
+  applyReviewCriteria,
   buildHumanReviewConfirmOptions,
   buildHumanReviewPrompt,
   buildToolSafetyStatusText,
   configuredApprovalModel,
+  configuredToolSafetyReviewCriteria,
   classifyPath,
   evaluateDocumentParse,
   evaluateAsyncShellStart,
@@ -20,6 +22,7 @@ import toolSafetyExtension, {
   evaluateReadOnlyOrchestrate,
   evaluateWebFetchMany,
   parseApprovalModelPreference,
+  parseToolSafetyReviewCriteria,
   resolveApprovalModelPreference,
   resolveTrustedWorkspaceRoot,
   setRuntimeApprovalModelPreference,
@@ -519,6 +522,239 @@ test("dangerous-looking shell commands route to the safety model instead of dete
   assert.equal(shellStart.ruleId, "async-shell-pipe-to-shell");
 });
 
+test("production-only criteria bypass review except for production or unidentified environment mutations", () => {
+  const criteriaForCommands = (commands: string[], approvalContext = "") => {
+    const input = { commands: commands.map((command) => shellCommand(command)) };
+    return applyReviewCriteria(
+      toolCall("shell_start", input),
+      evaluateAsyncShellStart(input, context(trustedWorkspacePath("repo"))),
+      "production-or-unapproved-environment",
+      approvalContext
+    );
+  };
+
+  const devIamInput = {
+    commands: [shellCommand("kubectl --context gke_project_region_app-dev exec deploy/api -- python -c 'setIamPolicy()'")]
+  };
+  const prodIamInput = {
+    commands: [shellCommand("kubectl --context gke_project_region_app-prod exec deploy/api -- python -c 'setIamPolicy()'")]
+  };
+  const unknownIamInput = {
+    commands: [shellCommand("kubectl exec deploy/api -- python -c 'setIamPolicy()'")]
+  };
+
+  assert.equal(
+    applyReviewCriteria(
+      toolCall("shell_start", devIamInput),
+      evaluateAsyncShellStart(devIamInput, context(trustedWorkspacePath("repo"))),
+      "production-or-unapproved-environment"
+    ).action,
+    "allow"
+  );
+  assert.equal(
+    applyReviewCriteria(
+      toolCall("shell_start", prodIamInput),
+      evaluateAsyncShellStart(prodIamInput, context(trustedWorkspacePath("repo"))),
+      "production-or-unapproved-environment"
+    ).action,
+    "review"
+  );
+  assert.equal(
+    applyReviewCriteria(
+      toolCall("shell_start", unknownIamInput),
+      evaluateAsyncShellStart(unknownIamInput, context(trustedWorkspacePath("repo"))),
+      "production-or-unapproved-environment"
+    ).action,
+    "review"
+  );
+
+  const unknownDeployInput = { commands: [shellCommand("npm run deploy")] };
+  const devDeployInput = { commands: [shellCommand("npm run deploy -- --environment app-dev")] };
+  assert.equal(
+    applyReviewCriteria(
+      toolCall("shell_start", unknownDeployInput),
+      evaluateAsyncShellStart(unknownDeployInput, context(trustedWorkspacePath("repo"))),
+      "production-or-unapproved-environment"
+    ).action,
+    "review"
+  );
+  assert.equal(
+    applyReviewCriteria(
+      toolCall("shell_start", devDeployInput),
+      evaluateAsyncShellStart(devDeployInput, context(trustedWorkspacePath("repo"))),
+      "production-or-unapproved-environment"
+    ).action,
+    "allow"
+  );
+
+  const conflictingTargetInput = {
+    commands: [shellCommand("kubectl --context app-prod patch service worker-dev")]
+  };
+  assert.equal(
+    applyReviewCriteria(
+      toolCall("shell_start", conflictingTargetInput),
+      evaluateAsyncShellStart(conflictingTargetInput, context(trustedWorkspacePath("repo"))),
+      "production-or-unapproved-environment"
+    ).action,
+    "review"
+  );
+
+  const productionMutations = [
+    "gcloud projects remove-iam-policy-binding app-prod --member user:test@example.com --role roles/viewer",
+    "aws iam attach-role-policy --role-name app-prod --policy-arn arn:aws:iam::aws:policy/ReadOnlyAccess",
+    "kubectl --context app-prod rollout restart deployment/api",
+    "kubectl --context app-prod replace -f service.yaml",
+    "kubectl --context app-prod label namespace default owner=team",
+    "aws cloudformation deploy --stack-name app-prod --template-file stack.yaml",
+    "aws s3 rm s3://app-prod-bucket/object",
+    "gcloud storage rm gs://app-prod-bucket/object",
+    "gcloud compute instances destroy api --project app-prod",
+    "kubectl --context app-prod run maintenance --image busybox",
+    "kubectl --context app-prod taint nodes worker dedicated=api:NoSchedule",
+    "kubectl --context app-prod rollout pause deployment/api",
+    "gcloud compute instances update api --project app-prod --description describe",
+    "aws iam update-role --role-name app-prod --description get"
+  ];
+  for (const command of productionMutations) {
+    assert.equal(criteriaForCommands([command]).action, "review", command);
+  }
+
+  assert.equal(criteriaForCommands(["kubectl --context app-prod get deploy/api"]).action, "allow");
+  assert.equal(criteriaForCommands(["kubectl --context app-prod get configmap patch"]).action, "allow");
+  assert.equal(criteriaForCommands(["gcloud compute instances describe update-worker --project app-prod"]).action, "allow");
+  assert.equal(criteriaForCommands(["kubectl --context app-prod auth can-i create pods"]).action, "allow");
+  assert.equal(criteriaForCommands(["echo setIamPolicy"]).action, "allow");
+  assert.equal(criteriaForCommands(["grep setIamPolicy ~/.ssh/deploy-prod-key"]).action, "allow");
+  assert.equal(criteriaForCommands(["sudo grep setIamPolicy ~/.ssh/deploy-prod-key"]).action, "allow");
+  assert.equal(criteriaForCommands(["python -c 'print(\"setIamPolicy\")'"]).action, "allow");
+  assert.equal(criteriaForCommands(["npm run build:deploy -- --environment app-prod"]).action, "review");
+  assert.equal(criteriaForCommands(["npm run deploy >/dev/null"]).action, "review");
+  assert.equal(criteriaForCommands(["npm run deploy -- --output dev.log"]).action, "review");
+  assert.equal(criteriaForCommands(["npm run deploy -- --output app-dev.log"]).action, "review");
+  assert.equal(criteriaForCommands(["npm run deploy -- --output app-dev"]).action, "review");
+  assert.equal(criteriaForCommands(["npm run deploy >/dev/fd/2"]).action, "review");
+  assert.equal(
+    criteriaForCommands(["npm run deploy -- --environment app-dev --credential-file ~/.ssh/deploy-prod-key"]).action,
+    "allow"
+  );
+  assert.equal(
+    criteriaForCommands(["kubectl patch configmap api -p '{\"environment\":\"app-dev\"}'"]).action,
+    "review",
+    "payload text must not count as target evidence"
+  );
+  assert.equal(
+    criteriaForCommands(["kubectl patch service api", "echo dev"]).action,
+    "review",
+    "an unrelated batch command must not approve an unidentified mutation"
+  );
+  assert.equal(
+    criteriaForCommands(["kubectl patch service api && echo dev"]).action,
+    "review",
+    "a later compound command must not approve the mutation"
+  );
+  assert.equal(
+    criteriaForCommands(["kubectl --context app-dev patch service api\nkubectl patch service other-api"]).action,
+    "review",
+    "a newline-separated unknown mutation must remain independent"
+  );
+  assert.equal(
+    criteriaForCommands(["kubectl --context app-dev patch service api && echo prod"]).action,
+    "allow",
+    "a later compound command must not turn an approved target into production"
+  );
+  assert.equal(
+    criteriaForCommands(["kubectl --context custom-green patch service api"], "Please deploy to custom-green.").action,
+    "allow"
+  );
+  assert.equal(
+    criteriaForCommands(["kubectl --context custom-green patch service api"], "Do not deploy to custom-green.").action,
+    "review"
+  );
+  assert.equal(
+    criteriaForCommands(["kubectl --context custom-green patch service api"], "Should we deploy custom-green?").action,
+    "review"
+  );
+  assert.equal(
+    criteriaForCommands(["kubectl --context custom-green patch service api"], "Never deploy to custom-green.").action,
+    "review"
+  );
+  assert.equal(
+    criteriaForCommands(["kubectl --context custom-green patch service api"], "I haven't approved custom-green.").action,
+    "review"
+  );
+  assert.equal(
+    criteriaForCommands(["kubectl --context custom-green patch service api"], "Can we deploy custom-green").action,
+    "review"
+  );
+  assert.equal(
+    criteriaForCommands(["kubectl --context custom-green patch service api"], "I cannot approve custom-green").action,
+    "review"
+  );
+  assert.equal(
+    criteriaForCommands(["kubectl --context custom-green patch service api"], "Deploy custom-green only after another review").action,
+    "review"
+  );
+  assert.equal(
+    criteriaForCommands([
+      "python3 - <<'PY'\ncontext = \"app-dev\"\nprint('x && y')\nPY\nkubectl patch service api"
+    ]).action,
+    "review",
+    "heredoc contents must not approve a later unidentified mutation"
+  );
+
+  const credentialReadInput = { files: [{ path: "~/.ssh/deploy-prod-key" }] };
+  assert.equal(
+    applyReviewCriteria(
+      toolCall("read_many", credentialReadInput),
+      evaluatePathReads(["~/.ssh/deploy-prod-key"], context(trustedWorkspacePath("repo")), "read_many"),
+      "production-or-unapproved-environment"
+    ).action,
+    "allow"
+  );
+  assert.equal(
+    applyReviewCriteria(
+      toolCall("bash", { command: "git push --force origin deploy-prod" }),
+      evaluateBash("git push --force origin deploy-prod"),
+      "production-or-unapproved-environment"
+    ).action,
+    "allow"
+  );
+  assert.equal(
+    applyReviewCriteria(
+      toolCall("bash", { command: "python custom-script.py" }),
+      evaluateBash("python custom-script.py"),
+      "production-or-unapproved-environment"
+    ).action,
+    "allow"
+  );
+});
+
+test("review criteria fall through old machine settings to the profile default", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-tool-safety-criteria-"));
+  const profileConfig = path.join(root, "profile-settings.json");
+  try {
+    await writeFile(profileConfig, JSON.stringify({ reviewCriteria: "production-or-unapproved-environment" }));
+    assert.equal(
+      configuredToolSafetyReviewCriteria(
+        { approvalModel: "openai/review" },
+        [{ path: profileConfig, source: "profile" }]
+      ),
+      "production-or-unapproved-environment"
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("review criteria parsing fails safe to the conservative mode", () => {
+  assert.equal(parseToolSafetyReviewCriteria(undefined), "conservative");
+  assert.equal(parseToolSafetyReviewCriteria("invalid"), "conservative");
+  assert.equal(
+    parseToolSafetyReviewCriteria("production-or-unapproved-environment"),
+    "production-or-unapproved-environment"
+  );
+});
+
 test("shell_start requires object commands with per-command cwd for host safety classification", () => {
   const emptyList = evaluateAsyncShellStart({ commands: [] });
   const missingCwd = evaluateAsyncShellStart({ commands: [{ command: "npm test" }] });
@@ -754,6 +990,7 @@ test("tool-safety setup writes approval model config and natural-language policy
     const policyPath = path.join(agentDir, "extensions", "akoumjian-tools", "tool-safety-policy.md");
     const config = JSON.parse(await readFile(configPath, "utf8")) as Record<string, unknown>;
     assert.equal(config.approvalModel, "openai/review-model:medium");
+    assert.equal(config.reviewCriteria, "conservative");
     await assert.rejects(readFile(policyPath, "utf8"), /ENOENT/);
     assert.match(notifications[0].message, /Policy guidance:/);
     assert.match(notifications[1].message, /Policy guidance: cleared/);

@@ -23,6 +23,7 @@ Config:
   ```json
   {
     "policyFile": "tool-safety-policy.md",
+    "reviewCriteria": "conservative",
     "approvalMaxTokens": 600,
     "currentUserMaxChars": 2400,
     "recentUserMessages": 3,
@@ -53,17 +54,20 @@ For each `tool_call` event:
    - Route credential-like paths, history-rewrite git ops, deploys, package installs, network exfiltration, privilege escalation, and similar to `review`.
    - Deny clearly malicious or self-harming patterns.
    The classification surfaces rule id, risk level, tags, and confidence, used as inputs for both the approval judge and the human review prompt.
-2. **Approval judge (model).** If the initial decision is `review` and an approval model is configured, the extension sends a structured request to the model:
+2. **Review-criteria narrowing.** `reviewCriteria` controls which host review candidates proceed to the model:
+   - `conservative` (default) preserves every host review candidate.
+   - `production-or-unapproved-environment` independently re-evaluates each `bash`/`shell_start` command, including commands the baseline allowed. It auto-allows non-environment actions and environment mutations with a recognizable local/dev/test/QA/staging/sandbox/preview/demo/ephemeral target. Explicit `prod`/`production` evidence takes precedence, and every environment-changing command in a batch must identify an approved target. A target named in an explicit recent user approval is also accepted. Environment mutations with no recognized target continue to review. This deterministic stage runs before the model, so its auto-allows do not depend on model availability. Non-shell retained tools cannot directly deploy or mutate an environment and are auto-allowed in this mode; environment-changing shell calls made by an orchestration child are evaluated normally.
+3. **Approval judge (model).** If the narrowed decision is `review` and an approval model is configured, the extension sends a structured request to the model:
    - System prompt: the package's approval-judge instructions (asks for `allow`/`review`/`deny` with risk, confidence, and a one-line reason).
    - User content: the policy text, the current and a few recent user messages (bounded), the proposed tool call (also bounded), and the initial classification.
    - Output is constrained to a short JSON-like block, parsed defensively. Failures are non-fatal and fall back to `review`.
-3. **Final decision.**
+4. **Final decision.**
    - `allow` → the tool runs.
    - `review` → in interactive mode, a confirmation prompt is shown to the user with a minimal one-line snippet describing the action; on approval the tool runs, on decline the tool is blocked with the reviewer's reason. In non-interactive mode, the call is blocked and the user is notified.
    - `deny` → the tool is blocked.
-4. **Audit details.** The extension can record the initial decision and model approval in the tool-call event audit log for inspection.
+5. **Audit details.** The extension records the initial host decision, criteria-stage decision, optional model approval, and optional human-review disposition in the tool-call event audit log.
 
-When runtime enforcement is disabled (`/safety:toggle off`), the policy still loads but no review/deny is applied.
+When runtime enforcement is disabled (`/safety:toggle off`), the policy still loads but no review/deny is applied. For transition safety, an older per-machine settings file that lacks `reviewCriteria` falls through to the profile/package value; `/safety:setup` then preserves the effective value. Unknown `reviewCriteria` values fail safe to `conservative`.
 
 ## Trusted workspace
 

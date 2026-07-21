@@ -113,7 +113,7 @@ Each extension below documents what it does, what it provides, and how to set it
 
 **Provides.** `tool_call` handler that classifies via heuristics + approval model + human prompt; `/safety:setup`, `/safety:status`, `/safety:model`, `/safety:toggle`; default policy in [`config/tool-safety-policy.md`](config/tool-safety-policy.md).
 
-**Setup.** Run `/safety:setup provider/model[:thinking]` once per machine. Optional `PI_TOOL_SAFETY_APPROVAL_MODEL` / `PI_TOOL_SAFETY_TRUSTED_WORKSPACE` env overrides.
+**Setup.** Run `/safety:setup provider/model[:thinking]` once per machine. Optional `PI_TOOL_SAFETY_APPROVAL_MODEL` / `PI_TOOL_SAFETY_TRUSTED_WORKSPACE` env overrides. `reviewCriteria` defaults to `conservative`; personal profiles may opt into `production-or-unapproved-environment`, which re-evaluates shell actions and auto-allows non-environment actions and clearly non-production environment mutations before model review.
 
 ---
 

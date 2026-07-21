@@ -12,6 +12,7 @@ import { guidedModelSetupUsage, parseGuidedModelSetupArgs, readSetupGuidance } f
 type SafetyAction = "allow" | "review" | "deny";
 type SafetyRisk = "low" | "medium" | "high";
 type SafetyConfidence = "low" | "medium" | "high";
+export type ToolSafetyReviewCriteria = "conservative" | "production-or-unapproved-environment";
 
 type SafetyDecision = {
   action: SafetyAction;
@@ -35,7 +36,9 @@ type ModelApproval = {
 
 type AuditDetails = {
   initialDecision: SafetyDecision;
+  criteriaDecision: SafetyDecision;
   modelApproval?: ModelApproval;
+  humanReviewApproved?: boolean;
 };
 
 type CommandRule = {
@@ -64,6 +67,7 @@ type ToolSafetySettings = {
   policyFile?: string;
   humanReviewTimeoutMs?: number;
   trustedWorkspaceRoot?: string;
+  reviewCriteria: ToolSafetyReviewCriteria;
 };
 
 const TOOL_SAFETY_CONFIG_FILE = "tool-safety-settings.json";
@@ -277,32 +281,36 @@ export default function toolSafetyExtension(api: ExtensionAPI): void {
     }
 
     const initialDecision = evaluateToolCall(event, context);
-    let decision = initialDecision;
+    const approvalContext = getUserMessages(context).slice(-(settings.recentUserMessages + 1)).join("\n");
+    const criteriaDecision = applyReviewCriteria(event, initialDecision, settings.reviewCriteria, approvalContext);
+    let decision = criteriaDecision;
     let modelApproval: ModelApproval | undefined;
 
     if (decision.action === "allow") {
-      writeAudit(context, event, decision, { initialDecision });
+      writeAudit(context, event, decision, { initialDecision, criteriaDecision });
       return;
     }
 
     if (decision.action === "deny") {
-      writeAudit(context, event, decision, { initialDecision });
+      writeAudit(context, event, decision, { initialDecision, criteriaDecision });
       return block(decision);
     }
 
     modelApproval = await requestModelApproval(context, event, decision);
     decision = applyModelApproval(decision, modelApproval);
-    writeAudit(context, event, decision, { initialDecision, modelApproval });
 
     if (decision.action === "allow") {
+      writeAudit(context, event, decision, { initialDecision, criteriaDecision, modelApproval });
       return;
     }
 
     if (decision.action === "deny") {
+      writeAudit(context, event, decision, { initialDecision, criteriaDecision, modelApproval });
       return block(decision);
     }
 
     const approved = await requestReview(context, event, decision);
+    writeAudit(context, event, decision, { initialDecision, criteriaDecision, modelApproval, humanReviewApproved: approved });
     if (!approved) {
       return block({
         ...decision,
@@ -310,6 +318,255 @@ export default function toolSafetyExtension(api: ExtensionAPI): void {
       });
     }
   });
+}
+
+export function applyReviewCriteria(
+  event: ToolCallEvent,
+  decision: SafetyDecision,
+  criteria: ToolSafetyReviewCriteria,
+  approvalContext = ""
+): SafetyDecision {
+  if (criteria === "conservative" || decision.action === "deny") {
+    return decision;
+  }
+
+  const environmentCommands = getShellCommands(event).flatMap(splitShellOperations).filter(isEnvironmentMutationCommand);
+  if (environmentCommands.length === 0) {
+    return reviewCriteriaAllow(decision, "non-environment-auto-allow", "Action is not a deployment or environment mutation.");
+  }
+
+  if (environmentCommands.some(hasProductionTarget)) {
+    return reviewCriteriaReview(decision, "production-target", "Deployment or environment mutation explicitly targets production.", "high");
+  }
+
+  const unidentified = environmentCommands.filter(
+    (command) => !hasApprovedNonProductionTarget(command) && !hasContextApprovedTarget(command, approvalContext)
+  );
+  if (unidentified.length > 0) {
+    return reviewCriteriaReview(
+      decision,
+      "unapproved-environment",
+      "Deployment or environment mutation does not identify an approved non-production target.",
+      "medium"
+    );
+  }
+
+  return reviewCriteriaAllow(
+    decision,
+    "approved-environment-auto-allow",
+    "Every deployment or environment mutation targets a clearly identified approved non-production environment."
+  );
+}
+
+function reviewCriteriaAllow(decision: SafetyDecision, suffix: string, reason: string): SafetyDecision {
+  return {
+    action: "allow",
+    risk: "low",
+    reason,
+    ruleId: `${decision.ruleId}+${suffix}`,
+    tags: [...decision.tags, "production-only-review"]
+  };
+}
+
+function reviewCriteriaReview(decision: SafetyDecision, suffix: string, reason: string, risk = decision.risk): SafetyDecision {
+  return {
+    ...decision,
+    action: "review",
+    risk,
+    reason,
+    ruleId: `${decision.ruleId}+${suffix}`,
+    tags: [...decision.tags, "production-only-review"]
+  };
+}
+
+function getShellCommands(event: ToolCallEvent): string[] {
+  const toolName = getToolName(event);
+  if (toolName === "bash") {
+    const command = getStringField(event.input, ["command", "cmd", "script"]);
+    return command ? [command] : [];
+  }
+  const input: unknown = event.input;
+  if (toolName !== "shell_start" || !isRecord(input) || !Array.isArray(input.commands)) {
+    return [];
+  }
+  return input.commands
+    .map((item: unknown) => isRecord(item) && typeof item.command === "string" ? item.command : "")
+    .filter((command: string) => command.length > 0);
+}
+
+function splitShellOperations(command: string): string[] {
+  const lines = command.split(/\r?\n/);
+  const operations: string[] = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const heredoc = line.match(/<<\s*["']?([a-z_][a-z0-9_]*)["']?/i);
+    if (!heredoc) {
+      operations.push(...splitInlineShellOperations(line));
+      continue;
+    }
+
+    const block = [line];
+    for (index += 1; index < lines.length; index += 1) {
+      block.push(lines[index]);
+      if (lines[index].trim() === heredoc[1]) break;
+    }
+    operations.push(block.join("\n"));
+  }
+
+  return operations.filter((operation) => operation.trim().length > 0);
+}
+
+function splitInlineShellOperations(command: string): string[] {
+  const operations: string[] = [];
+  let start = 0;
+  let quote: "'" | '"' | "`" | undefined;
+  let escaped = false;
+
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (character === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (character === quote) quote = undefined;
+      continue;
+    }
+    if (character === "'" || character === '"' || character === "`") {
+      quote = character;
+      continue;
+    }
+
+    const separatorLength = command.startsWith("&&", index) || command.startsWith("||", index)
+      ? 2
+      : character === ";" ? 1 : 0;
+    if (separatorLength === 0) continue;
+    const operation = command.slice(start, index).trim();
+    if (operation) operations.push(operation);
+    index += separatorLength - 1;
+    start = index + 1;
+  }
+
+  const finalOperation = command.slice(start).trim();
+  if (finalOperation) operations.push(finalOperation);
+  return operations;
+}
+
+function isEnvironmentMutationCommand(command: string): boolean {
+  const trimmed = command.trim();
+  if (/^(?:(?:sudo|env|command)\s+)*(?:(?:[a-z_][a-z0-9_]*=\S+)\s+)*(?:echo|printf|grep|rg|cat|sed|awk|head|tail|less|type|which)\b/i.test(trimmed)) return false;
+  if (/\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?[^\s;&|]*(?:deploy|promot|migrat)[^\s;&|]*/i.test(command)) return true;
+  if (/^(?:[^\s;&|]*\/)?(?:deploy|promote|migrate)(?:[._-][^\s;&|]+)?(?:\s|$)/i.test(trimmed)) return true;
+  const iamMutation = /\b(?:set|add|remove)[-_ ]?iam[-_ ]?policy(?:[-_ ]?binding)?\b/i;
+  const iamMutationCall = /\b(?:set|add|remove)[-_ ]?iam[-_ ]?policy(?:[-_ ]?binding)?\s*\(/i;
+  if (iamMutation.test(command) && (iamMutationCall.test(command) || /(?:https?:|urllib|requests?\.|curl\b|\.(?:set|add|remove)[-_ ]?iam)/i.test(command))) return true;
+
+  const tokens = shellCommandTokens(command);
+  if (tokens.includes("kubectl")) {
+    const positionals = positionalTokensAfter(tokens, "kubectl");
+    const action = positionals[0];
+    if (!action) return false;
+    if (["get", "describe", "logs", "top", "events", "explain", "api-resources", "api-versions", "cluster-info", "version", "wait", "diff", "auth", "config", "completion", "options", "proxy", "port-forward"].includes(action)) return false;
+    if (action === "rollout") return ["restart", "undo", "pause", "resume"].includes(positionals[1] ?? "");
+    return ["apply", "create", "delete", "patch", "scale", "replace", "label", "annotate", "edit", "set", "drain", "cordon", "uncordon", "run", "expose", "autoscale", "taint", "attach", "exec", "cp"].includes(action);
+  }
+  if (tokens.includes("gcloud")) {
+    const positionals = positionalTokensAfter(tokens, "gcloud");
+    if (["auth", "config"].includes(positionals[0] ?? "")) return false;
+    return classifyCloudAction(positionals, ["list", "describe", "get", "show", "print", "help", "version"]);
+  }
+  if (tokens.includes("aws")) {
+    const positionals = positionalTokensAfter(tokens, "aws");
+    if (positionals[0] === "configure") return false;
+    return classifyCloudAction(positionals.slice(1), ["list", "describe", "get", "head", "select", "lookup", "check", "validate", "generate", "help", "version", "presign"]);
+  }
+  if (tokens.includes("az")) {
+    const positionals = positionalTokensAfter(tokens, "az");
+    if (["login", "account", "config"].includes(positionals[0] ?? "")) return false;
+    return classifyCloudAction(positionals, ["list", "show", "get", "check", "help", "version"]);
+  }
+  if (/\bterraform\s+(?:apply|destroy|import|taint|untaint|state\s+(?:mv|rm))\b/i.test(command)) return true;
+  if (/\bpulumi\s+(?:up|destroy|import|state\s+(?:delete|move|repair))\b/i.test(command)) return true;
+  if (/\bhelm\s+(?:install|upgrade|uninstall|rollback)\b/i.test(command)) return true;
+  return /\bgarden\s+deploy\b/i.test(command);
+}
+
+function shellCommandTokens(command: string): string[] {
+  return Array.from(command.matchAll(/"(?:\\.|[^"])*"|'[^']*'|[^\s]+/g), (match) =>
+    match[0].replace(/^["']|["']$/g, "").replace(/^[;&|]+|[;&|]+$/g, "").toLowerCase()
+  ).filter(Boolean);
+}
+
+function positionalTokensAfter(tokens: string[], executable: string): string[] {
+  const start = tokens.indexOf(executable);
+  if (start === -1) return [];
+  const positionals: string[] = [];
+  for (let index = start + 1; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (!token.startsWith("-")) {
+      positionals.push(token);
+      continue;
+    }
+    if (!token.includes("=") && tokens[index + 1] && !tokens[index + 1].startsWith("-")) index += 1;
+  }
+  return positionals;
+}
+
+function classifyCloudAction(positionals: string[], readActions: string[]): boolean {
+  const mutationActions = new Set([
+    "add", "remove", "set", "update", "create", "delete", "deploy", "replace", "attach", "detach", "enable", "disable",
+    "start", "stop", "restart", "reset", "restore", "import", "destroy", "rm", "move", "cp", "copy", "sync", "submit", "cancel",
+    "promote", "put", "associate", "disassociate", "register", "deregister", "modify", "terminate", "run", "invoke"
+  ]);
+  const reads = new Set(readActions);
+  for (const token of positionals) {
+    const action = token.split("-")[0];
+    if (reads.has(action)) return false;
+    if (mutationActions.has(action)) return true;
+  }
+  return false;
+}
+
+function hasProductionTarget(command: string): boolean {
+  return extractEnvironmentTargets(command).some((target) => /(^|[^a-z0-9])(prod|production)(?=$|[^a-z0-9])/i.test(target));
+}
+
+function hasApprovedNonProductionTarget(command: string): boolean {
+  return extractEnvironmentTargets(command).some((target) =>
+    /(^|[^a-z0-9])(local|dev|development|test|testing|qa|staging|stage|sandbox|preview|demo|ephemeral)(?=$|[^a-z0-9])/i.test(target)
+  );
+}
+
+function hasContextApprovedTarget(command: string, approvalContext: string): boolean {
+  const targets = extractEnvironmentTargets(command).filter((target) => target.length >= 3);
+  return approvalContext.split(/\r?\n/).some((line) => {
+    const normalized = line.toLowerCase();
+    if (/[?]/.test(line) || /\b(do not|don't|never|can|cannot|can't|should|could|would|whether|if|after|before|pending|without approval|not authorized|not approved|not approve|have not approved|haven't approved|review)\b/i.test(line)) return false;
+    const explicitApproval = /\b(approv(?:e|ed)|authoriz(?:e|ed)|go ahead|proceed)\b/i.test(line);
+    const imperative = /^\s*(?:please\s+)?(?:deploy|promote|migrate|apply|change|update|use|target)\b/i.test(line);
+    if (!explicitApproval && !imperative) return false;
+    return targets.some((target) => normalized.includes(target.toLowerCase()));
+  });
+}
+
+function extractEnvironmentTargets(command: string): string[] {
+  const targets: string[] = [];
+  const targetPatterns = [
+    /(?:--(?:context|project|account|profile|cluster|namespace|environment|env|stage|target|host|database|service-account|role-name)|-n)(?:=|\s+)["']?([a-z0-9][a-z0-9._@/-]*)/gi
+  ];
+  if (/\b(?:python\d*|node|ruby|perl)\b/i.test(command)) {
+    targetPatterns.push(/\b(?:project|context|environment|env|cluster|namespace|account|email|service[_-]?account)\s*=\s*["']([^"']+)["']/gi);
+  }
+  for (const pattern of targetPatterns) {
+    for (const match of command.matchAll(pattern)) targets.push(match[1]);
+  }
+
+  return Array.from(new Set(targets));
 }
 
 function evaluateToolCall(event: ToolCallEvent, context: ExtensionContext): SafetyDecision {
@@ -1630,6 +1887,7 @@ export function buildToolSafetyStatusText(context: Pick<ExtensionContext, "model
     `Runtime override: ${runtime}`,
     `Config/env model: ${configured}`,
     `Policy source: ${policyInfo.source}`,
+    `Review criteria: ${settings.reviewCriteria}`,
     ...(settings.approvalModel ? [] : ["Setup: run /safety:setup provider/model[:thinking] to enable AI approval routing"]),
     `Trusted workspace root: ${getTrustedWorkspaceRoot() ?? "none"}`,
     `AI approval timeout: ${settings.approvalTimeoutMs === undefined ? "none" : `${settings.approvalTimeoutMs}ms`}`,
@@ -2329,7 +2587,8 @@ function readToolSafetySettings(): ToolSafetySettings {
     policyMaxChars: readNumericSetting(fileSettings, "policyMaxChars", "PI_TOOL_SAFETY_POLICY_MAX_CHARS", 12000, 1000, 30000),
     policyFile: firstNonEmptyString(fileSettings.policyFile),
     humanReviewTimeoutMs: readOptionalNumericSetting(fileSettings, "humanReviewTimeoutMs", "PI_TOOL_SAFETY_HUMAN_REVIEW_TIMEOUT_MS", 1000, 600000),
-    trustedWorkspaceRoot: readOptionalStringSetting(fileSettings, "trustedWorkspaceRoot", "PI_TOOL_SAFETY_TRUSTED_WORKSPACE")
+    trustedWorkspaceRoot: readOptionalStringSetting(fileSettings, "trustedWorkspaceRoot", "PI_TOOL_SAFETY_TRUSTED_WORKSPACE"),
+    reviewCriteria: configuredToolSafetyReviewCriteria(fileSettings)
   };
 }
 
@@ -2349,8 +2608,35 @@ function serializeToolSafetySettings(current: ToolSafetySettings, selection: App
     toolInputMaxChars: current.toolInputMaxChars,
     policyMaxChars: current.policyMaxChars,
     ...(current.humanReviewTimeoutMs === undefined ? {} : { humanReviewTimeoutMs: current.humanReviewTimeoutMs }),
-    ...(current.trustedWorkspaceRoot === undefined ? {} : { trustedWorkspaceRoot: current.trustedWorkspaceRoot })
+    ...(current.trustedWorkspaceRoot === undefined ? {} : { trustedWorkspaceRoot: current.trustedWorkspaceRoot }),
+    reviewCriteria: current.reviewCriteria
   };
+}
+
+export function configuredToolSafetyReviewCriteria(
+  fileSettings: Record<string, unknown>,
+  candidates: PiToolsConfigCandidate[] = piToolsConfigCandidates(TOOL_SAFETY_CONFIG_FILE, import.meta.url)
+): ToolSafetyReviewCriteria {
+  if (Object.hasOwn(fileSettings, "reviewCriteria")) {
+    return parseToolSafetyReviewCriteria(fileSettings.reviewCriteria);
+  }
+
+  for (const candidate of candidates) {
+    if (!existsSync(candidate.path)) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(candidate.path, "utf8")) as unknown;
+      if (isRecord(parsed) && Object.hasOwn(parsed, "reviewCriteria")) {
+        return parseToolSafetyReviewCriteria(parsed.reviewCriteria);
+      }
+    } catch {
+      return "conservative";
+    }
+  }
+  return "conservative";
+}
+
+export function parseToolSafetyReviewCriteria(value: unknown): ToolSafetyReviewCriteria {
+  return value === "production-or-unapproved-environment" ? value : "conservative";
 }
 
 export function configuredApprovalModel(fileValue: unknown, envValue = process.env.PI_TOOL_SAFETY_APPROVAL_MODEL): ApprovalModelPreference | undefined {
