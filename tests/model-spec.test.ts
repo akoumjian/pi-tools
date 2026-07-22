@@ -3,7 +3,12 @@ import test from "node:test";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { parseModelThinkingPair, resolveExtensionModel } from "../extensions/_shared/model-spec.js";
 
-function fakeModel(provider: string, id: string, reasoning = true): Model<Api> {
+function fakeModel(
+  provider: string,
+  id: string,
+  reasoning = true,
+  thinkingLevelMap?: Model<Api>["thinkingLevelMap"]
+): Model<Api> {
   return {
     id,
     name: id,
@@ -11,6 +16,7 @@ function fakeModel(provider: string, id: string, reasoning = true): Model<Api> {
     provider,
     baseUrl: "https://example.invalid",
     reasoning,
+    thinkingLevelMap,
     input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 100_000,
@@ -30,7 +36,7 @@ function fakeRegistry(models: Model<Api>[], authed: Set<string> = new Set(models
 }
 
 test("resolveExtensionModel applies fallback thinking for plain provider/model specs", () => {
-  const model = fakeModel("anthropic", "claude-opus-4-7");
+  const model = fakeModel("anthropic", "claude-opus-4-7", true, { xhigh: "xhigh" });
   const resolved = resolveExtensionModel({
     registry: fakeRegistry([model]),
     requested: "anthropic/claude-opus-4-7",
@@ -43,16 +49,37 @@ test("resolveExtensionModel applies fallback thinking for plain provider/model s
 });
 
 test("resolveExtensionModel lets inline thinking override configured fallback", () => {
-  const model = fakeModel("anthropic", "claude-opus-4-7");
+  const model = fakeModel("anthropic", "claude-opus-4-7", true, { max: "max" });
   const resolved = resolveExtensionModel({
     registry: fakeRegistry([model]),
-    requested: "anthropic/claude-opus-4-7:high",
+    requested: "anthropic/claude-opus-4-7:max",
     fallbackThinkingLevel: "xhigh",
     label: "Review",
     noModelMessage: "missing"
   });
 
-  assert.deepEqual(resolved, { model, thinkingLevel: "high" });
+  assert.deepEqual(resolved, { model, thinkingLevel: "max" });
+});
+
+test("resolveExtensionModel clamps unavailable extended thinking levels using model metadata", () => {
+  const xhighModel = fakeModel("anthropic", "claude-opus-4-7", true, { xhigh: "xhigh" });
+  const standardModel = fakeModel("anthropic", "claude-opus-4-6");
+
+  assert.equal(resolveExtensionModel({
+    registry: fakeRegistry([xhighModel]),
+    requested: "anthropic/claude-opus-4-7:max",
+    fallbackThinkingLevel: "low",
+    label: "Review",
+    noModelMessage: "missing"
+  }).thinkingLevel, "xhigh");
+
+  assert.equal(resolveExtensionModel({
+    registry: fakeRegistry([standardModel]),
+    requested: "anthropic/claude-opus-4-6:xhigh",
+    fallbackThinkingLevel: "low",
+    label: "Review",
+    noModelMessage: "missing"
+  }).thinkingLevel, "high");
 });
 
 test("resolveExtensionModel supports bare model ids with inline thinking", () => {

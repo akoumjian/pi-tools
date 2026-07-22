@@ -97,7 +97,7 @@ test("provider context review command renders sanitized prompt, tool declaration
     assert.match(artifact.systemPrompt, /SENTINEL_APPEND_SYSTEM_PROMPT/);
     assert.match(artifact.systemPrompt, /SENTINEL_CHILD_ROLE_AND_CONFINEMENT/);
     assert.match(artifact.systemPrompt, /SENTINEL_SKILL_DESCRIPTION/);
-    assert.match(artifact.systemPrompt, /Current date: 2000-01-02/);
+    assert.doesNotMatch(artifact.systemPrompt, /Current date: 2000-01-02/);
     assert.match(artifact.systemPrompt, /Current working directory: \/review\/workspace/);
     assert.doesNotMatch(artifact.systemPrompt, /<DATE>|<repo>|\/Users\//);
     assert.match(artifact.systemPrompt, /read_many use:/);

@@ -47,7 +47,7 @@ const plainTheme = {
   strikethrough(text: string): string {
     return text;
   },
-  getThinkingBorderColor(level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh"): (text: string) => string {
+  getThinkingBorderColor(level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"): (text: string) => string {
     return (text: string) => `${level}:${text}`;
   },
   getBashModeBorderColor(): (text: string) => string {

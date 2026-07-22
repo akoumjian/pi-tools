@@ -2,9 +2,9 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { getModel } from "@earendil-works/pi-ai";
-import { streamAnthropic } from "@earendil-works/pi-ai/anthropic";
-import { streamOpenAICodexResponses } from "@earendil-works/pi-ai/openai-codex-responses";
+import { stream as streamAnthropic } from "@earendil-works/pi-ai/api/anthropic-messages";
+import { stream as streamOpenAICodexResponses } from "@earendil-works/pi-ai/api/openai-codex-responses";
+import { getBuiltinModel as getModel } from "@earendil-works/pi-ai/providers/all";
 import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));

@@ -19,6 +19,7 @@ function fakeModel(provider: string, id: string, reasoning = true): Model<Api> {
     provider,
     baseUrl: "https://example.invalid",
     reasoning,
+    thinkingLevelMap: reasoning ? { xhigh: "xhigh" } : undefined,
     input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 100_000,

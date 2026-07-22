@@ -166,7 +166,8 @@ function refreshingFakeRegistry(initialModels: Model<Api>[], refreshedModels: Mo
     getAll(): Model<Api>[] {
       return models;
     },
-    refresh(): void {
+    async refresh(): Promise<void> {
+      await Promise.resolve();
       refreshCount += 1;
       models = refreshedModels;
     }

@@ -41,7 +41,6 @@ export async function withChildAgentSession<T>(
   const services = await createAgentSessionServices({
     cwd: options.cwd,
     agentDir: getAgentDir(),
-    modelRegistry: context.modelRegistry,
     resourceLoaderOptions: {
       appendSystemPromptOverride: options.systemPrompts?.length
         ? (base) => [...base, ...options.systemPrompts!.filter((prompt) => prompt.trim()).map((prompt) => prompt.trim())]
@@ -60,6 +59,17 @@ export async function withChildAgentSession<T>(
   }
   for (const warning of services.diagnostics.filter((diagnostic) => diagnostic.type === "warning")) {
     options.onWarning?.(warning.message);
+  }
+
+  const parentProvider = context.modelRegistry.getProvider(options.model.provider);
+  if (parentProvider) {
+    services.modelRuntime.registerNativeProvider(parentProvider);
+  }
+  if (await services.modelRuntime.getAuth(options.model) === undefined) {
+    const parentAuth = await context.modelRegistry.getApiKeyAndHeaders(options.model);
+    if (parentAuth.ok && parentAuth.apiKey) {
+      await services.modelRuntime.setRuntimeApiKey(options.model.provider, parentAuth.apiKey, { allowNetwork: false });
+    }
   }
 
   const { session } = await createAgentSessionFromServices({

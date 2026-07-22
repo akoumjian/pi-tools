@@ -38,7 +38,7 @@ import {
 } from "./spawn.js";
 import { createSerialTaskGate, runWriterTask, type WriterWorktreeReport } from "./writer.js";
 
-const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 const TaskParams = Type.Object({
   id: Type.Optional(Type.String({ minLength: 1, description: "Stable task id used in result labels." })),
   task: Type.String({ minLength: 1, description: "Focused task delegated to an isolated child session." }),

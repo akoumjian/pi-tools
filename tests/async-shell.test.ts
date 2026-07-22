@@ -277,7 +277,7 @@ test("shell_start sends one deferred completion batch for notified completed job
     assert.match(startText, /recent_output: shell_read jobId=.*mode=tail/);
     assert.match(startText, /range_output: shell_read jobId=.*mode=range/);
 
-    await delay(1200);
+    await delay(2500);
 
     assert.equal(api.sentMessages.length, 1);
     const sentMessage = api.sentMessages[0];
@@ -332,7 +332,7 @@ test("shell_start keeps completions queued when its captured context becomes sta
     );
 
     stale = true;
-    await delay(1200);
+    await delay(2500);
     assert.equal(api.sentMessages.length, 0);
 
     const replacementContext = createContext(dir);
@@ -365,7 +365,7 @@ test("per-command notifyOnExit false suppresses deferred completion notices", as
       createContext(dir)
     );
 
-    await delay(1200);
+    await delay(2500);
 
     assert.equal(api.sentMessages.length, 0);
   });

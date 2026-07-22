@@ -30,7 +30,7 @@ The extension is registered in `package.json#pi.extensions`; `scripts/orchestrat
     role?: "reader" | "planner" | "writer"; // default reader
     model?: string;               // primary provider/model override
     fallbackModels?: string[];    // up to 4 explicit provider/model[:thinking] routes
-    thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+    thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   }>;
 }
 ```

@@ -1,10 +1,10 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import { clampThinkingLevel as clampModelThinkingLevel, type Api, type Model } from "@earendil-works/pi-ai";
 
 export type ExtensionModelRegistry = {
   hasConfiguredAuth(model: Model<Api>): boolean;
   getAll(): Model<Api>[];
-  refresh?(): void;
+  refresh?(): void | Promise<void>;
 };
 
 export type ResolvedExtensionModel = {
@@ -26,7 +26,7 @@ export type ParsedModelThinkingPair = {
   thinkingLevel: ThinkingLevel;
 };
 
-const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 export function isValidThinkingLevel(value: unknown): value is ThinkingLevel {
   return typeof value === "string" && THINKING_LEVELS.includes(value as ThinkingLevel);
@@ -46,7 +46,7 @@ export function resolveExtensionModel(options: ResolveExtensionModelOptions): Re
     assertConfiguredAuth(options.registry, options.currentModel, `Current model`);
     return {
       model: options.currentModel,
-      thinkingLevel: clampThinkingLevel(options.currentModel, options.fallbackThinkingLevel)
+      thinkingLevel: clampModelThinkingLevel(options.currentModel, options.fallbackThinkingLevel)
     };
   }
 
@@ -63,7 +63,7 @@ export function resolveExtensionModel(options: ResolveExtensionModelOptions): Re
   assertConfiguredAuth(options.registry, resolved.model, `${options.label} model`);
   return {
     model: resolved.model,
-    thinkingLevel: clampThinkingLevel(resolved.model, resolved.thinkingLevel ?? options.fallbackThinkingLevel)
+    thinkingLevel: clampModelThinkingLevel(resolved.model, resolved.thinkingLevel ?? options.fallbackThinkingLevel)
   };
 }
 
@@ -107,10 +107,6 @@ function assertConfiguredAuth(registry: ExtensionModelRegistry, model: Model<Api
   if (!registry.hasConfiguredAuth(model)) {
     throw new Error(`${label} has no configured auth: ${formatModelName(model)}`);
   }
-}
-
-function clampThinkingLevel(model: Model<Api>, thinkingLevel: ThinkingLevel): ThinkingLevel {
-  return model.reasoning ? thinkingLevel : "off";
 }
 
 type ParseModelPatternResult = {

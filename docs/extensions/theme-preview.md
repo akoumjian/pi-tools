@@ -25,7 +25,7 @@ When the command opens it:
    - Tool call/result rows (pending, success, error)
    - Markdown and inline code
    - Diff and syntax highlighting
-   - Thinking-level labels (off/minimal/low/medium/high/xhigh)
+   - Thinking-level labels (off/minimal/low/medium/high/xhigh/max)
    - User and custom messages
    - All `theme.fg(token, ...)` and `theme.bg(token, ...)` tokens
 5. Listens for input:

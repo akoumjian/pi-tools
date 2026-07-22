@@ -500,7 +500,7 @@ function addDiffAndSyntaxSection(lines: string[], theme: PreviewTheme, width: nu
 
 function addThinkingSection(lines: string[], theme: PreviewTheme, width: number): void {
   addSection(lines, theme, width, "Thinking and shell borders");
-  const levels = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+  const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
   addWrappedChips(
     lines,
     theme,

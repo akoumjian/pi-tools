@@ -326,7 +326,8 @@ const ThinkingLevelSchema = Type.Union([
   Type.Literal("low"),
   Type.Literal("medium"),
   Type.Literal("high"),
-  Type.Literal("xhigh")
+  Type.Literal("xhigh"),
+  Type.Literal("max")
 ]);
 
 const RouteAttemptSchema = Type.Object({

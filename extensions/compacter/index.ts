@@ -1,5 +1,5 @@
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { completeSimple, type Api, type AssistantMessage, type Model, type SimpleStreamOptions } from "@earendil-works/pi-ai";
+import { type Api, type AssistantMessage, type Model, type Provider, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import {
   convertToLlm,
   estimateTokens,
@@ -161,8 +161,10 @@ type TextChunk = {
 
 type CompletionOptions = {
   model: Model<Api>;
-  apiKey: string;
+  provider: Provider;
+  apiKey?: string;
   headers?: Record<string, string>;
+  env?: Record<string, string>;
   signal: AbortSignal;
   thinkingLevel: ThinkingLevel;
   budget: SummarizationBudget;
@@ -280,15 +282,28 @@ async function runCompacter(
     noModelMessage: "No current model is selected. Select a model or pass /compacter --model provider/model."
   });
   const auth = await context.modelRegistry.getApiKeyAndHeaders(resolved.model);
-  if (!auth.ok || !auth.apiKey) {
-    throw new Error(!auth.ok ? auth.error : `No API key for ${formatModelName(resolved.model)}`);
+  if (!auth.ok) {
+    throw new Error(auth.error);
+  }
+  const providerAuth = await context.modelRegistry.getProviderAuth(resolved.model.provider);
+  if (!providerAuth) {
+    throw new Error(`No resolved provider auth for ${formatModelName(resolved.model)}`);
+  }
+  const provider = context.modelRegistry.getProvider(resolved.model.provider);
+  if (!provider) {
+    throw new Error(`No runtime provider for ${formatModelName(resolved.model)}`);
   }
 
-  const budget = createSummarizationBudget(resolved.model, preparation.settings.reserveTokens);
+  const requestModel = providerAuth.auth.baseUrl
+    ? { ...resolved.model, baseUrl: providerAuth.auth.baseUrl }
+    : resolved.model;
+  const budget = createSummarizationBudget(requestModel, preparation.settings.reserveTokens);
   const completionOptions: CompletionOptions = {
-    model: resolved.model,
+    model: requestModel,
+    provider,
     apiKey: auth.apiKey,
     headers: auth.headers,
+    env: auth.env ?? providerAuth.env,
     signal,
     thinkingLevel: resolved.thinkingLevel,
     budget
@@ -430,6 +445,7 @@ async function completePrompt(promptText: string, options: CompletionOptions, ma
     signal: options.signal,
     apiKey: options.apiKey,
     headers: options.headers,
+    env: options.env,
     maxRetries: 0
   };
   if (options.model.reasoning && options.thinkingLevel !== "off") {
@@ -437,10 +453,10 @@ async function completePrompt(promptText: string, options: CompletionOptions, ma
   }
 
   stats.modelCalls += 1;
-  const response = await completeSimple(options.model, {
+  const response = await options.provider.streamSimple(options.model, {
     systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
     messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }]
-  }, completionOptions);
+  }, completionOptions).result();
 
   if (response.stopReason === "error") {
     throw new Error(formatSummarizationFailure(response, options.model));

@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { isIP } from "node:net";
 import path from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { completeSimple, type Api, type Message, type Model } from "@earendil-works/pi-ai";
+import { type Api, type Message, type Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
 import { formatConfigPath, piToolsConfigCandidates, readPiToolsJsonConfig, readPiToolsReferencedTextConfig, removeAgentExtensionConfig, writeAgentExtensionConfig, writeAgentExtensionTextConfig, type ConfigPath, type PiToolsConfigCandidate } from "../_shared/config.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
@@ -222,9 +222,9 @@ const commandRules: CommandRule[] = [
 ];
 
 export default function toolSafetyExtension(api: ExtensionAPI): void {
-  api.on("session_start", (_event, context) => {
+  api.on("session_start", async (_event, context) => {
     approvalModelUnavailableWarningShown = false;
-    notifyApprovalModelUnavailableOnce(context);
+    await notifyApprovalModelUnavailableOnce(context);
   });
 
   registerCommandWithAliases(
@@ -233,7 +233,7 @@ export default function toolSafetyExtension(api: ExtensionAPI): void {
     {
       description: "Persist the tool-safety approval judge model for this machine (usage: /safety:setup provider/model[:thinking])",
       handler: async (args, context) => {
-        handleToolSafetySetupCommand(args, context);
+        await handleToolSafetySetupCommand(args, context);
       }
     },
     []
@@ -257,7 +257,7 @@ export default function toolSafetyExtension(api: ExtensionAPI): void {
     {
       description: "Set or reset the runtime tool-safety approval judge model (usage: /safety:model provider/model[:thinking] | reset)",
       handler: async (args, context) => {
-        handleToolSafetyModelCommand(args, context);
+        await handleToolSafetyModelCommand(args, context);
       }
     },
     []
@@ -1627,7 +1627,7 @@ async function requestModelApproval(
   event: ToolCallEvent,
   decision: SafetyDecision
 ): Promise<ModelApproval> {
-  const selection = selectApprovalModel(context);
+  const selection = await selectApprovalModel(context);
   const { model, modelName, thinkingLevel } = selection;
   if (!model) {
     return modelApprovalError(selection.error ?? "No model is selected for AI safety approval.", modelName, "", thinkingLevel);
@@ -1638,14 +1638,22 @@ async function requestModelApproval(
     return modelApprovalError(auth.error, modelName, "", thinkingLevel);
   }
 
-  if (!auth.apiKey && !auth.headers) {
-    return modelApprovalError(`No request credentials are available for ${modelName}.`, modelName, "", thinkingLevel);
+  const providerAuth = await context.modelRegistry.getProviderAuth(model.provider);
+  if (!providerAuth) {
+    return modelApprovalError(`No resolved provider auth is available for ${modelName}.`, modelName, "", thinkingLevel);
+  }
+  const provider = context.modelRegistry.getProvider(model.provider);
+  if (!provider) {
+    return modelApprovalError(`No runtime provider is available for ${modelName}.`, modelName, "", thinkingLevel);
   }
 
+  const requestModel = providerAuth.auth.baseUrl
+    ? { ...model, baseUrl: providerAuth.auth.baseUrl }
+    : model;
   const abort = createTimeoutSignal(undefined, settings.approvalTimeoutMs);
   try {
-    const response = await completeSimple(
-      model,
+    const response = await provider.streamSimple(
+      requestModel,
       {
         systemPrompt: modelApprovalSystemPrompt,
         messages: [
@@ -1659,11 +1667,12 @@ async function requestModelApproval(
       {
         apiKey: auth.apiKey,
         headers: auth.headers,
+        env: auth.env ?? providerAuth.env,
         reasoning: thinkingLevel === "off" ? undefined : thinkingLevel,
         maxTokens: settings.approvalMaxTokens,
         signal: abort.signal
       }
-    );
+    ).result();
 
     if (response.stopReason === "error" || response.stopReason === "aborted") {
       return modelApprovalError(response.errorMessage ?? `Model stopped with ${response.stopReason}.`, modelName, "", thinkingLevel);
@@ -1683,8 +1692,8 @@ async function requestModelApproval(
   }
 }
 
-function selectApprovalModel(context: ExtensionContext): ApprovalModelSelection {
-  return resolveApprovalModelPreference(getEffectiveApprovalModelPreference().preference, context.modelRegistry);
+async function selectApprovalModel(context: ExtensionContext): Promise<ApprovalModelSelection> {
+  return resolveApprovalModelPreferenceWithRefresh(getEffectiveApprovalModelPreference().preference, context.modelRegistry);
 }
 
 export function setRuntimeApprovalModelPreference(preference: ApprovalModelPreference | undefined): void {
@@ -1702,7 +1711,7 @@ function getEffectiveApprovalModelPreference(): { preference?: ApprovalModelPref
     : { preference: settings.approvalModel, source: "config" };
 }
 
-function notifyApprovalModelUnavailableOnce(context: Pick<ExtensionContext, "hasUI" | "modelRegistry" | "ui">): void {
+async function notifyApprovalModelUnavailableOnce(context: Pick<ExtensionContext, "hasUI" | "modelRegistry" | "ui">): Promise<void> {
   if (approvalModelUnavailableWarningShown || !runtimeToolSafetyEnabled || context.hasUI === false) {
     return;
   }
@@ -1712,7 +1721,7 @@ function notifyApprovalModelUnavailableOnce(context: Pick<ExtensionContext, "has
     return;
   }
 
-  const selection = resolveApprovalModelPreference(effective.preference, context.modelRegistry);
+  const selection = await resolveApprovalModelPreferenceWithRefresh(effective.preference, context.modelRegistry);
   if (selection.model) {
     return;
   }
@@ -1724,7 +1733,7 @@ function notifyApprovalModelUnavailableOnce(context: Pick<ExtensionContext, "has
   );
 }
 
-function handleToolSafetySetupCommand(rawArgs: string, context: ExtensionContext): void {
+async function handleToolSafetySetupCommand(rawArgs: string, context: ExtensionContext): Promise<void> {
   let args: ReturnType<typeof parseGuidedModelSetupArgs>;
   try {
     args = parseGuidedModelSetupArgs(rawArgs, "/safety:setup");
@@ -1744,7 +1753,7 @@ function handleToolSafetySetupCommand(rawArgs: string, context: ExtensionContext
     return;
   }
 
-  const selection = resolveApprovalModelPreference(preference, context.modelRegistry);
+  const selection = await resolveApprovalModelPreferenceWithRefresh(preference, context.modelRegistry);
   if (!selection.model) {
     context.ui.notify(`Tool-safety setup did not write config: ${selection.error ?? "model unavailable"}`, "error");
     return;
@@ -1808,7 +1817,7 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function handleToolSafetyModelCommand(rawArgs: string, context: ExtensionContext): void {
+async function handleToolSafetyModelCommand(rawArgs: string, context: ExtensionContext): Promise<void> {
   const args = rawArgs.trim();
   if (!args) {
     context.ui.notify(`${toolSafetyModelUsage()}\n\n${buildToolSafetyStatusText(context)}`, "info");
@@ -1827,7 +1836,7 @@ function handleToolSafetyModelCommand(rawArgs: string, context: ExtensionContext
     return;
   }
 
-  const selection = resolveApprovalModelPreference(preference, context.modelRegistry);
+  const selection = await resolveApprovalModelPreferenceWithRefresh(preference, context.modelRegistry);
   if (!selection.model) {
     context.ui.notify(`Tool-safety approval model was not changed: ${selection.error ?? "model unavailable"}`, "error");
     return;
@@ -1907,13 +1916,20 @@ export type ApprovalModelSelection = {
 };
 
 export function resolveApprovalModelPreference(preferred: ApprovalModelPreference | undefined, registry: ExtensionModelRegistry): ApprovalModelSelection {
+  return resolveApprovalModelPreferenceOnce(preferred, registry);
+}
+
+export async function resolveApprovalModelPreferenceWithRefresh(
+  preferred: ApprovalModelPreference | undefined,
+  registry: ExtensionModelRegistry
+): Promise<ApprovalModelSelection> {
   const initial = resolveApprovalModelPreferenceOnce(preferred, registry);
   if (initial.model || preferred === undefined || !registry.refresh) {
     return initial;
   }
 
   try {
-    registry.refresh();
+    await registry.refresh();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return {
