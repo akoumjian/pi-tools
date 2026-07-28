@@ -1,10 +1,11 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, open, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { Type, type Static } from "@earendil-works/pi-ai";
 import {
+  createReadToolDefinition,
   defineTool,
   type AgentToolResult,
   type ExtensionAPI,
@@ -25,17 +26,35 @@ type TruncationDetails = {
   nextOffset?: number;
 };
 
-type ReadFileDetails = {
+type ToolContent = AgentToolResult<unknown>["content"][number];
+type ToolImageContent = Extract<ToolContent, { type: "image" }>;
+
+type ReadFileBaseDetails = {
   path: string;
   resolvedPath: string;
-  offset: number;
-  requestedLimit?: number;
-  truncation: TruncationDetails;
+  kind: "text" | "image";
   previewLines: string[];
 };
 
+type ReadTextFileDetails = ReadFileBaseDetails & {
+  kind: "text";
+  offset: number;
+  requestedLimit?: number;
+  truncation: TruncationDetails;
+};
+
+type ReadImageFileDetails = ReadFileBaseDetails & {
+  kind: "image";
+  mimeType: string;
+  attachmentCount: number;
+  omitted: boolean;
+};
+
+type ReadFileDetails = ReadTextFileDetails | ReadImageFileDetails;
+
 type ReadFileResult = ReadFileDetails & {
-  content: string;
+  text: string;
+  imageContent?: ToolImageContent[];
 };
 
 type ReadManyDetails = {
@@ -348,16 +367,17 @@ function registerBatchTools(api: ExtensionAPI): void {
     name: "read_many",
     label: "Read Many",
     description: [
-      "Read known text file ranges in one parallel-capable tool call. Always pass files: [...]; use a one-item list for a single text file when batch shape is convenient. Batch independent file reads together instead of making serial read_many calls.",
+      "Read known text file ranges and supported local images in one parallel-capable tool call. Always pass files: [...]; use a one-item list for a single file when batch shape is convenient. Batch independent file reads together instead of making serial read_many calls.",
       "Do not use read_many to discover files, scan a repository, or load many large files speculatively. Use search_many first for structured rg-backed file discovery/content search, or shell_start with rg/rg --files/find/git grep when custom shell inspection is needed.",
-      "Each item accepts { path, offset?, limit? }. Omit limit when full remaining file contents are actually needed. Output is grouped by file. Result details shape: { files: [{ path, resolvedPath, offset, requestedLimit?, truncation: { truncated, truncatedBy, totalLines, outputLines, totalBytes, outputBytes, nextOffset? } }] }.",
-      "Use offset as a 1-indexed starting line and limit as the maximum lines for that file. For huge files, continue with the returned nextOffset."
+      "Each item accepts { path, offset?, limit? }. For text files, omit limit when full remaining file contents are actually needed. For supported images (jpg, png, gif, webp), read_many returns Pi-compatible image attachments using the built-in read image pipeline; offset/limit are ignored for images.",
+      "Output is grouped by file. Result details shape: { files: [{ kind: 'text', path, resolvedPath, offset, requestedLimit?, truncation: { truncated, truncatedBy, totalLines, outputLines, totalBytes, outputBytes, nextOffset? } } | { kind: 'image', path, resolvedPath, mimeType, attachmentCount, omitted }] }.",
+      "Use offset as a 1-indexed starting line and limit as the maximum lines for text files. For huge text files, continue with the returned nextOffset."
     ].join(" "),
     parameters: ReadManyParams,
     executionMode: "parallel",
     renderShell: "self",
-    async execute(_toolCallId, params, _signal, _onUpdate, context): Promise<AgentToolResult<ReadManyDetails>> {
-      return readMany(context, params);
+    async execute(_toolCallId, params, signal, _onUpdate, context): Promise<AgentToolResult<ReadManyDetails>> {
+      return readMany(context, params, signal);
     },
     renderCall(args, theme) {
       return renderReadManyCall(args, theme);
@@ -671,17 +691,18 @@ function escapeXml(text: string): string {
     .replace(/'/g, "&apos;");
 }
 
-export async function readMany(context: ExtensionContext, input: ReadManyInput): Promise<AgentToolResult<ReadManyDetails>> {
-  const results = await Promise.all(input.files.map((item) => readOne(context, item)));
-  const details = results.map(({ content: _content, ...detail }) => detail);
+export async function readMany(context: ExtensionContext, input: ReadManyInput, signal?: AbortSignal): Promise<AgentToolResult<ReadManyDetails>> {
+  const results = await Promise.all(input.files.map((item) => readOne(context, item, signal)));
+  const details = results.map(({ text: _text, imageContent: _imageContent, ...detail }) => detail);
   const text = [
     `Read ${results.length} file${results.length === 1 ? "" : "s"}.`,
     "",
     results.map((file) => formatReadFile(file)).join("\n\n")
   ].join("\n");
+  const images = results.flatMap((file) => file.imageContent ?? []);
 
   return {
-    content: [{ type: "text", text }],
+    content: [{ type: "text", text }, ...images],
     details: { files: details }
   };
 }
@@ -869,9 +890,14 @@ function formatSearchResult(index: number, result: SearchResult): string {
   return `--- search ${index}: ${label}${glob} (${result.outputLines} line${result.outputLines === 1 ? "" : "s"}) ---\n${output}${truncated}`;
 }
 
-async function readOne(context: ExtensionContext, item: ReadManyInput["files"][number]): Promise<ReadFileResult> {
+async function readOne(context: ExtensionContext, item: ReadManyInput["files"][number], signal?: AbortSignal): Promise<ReadFileResult> {
   const resolvedPath = resolvePath(context.cwd, item.path);
   await access(resolvedPath, constants.R_OK);
+
+  const mimeType = await detectSupportedImageMimeTypeFromFile(resolvedPath);
+  if (mimeType !== null) {
+    return readImageOne(context, item, resolvedPath, mimeType, signal);
+  }
 
   const content = await readFile(resolvedPath, "utf8");
   const lines = content.split("\n");
@@ -887,17 +913,70 @@ async function readOne(context: ExtensionContext, item: ReadManyInput["files"][n
   const truncated = buildReadTruncation(selected, outputContent, totalLines, Buffer.byteLength(content, "utf8"), start);
 
   return {
+    kind: "text",
     path: item.path,
     resolvedPath,
     offset,
     requestedLimit: item.limit,
     truncation: truncated,
     previewLines: previewLines(outputContent, 2),
-    content: outputContent
+    text: outputContent
   };
 }
 
+async function readImageOne(
+  context: ExtensionContext,
+  item: ReadManyInput["files"][number],
+  resolvedPath: string,
+  detectedMimeType: string,
+  signal?: AbortSignal
+): Promise<ReadFileResult> {
+  const readTool = createReadToolDefinition(context.cwd);
+  if (readTool.execute === undefined) {
+    throw new Error("Built-in read tool does not expose an execute function for image reads.");
+  }
+
+  const result = await readTool.execute(
+    `read_many:${item.path}`,
+    { path: item.path, offset: item.offset, limit: item.limit },
+    signal,
+    undefined,
+    context
+  );
+  const text = textContentFromToolResult(result).trimEnd() || `Read image file [${detectedMimeType}]`;
+  const imageContent = imageContentFromToolResult(result);
+  const mimeType = imageContent[0]?.mimeType ?? detectedMimeType;
+
+  return {
+    kind: "image",
+    path: item.path,
+    resolvedPath,
+    mimeType,
+    attachmentCount: imageContent.length,
+    omitted: imageContent.length === 0,
+    previewLines: previewLines(text, 2),
+    text,
+    imageContent
+  };
+}
+
+function textContentFromToolResult(result: AgentToolResult<unknown>): string {
+  return result.content
+    .filter((item) => item.type === "text")
+    .map((item) => item.text)
+    .join("\n");
+}
+
+function imageContentFromToolResult(result: AgentToolResult<unknown>): ToolImageContent[] {
+  return result.content.filter((item): item is ToolImageContent => item.type === "image");
+}
+
 function formatReadFile(file: ReadFileResult): string {
+  if (file.kind === "image") {
+    const status = file.omitted ? "omitted" : `${file.attachmentCount} attachment${file.attachmentCount === 1 ? "" : "s"}`;
+    return `--- ${file.path} (image ${file.mimeType}, ${status}) ---\n${file.text}`;
+  }
+
   const startLine = file.offset;
   const endLine = file.offset + file.truncation.outputLines - 1;
   const header = `--- ${file.path} (lines ${startLine}-${Math.max(startLine, endLine)} of ${file.truncation.totalLines}) ---`;
@@ -905,7 +984,7 @@ function formatReadFile(file: ReadFileResult): string {
     ? ""
     : `\n[truncated by ${file.truncation.truncatedBy}; continue with offset=${file.truncation.nextOffset}]`;
 
-  return `${header}\n${file.content}${continuation}`;
+  return `${header}\n${file.text}${continuation}`;
 }
 
 function buildReadTruncation(selected: string[], outputContent: string, totalLines: number, totalBytes: number, startIndex: number): TruncationDetails {
@@ -921,6 +1000,86 @@ function buildReadTruncation(selected: string[], outputContent: string, totalLin
     outputBytes: Buffer.byteLength(outputContent, "utf8"),
     nextOffset: hasMoreFileLines ? startIndex + outputLines + 1 : undefined
   };
+}
+
+const IMAGE_TYPE_SNIFF_BYTES = 4100;
+const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+
+async function detectSupportedImageMimeTypeFromFile(filePath: string): Promise<string | null> {
+  const handle = await open(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(IMAGE_TYPE_SNIFF_BYTES);
+    const { bytesRead } = await handle.read(buffer, 0, IMAGE_TYPE_SNIFF_BYTES, 0);
+    return detectSupportedImageMimeType(buffer.subarray(0, bytesRead));
+  } finally {
+    await handle.close();
+  }
+}
+
+function detectSupportedImageMimeType(buffer: Buffer): string | null {
+  if (startsWith(buffer, [0xff, 0xd8, 0xff])) {
+    return buffer[3] === 0xf7 ? null : "image/jpeg";
+  }
+  if (startsWith(buffer, PNG_SIGNATURE)) {
+    return isPng(buffer) && !isAnimatedPng(buffer) ? "image/png" : null;
+  }
+  if (startsWithAscii(buffer, 0, "GIF")) {
+    return "image/gif";
+  }
+  if (startsWithAscii(buffer, 0, "RIFF") && startsWithAscii(buffer, 8, "WEBP")) {
+    return "image/webp";
+  }
+  return null;
+}
+
+function isPng(buffer: Buffer): boolean {
+  return buffer.length >= 16 && readUint32BE(buffer, PNG_SIGNATURE.length) === 13 && startsWithAscii(buffer, 12, "IHDR");
+}
+
+function isAnimatedPng(buffer: Buffer): boolean {
+  let offset = PNG_SIGNATURE.length;
+  while (offset + 8 <= buffer.length) {
+    const chunkLength = readUint32BE(buffer, offset);
+    const chunkTypeOffset = offset + 4;
+    if (startsWithAscii(buffer, chunkTypeOffset, "acTL")) {
+      return true;
+    }
+    if (startsWithAscii(buffer, chunkTypeOffset, "IDAT")) {
+      return false;
+    }
+    const nextOffset = offset + 8 + chunkLength + 4;
+    if (nextOffset <= offset || nextOffset > buffer.length) {
+      return false;
+    }
+    offset = nextOffset;
+  }
+  return false;
+}
+
+function readUint32BE(buffer: Buffer, offset: number): number {
+  return ((buffer[offset] ?? 0) * 0x1000000) +
+    ((buffer[offset + 1] ?? 0) << 16) +
+    ((buffer[offset + 2] ?? 0) << 8) +
+    (buffer[offset + 3] ?? 0);
+}
+
+function startsWith(buffer: Buffer, bytes: number[]): boolean {
+  if (buffer.length < bytes.length) {
+    return false;
+  }
+  return bytes.every((byte, index) => buffer[index] === byte);
+}
+
+function startsWithAscii(buffer: Buffer, offset: number, text: string): boolean {
+  if (buffer.length < offset + text.length) {
+    return false;
+  }
+  for (let index = 0; index < text.length; index += 1) {
+    if (buffer[offset + index] !== text.charCodeAt(index)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 const NATIVE_MUTATION_ENTRY_ID_HASH_LENGTH = 12;
@@ -1357,6 +1516,10 @@ function formatReadRequest(file: ReadManyInput["files"][number]): string {
 }
 
 function formatReadResultSpan(file: ReadFileDetails): string {
+  if (file.kind === "image") {
+    return `${compactPath(file.path)} [image]`;
+  }
+
   const start = file.offset;
   const end = Math.max(start, file.offset + file.truncation.outputLines - 1);
   return `${compactPath(file.path)}:${start}:${end}`;

@@ -130,7 +130,7 @@ Each extension below documents what it does, what it provides, and how to set it
 
 [Full docs](docs/extensions/native-tools.md).
 
-**Purpose.** Replace stock single-file `read`/`grep`/`find`/`write`/`edit` tools with batch-native equivalents. Strict-replacement enforcement removes banned tools and adds required replacements at session start, while slim prompt guidance steers search-vs-read, edit-vs-write, shell log inspection, and research/document workflows.
+**Purpose.** Replace stock single-file `read`/`grep`/`find`/`write`/`edit` tools with batch-native equivalents. `read_many` handles text ranges and supported local images using Pi's built-in image attachment pipeline. Strict-replacement enforcement removes banned tools and adds required replacements at session start, while slim prompt guidance steers search-vs-read, edit-vs-write, shell log inspection, and research/document workflows.
 
 **Provides.** `read_many`, `search_many`, `write_many`, `edit_many`; disabled `bash` stub redirecting to `shell_start`; `/native:status`; compact renderers with `⎿ error: …` fallback on validation/exec errors.
 

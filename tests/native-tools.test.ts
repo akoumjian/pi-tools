@@ -120,6 +120,26 @@ function required<T>(value: T | undefined, name: string): T {
   return value;
 }
 
+type ReadManyResultFile = Awaited<ReturnType<typeof readMany>>["details"]["files"][number];
+
+type TextReadManyResultFile = Extract<ReadManyResultFile, { kind: "text" }>;
+
+type ImageReadManyResultFile = Extract<ReadManyResultFile, { kind: "image" }>;
+
+function requiredTextReadFile(file: ReadManyResultFile): TextReadManyResultFile {
+  if (file.kind !== "text") {
+    throw new Error(`expected text result, got ${file.kind}`);
+  }
+  return file;
+}
+
+function requiredImageReadFile(file: ReadManyResultFile): ImageReadManyResultFile {
+  if (file.kind !== "image") {
+    throw new Error(`expected image result, got ${file.kind}`);
+  }
+  return file;
+}
+
 test("native extension registers batch file tools but not single read/edit/write overrides", () => {
   const api = createFakeApi([], []);
 
@@ -736,11 +756,13 @@ test("read_many reads independent files with per-file offset and limit", async (
       ]
     });
 
-    assert.equal(result.details.files[0].offset, 2);
-    assert.equal(result.details.files[0].requestedLimit, 2);
-    assert.equal(result.details.files[0].truncation.nextOffset, 4);
-    assert.deepEqual(result.details.files[0].previewLines, ["a2", "a3"]);
-    assert.equal(result.details.files[1].truncation.nextOffset, 2);
+    const alpha = requiredTextReadFile(result.details.files[0]);
+    const beta = requiredTextReadFile(result.details.files[1]);
+    assert.equal(alpha.offset, 2);
+    assert.equal(alpha.requestedLimit, 2);
+    assert.equal(alpha.truncation.nextOffset, 4);
+    assert.deepEqual(alpha.previewLines, ["a2", "a3"]);
+    assert.equal(beta.truncation.nextOffset, 2);
 
     const text = textFromResult(result);
     assert.match(text, /--- @alpha\.txt \(lines 2-3 of 5\) ---\na2\na3/);
@@ -763,6 +785,33 @@ test("read_many reads independent files with per-file offset and limit", async (
   });
 });
 
+test("read_many returns supported images as model image attachments", async () => {
+  await withTempDir(async (dir) => {
+    const png = await readFile(path.join(process.cwd(), "node_modules/@earendil-works/pi-coding-agent/docs/images/exy.png"));
+    await writeFile(path.join(dir, "exy.png"), png);
+
+    const result = await readMany(createContext(dir), {
+      files: [{ path: "exy.png" }]
+    });
+
+    const file = requiredImageReadFile(result.details.files[0]);
+    assert.match(file.mimeType, /^image\/(png|jpeg)$/);
+    assert.equal(file.attachmentCount, 1);
+    assert.equal(file.omitted, false);
+    assert.equal(result.content.filter((item) => item.type === "image").length, 1);
+
+    const text = textFromResult(result);
+    assert.match(text, /--- exy\.png \(image image\/(png|jpeg), 1 attachment\) ---/);
+    assert.match(text, /Read image file \[image\/(png|jpeg)\]/);
+
+    const api = createFakeApi([], []);
+    nativeToolsExtension(api);
+    const readManyTool = required(api.registeredTools.find((tool) => tool.name === "read_many"), "read_many tool");
+    const renderedResult = renderToolResult(readManyTool, result);
+    assert.match(renderedResult, /⎿ Read exy\.png \[image\]/);
+  });
+});
+
 test("read_many keeps uncapped model-facing reads separate from minimal display", async () => {
   await withTempDir(async (dir) => {
     const lines = Array.from({ length: 6000 }, (_value, index) => `line-${index + 1}`);
@@ -772,8 +821,9 @@ test("read_many keeps uncapped model-facing reads separate from minimal display"
       files: [{ path: "long.txt", limit: 6000 }]
     });
 
-    assert.equal(result.details.files[0].truncation.outputLines, 6000);
-    assert.equal(result.details.files[0].truncation.truncated, false);
+    const file = requiredTextReadFile(result.details.files[0]);
+    assert.equal(file.truncation.outputLines, 6000);
+    assert.equal(file.truncation.truncated, false);
     assert.match(textFromResult(result), /line-6000/);
 
     const api = createFakeApi([], []);
@@ -806,9 +856,10 @@ test("read_many returns content beyond the previous byte display cap", async () 
       files: [{ path: "long.txt" }]
     });
 
-    assert.equal(result.details.files[0].truncation.truncated, false);
-    assert.equal(result.details.files[0].truncation.outputLines, 2);
-    assert.ok(result.details.files[0].truncation.outputBytes > 50 * 1024);
+    const file = requiredTextReadFile(result.details.files[0]);
+    assert.equal(file.truncation.truncated, false);
+    assert.equal(file.truncation.outputLines, 2);
+    assert.ok(file.truncation.outputBytes > 50 * 1024);
     assert.match(textFromResult(result), /next/);
   });
 });

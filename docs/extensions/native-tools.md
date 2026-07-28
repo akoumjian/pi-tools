@@ -43,9 +43,10 @@ read_many({
 })
 ```
 
-- Use `offset`/`limit` to read precise ranges of large files.
-- Omit `limit` to read from `offset` to end of file.
-- For huge files, follow the `truncation.nextOffset` in the result to continue.
+- Use `offset`/`limit` to read precise ranges of large text files.
+- Omit `limit` to read text from `offset` to end of file.
+- For huge text files, follow the `truncation.nextOffset` in the result to continue.
+- Supported local images (jpg, png, gif, webp) use Pi's built-in read image pipeline and are returned as model image attachments; `offset`/`limit` are ignored for images.
 
 ### search_many
 
@@ -119,7 +120,8 @@ The slim prompt removes Pi's default `Available tools`/`Guidelines` prose and in
 
 ### read_many
 
-- Reads each file with line-level pagination, returning the slice and a `truncation` block describing whether the read was capped by lines or bytes plus a `nextOffset` for continuation.
+- Reads text files with line-level pagination, returning the slice and a `truncation` block describing whether the read was capped by lines or bytes plus a `nextOffset` for continuation.
+- Reads supported image files through Pi's built-in image handling (including inline image attachment generation and any built-in resizing/omission behavior).
 - File-by-file results, no truncation across files.
 
 ### search_many
@@ -155,9 +157,13 @@ If a profile or extension re-adds a banned stock tool, strict mode reports the c
   details: {
     files: [
       {
-        path, resolvedPath, offset,
+        kind: "text", path, resolvedPath, offset,
         requestedLimit?,
         truncation: { truncated, truncatedBy: "lines" | "bytes" | null, totalLines, outputLines, totalBytes, outputBytes, nextOffset? },
+        previewLines: string[]
+      } | {
+        kind: "image", path, resolvedPath,
+        mimeType, attachmentCount, omitted,
         previewLines: string[]
       }, ...
     ]
