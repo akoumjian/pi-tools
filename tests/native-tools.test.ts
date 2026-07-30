@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import type { ExtensionAPI, ExtensionContext, MessageRenderer, Skill, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { withFileMutationQueue, type ExtensionAPI, type ExtensionContext, type MessageRenderer, type Skill, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import asyncShellExtension from "../extensions/async-shell/index.js";
 import nativeToolsExtension, {
   buildNativeToolsStatusText,
@@ -640,6 +640,87 @@ test("native-tools-status reports strict replacement diagnostics", () => {
   assert.match(status, /Strict replacement: ok/);
   assert.match(status, /Active banned stock tools: none/);
   assert.match(status, /Missing required replacements: none/);
+});
+
+test("native batch tools reject pre-aborted work before reads, searches, or mutations", async () => {
+  await withTempDir(async (dir) => {
+    await writeFile(path.join(dir, "existing.txt"), "before\n", "utf8");
+    const controller = new AbortController();
+    controller.abort();
+
+    await assert.rejects(readMany(createContext(dir), { files: [{ path: "existing.txt" }] }, controller.signal), { name: "AbortError" });
+    await assert.rejects(searchMany(createContext(dir), { searches: [{ kind: "files", path: "." }] }, controller.signal), { name: "AbortError" });
+    await assert.rejects(
+      writeMany(createContext(dir), { writes: [{ path: "new.txt", content: "new\n" }] }, undefined, controller.signal),
+      { name: "AbortError" }
+    );
+    await assert.rejects(
+      editMany(createContext(dir), { files: [{ path: "existing.txt", edits: [{ oldText: "before", newText: "after" }] }] }, undefined, controller.signal),
+      { name: "AbortError" }
+    );
+
+    assert.equal(await readFile(path.join(dir, "existing.txt"), "utf8"), "before\n");
+    await assert.rejects(readFile(path.join(dir, "new.txt"), "utf8"), /ENOENT/);
+  });
+});
+
+test("write_many aborts promptly while queued and never commits the deferred write", async () => {
+  await withTempDir(async (dir) => {
+    const targetPath = path.join(dir, "queued.txt");
+    let releaseQueue!: () => void;
+    const blocker = withFileMutationQueue(targetPath, () => new Promise<void>((resolve) => {
+      releaseQueue = resolve;
+    }));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const controller = new AbortController();
+    const writing = writeMany(
+      createContext(dir),
+      { writes: [{ path: "queued.txt", content: "must not land\n" }] },
+      undefined,
+      controller.signal
+    );
+    controller.abort();
+
+    try {
+      await assert.rejects(
+        Promise.race([
+          writing,
+          new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("interrupted queue wait did not settle")), 500))
+        ]),
+        { name: "AbortError" }
+      );
+      await assert.rejects(readFile(targetPath, "utf8"), /ENOENT/);
+    } finally {
+      releaseQueue();
+      await blocker;
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await assert.rejects(readFile(targetPath, "utf8"), /ENOENT/);
+  });
+});
+
+test("search_many terminates its owned rg child on interruption", async () => {
+  await withTempDir(async (dir) => {
+    const binDir = path.join(dir, "bin");
+    await mkdir(binDir);
+    const rgPath = path.join(binDir, "rg");
+    await writeFile(rgPath, "#!/bin/sh\nsleep 30\n", "utf8");
+    await chmod(rgPath, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${binDir}${path.delimiter}${previousPath ?? ""}`;
+    try {
+      const controller = new AbortController();
+      const startedAt = Date.now();
+      const search = searchMany(createContext(dir), { searches: [{ kind: "files", path: "." }] }, controller.signal);
+      setTimeout(() => controller.abort(), 50);
+      await assert.rejects(search, { name: "AbortError" });
+      assert.ok(Date.now() - startedAt < 1_500, "interrupted rg should settle promptly");
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  });
 });
 
 test("search_many lists files and searches content with line numbers", async () => {

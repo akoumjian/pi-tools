@@ -4,6 +4,7 @@ import path from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { type Api, type Message, type Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
+import { abortableDialogOptions, createAbortScope, throwIfAborted } from "../_shared/cancellation.js";
 import { formatConfigPath, piToolsConfigCandidates, readPiToolsJsonConfig, readPiToolsReferencedTextConfig, removeAgentExtensionConfig, writeAgentExtensionConfig, writeAgentExtensionTextConfig, type ConfigPath, type PiToolsConfigCandidate } from "../_shared/config.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 import { formatModelName, normalizeThinkingLevel, parseOptionalModelThinkingPair, resolveExtensionModel, type ExtensionModelRegistry } from "../_shared/model-spec.js";
@@ -280,6 +281,7 @@ export default function toolSafetyExtension(api: ExtensionAPI): void {
       return;
     }
 
+    throwIfAborted(context.signal);
     const initialDecision = evaluateToolCall(event, context);
     const approvalContext = getUserMessages(context).slice(-(settings.recentUserMessages + 1)).join("\n");
     const criteriaDecision = applyReviewCriteria(event, initialDecision, settings.reviewCriteria, approvalContext);
@@ -1627,18 +1629,22 @@ async function requestModelApproval(
   event: ToolCallEvent,
   decision: SafetyDecision
 ): Promise<ModelApproval> {
+  throwIfAborted(context.signal);
   const selection = await selectApprovalModel(context);
+  throwIfAborted(context.signal);
   const { model, modelName, thinkingLevel } = selection;
   if (!model) {
     return modelApprovalError(selection.error ?? "No model is selected for AI safety approval.", modelName, "", thinkingLevel);
   }
 
   const auth = await context.modelRegistry.getApiKeyAndHeaders(model);
+  throwIfAborted(context.signal);
   if (!auth.ok) {
     return modelApprovalError(auth.error, modelName, "", thinkingLevel);
   }
 
   const providerAuth = await context.modelRegistry.getProviderAuth(model.provider);
+  throwIfAborted(context.signal);
   if (!providerAuth) {
     return modelApprovalError(`No resolved provider auth is available for ${modelName}.`, modelName, "", thinkingLevel);
   }
@@ -1650,7 +1656,7 @@ async function requestModelApproval(
   const requestModel = providerAuth.auth.baseUrl
     ? { ...model, baseUrl: providerAuth.auth.baseUrl }
     : model;
-  const abort = createTimeoutSignal(undefined, settings.approvalTimeoutMs);
+  const abort = createAbortScope(context.signal, settings.approvalTimeoutMs);
   try {
     const response = await provider.streamSimple(
       requestModel,
@@ -1675,6 +1681,7 @@ async function requestModelApproval(
     ).result();
 
     if (response.stopReason === "error" || response.stopReason === "aborted") {
+      throwIfAborted(context.signal);
       return modelApprovalError(response.errorMessage ?? `Model stopped with ${response.stopReason}.`, modelName, "", thinkingLevel);
     }
 
@@ -1686,6 +1693,7 @@ async function requestModelApproval(
 
     return parseModelApproval(text, modelName, thinkingLevel);
   } catch (error) {
+    throwIfAborted(context.signal);
     return modelApprovalError(error instanceof Error ? error.message : String(error), modelName, "", thinkingLevel);
   } finally {
     abort.dispose();
@@ -2020,18 +2028,25 @@ async function requestReview(context: ExtensionContext, event: ToolCallEvent, de
     return false;
   }
 
+  throwIfAborted(context.signal);
   const prompt = buildHumanReviewPrompt(event, decision);
-  const options = buildHumanReviewConfirmOptions();
+  const options = buildHumanReviewConfirmOptions(settings.humanReviewTimeoutMs, context.signal);
 
   try {
-    return await context.ui.confirm(prompt.title, prompt.message, options);
+    const approved = await context.ui.confirm(prompt.title, prompt.message, options);
+    throwIfAborted(context.signal);
+    return approved;
   } catch {
+    throwIfAborted(context.signal);
     return false;
   }
 }
 
-export function buildHumanReviewConfirmOptions(timeoutMs = settings.humanReviewTimeoutMs): { timeout: number } | undefined {
-  return timeoutMs === undefined ? undefined : { timeout: timeoutMs };
+export function buildHumanReviewConfirmOptions(
+  timeoutMs = settings.humanReviewTimeoutMs,
+  signal?: AbortSignal
+): ReturnType<typeof abortableDialogOptions> {
+  return abortableDialogOptions(signal, timeoutMs);
 }
 
 export function buildHumanReviewPrompt(event: ToolCallEvent, decision: SafetyDecision): { title: string; message: string } {
@@ -2279,28 +2294,6 @@ function maxRisk(left: SafetyRisk, right: SafetyRisk): SafetyRisk {
   };
 
   return ranks[left] >= ranks[right] ? left : right;
-}
-
-function createTimeoutSignal(parent: AbortSignal | undefined, timeoutMs: number | undefined): { signal: AbortSignal; dispose: () => void } {
-  const controller = new AbortController();
-  const timeout = timeoutMs === undefined ? undefined : setTimeout(() => controller.abort(), timeoutMs);
-  const abort = () => controller.abort();
-
-  if (parent?.aborted) {
-    controller.abort();
-  } else {
-    parent?.addEventListener("abort", abort, { once: true });
-  }
-
-  return {
-    signal: controller.signal,
-    dispose: () => {
-      if (timeout !== undefined) {
-        clearTimeout(timeout);
-      }
-      parent?.removeEventListener("abort", abort);
-    }
-  };
 }
 
 function getToolName(event: ToolCallEvent): string {

@@ -132,7 +132,9 @@ The slim prompt removes Pi's default `Available tools`/`Guidelines` prose and in
 
 ### write_many / edit_many
 
-- Each file is processed sequentially under `withFileMutationQueue` (a Pi core helper that serializes mutations per file).
+- Each target is processed under `withFileMutationQueue` (a Pi core helper that serializes mutations to the same resolved file); distinct targets may run concurrently.
+- All four tools honor the parent agent's abort signal. Reads stop cooperatively and an owned `rg` child is terminated. Mutations check again after acquiring their file queue and immediately before each write, but never attempt to interrupt a write syscall already in progress.
+- Batch mutations start independent file operations together and are not transactional across files. On interruption, writes already in progress are allowed to settle while entries that have not reached their commit point stop; this can leave a documented partial application. The tool waits for every started commit to settle before returning, so inspect the named files before retrying an interrupted batch.
 - `write_many` writes the new contents and reports byte/line counts.
 - `edit_many` runs each replacement on the original file content (snapshot), validates exact-once occurrences and non-overlap, applies them, and reports per-edit line ranges in the diff.
 - When `mutation-review` is configured and reviews the call, the result may include a `mutationReview` block describing which mutations were blocked, plus a pending review id. Use `apply_reviewed_mutation` to apply a previously-blocked mutation after acknowledgement.

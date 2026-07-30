@@ -8,7 +8,6 @@ import {
   buildSessionContext,
   convertToLlm,
   defineTool,
-  withFileMutationQueue,
   type AgentToolResult,
   type ExtensionAPI,
   type ExtensionContext,
@@ -37,6 +36,7 @@ import {
   type ResolvedExtensionModel
 } from "../_shared/model-spec.js";
 import { withChildAgentSession } from "../_shared/child-agent-session.js";
+import { settleAllOrThrow, throwIfAborted, withAbortableFileMutationQueue } from "../_shared/cancellation.js";
 import { formatConfigPath, readPiToolsJsonConfigSource, readPiToolsReferencedTextConfig, writeAgentExtensionConfig, type PiToolsJsonConfig } from "../_shared/config.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 import { guidedModelSetupUsage, parseGuidedModelSetupArgs, readSetupGuidance } from "../_shared/setup-command.js";
@@ -239,6 +239,7 @@ async function reviewMutationToolCall(event: ToolCallEvent, context: ExtensionCo
     return undefined;
   }
 
+  throwIfAborted(context.signal);
   const rawSettings = readMutationReviewSettings();
   const settings = getEffectiveMutationReviewSettings(rawSettings);
   if (!isMutationReviewConfigured(settings)) {
@@ -292,6 +293,7 @@ async function reviewMutationToolCall(event: ToolCallEvent, context: ExtensionCo
     });
     return undefined;
   } catch (error) {
+    throwIfAborted(context.signal);
     const blocked = rememberPendingReviewedMutation(context, proposal, { failure: errorMessage(error) });
     return {
       block: true,
@@ -316,8 +318,8 @@ function registerApplyReviewedMutationTool(api: ExtensionAPI): void {
     ],
     parameters: ApplyReviewedMutationParams,
     executionMode: "sequential",
-    async execute(_toolCallId, params: ApplyReviewedMutationInput, _signal, _onUpdate, context): Promise<AgentToolResult<ApplyReviewedMutationDetails>> {
-      return applyReviewedMutation(context, params.id);
+    async execute(_toolCallId, params: ApplyReviewedMutationInput, signal, _onUpdate, context): Promise<AgentToolResult<ApplyReviewedMutationDetails>> {
+      return applyReviewedMutation(context, params.id, signal);
     }
   }));
 }
@@ -411,7 +413,12 @@ function registerMutationReviewToggleCommand(api: ExtensionAPI): void {
   );
 }
 
-export async function applyReviewedMutation(context: ExtensionContext, id: string): Promise<AgentToolResult<ApplyReviewedMutationDetails>> {
+export async function applyReviewedMutation(
+  context: ExtensionContext,
+  id: string,
+  signal?: AbortSignal
+): Promise<AgentToolResult<ApplyReviewedMutationDetails>> {
+  throwIfAborted(signal);
   const pendingId = id.trim();
   if (!pendingId) {
     throw new Error("apply_reviewed_mutation requires a non-empty id.");
@@ -423,9 +430,11 @@ export async function applyReviewedMutation(context: ExtensionContext, id: strin
   }
 
   const files = await withReviewedMutationQueues(pending.proposal.operations, async () => {
-    await validateReviewedMutationBeforeHashes(pending);
-    return Promise.all(pending.proposal.operations.map(writeReviewedMutationOperation));
-  });
+    throwIfAborted(signal);
+    await validateReviewedMutationBeforeHashes(pending, signal);
+    throwIfAborted(signal);
+    return settleAllOrThrow(pending.proposal.operations.map((operation) => writeReviewedMutationOperation(operation, signal)), signal);
+  }, signal);
 
   deletePendingReviewedMutation(pending);
 
@@ -788,25 +797,31 @@ function deletePendingReviewedMutation(pending: PendingReviewedMutation): void {
   }
 }
 
-async function withReviewedMutationQueues<T>(operations: FileMutationOperation[], run: () => Promise<T>): Promise<T> {
+async function withReviewedMutationQueues<T>(
+  operations: FileMutationOperation[],
+  run: () => Promise<T>,
+  signal?: AbortSignal
+): Promise<T> {
   const paths = uniqueStrings(operations.map((operation) => operation.resolvedPath)).sort();
-  return withQueuedPaths(paths, run);
+  return withQueuedPaths(paths, run, signal);
 }
 
-async function withQueuedPaths<T>(paths: string[], run: () => Promise<T>): Promise<T> {
+async function withQueuedPaths<T>(paths: string[], run: () => Promise<T>, signal?: AbortSignal): Promise<T> {
   const [first, ...rest] = paths;
   if (!first) {
     return run();
   }
-  return withFileMutationQueue(first, () => withQueuedPaths(rest, run));
+  return withAbortableFileMutationQueue(first, signal, () => withQueuedPaths(rest, run, signal));
 }
 
-async function validateReviewedMutationBeforeHashes(pending: PendingReviewedMutation): Promise<void> {
-  await Promise.all(pending.proposal.operations.map((operation) => validateReviewedMutationOperation(pending.id, operation)));
+async function validateReviewedMutationBeforeHashes(pending: PendingReviewedMutation, signal?: AbortSignal): Promise<void> {
+  await settleAllOrThrow(pending.proposal.operations.map((operation) => validateReviewedMutationOperation(pending.id, operation, signal)), signal);
 }
 
-async function validateReviewedMutationOperation(pendingId: string, operation: FileMutationOperation): Promise<void> {
+async function validateReviewedMutationOperation(pendingId: string, operation: FileMutationOperation, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
   const current = await readOptionalText(operation.resolvedPath);
+  throwIfAborted(signal);
   if (operation.beforeHash === undefined) {
     if (current !== undefined) {
       throw new Error(`Cannot apply ${pendingId}: ${operation.path} did not exist during review, but it exists now (${shortHash(hashText(current))}).`);
@@ -824,8 +839,10 @@ async function validateReviewedMutationOperation(pendingId: string, operation: F
   }
 }
 
-async function writeReviewedMutationOperation(operation: FileMutationOperation): Promise<ApplyReviewedMutationFileDetails> {
+async function writeReviewedMutationOperation(operation: FileMutationOperation, signal?: AbortSignal): Promise<ApplyReviewedMutationFileDetails> {
+  throwIfAborted(signal);
   await mkdir(path.dirname(operation.resolvedPath), { recursive: true });
+  throwIfAborted(signal);
   await writeFile(operation.resolvedPath, operation.after, "utf8");
   return {
     id: operation.id,
@@ -850,6 +867,7 @@ export async function runMutationReviewSubagent(
   const childToolNames = uniqueStrings([...settings.tools, DECISION_TOOL_NAME]);
   const { model, thinkingLevel } = selectMutationReviewModel(context.modelRegistry, settings.defaultModel, context.model, settings.thinkingLevel);
 
+  throwIfAborted(context.signal);
   return withChildAgentSession(context, {
     cwd: context.cwd,
     model,
@@ -859,6 +877,7 @@ export async function runMutationReviewSubagent(
     systemPrompts: [reviewerSystemPrompt],
     extensionsOverride: omitMutationReviewExtension,
     extensionFactories: [createMutationReviewToolBudgetExtension()],
+    signal: context.signal,
     onError: (error) => context.ui.notify(`Mutation review child extension error: ${error.error}`, "warning"),
     onEvent: (event) => {
       if (event.type === "tool_execution_start") {
@@ -871,6 +890,7 @@ export async function runMutationReviewSubagent(
     }
   }, async (session) => {
     await session.prompt(buildMutationReviewTask(context, proposal, settings), { source: "extension" });
+    throwIfAborted(context.signal);
     let finalAssistant = getFinalAssistant(session.messages);
     throwIfStoppedWithError(finalAssistant);
 
@@ -878,6 +898,7 @@ export async function runMutationReviewSubagent(
     if (!decision) {
       context.ui.setStatus(STATUS_KEY, `mutation review deciding · ${toolCallCount} tool call${toolCallCount === 1 ? "" : "s"} · structured decision retry`);
       await session.prompt(buildMutationReviewDecisionRepairTask(), { source: "extension" });
+      throwIfAborted(context.signal);
       finalAssistant = getFinalAssistant(session.messages);
       throwIfStoppedWithError(finalAssistant);
       decision = decisionToolState.decision() ?? (finalAssistant ? recoverMutationReviewDecisionFromAssistant(finalAssistant, proposal) : undefined);

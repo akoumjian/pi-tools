@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { Type, type Static } from "@earendil-works/pi-ai";
 import type { AgentToolResult, ExtensionAPI, ExtensionCommandContext, RegisteredCommand, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { throwIfAborted } from "../_shared/cancellation.js";
 import { findPiToolsConfigFile, readPiToolsJsonConfig } from "../_shared/config.js";
 import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
@@ -122,7 +123,9 @@ export function createDocumentParseTool(settings: ToolDisplaySettings): ToolDefi
     parameters: DocumentParseSchema,
     executionMode: "parallel",
     async execute(toolCallId, params, signal, onUpdate, context): Promise<AgentToolResult<DocumentParseDetails>> {
+      throwIfAborted(signal);
       const original = await getOriginalDocumentParseTool();
+      throwIfAborted(signal);
       const result = await original.execute(toolCallId, params, signal, onUpdate as never, context) as AgentToolResult<DocumentParseDetails>;
       return adaptDocumentParseResultHandoff(result);
     }

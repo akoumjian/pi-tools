@@ -371,6 +371,63 @@ test("per-command notifyOnExit false suppresses deferred completion notices", as
   });
 });
 
+test("shell_start rejects a pre-aborted call before creating durable job state", async () => {
+  await withTempDir(async (dir) => {
+    const api = createFakeApi();
+    asyncShellExtension(api);
+    const shellStart = required(api.registeredTools.find((tool) => tool.name === "shell_start"), "shell_start tool");
+    const controller = new AbortController();
+    controller.abort();
+
+    await assert.rejects(
+      shellStart.execute!(
+        "tool-call-id",
+        { commands: [{ command: "printf never", cwd: dir, notifyOnExit: false }] } as never,
+        controller.signal,
+        undefined,
+        createContext(dir)
+      ),
+      { name: "AbortError" }
+    );
+    await assert.rejects(stat(path.join(dir, ".pi", "async-shell")), /ENOENT/);
+  });
+});
+
+test("shell_start interruption ends only the foreground grace wait and preserves the durable job", async () => {
+  await withTempDir(async (dir) => {
+    const api = createFakeApi();
+    asyncShellExtension(api);
+    const shellStart = required(api.registeredTools.find((tool) => tool.name === "shell_start"), "shell_start tool");
+    const shellStatus = required(api.registeredTools.find((tool) => tool.name === "shell_status"), "shell_status tool");
+    const controller = new AbortController();
+    const startedAt = Date.now();
+    setTimeout(() => controller.abort(), 50);
+
+    const started = await shellStart.execute!(
+      "tool-call-id",
+      { commands: [{ command: "sleep 0.3; printf survived", cwd: dir, notifyOnExit: false }] } as never,
+      controller.signal,
+      undefined,
+      createContext(dir)
+    );
+    assert.ok(Date.now() - startedAt < 1_000, "foreground grace wait should settle promptly after interruption");
+    const startedJob = (started.details as { jobs: Array<{ jobId: string; status: string; stdoutLog: string }> }).jobs[0];
+    assert.equal(startedJob.status, "running");
+
+    await delay(500);
+    const status = await shellStatus.execute!(
+      "tool-call-id",
+      { jobId: startedJob.jobId } as never,
+      new AbortController().signal,
+      undefined,
+      createContext(dir)
+    );
+    assert.equal((status.details as { job: { status: string } }).job.status, "exited");
+    assert.equal(await readFile(startedJob.stdoutLog, "utf8"), "survived");
+    assert.equal(api.sentMessages.length, 0);
+  });
+});
+
 test("shell_start reports spawn errors for missing shells", async () => {
   await withTempDir(async (dir) => {
     const api = createFakeApi();

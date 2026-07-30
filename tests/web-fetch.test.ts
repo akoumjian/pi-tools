@@ -161,6 +161,34 @@ test("web_fetch_many reports actionable cache write failures", async () => {
   });
 });
 
+test("web_fetch_many propagates parent interruption instead of returning per-item fetch errors", async () => {
+  await withTempDir(async (dir) => {
+    const controller = new AbortController();
+    let called = false;
+    const fetching = webFetchMany(
+      createContext(dir),
+      { urls: [{ url: "https://example.com/slow" }] },
+      fakeFetch((_url, init) => {
+        called = true;
+        return new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          if (signal?.aborted) {
+            reject(signal.reason);
+            return;
+          }
+          signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      }),
+      controller.signal
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    controller.abort();
+
+    await assert.rejects(fetching, { name: "AbortError" });
+    assert.equal(called, true);
+  });
+});
+
 test("web_fetch_many refuses local and private-network URLs before fetching", async () => {
   await withTempDir(async (dir) => {
     let called = false;

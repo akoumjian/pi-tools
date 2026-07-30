@@ -1,6 +1,7 @@
 import { Type, type Static } from "@earendil-works/pi-ai";
 import { defineTool, type AgentToolResult, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { throwIfAborted } from "../_shared/cancellation.js";
 import { formatConfigPath, readPiToolsJsonConfigSource } from "../_shared/config.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
@@ -134,6 +135,7 @@ export type SearxngStatus = {
 };
 
 async function search(input: SearchInput, signal?: AbortSignal): Promise<AgentToolResult<SearchDetails>> {
+  throwIfAborted(signal);
   const baseUrl = searxngBaseUrl();
 
   const url = searchUrl(baseUrl);
@@ -164,6 +166,7 @@ async function search(input: SearchInput, signal?: AbortSignal): Promise<AgentTo
       signal: requestSignal
     });
   } catch (error) {
+    throwIfAborted(signal);
     throw new Error(`SearXNG search failed for ${baseUrl}: ${errorMessage(error)}. Start the configured local SearXNG service, run /searxng:setup --start, or set SEARXNG_URL to a reachable JSON-enabled instance.`);
   }
 

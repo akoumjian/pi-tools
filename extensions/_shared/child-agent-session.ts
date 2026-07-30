@@ -13,6 +13,7 @@ import {
   type LoadExtensionsResult,
   type ToolDefinition
 } from "@earendil-works/pi-coding-agent";
+import { throwIfAborted } from "./cancellation.js";
 
 export type ChildAgentSession = Awaited<ReturnType<typeof createAgentSessionFromServices>>["session"];
 
@@ -37,6 +38,7 @@ export async function withChildAgentSession<T>(
   options: ChildAgentSessionOptions,
   run: (session: ChildAgentSession) => Promise<T>
 ): Promise<T> {
+  throwIfAborted(options.signal);
   const tools = uniqueStrings(options.tools);
   const services = await createAgentSessionServices({
     cwd: options.cwd,
@@ -53,6 +55,7 @@ export async function withChildAgentSession<T>(
     }
   });
 
+  throwIfAborted(options.signal);
   const errors = services.diagnostics.filter((diagnostic) => diagnostic.type === "error");
   if (errors.length > 0) {
     throw new Error(`Child session failed to load resources: ${errors.map((diagnostic) => diagnostic.message).join("; ")}`);
@@ -81,23 +84,31 @@ export async function withChildAgentSession<T>(
     customTools: options.customTools
   });
   const unsubscribe = options.onEvent ? session.subscribe(options.onEvent) : undefined;
-  const abort = () => void session.abort();
+  let abortPromise: Promise<void> | undefined;
+  const abort = (): void => {
+    abortPromise ??= session.abort();
+  };
   if (options.signal?.aborted) abort();
   else options.signal?.addEventListener("abort", abort, { once: true });
 
-  await session.bindExtensions({
-    uiContext: createFailClosedChildUI(context.ui, options.onInteractiveDenial),
-    shutdownHandler: abort,
-    onError: (error) => {
-      if (options.onError) options.onError(error);
-      else context.ui.notify(`Child extension error: ${formatExtensionError(error)}`, "warning");
-    }
-  });
-
   try {
-    return await run(session);
+    await session.bindExtensions({
+      uiContext: createFailClosedChildUI(context.ui, options.onInteractiveDenial),
+      shutdownHandler: abort,
+      onError: (error) => {
+        if (options.onError) options.onError(error);
+        else context.ui.notify(`Child extension error: ${formatExtensionError(error)}`, "warning");
+      }
+    });
+    throwIfAborted(options.signal);
+    const result = await run(session);
+    throwIfAborted(options.signal);
+    return result;
   } finally {
     options.signal?.removeEventListener("abort", abort);
+    if (abortPromise !== undefined) {
+      await abortPromise;
+    }
     unsubscribe?.();
     session.dispose();
   }

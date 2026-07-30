@@ -6,6 +6,7 @@ import type { Readable } from "node:stream";
 import { Type, type Static } from "@earendil-works/pi-ai";
 import { defineTool, type AgentToolResult, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { throwIfAborted } from "../_shared/cancellation.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
@@ -247,8 +248,8 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     parameters: StartParams,
     executionMode: "parallel",
     renderShell: "self",
-    async execute(_toolCallId, params, _signal, onUpdate, context): Promise<AgentToolResult<StartDetails>> {
-      return startJobs(api, context, params, onUpdate);
+    async execute(_toolCallId, params, signal, onUpdate, context): Promise<AgentToolResult<StartDetails>> {
+      return startJobs(api, context, params, onUpdate, signal);
     },
     renderCall(args, theme) {
       return renderShellStartCall(args, theme);
@@ -272,7 +273,8 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     parameters: StatusParams,
     executionMode: "parallel",
     renderShell: "self",
-    async execute(_toolCallId, params: StatusInput, _signal, _onUpdate, context): Promise<AgentToolResult<JobSummaryDetails | JobListDetails>> {
+    async execute(_toolCallId, params: StatusInput, signal, _onUpdate, context): Promise<AgentToolResult<JobSummaryDetails | JobListDetails>> {
+      throwIfAborted(signal);
       if (params.jobId === undefined) {
         const jobsList = listJobs(context, params.limit ?? 20);
         return {
@@ -309,7 +311,8 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     parameters: ReadParams,
     executionMode: "parallel",
     renderShell: "self",
-    async execute(_toolCallId, params: ReadInput, _signal, _onUpdate, context): Promise<AgentToolResult<ShellReadDetails>> {
+    async execute(_toolCallId, params: ReadInput, signal, _onUpdate, context): Promise<AgentToolResult<ShellReadDetails>> {
+      throwIfAborted(signal);
       const job = requireJob(context, params.jobId);
       acknowledgeObservedJobCompletion(job);
       return shellReadResult(job, params);
@@ -336,7 +339,8 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     parameters: CancelParams,
     executionMode: "parallel",
     renderShell: "self",
-    async execute(_toolCallId, params, _signal, _onUpdate, context): Promise<AgentToolResult<JobSummaryDetails>> {
+    async execute(_toolCallId, params, signal, _onUpdate, context): Promise<AgentToolResult<JobSummaryDetails>> {
+      throwIfAborted(signal);
       const job = requireActiveJob(context, params.jobId);
       cancelJob(job, params.signal ?? "SIGTERM");
       return jobResult(job, "Cancellation requested", 80);
@@ -351,7 +355,14 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
 
 }
 
-async function startJobs(api: ExtensionAPI, context: ExtensionContext, input: StartInput, onUpdate: StartUpdate | undefined): Promise<AgentToolResult<StartDetails>> {
+async function startJobs(
+  api: ExtensionAPI,
+  context: ExtensionContext,
+  input: StartInput,
+  onUpdate: StartUpdate | undefined,
+  signal?: AbortSignal
+): Promise<AgentToolResult<StartDetails>> {
+  throwIfAborted(signal);
   const specs = normalizeCommandSpecs(input);
 
   const runtimes = specs.map((spec) => startJob(api, context, {
@@ -364,7 +375,7 @@ async function startJobs(api: ExtensionAPI, context: ExtensionContext, input: St
 
   onUpdate?.(partialStartResult(runtimes));
 
-  await waitForJobsWithUpdates(runtimes, secondsToMilliseconds(START_WAIT_FOR_COMPLETION_SECONDS), onUpdate);
+  await waitForJobsWithUpdates(runtimes, secondsToMilliseconds(START_WAIT_FOR_COMPLETION_SECONDS), onUpdate, signal);
 
   finishStartGracePeriod(runtimes);
   return startResult(runtimes);
@@ -737,42 +748,56 @@ function cancelJob(job: JobRuntime, signal: NodeJS.Signals): void {
   }
 }
 
-async function waitForJob(job: JobRuntime, timeoutMs: number): Promise<boolean> {
+async function waitForJob(job: JobRuntime, timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
   if (isTerminal(job.status)) {
     return true;
+  }
+  if (signal?.aborted) {
+    return false;
   }
 
   job.activeWaiters += 1;
   try {
     return await new Promise<boolean>((resolve) => {
-      const timeout = setTimeout(() => {
-        cleanup();
-        resolve(false);
-      }, timeoutMs);
-
-      const done = () => {
-        cleanup();
-        resolve(true);
-      };
-
+      let settled = false;
+      let timeout: NodeJS.Timeout;
       const cleanup = () => {
         clearTimeout(timeout);
+        signal?.removeEventListener("abort", aborted);
         const index = job.waiters.indexOf(done);
         if (index !== -1) {
           job.waiters.splice(index, 1);
         }
       };
+      const settle = (completed: boolean) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(completed);
+      };
+      const done = () => settle(true);
+      const aborted = () => settle(false);
 
+      timeout = setTimeout(() => settle(false), timeoutMs);
+      signal?.addEventListener("abort", aborted, { once: true });
       job.waiters.push(done);
+      if (signal?.aborted) {
+        aborted();
+      }
     });
   } finally {
     job.activeWaiters -= 1;
   }
 }
 
-async function waitForJobsWithUpdates(jobsList: JobRuntime[], timeoutMs: number, onUpdate: StartUpdate | undefined): Promise<void> {
+async function waitForJobsWithUpdates(
+  jobsList: JobRuntime[],
+  timeoutMs: number,
+  onUpdate: StartUpdate | undefined,
+  signal?: AbortSignal
+): Promise<void> {
   if (onUpdate === undefined) {
-    await Promise.all(jobsList.map((job) => waitForJob(job, timeoutMs)));
+    await Promise.all(jobsList.map((job) => waitForJob(job, timeoutMs, signal)));
     return;
   }
 
@@ -781,7 +806,7 @@ async function waitForJobsWithUpdates(jobsList: JobRuntime[], timeoutMs: number,
   }, 500);
 
   try {
-    await Promise.all(jobsList.map((job) => waitForJob(job, timeoutMs)));
+    await Promise.all(jobsList.map((job) => waitForJob(job, timeoutMs, signal)));
   } finally {
     clearInterval(interval);
     onUpdate(partialStartResult(jobsList));

@@ -75,6 +75,25 @@ test("searxng extension registers search tool and status command", () => {
   assert.equal(api.commands.has("searxng-status"), false, "deprecated kebab alias removed");
 });
 
+test("searxng search rejects a pre-aborted call before network access", async () => {
+  const api = createFakeApi();
+  searxngSearchExtension(api);
+  const tool = required(api.registeredTools.find((registeredTool) => registeredTool.name === "searxng_search"), "searxng_search tool");
+  const controller = new AbortController();
+  controller.abort();
+
+  await assert.rejects(
+    tool.execute!(
+      "tool-call-id",
+      { query: "never fetched" } as never,
+      controller.signal,
+      undefined,
+      {} as never
+    ),
+    { name: "AbortError" }
+  );
+});
+
 test("searxng setup defaults to less common local port", () => {
   const report = runSearxngSetup({
     homeDir: "/tmp/pi-home",

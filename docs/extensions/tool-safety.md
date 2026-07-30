@@ -61,9 +61,10 @@ For each `tool_call` event:
    - System prompt: the package's approval-judge instructions (asks for `allow`/`review`/`deny` with risk, confidence, and a one-line reason).
    - User content: the policy text, the current and a few recent user messages (bounded), the proposed tool call (also bounded), and the initial classification.
    - Output is constrained to a short JSON-like block, parsed defensively. Failures are non-fatal and fall back to `review`.
+   - The request composes its optional timeout with the parent agent's abort signal. Parent interruption propagates as interruption rather than being downgraded to judge unavailability.
 4. **Final decision.**
    - `allow` → the tool runs.
-   - `review` → in interactive mode, a confirmation prompt is shown to the user with a minimal one-line snippet describing the action; on approval the tool runs, on decline the tool is blocked with the reviewer's reason. In non-interactive mode, the call is blocked and the user is notified.
+   - `review` → in interactive mode, a confirmation prompt is shown to the user with a minimal one-line snippet describing the action; on approval the tool runs, on decline the tool is blocked with the reviewer's reason. The dialog receives the same parent abort signal, so interrupting the run dismisses it without recording the interruption as a denial. In non-interactive mode, the call is blocked and the user is notified.
    - `deny` → the tool is blocked.
 5. **Audit details.** The extension records the initial host decision, criteria-stage decision, optional model approval, and optional human-review disposition in the tool-call event audit log.
 
@@ -98,4 +99,4 @@ File mutations inside that root are treated as routine; mutations outside it are
 - A non-reasoning model is automatically clamped to thinking level `off`. Reasoning models honor whatever level the setup command persisted.
 - The package-default policy in [`tool-safety-policy.md`](../../config/tool-safety-policy.md) intentionally allows routine git commit/push for the agent's own working branch (non-protected, non-history-rewriting) while still routing protected branches, force pushes, deploys, and credentials to `review`.
 - This extension is deliberately not coupled to model-spec lookup: it never tries to *resolve* a model; it accepts the configured spec, asks Pi to invoke it, and treats unresolvable specs as a non-fatal degradation with a single warning notification.
-- Tests cover policy parsing, rule classification, model parsing, approval flow, trust-root behavior, env overrides, and one-shot warning logic (`tests/tool-safety.test.ts`).
+- Tests cover policy parsing, rule classification, model parsing, approval flow, parent-signal dialog interruption, trust-root behavior, env overrides, and one-shot warning logic (`tests/tool-safety.test.ts`).

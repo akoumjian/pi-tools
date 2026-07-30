@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import type { Api, AssistantMessage, Model } from "@earendil-works/pi-ai";
 import { Check } from "typebox/value";
-import { SessionManager, type ExtensionAPI, type ExtensionContext, type ToolCallEvent, type ToolDefinition, type ToolResultEvent } from "@earendil-works/pi-coding-agent";
+import { SessionManager, withFileMutationQueue, type ExtensionAPI, type ExtensionContext, type ToolCallEvent, type ToolDefinition, type ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import mutationReviewExtension, {
   applyReviewedMutation,
   blockedOperationsForDecision,
@@ -655,6 +655,56 @@ test("applyReviewedMutation applies cached mutation after validating before hash
     assert.equal(result.details.id, pending.id);
     assert.equal(result.details.files[0].afterHash, proposal.operations[0].afterHash);
     await assert.rejects(() => applyReviewedMutation(context, pending.id), /No pending reviewed mutation/);
+  });
+});
+
+test("applyReviewedMutation stops after an interrupted queue wait and preserves the pending mutation", async () => {
+  await withTempDir(async (dir) => {
+    const context = createContext(dir);
+    const targetPath = path.join(dir, "edit.ts");
+    await writeFile(targetPath, "const value = 1;\n", "utf8");
+    const proposal = await extractFileMutationProposal(context, {
+      type: "tool_call",
+      toolName: "edit_many",
+      toolCallId: "call-interrupted-apply",
+      input: {
+        files: [{ path: "edit.ts", edits: [{ oldText: "const value = 1;", newText: "const value = 2;" }] }]
+      }
+    } as ToolCallEvent);
+    assert.ok(proposal);
+    const pending = rememberPendingReviewedMutation(context, proposal, { review: fakeReviewResult() });
+
+    let releaseQueue!: () => void;
+    let queueAcquired!: () => void;
+    const acquired = new Promise<void>((resolve) => { queueAcquired = resolve; });
+    const blocker = withFileMutationQueue(targetPath, async () => {
+      queueAcquired();
+      await new Promise<void>((resolve) => { releaseQueue = resolve; });
+    });
+    await acquired;
+
+    const controller = new AbortController();
+    const applying = applyReviewedMutation(context, pending.id, controller.signal);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    controller.abort();
+    try {
+      await assert.rejects(
+        Promise.race([
+          applying,
+          new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("interrupted queue wait did not settle")), 500))
+        ]),
+        { name: "AbortError" }
+      );
+      assert.equal(await readFile(targetPath, "utf8"), "const value = 1;\n");
+    } finally {
+      releaseQueue();
+      await blocker;
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const retried = await applyReviewedMutation(context, pending.id);
+    assert.equal(retried.details.id, pending.id);
+    assert.equal(await readFile(targetPath, "utf8"), "const value = 2;\n");
   });
 });
 

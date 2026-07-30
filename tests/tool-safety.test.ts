@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type ExtensionAPI, type ExtensionContext, type ToolCallEvent } from "@earendil-works/pi-coding-agent";
 import toolSafetyExtension, {
   applyModelApproval,
   applyReviewCriteria,
@@ -501,9 +501,44 @@ test("human review prompt summarizes batch file paths", () => {
   assert.doesNotMatch(prompt.message, /oldText/);
 });
 
-test("human review confirmation has no timeout by default", () => {
+test("human review confirmation composes the parent signal and optional timeout", () => {
+  const signal = new AbortController().signal;
   assert.equal(buildHumanReviewConfirmOptions(), undefined);
   assert.deepEqual(buildHumanReviewConfirmOptions(5000), { timeout: 5000 });
+  assert.deepEqual(buildHumanReviewConfirmOptions(undefined, signal), { signal });
+  assert.deepEqual(buildHumanReviewConfirmOptions(5000, signal), { signal, timeout: 5000 });
+});
+
+test("tool-safety human review exits on parent interruption instead of recording a denial", async () => {
+  const api = createToolSafetyApi();
+  toolSafetyExtension(api);
+  const handler = api.handlers.get("tool_call")?.[0];
+  assert.ok(handler);
+
+  const controller = new AbortController();
+  let dialogSignal: AbortSignal | undefined;
+  const context = {
+    cwd: "/repo",
+    hasUI: true,
+    signal: controller.signal,
+    model: undefined,
+    modelRegistry: fakeRegistry([]),
+    sessionManager: SessionManager.inMemory("/repo"),
+    ui: {
+      notify(): void {},
+      confirm(_title: string, _message: string, options?: { signal?: AbortSignal }): Promise<boolean> {
+        dialogSignal = options?.signal;
+        return new Promise((resolve) => options?.signal?.addEventListener("abort", () => resolve(false), { once: true }));
+      }
+    }
+  } as unknown as ExtensionContext;
+
+  const review = handler(toolCall("shell_start", { commands: [shellCommand("rm -rf ~")] }), context);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  controller.abort();
+
+  await assert.rejects(review, { name: "AbortError" });
+  assert.equal(dialogSignal, controller.signal);
 });
 
 test("dangerous-looking shell commands route to the safety model instead of deterministic deny", () => {

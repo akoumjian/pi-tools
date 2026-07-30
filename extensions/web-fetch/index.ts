@@ -10,6 +10,7 @@ import { Readability } from "@mozilla/readability";
 import { JSDOM } from "jsdom";
 import TurndownService from "turndown";
 import { describePathAccess } from "../async-shell/index.js";
+import { settleAllOrThrow, throwIfAborted } from "../_shared/cancellation.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
@@ -169,9 +170,10 @@ export async function webFetchMany(
   fetchImpl: FetchLike = fetch,
   signal?: AbortSignal
 ): Promise<AgentToolResult<WebFetchManyDetails>> {
+  throwIfAborted(signal);
   const cacheRoot = webFetchCacheRoot(context);
   const concurrency = clampInteger(input.concurrency ?? DEFAULT_CONCURRENCY, 1, MAX_CONCURRENCY);
-  const results = await mapLimit(input.urls, concurrency, (item, index) => fetchOne(context, cacheRoot, item, index, fetchImpl, signal));
+  const results = await mapLimit(input.urls, concurrency, (item, index) => fetchOne(context, cacheRoot, item, index, fetchImpl, signal), signal);
 
   return {
     content: [{ type: "text", text: formatWebFetchManyContent(results) }],
@@ -209,12 +211,14 @@ async function fetchOne(
 ): Promise<WebFetchResultDetails> {
   const fetchedAt = new Date().toISOString();
   try {
+    throwIfAborted(parentSignal);
     const url = validateFetchUrl(item.url);
     const maxBytes = clampInteger(item.maxBytes ?? DEFAULT_MAX_BYTES, 1024, MAX_MAX_BYTES);
     const timeoutSeconds = clampInteger(item.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS, 1, MAX_TIMEOUT_SECONDS);
     const timeoutSignal = AbortSignal.timeout(timeoutSeconds * 1000);
     const requestSignal = parentSignal === undefined ? timeoutSignal : AbortSignal.any([parentSignal, timeoutSignal]);
     const { response, finalUrl } = await fetchWithRedirects(url, requestSignal, fetchImpl);
+    throwIfAborted(parentSignal);
     const contentType = normalizeContentType(response.headers.get("content-type"));
     const base: WebFetchResultDetails = {
       url: item.url,
@@ -231,7 +235,9 @@ async function fetchOne(
     }
 
     const bytes = await readResponseBytes(response, maxBytes);
+    throwIfAborted(parentSignal);
     const cacheDir = await createCacheDir(cacheRoot, index, item.url);
+    throwIfAborted(parentSignal);
     const mode = item.mode ?? "auto";
     const effectiveKind = classifyResponse(finalUrl, contentType, bytes, mode);
 
@@ -241,6 +247,7 @@ async function fetchOne(
 
     return await handleDownloadResponse(base, cacheDir, bytes, finalUrl, response.headers, contentType, effectiveKind);
   } catch (error) {
+    throwIfAborted(parentSignal);
     return {
       url: item.url,
       label: item.label,
@@ -678,12 +685,19 @@ function extensionForContentType(contentType: string | undefined): string | unde
   }[mediaType];
 }
 
-async function mapLimit<T, R>(items: T[], limit: number, run: (item: T, index: number) => Promise<R>): Promise<R[]> {
+async function mapLimit<T, R>(
+  items: T[],
+  limit: number,
+  run: (item: T, index: number) => Promise<R>,
+  signal?: AbortSignal
+): Promise<R[]> {
+  throwIfAborted(signal);
   const results = new Array<R>(items.length);
   let nextIndex = 0;
 
   async function worker(): Promise<void> {
     while (nextIndex < items.length) {
+      throwIfAborted(signal);
       const currentIndex = nextIndex;
       nextIndex += 1;
       results[currentIndex] = await run(items[currentIndex], currentIndex);
@@ -691,7 +705,7 @@ async function mapLimit<T, R>(items: T[], limit: number, run: (item: T, index: n
   }
 
   const workerCount = Math.min(limit, items.length);
-  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  await settleAllOrThrow(Array.from({ length: workerCount }, () => worker()), signal);
   return results;
 }
 

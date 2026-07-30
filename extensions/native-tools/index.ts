@@ -10,10 +10,10 @@ import {
   type BuildSystemPromptOptions,
   type ExtensionAPI,
   type ExtensionContext,
-  type Skill,
-  withFileMutationQueue
+  type Skill
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { abortErrorFromSignal, settleAllOrThrow, terminateProcessOnAbort, throwIfAborted, withAbortableFileMutationQueue } from "../_shared/cancellation.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
@@ -368,8 +368,8 @@ function registerBatchTools(api: ExtensionAPI): void {
     parameters: ReadManyParams,
     executionMode: "parallel",
     renderShell: "self",
-    async execute(_toolCallId, params, _signal, _onUpdate, context): Promise<AgentToolResult<ReadManyDetails>> {
-      return readMany(context, params);
+    async execute(_toolCallId, params, signal, _onUpdate, context): Promise<AgentToolResult<ReadManyDetails>> {
+      return readMany(context, params, signal);
     },
     renderCall(args, theme) {
       return renderReadManyCall(args, theme);
@@ -398,8 +398,8 @@ function registerBatchTools(api: ExtensionAPI): void {
     parameters: SearchManyParams,
     executionMode: "parallel",
     renderShell: "self",
-    async execute(_toolCallId, params, _signal, _onUpdate, context): Promise<AgentToolResult<SearchManyDetails>> {
-      return searchMany(context, params);
+    async execute(_toolCallId, params, signal, _onUpdate, context): Promise<AgentToolResult<SearchManyDetails>> {
+      return searchMany(context, params, signal);
     },
     renderCall(args, theme) {
       return renderSearchManyCall(args, theme);
@@ -427,8 +427,8 @@ function registerBatchTools(api: ExtensionAPI): void {
     parameters: WriteManyParams,
     executionMode: "parallel",
     renderShell: "self",
-    async execute(toolCallId, params, _signal, _onUpdate, context): Promise<AgentToolResult<WriteManyDetails>> {
-      return writeMany(context, params, toolCallId);
+    async execute(toolCallId, params, signal, _onUpdate, context): Promise<AgentToolResult<WriteManyDetails>> {
+      return writeMany(context, params, toolCallId, signal);
     },
     renderCall(args, theme) {
       return renderWriteManyCall(args, theme);
@@ -456,8 +456,8 @@ function registerBatchTools(api: ExtensionAPI): void {
     parameters: EditManyParams,
     executionMode: "parallel",
     renderShell: "self",
-    async execute(toolCallId, params, _signal, _onUpdate, context): Promise<AgentToolResult<EditManyDetails>> {
-      return editMany(context, params, toolCallId);
+    async execute(toolCallId, params, signal, _onUpdate, context): Promise<AgentToolResult<EditManyDetails>> {
+      return editMany(context, params, toolCallId, signal);
     },
     renderCall(args, theme) {
       return renderEditManyCall(args, theme);
@@ -730,8 +730,9 @@ function escapeXml(text: string): string {
     .replace(/'/g, "&apos;");
 }
 
-export async function readMany(context: ExtensionContext, input: ReadManyInput): Promise<AgentToolResult<ReadManyDetails>> {
-  const results = await Promise.all(input.files.map((item) => readOne(context, item)));
+export async function readMany(context: ExtensionContext, input: ReadManyInput, signal?: AbortSignal): Promise<AgentToolResult<ReadManyDetails>> {
+  throwIfAborted(signal);
+  const results = await settleAllOrThrow(input.files.map((item) => readOne(context, item, signal)), signal);
   const details = results.map(({ content: _content, ...detail }) => detail);
   const text = [
     `Read ${results.length} file${results.length === 1 ? "" : "s"}.`,
@@ -745,8 +746,9 @@ export async function readMany(context: ExtensionContext, input: ReadManyInput):
   };
 }
 
-export async function searchMany(context: ExtensionContext, input: SearchManyInput): Promise<AgentToolResult<SearchManyDetails>> {
-  const results = await Promise.all(input.searches.map((item) => searchOne(context, item)));
+export async function searchMany(context: ExtensionContext, input: SearchManyInput, signal?: AbortSignal): Promise<AgentToolResult<SearchManyDetails>> {
+  throwIfAborted(signal);
+  const results = await settleAllOrThrow(input.searches.map((item) => searchOne(context, item, signal)), signal);
   const details = results.map(({ output: _output, ...detail }) => detail);
   const text = [
     `Completed ${results.length} search${results.length === 1 ? "" : "es"}.`,
@@ -760,14 +762,15 @@ export async function searchMany(context: ExtensionContext, input: SearchManyInp
   };
 }
 
-async function searchOne(context: ExtensionContext, item: SearchManyInput["searches"][number]): Promise<SearchResult> {
+async function searchOne(context: ExtensionContext, item: SearchManyInput["searches"][number], signal?: AbortSignal): Promise<SearchResult> {
+  throwIfAborted(signal);
   const kind = item.kind as SearchKind;
   const searchPath = item.path ?? ".";
   const resolvedPath = resolvePath(context.cwd, searchPath);
   const contextLines = kind === "content" ? item.context ?? 0 : 0;
   const maxResults = item.maxResults ?? 100;
   const args = buildRgArgs(context.cwd, item, resolvedPath, contextLines);
-  const run = await runRg(context.cwd, args);
+  const run = await runRg(context.cwd, args, signal);
 
   if (!run.truncated && run.exitCode !== 0 && run.exitCode !== 1) {
     throw new Error(`rg failed for ${searchPath}: ${run.stderr || `exit code ${run.exitCode}`}`);
@@ -843,9 +846,11 @@ function searchPathArgument(cwd: string, resolvedPath: string): string {
   return resolvedPath;
 }
 
-function runRg(cwd: string, args: string[]): Promise<RgResult> {
+function runRg(cwd: string, args: string[], signal?: AbortSignal): Promise<RgResult> {
+  throwIfAborted(signal);
   return new Promise((resolve, reject) => {
     const child = spawn("rg", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    const cleanupAbort = terminateProcessOnAbort(child, signal);
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let stdoutBytes = 0;
@@ -885,7 +890,12 @@ function runRg(cwd: string, args: string[]): Promise<RgResult> {
       spawnError = error;
     });
 
-    child.on("close", (exitCode, signal) => {
+    child.on("close", (exitCode, processSignal) => {
+      cleanupAbort();
+      if (signal?.aborted) {
+        reject(abortErrorFromSignal(signal));
+        return;
+      }
       if (spawnError !== undefined) {
         reject(new Error(`Failed to run rg. Install ripgrep or use shell_start for custom search: ${spawnError.message}`));
         return;
@@ -895,7 +905,7 @@ function runRg(cwd: string, args: string[]): Promise<RgResult> {
         stdout: Buffer.concat(stdout).toString("utf8"),
         stderr: Buffer.concat(stderr).toString("utf8").trim(),
         exitCode,
-        signal,
+        signal: processSignal,
         truncated
       });
     });
@@ -928,11 +938,13 @@ function formatSearchResult(index: number, result: SearchResult): string {
   return `--- search ${index}: ${label}${glob} (${result.outputLines} line${result.outputLines === 1 ? "" : "s"}) ---\n${output}${truncated}`;
 }
 
-async function readOne(context: ExtensionContext, item: ReadManyInput["files"][number]): Promise<ReadFileResult> {
+async function readOne(context: ExtensionContext, item: ReadManyInput["files"][number], signal?: AbortSignal): Promise<ReadFileResult> {
+  throwIfAborted(signal);
   const resolvedPath = resolvePath(context.cwd, item.path);
   await access(resolvedPath, constants.R_OK);
+  throwIfAborted(signal);
 
-  const content = await readFile(resolvedPath, "utf8");
+  const content = await readFile(resolvedPath, { encoding: "utf8", signal });
   const lines = content.split("\n");
   const totalLines = lines.length;
   const offset = item.offset ?? 1;
@@ -1038,10 +1050,11 @@ function stableStringifyNativeMutationEntry(value: unknown): string {
   return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableStringifyNativeMutationEntry(record[key])}`).join(",")}}`;
 }
 
-export async function writeMany(context: ExtensionContext, input: WriteManyInput, toolCallId?: string): Promise<AgentToolResult<WriteManyDetails>> {
+export async function writeMany(context: ExtensionContext, input: WriteManyInput, toolCallId?: string, signal?: AbortSignal): Promise<AgentToolResult<WriteManyDetails>> {
+  throwIfAborted(signal);
   assertUniquePaths(context, input.writes.map((item) => item.path), "write_many");
   const entryIds = nativeWriteMutationEntryIds(input.writes);
-  const files = await Promise.all(input.writes.map((item, index) => writeOne(context, item, entryIds[index], toolCallId)));
+  const files = await settleAllOrThrow(input.writes.map((item, index) => writeOne(context, item, entryIds[index], toolCallId, signal)), signal);
 
   return {
     content: [{ type: "text", text: [`Wrote ${files.length} file${files.length === 1 ? "" : "s"}.`, ...files.map((file) => `- ${file.id} ${file.path}: ${file.bytes} bytes`)].join("\n") }],
@@ -1049,11 +1062,14 @@ export async function writeMany(context: ExtensionContext, input: WriteManyInput
   };
 }
 
-async function writeOne(context: ExtensionContext, item: WriteManyInput["writes"][number], id: string, toolCallId: string | undefined): Promise<WriteFileDetails> {
+async function writeOne(context: ExtensionContext, item: WriteManyInput["writes"][number], id: string, toolCallId: string | undefined, signal?: AbortSignal): Promise<WriteFileDetails> {
   return withMutationEntryErrorContext(id, item.path, async () => {
+    throwIfAborted(signal);
     const resolvedPath = resolvePath(context.cwd, item.path);
-    await withFileMutationQueue(resolvedPath, async () => {
+    await withAbortableFileMutationQueue(resolvedPath, signal, async () => {
+      throwIfAborted(signal);
       await mkdir(path.dirname(resolvedPath), { recursive: true });
+      throwIfAborted(signal);
       await writeFile(resolvedPath, item.content, "utf8");
     });
 
@@ -1068,10 +1084,11 @@ async function writeOne(context: ExtensionContext, item: WriteManyInput["writes"
   });
 }
 
-export async function editMany(context: ExtensionContext, input: EditManyInput, toolCallId?: string): Promise<AgentToolResult<EditManyDetails>> {
+export async function editMany(context: ExtensionContext, input: EditManyInput, toolCallId?: string, signal?: AbortSignal): Promise<AgentToolResult<EditManyDetails>> {
+  throwIfAborted(signal);
   assertUniquePaths(context, input.files.map((item) => item.path), "edit_many");
   const entryIds = nativeEditMutationEntryIds(input.files);
-  const files = await Promise.all(input.files.map((item, index) => editOne(context, item, entryIds[index], toolCallId)));
+  const files = await settleAllOrThrow(input.files.map((item, index) => editOne(context, item, entryIds[index], toolCallId, signal)), signal);
 
   return {
     content: [{ type: "text", text: [`Edited ${files.length} file${files.length === 1 ? "" : "s"}.`, ...files.map((file) => `- ${file.id} ${file.path}: replaced ${file.replacements} block(s)`)].join("\n") }],
@@ -1079,13 +1096,17 @@ export async function editMany(context: ExtensionContext, input: EditManyInput, 
   };
 }
 
-async function editOne(context: ExtensionContext, item: EditManyInput["files"][number], id: string, toolCallId: string | undefined): Promise<EditFileDetails> {
+async function editOne(context: ExtensionContext, item: EditManyInput["files"][number], id: string, toolCallId: string | undefined, signal?: AbortSignal): Promise<EditFileDetails> {
   return withMutationEntryErrorContext(id, item.path, async () => {
+    throwIfAborted(signal);
     const resolvedPath = resolvePath(context.cwd, item.path);
 
-    return withFileMutationQueue(resolvedPath, async () => {
+    return withAbortableFileMutationQueue(resolvedPath, signal, async () => {
+      throwIfAborted(signal);
       const original = await readFile(resolvedPath, "utf8");
+      throwIfAborted(signal);
       const edited = applyExactReplacements(original, item.edits, item.path);
+      throwIfAborted(signal);
       await writeFile(resolvedPath, edited.content, "utf8");
 
       return {
@@ -1106,6 +1127,9 @@ async function withMutationEntryErrorContext<T>(id: string, rawPath: string, run
   try {
     return await run();
   } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw error;
+    }
     throw new Error(`${id} ${rawPath}: ${nativeToolErrorMessage(error)}`);
   }
 }

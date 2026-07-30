@@ -89,7 +89,7 @@ Cancel implicitly suppresses the completion notice for that job (`notifyOnExit` 
 ## Behavior
 
 1. Each command is spawned via `spawn(shell, ["-lc", command], { cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] })`. A durable `jobId` of the form `job_<yyyymmddhhmmss>_<random8>` is created, metadata is written to `meta.json`, and stdout/stderr are streamed to `stdout.log` and `stderr.log` under `.pi/async-shell/jobs/<jobId>/`.
-2. `shell_start` then waits up to a fixed **6-second** in-band grace period for all jobs in the call to finish. Jobs that finish in-band are reported as completed in the start result and never produce a completion notice; jobs still running at the end of the grace period continue in the background.
+2. `shell_start` then waits up to a fixed **6-second** in-band grace period for all jobs in the call to finish. Jobs that finish in-band are reported as completed in the start result and never produce a completion notice; jobs still running at the end of the grace period continue in the background. If the parent agent is interrupted during this grace period, only the wait ends early: already-created jobs remain durable and their metadata is returned. `shell_cancel` remains the only tool that terminates a job.
 3. The in-band result groups one metadata entry per command:
    ```ts
    { jobs: [{ jobId, job_name?, command, cwd, status, durationMs?, exitCode?, signal?, error?, stdoutLog, stderrLog, outputBytes }, ...] }
@@ -166,4 +166,4 @@ If you need to inspect storage health, run `/async:status`.
 
 - There is intentionally no model-facing `shell_wait` or polling tool. Continue useful work while jobs run; if there is no useful work, stop after reporting that jobs are running. Completion notices will resume the agent.
 - Do not paste raw stdout/stderr unless the user explicitly asks. Use `shell_read` tail mode for recent inspection after a completion notice, `shell_read` range mode for exact line ranges/continuation, and `search_many`/`read_many` on `stdout_log` or `stderr_log` for targeted file inspection.
-- Tests cover spawn, durable logs, batched completions, `notifyOnExit:false`, cancel suppression, `shell_read` tail/range reads, compact rendering, and error fallback (`tests/async-shell.test.ts`, `tests/native-tools.test.ts`).
+- Tests cover spawn, durable logs, pre-start interruption, interruption during the grace period without job termination, batched completions, `notifyOnExit:false`, cancel suppression, `shell_read` tail/range reads, compact rendering, and error fallback (`tests/async-shell.test.ts`, `tests/native-tools.test.ts`).
