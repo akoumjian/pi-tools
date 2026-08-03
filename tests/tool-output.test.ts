@@ -74,6 +74,7 @@ const samples: Record<RetainedToolName, unknown> = {
     content: [text("file content")],
     details: {
       files: [{
+        kind: "text",
         path: "a.ts",
         resolvedPath: "/repo/a.ts",
         offset: 1,
@@ -245,6 +246,45 @@ test("conditional output variants preserve runtime-only boundaries", () => {
   const readByteTruncation = structuredClone(samples.read_many) as { details: { files: Array<{ truncation: { truncatedBy: string | null } }> } };
   readByteTruncation.details.files[0]!.truncation.truncatedBy = "bytes";
   assert.equal(Check(RetainedToolOutputSchemas.read_many, readByteTruncation), true, "read_many retains byte-truncation support");
+  assert.equal(Check(RetainedToolOutputSchemas.read_many, {
+    content: [text("Read image"), { type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
+    details: {
+      files: [{
+        kind: "image",
+        path: "image.bin",
+        resolvedPath: "/repo/image.bin",
+        inputMimeType: "image/png",
+        mimeType: "image/png",
+        originalBytes: 5,
+        attachmentCount: 1,
+        previewLines: ["Read image file [image/png]"]
+      }]
+    }
+  }), true, "read_many accepts provider-visible image content and image details");
+  const imageDetails = {
+    files: [{
+      kind: "image",
+      path: "image.bin",
+      resolvedPath: "/repo/image.bin",
+      inputMimeType: "image/png",
+      mimeType: "image/png",
+      originalBytes: 5,
+      attachmentCount: 1,
+      previewLines: ["Read image file [image/png]"]
+    }]
+  };
+  assert.equal(Check(RetainedToolOutputSchemas.read_many, {
+    content: [text("Read image"), { type: "image", data: "", mimeType: "image/png" }],
+    details: { files: [] }
+  }), false, "read_many rejects empty image payloads and impossible empty details");
+  assert.equal(Check(RetainedToolOutputSchemas.read_many, {
+    content: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
+    details: imageDetails
+  }), false, "read_many requires its one text summary before image attachments");
+  assert.equal(Check(RetainedToolOutputSchemas.read_many, {
+    content: [text("first"), text("second")],
+    details: imageDetails
+  }), false, "read_many rejects impossible extra text content blocks");
 
   assert.equal(Check(RetainedToolOutputSchemas.orchestrate, { ...(samples.orchestrate as object), isError: true }), false, "raw execute isError is not a tool-result field");
   assert.equal(Check(RetainedToolOutputSchemas.reconcile, { ...(samples.reconcile as object), isError: true }), false, "raw execute isError is not a tool-result field");

@@ -110,6 +110,6 @@ If you want to verify the cache state, run `/fetch:status`.
 
 ## Notes
 
-- For agent workflows, use `searxng_search` first to discover URLs, then `web_fetch_many` for retrieval. After `web_fetch_many` fetches HTML, follow up with `read_many` on `textPath` when the preview is not enough. After `web_fetch_many` fetches PDFs, Office documents, spreadsheets, or images, follow up with `document_parse` on `downloadedPath`.
+- For agent workflows, use `searxng_search` first to discover URLs, then `web_fetch_many` for retrieval. After `web_fetch_many` fetches HTML, follow up with `read_many` on `textPath` when the preview is not enough. Read supported downloaded JPEG/PNG/GIF/WebP/BMP images directly with `read_many` when visual inspection is enough; use `document_parse` on `downloadedPath` for PDFs, Office documents, spreadsheets, OCR/layout extraction, or unsupported image formats.
 - The redirect limit and `User-Agent` are intentionally fixed; if you need a custom UA, plumb it through `mode: "download"` plus a `shell_start` `curl` call instead.
 - Tests cover URL safety, HTML extraction, redirect handling, and download/document-parse hints (`tests/web-fetch.test.ts`).

@@ -12,6 +12,12 @@ export const TextContentSchema = Type.Object({
   text: Type.String()
 }, { additionalProperties: false });
 
+export const ImageContentSchema = Type.Object({
+  type: Type.Literal("image"),
+  data: Type.String({ minLength: 1 }),
+  mimeType: Type.String({ pattern: "^image/" })
+}, { additionalProperties: false });
+
 export const EmptyDetailsSchema = Type.Object({}, { additionalProperties: false });
 
 function textResultSchema(details: TSchema, maxItems = 1, minItems = 1): TSchema {
@@ -154,18 +160,56 @@ const ShellCancelDetailsSchema = Type.Object({
   output: JobOutputSchema
 }, { additionalProperties: false });
 
-const ReadFileDetailsSchema = Type.Object({
+const ReadFileBaseProperties = {
   path: Type.String({ minLength: 1 }),
   resolvedPath: Type.String({ minLength: 1 }),
+  previewLines: Type.Array(Type.String(), { maxItems: 2 })
+};
+
+const ReadTextFileDetailsSchema = Type.Object({
+  ...ReadFileBaseProperties,
+  kind: Type.Literal("text"),
   offset: PositiveNumberSchema,
   requestedLimit: Type.Optional(PositiveNumberSchema),
-  truncation: TruncationSchema,
-  previewLines: Type.Array(Type.String(), { maxItems: 2 })
+  truncation: TruncationSchema
 }, { additionalProperties: false });
+
+const ReadImageFileDetailsSchema = Type.Object({
+  ...ReadFileBaseProperties,
+  kind: Type.Literal("image"),
+  inputMimeType: Type.Union([
+    Type.Literal("image/jpeg"),
+    Type.Literal("image/png"),
+    Type.Literal("image/gif"),
+    Type.Literal("image/webp"),
+    Type.Literal("image/bmp")
+  ]),
+  mimeType: Type.String({ pattern: "^image/" }),
+  originalBytes: NonNegativeIntegerSchema,
+  attachmentCount: Type.Literal(1)
+}, { additionalProperties: false });
+
+const ReadFileDetailsSchema = Type.Union([ReadTextFileDetailsSchema, ReadImageFileDetailsSchema]);
 
 const ReadManyDetailsSchema = Type.Object({
   files: Type.Array(ReadFileDetailsSchema, { minItems: 1, maxItems: 24 })
 }, { additionalProperties: false });
+
+const ReadManyContentSchema = Type.Unsafe({
+  type: "array",
+  prefixItems: [TextContentSchema],
+  items: ImageContentSchema,
+  minItems: 1,
+  maxItems: 21
+});
+
+const ReadManyResultSchema = Type.Union([
+  Type.Object({
+    content: ReadManyContentSchema,
+    details: ReadManyDetailsSchema
+  }, { additionalProperties: false }),
+  RuntimeErrorResultSchema
+]);
 
 const SearchResultDetailsSchema = Type.Object({
   kind: Type.Union([Type.Literal("content"), Type.Literal("files")]),
@@ -458,7 +502,7 @@ export const RetainedToolOutputSchemas = {
   shell_status: finalResultSchema(ShellStatusDetailsSchema),
   shell_read: finalResultSchema(ShellReadDetailsSchema),
   shell_cancel: finalResultSchema(ShellCancelDetailsSchema),
-  read_many: finalResultSchema(ReadManyDetailsSchema),
+  read_many: ReadManyResultSchema,
   search_many: finalResultSchema(SearchManyDetailsSchema),
   write_many: mutationResultSchema(WriteManyDetailsSchema),
   edit_many: mutationResultSchema(EditManyDetailsSchema),

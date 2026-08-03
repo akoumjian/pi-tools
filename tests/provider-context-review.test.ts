@@ -160,7 +160,7 @@ test("provider context review command renders sanitized prompt, tool declaration
     const anthropicTools = artifact.providerPayloads.anthropicMessages.tools ?? [];
     assert.deepEqual(openaiTools.map((tool) => tool.name), names);
     assert.deepEqual(anthropicTools.map((tool) => tool.name), names);
-    assert.match(openaiTools.find((tool) => tool.name === "read_many")?.description ?? "", /known text file ranges/);
+    assert.match(openaiTools.find((tool) => tool.name === "read_many")?.description ?? "", /known UTF-8 text file ranges and supported local images/);
     for (const tool of artifact.activeTools) {
       const openaiTool = openaiTools.find((candidate) => candidate.name === tool.name);
       const anthropicTool = anthropicTools.find((candidate) => candidate.name === tool.name);
@@ -179,13 +179,19 @@ test("provider context review command renders sanitized prompt, tool declaration
       assert.match(JSON.stringify(artifact.providerPayloads.openaiCodexResponses.instructions), new RegExp(`${tool.name} output: JSON Schema:`));
       assert.match(JSON.stringify(artifact.providerPayloads.anthropicMessages.system), new RegExp(`${tool.name} output: JSON Schema:`));
     }
-    assert.match(JSON.stringify(openaiTools.find((tool) => tool.name === "read_many")?.parameters), /1-indexed line number/);
-    assert.match(JSON.stringify(anthropicTools.find((tool) => tool.name === "read_many")?.input_schema), /1-indexed line number/);
+    assert.match(JSON.stringify(openaiTools.find((tool) => tool.name === "read_many")?.parameters), /Text files only: 1-indexed line number/);
+    assert.match(JSON.stringify(anthropicTools.find((tool) => tool.name === "read_many")?.input_schema), /Text files only: 1-indexed line number/);
+    assert.match(artifact.systemPrompt, /JPEG, PNG, GIF, WebP, and BMP/);
+    assert.match(artifact.systemPrompt, /at most 20 images and 18 MiB/);
+    assert.match(artifact.systemPrompt, /models without image input fail loudly/);
 
     const openaiWire = JSON.stringify(artifact.providerPayloads.openaiCodexResponses);
     const anthropicWire = JSON.stringify(artifact.providerPayloads.anthropicMessages);
     assert.match(openaiWire, /SENTINEL_RESULT_CONTENT/);
     assert.match(anthropicWire, /SENTINEL_RESULT_CONTENT/);
+    assert.match(openaiWire, /data:image\/png;base64,U0VOVElORUxfSU1BR0VfQllURVM=/);
+    assert.match(anthropicWire, /"media_type":"image\/png"/);
+    assert.match(anthropicWire, /U0VOVElORUxfSU1BR0VfQllURVM=/);
     assert.doesNotMatch(openaiWire, /SENTINEL_INTERNAL_DETAILS/);
     assert.doesNotMatch(anthropicWire, /SENTINEL_INTERNAL_DETAILS/);
     assert.match(JSON.stringify(artifact.toolResultVisibility.internalPiMessage.details), /SENTINEL_INTERNAL_DETAILS/);

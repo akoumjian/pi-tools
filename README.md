@@ -3,7 +3,7 @@
 Reusable extensions for the [Pi coding agent](https://pi.dev/). The package focuses on compact agent-oriented tooling:
 
 - async shell jobs with batched completion notices
-- batch-native file and search tools that replace stock single-file/shell tools
+- batch-native text/image file and search tools that replace stock single-file/shell tools
 - safety review hooks (rule + model + human) and a mutation-review reviewer
 - web research (SearXNG, web fetch with readability + document parse handoff)
 - explicit provider-safe retry of settled transient failures via `/retry`
@@ -56,7 +56,7 @@ Do not use `npm install @akoumjian/pi-tools@<git+ssh url>`: that form rewrites `
 Tools (LLM-callable):
 
 - `shell_start`, `shell_status`, `shell_read`, `shell_cancel` — async shell jobs
-- `read_many`, `search_many`, `write_many`, `edit_many` — batch-native file tools
+- `read_many`, `search_many`, `write_many`, `edit_many` — batch-native file tools (`read_many` delivers UTF-8 text and supported filesystem images)
 - `apply_reviewed_mutation` — cheap re-apply of a previously-reviewed edit/write
 - `searxng_search` — search through a configured SearXNG instance
 - `web_fetch_many` — fetch + cache + readability-extract URLs, hand off non-HTML to `document_parse`
@@ -135,7 +135,7 @@ Each extension below documents what it does, what it provides, and how to set it
 
 [Full docs](docs/extensions/native-tools.md).
 
-**Purpose.** Replace stock single-file `read`/`grep`/`find`/`write`/`edit` tools with batch-native equivalents. Strict-replacement enforcement removes banned tools and adds required replacements at session start, while slim prompt guidance steers search-vs-read, edit-vs-write, shell log inspection, and research/document workflows.
+**Purpose.** Replace stock single-file `read`/`grep`/`find`/`write`/`edit` tools with batch-native equivalents. `read_many` preserves text ranges and directly delivers byte-detected JPEG/PNG/GIF/WebP/BMP content to the active vision model; image ranges, unsupported binaries, and non-vision use fail loudly. Strict-replacement enforcement removes banned tools and adds required replacements at session start, while slim prompt guidance steers search-vs-read, edit-vs-write, shell log inspection, and research/document workflows.
 
 **Provides.** `read_many`, `search_many`, `write_many`, `edit_many`; disabled `bash` stub redirecting to `shell_start`; `/native:status`; compact renderers with `⎿ error: …` fallback on validation/exec errors.
 

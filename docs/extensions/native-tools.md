@@ -43,9 +43,12 @@ read_many({
 })
 ```
 
-- Use `offset`/`limit` to read precise ranges of large files.
-- Omit `limit` to read from `offset` to end of file.
-- For huge files, follow the `truncation.nextOffset` in the result to continue.
+- Reads UTF-8 text plus byte-detected JPEG, PNG, GIF, WebP, and BMP images. File extensions do not control detection.
+- Use `offset`/`limit` to read precise text ranges; image items reject both parameters.
+- Omit `limit` to read text from `offset` to end of file. For huge text files, follow `truncation.nextOffset`.
+- Images are processed by the host's built-in read pipeline, auto-resized to at most 2000x2000 and below the 4.5 MB per-image base64 inline limit, and attached directly to the current model with no extra completion.
+- One call may contain at most 20 images and 18 MiB of aggregate base64 image data; split larger sets into smaller batches.
+- A text-only active model, missing model, limit violation, processing failure, or unsupported binary causes a loud batch error rather than silently omitting pixels. Use `document_parse` for PDFs, Office files, spreadsheets, OCR, and other document formats.
 
 ### search_many
 
@@ -119,8 +122,10 @@ The slim prompt removes Pi's default `Available tools`/`Guidelines` prose and in
 
 ### read_many
 
-- Reads each file with line-level pagination, returning the slice and a `truncation` block describing whether the read was capped by lines or bytes plus a `nextOffset` for continuation.
-- File-by-file results, no truncation across files.
+- UTF-8 text keeps the existing line-level pagination behavior, returning the requested slice and a `truncation` block with `nextOffset` when continuation is needed.
+- Supported images are detected from file bytes, not suffixes, then passed through the exported built-in read image pipeline. Input summaries and image attachments preserve request order; provider-visible content is one ordered text summary followed by ordered image blocks.
+- Text-only batches retain one text content block. Mixed/image batches add one image content block per image; no hidden vision model or secondary completion is used.
+- Image `offset`/`limit`, more than 20 images, more than 18 MiB aggregate base64 image data, unsupported binary data, image-processing omission, and non-vision models fail the entire batch. Independent siblings are awaited, but no partial success result is delivered.
 
 ### search_many
 
@@ -157,9 +162,16 @@ If a profile or extension re-adds a banned stock tool, strict mode reports the c
   details: {
     files: [
       {
+        kind: "text",
         path, resolvedPath, offset,
         requestedLimit?,
         truncation: { truncated, truncatedBy: "lines" | "bytes" | null, totalLines, outputLines, totalBytes, outputBytes, nextOffset? },
+        previewLines: string[]
+      } | {
+        kind: "image",
+        path, resolvedPath,
+        inputMimeType: "image/jpeg" | "image/png" | "image/gif" | "image/webp" | "image/bmp",
+        mimeType, originalBytes, attachmentCount: 1,
         previewLines: string[]
       }, ...
     ]
@@ -199,7 +211,7 @@ If a profile or extension re-adds a banned stock tool, strict mode reports the c
 ## TUI rendering
 
 - `⏺ Read(<files>) …` / `⏺ Search(<patterns>) …` / `⏺ Write(<files>) …` / `⏺ Edit(<files>) …` call rows.
-- `⎿ Read <span>` / `⎿ <N> matches across <M> searches` / `⎿ Wrote <files>` / `⎿ Updated <files> with N edit(s)` result rows.
+- `⎿ Read <span>` (images render as `<path> [image]`) / `⎿ <N> matches across <M> searches` / `⎿ Wrote <files>` / `⎿ Updated <files> with N edit(s)` result rows.
 - Mutation-review partial blocks render as a separate `skipped <id> blocked by mutation review: <one-line reason>` row.
 - All renderers go through a shared error helper that produces `⎿ error: <one-line summary>` on tool failure.
 
@@ -233,4 +245,4 @@ None. The extension is automatic at load. Run `/native:status` to confirm strict
 - `read_many`, `search_many`, `write_many`, `edit_many` are designed to encourage batching. Active-tool prompt steering tells the agent to prefer one call with a list over multiple single-item calls.
 - When a supported custom base system prompt is active, the adapter appends the structured active-tool snippets and guidelines that the core custom-prompt branch omits while preserving the assembled prompt as an opaque prefix.
 - For repository-scale discovery, `search_many` is the right entry point; `read_many` should be reserved for reading specific ranges discovered via search.
-- Tests cover schemas, strict replacement, custom-prompt guidance, batch behavior, renderers (call/result/error), and integration with `mutation-review` (`tests/native-tools.test.ts`).
+- Tests cover schemas, strict replacement, custom-prompt guidance, text behavior, single/multiple/mixed images, ordering, MIME/fidelity, resizing, temporary drag/drop-style paths, image and binary errors, provider serialization, renderers, and integration with `mutation-review` (`tests/native-tools.test.ts`, `tests/tool-output.test.ts`, `tests/provider-context-review.test.ts`).

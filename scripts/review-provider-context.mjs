@@ -114,11 +114,11 @@ const resultContracts = {
     content: "cancellation outcome and where/how to inspect remaining output"
   },
   read_many: {
-    success: "content groups exact text ranges by file with returned/total lines and truncation",
-    progress: "not applicable: independent file reads complete as one batch",
-    error: "any path/range/read failure rejects the batch as a model-visible error; no sibling success result is delivered",
-    details: "internal per-file range/truncation metadata",
-    content: "known path, range, full requested text, and nextOffset when continuation is needed"
+    success: "content groups exact UTF-8 text ranges and directly attaches byte-detected supported images in input order without another model call",
+    progress: "not applicable: independent text/image reads and image processing complete as one batch",
+    error: "any path/range/read failure, unsupported binary, image range, image-count/aggregate-payload limit, image-processing failure, or non-vision model rejects the batch; no sibling success result is delivered",
+    details: "internal discriminated text range/truncation or image MIME/byte/attachment metadata",
+    content: "known path, text range and nextOffset, plus ordered text image summaries and provider-visible image content"
   },
   search_many: {
     success: "content groups rg-backed file/content matches with line/column context and caps",
@@ -189,7 +189,10 @@ const internalToolResult = {
   role: "toolResult",
   toolCallId: "call_fixture_read_many",
   toolName: "read_many",
-  content: [{ type: "text", text: "SENTINEL_RESULT_CONTENT\n[truncated by lines; continue with offset=42]" }],
+  content: [
+    { type: "text", text: "SENTINEL_RESULT_CONTENT\n[truncated by lines; continue with offset=42]" },
+    { type: "image", data: "U0VOVElORUxfSU1BR0VfQllURVM=", mimeType: "image/png" }
+  ],
   details: { internalOnlySentinel: "SENTINEL_INTERNAL_DETAILS", nextOffset: 42 },
   isError: false,
   timestamp: 0
@@ -344,7 +347,7 @@ const artifact = normalize({
   },
   toolResultVisibility: {
     internalPiMessage: internalToolResult,
-    note: "Provider payloads contain SENTINEL_RESULT_CONTENT but must not contain SENTINEL_INTERNAL_DETAILS."
+    note: "Provider payloads contain SENTINEL_RESULT_CONTENT and the synthetic image attachment but must not contain SENTINEL_INTERNAL_DETAILS."
   }
 });
 const json = `${JSON.stringify(artifact, null, 2)}\n`;

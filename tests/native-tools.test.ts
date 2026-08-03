@@ -41,8 +41,15 @@ const renderTheme = {
   bold: (text: string) => text
 };
 
-function createContext(cwd: string): ExtensionContext {
-  return { cwd } as ExtensionContext;
+function createContext(cwd: string, imageSupport?: boolean): ExtensionContext {
+  return {
+    cwd,
+    model: imageSupport === undefined ? undefined : {
+      id: imageSupport ? "fixture-vision" : "fixture-text",
+      provider: "fixture",
+      input: imageSupport ? ["text", "image"] : ["text"]
+    }
+  } as ExtensionContext;
 }
 
 function createFakeApi(activeTools: string[], allToolNames: string[]): FakeApi {
@@ -126,6 +133,34 @@ function required<T>(value: T | undefined, name: string): T {
   return value;
 }
 
+type ReadManyResultFile = Awaited<ReturnType<typeof readMany>>["details"]["files"][number];
+type TextReadManyResultFile = Extract<ReadManyResultFile, { kind: "text" }>;
+type ImageReadManyResultFile = Extract<ReadManyResultFile, { kind: "image" }>;
+
+function requiredTextReadFile(file: ReadManyResultFile): TextReadManyResultFile {
+  if (file.kind !== "text") {
+    throw new Error(`expected text result, got ${file.kind}`);
+  }
+  return file;
+}
+
+function requiredImageReadFile(file: ReadManyResultFile): ImageReadManyResultFile {
+  if (file.kind !== "image") {
+    throw new Error(`expected image result, got ${file.kind}`);
+  }
+  return file;
+}
+
+function imageBlocks(result: Awaited<ReturnType<typeof readMany>>): Array<{ type: "image"; data: string; mimeType: string }> {
+  return result.content.filter((content): content is { type: "image"; data: string; mimeType: string } => content.type === "image");
+}
+
+const TINY_PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
+const TINY_GIF = Buffer.from("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==", "base64");
+const TINY_WEBP = Buffer.from("UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEALmk0mk0iIiIiIgBoSygABc6zbAAA", "base64");
+const TINY_BMP = Buffer.from("Qk06AAAAAAAAADYAAAAoAAAAAQAAAP////8BABgAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAA////AA==", "base64");
+const TINY_JPEG = Buffer.from("/9j/4AAQSkZJRgABAgAAZABkAAD/7AARRHVja3kAAQAEAAAAMAAA/+4ADkFkb2JlAGTAAAAAAf/bAIQACQYGBgcGCQcHCQ0IBwgNDwsJCQsPEQ4ODw4OERENDg4ODg0RERQUFhQUERoaHBwaGiYmJiYmKysrKysrKysrKwEJCAgJCgkMCgoMDwwODA8TDg4ODhMVDg4PDg4VGhMRERERExoXGhYWFhoXHR0aGh0dJCQjJCQrKysrKysrKysr/8AAEQgAjACMAwEiAAIRAQMRAf/EAF4AAQEBAAAAAAAAAAAAAAAAAAABBwEBAQAAAAAAAAAAAAAAAAAAAAIQAAEDAwIHAQEAAAAAAAAAAADwAREhYaExkUFRcYGxwdHh8REBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AyGFEjHaBS2fDDs2zkhKmBKktb7km+ZwwCnXPkLVmCTMItj6AXFxRS465/BTnkAJvkLkJe+7AKKoi2AtRS2zuAWsCb5GOlBN8gKfmuGHZ8MFqIth3ALmFoFwbwKWyAlTAp17uKqBvgBD8sM4fTjhvAhkzhaRkBMKBrfs7jGPIpzy7gFrAqnC0C0gB0EWwBDW2cBVQwm+QtPpa3wBO3sVvszCnLAhkzgL5/RLf13cLQd8/AGlu0Cb5HTx9KuAEieGJEdcehS3eRTp2ATdt3CpIm+QtZwAhROXFeb7swp/ahaM3kBE/jSIUBc/AWrgBN8uNFAl+b7sAXFxFn2YLUU5Ns7gFX8C4ib+hN8gFWXwK3bZglxEJm+gKdciLPsFV/TClsgJUwKJ5FVA7tvIFrfZhVfGJDcsCKaYgAqv6YRbE+RWOWBtu7+AL3yRalXLyKqAIIfk+zARbDgFyEsncYwJvlgFRW+GEWntIi2P0BooyFxcNr8Ep3+ANLbMO+QyhvbiqdgC0kVvgUUiLYgBS2QtPbiVI1/sgOmG9uO+Y8DW+7jS2zAOnj6O2BndwuIAUtkdRN8gFoK3wwXMQyZwHVbClsuNLd4E3yAUR6FVDBR+BafQGt93LVMxJTv8ABts4CVLhcfYWsCb5kC9/BHdU8CLYFY5bMAd+eX9MGthhpbA1vu4B7+RKkaW2Yq4AQtVBBFsAJU/AuIXBhN8gGWnstefhiZyWvLAEnbYS1uzSFP6Jvn4Baxx70JKkQojLib5AVTey1jjgkKJGO0AKWyOm7N7cSpgSpAdPH0Tfd/gp1z5C1ZgKqN9J2wFxcUUuAFLZAm+QC0Fb4YUVRFsAOvj4KW2dwtYE3yAWk/wS/PLMKfmuGHZ8MAXF/Ja32Yi5haAKWz4Ydm2cSpgU693Atb7km+Zwwh+WGcPpxw3gAkzCLY+iYUDW/Z3Adc/gpzyFrAqnALkJe+7DoItgAtRS2zuKqGE3yAx0oJvkdvYrfZmALURbDuL5/RLf13cAuDeBS2RpbtAm+QFVA3wR+3fUtFHoBDJnC0jIXH0HWsgMY8inPLuOkd9chp4z20ALQLSA8cI9jYAIa2zjzjBd8gRafS1vgiUho/kAKcsCGTOGWvoOpkAtB3z8Hm8x2Ff5ADp4+lXAlIvcmwH/2Q==", "base64");
+
 test("native extension registers batch file tools but not single read/edit/write overrides", () => {
   const api = createFakeApi([], []);
 
@@ -140,6 +175,7 @@ test("native extension registers batch file tools but not single read/edit/write
   assert.equal(typeof readManyTool.renderResult, "function");
   assert.equal(readManyTool.renderShell, "self");
   assert.match(readManyTool.promptSnippet ?? "", /files:\[\.\.\.\]/);
+  assert.match(readManyTool.promptSnippet ?? "", /filesystem images/);
   assert.ok(readManyTool.promptGuidelines?.some((line) => line.startsWith("read_many use:")));
   assert.ok(readManyTool.promptGuidelines?.some((line) => line.startsWith("read_many input:")));
   assert.ok(readManyTool.promptGuidelines?.some((line) => line.startsWith("read_many output:")));
@@ -148,6 +184,10 @@ test("native extension registers batch file tools but not single read/edit/write
   assert.match(readManyTool.description, /Batch independent file reads/);
   assert.match(readManyTool.description, /offset/);
   assert.match(readManyTool.description, /limit/);
+  assert.match(readManyTool.description, /JPEG, PNG, GIF, WebP, BMP/);
+  assert.match(readManyTool.description, /no extra model call/);
+  assert.match(readManyTool.promptGuidelines?.join("\n") ?? "", /does not support image input|models without image input/);
+  assert.match(readManyTool.promptGuidelines?.join("\n") ?? "", /at most 20 images and 18 MiB/);
   const filesSchema = required(schemaFor(readManyTool).properties?.files, "read_many files schema");
   const fileItemSchema = required(filesSchema.items, "read_many file item schema");
   assert.equal(fileItemSchema.properties?.offset.minimum, 1);
@@ -839,11 +879,13 @@ test("read_many reads independent files with per-file offset and limit", async (
       ]
     });
 
-    assert.equal(result.details.files[0].offset, 2);
-    assert.equal(result.details.files[0].requestedLimit, 2);
-    assert.equal(result.details.files[0].truncation.nextOffset, 4);
-    assert.deepEqual(result.details.files[0].previewLines, ["a2", "a3"]);
-    assert.equal(result.details.files[1].truncation.nextOffset, 2);
+    const alpha = requiredTextReadFile(result.details.files[0]);
+    const beta = requiredTextReadFile(result.details.files[1]);
+    assert.equal(alpha.offset, 2);
+    assert.equal(alpha.requestedLimit, 2);
+    assert.equal(alpha.truncation.nextOffset, 4);
+    assert.deepEqual(alpha.previewLines, ["a2", "a3"]);
+    assert.equal(beta.truncation.nextOffset, 2);
 
     const text = textFromResult(result);
     assert.match(text, /--- @alpha\.txt \(lines 2-3 of 5\) ---\na2\na3/);
@@ -866,6 +908,151 @@ test("read_many reads independent files with per-file offset and limit", async (
   });
 });
 
+test("read_many returns a byte-detected temporary-path image to the active vision model without re-encoding", async () => {
+  await withTempDir(async (dir) => {
+    const imagePath = path.join(dir, "Dragged Image 你好.data");
+    await writeFile(imagePath, TINY_PNG);
+
+    const result = await readMany(createContext(dir, true), {
+      files: [{ path: imagePath }]
+    });
+
+    const file = requiredImageReadFile(result.details.files[0]);
+    assert.equal(file.inputMimeType, "image/png");
+    assert.equal(file.mimeType, "image/png");
+    assert.equal(file.originalBytes, TINY_PNG.byteLength);
+    assert.equal(file.attachmentCount, 1);
+    assert.deepEqual(imageBlocks(result), [{ type: "image", data: TINY_PNG.toString("base64"), mimeType: "image/png" }]);
+    assert.match(textFromResult(result), /Dragged Image 你好\.data \(image image\/png; attachment follows in input order\)/);
+
+    const api = createFakeApi([], []);
+    nativeToolsExtension(api);
+    const tool = required(api.registeredTools.find((candidate) => candidate.name === "read_many"), "read_many tool");
+    assert.match(renderToolResult(tool, result), /⎿ Read .*Dragged Image 你好\.data \[image\]/);
+  });
+});
+
+test("read_many supports multiple image formats and preserves attachment order", async () => {
+  await withTempDir(async (dir) => {
+    const inputs = [
+      ["one.gif", TINY_GIF],
+      ["two.webp", TINY_WEBP],
+      ["three.bmp", TINY_BMP],
+      ["four.jpeg", TINY_JPEG]
+    ] as const;
+    await Promise.all(inputs.map(([name, bytes]) => writeFile(path.join(dir, name), bytes)));
+
+    const result = await readMany(createContext(dir, true), {
+      files: inputs.map(([name]) => ({ path: name }))
+    });
+
+    assert.deepEqual(result.details.files.map((file) => requiredImageReadFile(file).inputMimeType), [
+      "image/gif",
+      "image/webp",
+      "image/bmp",
+      "image/jpeg"
+    ]);
+    assert.deepEqual(imageBlocks(result).map((image) => image.mimeType), ["image/gif", "image/webp", "image/png", "image/jpeg"]);
+    assert.deepEqual(imageBlocks(result)[0], { type: "image", data: TINY_GIF.toString("base64"), mimeType: "image/gif" });
+    assert.deepEqual(imageBlocks(result)[1], { type: "image", data: TINY_WEBP.toString("base64"), mimeType: "image/webp" });
+  });
+});
+
+test("read_many preserves mixed text-summary and image-attachment input ordering", async () => {
+  await withTempDir(async (dir) => {
+    await Promise.all([
+      writeFile(path.join(dir, "before.txt"), "before-text", "utf8"),
+      writeFile(path.join(dir, "middle.png"), TINY_PNG),
+      writeFile(path.join(dir, "after.txt"), "after-text", "utf8")
+    ]);
+
+    const result = await readMany(createContext(dir, true), {
+      files: [{ path: "before.txt" }, { path: "middle.png" }, { path: "after.txt" }]
+    });
+
+    assert.deepEqual(result.details.files.map((file) => file.kind), ["text", "image", "text"]);
+    const text = textFromResult(result);
+    assert.ok(text.indexOf("before.txt") < text.indexOf("middle.png"));
+    assert.ok(text.indexOf("middle.png") < text.indexOf("after.txt"));
+    assert.equal(imageBlocks(result).length, 1);
+    assert.equal(result.content[0]?.type, "text");
+    assert.equal(result.content[1]?.type, "image");
+  });
+});
+
+test("read_many uses the host image pipeline's dimension and inline-size resizing", async () => {
+  await withTempDir(async (dir) => {
+    const largePng = await readFile(path.join(process.cwd(), "node_modules/@earendil-works/pi-coding-agent/docs/images/interactive-mode.png"));
+    await writeFile(path.join(dir, "tall.png"), largePng);
+
+    const result = await readMany(createContext(dir, true), { files: [{ path: "tall.png" }] });
+
+    const file = requiredImageReadFile(result.details.files[0]);
+    assert.equal(file.inputMimeType, "image/png");
+    assert.match(file.mimeType, /^image\/(png|jpeg)$/);
+    assert.match(textFromResult(result), /original 1726x2162, displayed at 1597x2000/);
+    assert.equal(imageBlocks(result).length, 1);
+  });
+});
+
+test("read_many rejects image ranges, unsupported binaries, processing failures, and non-vision models", async () => {
+  await withTempDir(async (dir) => {
+    const malformedPng = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13]),
+      Buffer.from("IHDR", "ascii")
+    ]);
+    await Promise.all([
+      writeFile(path.join(dir, "image.png"), TINY_PNG),
+      writeFile(path.join(dir, "binary.dat"), Buffer.from([0, 1, 2, 3, 255])),
+      writeFile(path.join(dir, "broken.png"), malformedPng)
+    ]);
+
+    await assert.rejects(
+      readMany(createContext(dir, true), { files: [{ path: "image.png", offset: 1 }] }),
+      /does not accept offset or limit/
+    );
+    await assert.rejects(
+      readMany(createContext(dir, false), { files: [{ path: "image.png" }] }),
+      /active model fixture\/fixture-text does not support image input/
+    );
+    await assert.rejects(
+      readMany(createContext(dir), { files: [{ path: "image.png" }] }),
+      /no active model is available/
+    );
+    await assert.rejects(
+      readMany(createContext(dir, true), { files: [{ path: "binary.dat" }] }),
+      /Unsupported binary file binary\.dat.*use document_parse/
+    );
+    await assert.rejects(
+      readMany(createContext(dir, true), { files: [{ path: "broken.png" }] }),
+      /Could not deliver image broken\.png:.*omitted/
+    );
+  });
+});
+
+test("read_many preserves UTF-8 text beginning with GIF and enforces aggregate image limits", async () => {
+  await withTempDir(async (dir) => {
+    await Promise.all([
+      writeFile(path.join(dir, "gif-prefix.txt"), "GIF is ordinary UTF-8 text\nsecond line", "utf8"),
+      writeFile(path.join(dir, "tiny.png"), TINY_PNG),
+      writeFile(path.join(dir, "near-limit.png"), Buffer.concat([TINY_PNG, Buffer.alloc(3 * 1024 * 1024)]))
+    ]);
+
+    const textResult = await readMany(createContext(dir), { files: [{ path: "gif-prefix.txt" }] });
+    assert.equal(requiredTextReadFile(textResult.details.files[0]).kind, "text");
+    assert.match(textFromResult(textResult), /GIF is ordinary UTF-8 text/);
+
+    await assert.rejects(
+      readMany(createContext(dir, true), { files: Array.from({ length: 21 }, () => ({ path: "tiny.png" })) }),
+      /at most 20 images per call; received 21/
+    );
+    await assert.rejects(
+      readMany(createContext(dir, true), { files: Array.from({ length: 5 }, () => ({ path: "near-limit.png" })) }),
+      /exceeding the 18\.0 MB aggregate limit/
+    );
+  });
+});
+
 test("read_many keeps uncapped model-facing reads separate from minimal display", async () => {
   await withTempDir(async (dir) => {
     const lines = Array.from({ length: 6000 }, (_value, index) => `line-${index + 1}`);
@@ -875,8 +1062,9 @@ test("read_many keeps uncapped model-facing reads separate from minimal display"
       files: [{ path: "long.txt", limit: 6000 }]
     });
 
-    assert.equal(result.details.files[0].truncation.outputLines, 6000);
-    assert.equal(result.details.files[0].truncation.truncated, false);
+    const file = requiredTextReadFile(result.details.files[0]);
+    assert.equal(file.truncation.outputLines, 6000);
+    assert.equal(file.truncation.truncated, false);
     assert.match(textFromResult(result), /line-6000/);
 
     const api = createFakeApi([], []);
@@ -909,9 +1097,10 @@ test("read_many returns content beyond the previous byte display cap", async () 
       files: [{ path: "long.txt" }]
     });
 
-    assert.equal(result.details.files[0].truncation.truncated, false);
-    assert.equal(result.details.files[0].truncation.outputLines, 2);
-    assert.ok(result.details.files[0].truncation.outputBytes > 50 * 1024);
+    const file = requiredTextReadFile(result.details.files[0]);
+    assert.equal(file.truncation.truncated, false);
+    assert.equal(file.truncation.outputLines, 2);
+    assert.ok(file.truncation.outputBytes > 50 * 1024);
     assert.match(textFromResult(result), /next/);
   });
 });
