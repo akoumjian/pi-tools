@@ -7,6 +7,7 @@ Reusable extensions for the [Pi coding agent](https://pi.dev/). The package focu
 - safety review hooks (rule + model + human) and a mutation-review reviewer
 - web research (SearXNG, web fetch with readability + document parse handoff)
 - explicit provider-safe retry of settled transient failures via `/retry`
+- provider-free active-context clipboard snapshots via `/context:copy`
 - robust chunked context compaction via `/compacter`
 - a `/review` subagent workflow
 - bounded reader/planner/writer orchestration with isolated worktrees and deterministic reconciliation
@@ -71,6 +72,7 @@ Commands:
 - `/async:status`, `/async:view [job-id] [--stream both|stdout|stderr] [--tail 1..500] [--follow]`
 - `/native:status`
 - `/retry`
+- `/context:copy [--raw]`
 - `/compacter [--model provider/model] [instructions]`, `/compacter status|on|off|toggle`
 - `/mutation:setup`, `/mutation:status`, `/mutation:model`, `/mutation:toggle`, `/mutation:apply`
 - `/searxng:setup`, `/searxng:status`
@@ -81,7 +83,7 @@ Commands:
 - `/docparser:doctor`
 - `/orchestrator:setup`, `/orchestrator:status`
 
-The load order in `package.json#pi.extensions` is intentional: terminal patches first, safety before async shell, native batch tools before manual-retry, manual-retry before compacter so compaction input is filtered first, and optional display overrides last.
+The load order in `package.json#pi.extensions` is intentional: terminal patches first, safety before async shell, native batch tools before manual-retry, manual-retry before context-export and compacter so both copied and summarized context use the same retry filtering, and optional display overrides last.
 
 ## Extensions
 
@@ -152,6 +154,18 @@ Each extension below documents what it does, what it provides, and how to set it
 **Provides.** `/retry`; provider-context and pre-compaction filtering. Failed attempts and markers remain auditable in durable session history. This is an explicit provider-facing approximation, not Pi core's private unchanged-state retry transaction.
 
 **Setup.** None. Fully restart Pi after installation or update.
+
+---
+
+### context-export
+
+[Full docs](docs/extensions/context-export.md).
+
+**Purpose.** Copy a deterministic, provider-free snapshot of the current active, compaction-aware Pi context directly to the system clipboard without adding a session message or writing a sidecar file.
+
+**Provides.** `/context:copy [--raw]`. The default applies best-effort secret redaction and replaces hidden thinking, image bytes, and opaque signatures with metadata. Raw mode requires confirmation. Both modes include the effective system prompt, active model/thinking setting, active tool contracts, and active messages; neither claims to be an exact provider HTTP request body.
+
+**Setup.** None. Interactive TUI only; uses Pi's cross-platform clipboard support and fails without truncation above 4 MiB.
 
 ---
 

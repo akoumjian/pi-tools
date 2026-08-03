@@ -28,6 +28,7 @@
       "extensions/async-shell/index.ts",
       "extensions/native-tools/index.ts",
       "extensions/manual-retry/index.ts",
+      "extensions/context-export/index.ts",
       "extensions/compacter/index.ts",
       "extensions/mutation-review/index.ts",
       "extensions/searxng-search/index.ts",

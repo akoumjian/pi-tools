@@ -65,6 +65,7 @@ test("pi-tools registered extensions have shipping default config files where re
     "config/file-open-settings.json",
     "docs/README.md",
     "docs/extensions/async-shell.md",
+    "docs/extensions/context-export.md",
     "docs/extensions/file-open.md",
     "docs/extensions/manual-retry.md",
     "docs/extensions/mutation-review.md",
@@ -83,13 +84,16 @@ test("pi-tools registered extensions have shipping default config files where re
   }
 });
 
-test("manual retry loads before compacter so summarizer input is filtered first", () => {
+test("manual retry loads before context export and compacter so derived context is filtered first", () => {
   const extensions = packageJson().pi?.extensions ?? [];
   const retryIndex = extensions.indexOf("extensions/manual-retry/index.ts");
+  const contextExportIndex = extensions.indexOf("extensions/context-export/index.ts");
   const compacterIndex = extensions.indexOf("extensions/compacter/index.ts");
 
   assert.ok(retryIndex >= 0, "manual-retry must be registered");
+  assert.ok(contextExportIndex >= 0, "context-export must be registered");
   assert.ok(compacterIndex >= 0, "compacter must be registered");
+  assert.ok(retryIndex < contextExportIndex, "manual-retry must load before context-export");
   assert.ok(retryIndex < compacterIndex, "manual-retry must load before compacter");
 });
 
