@@ -6,6 +6,7 @@ Reusable extensions for the [Pi coding agent](https://pi.dev/). The package focu
 - batch-native file and search tools that replace stock single-file/shell tools
 - safety review hooks (rule + model + human) and a mutation-review reviewer
 - web research (SearXNG, web fetch with readability + document parse handoff)
+- explicit provider-safe retry of settled transient failures via `/retry`
 - robust chunked context compaction via `/compacter`
 - a `/review` subagent workflow
 - bounded reader/planner/writer orchestration with isolated worktrees and deterministic reconciliation
@@ -69,6 +70,7 @@ Commands:
 - `/safety:setup`, `/safety:status`, `/safety:model`, `/safety:toggle`
 - `/async:status`
 - `/native:status`
+- `/retry`
 - `/compacter [--model provider/model] [instructions]`, `/compacter status|on|off|toggle`
 - `/mutation:setup`, `/mutation:status`, `/mutation:model`, `/mutation:toggle`, `/mutation:apply`
 - `/searxng:setup`, `/searxng:status`
@@ -79,7 +81,7 @@ Commands:
 - `/docparser:doctor`
 - `/orchestrator:setup`, `/orchestrator:status`
 
-The load order in `package.json#pi.extensions` is intentional: terminal patches first, safety before async shell, native batch tools before compacter/mutation-review, optional display overrides last.
+The load order in `package.json#pi.extensions` is intentional: terminal patches first, safety before async shell, native batch tools before manual-retry, manual-retry before compacter so compaction input is filtered first, and optional display overrides last.
 
 ## Extensions
 
@@ -138,6 +140,18 @@ Each extension below documents what it does, what it provides, and how to set it
 **Provides.** `read_many`, `search_many`, `write_many`, `edit_many`; disabled `bash` stub redirecting to `shell_start`; `/native:status`; compact renderers with `⎿ error: …` fallback on validation/exec errors.
 
 **Setup.** None. Automatic on load.
+
+---
+
+### manual-retry
+
+[Full docs](docs/extensions/manual-retry.md).
+
+**Purpose.** Retry a fully settled transient provider failure without duplicating user text. The extension persists a hidden empty marker, filters retry markers and failed/aborted assistants from provider and compaction context, and starts a fresh normal run only when the persisted session is idle and queue-free.
+
+**Provides.** `/retry`; provider-context and pre-compaction filtering. Failed attempts and markers remain auditable in durable session history. This is an explicit provider-facing approximation, not Pi core's private unchanged-state retry transaction.
+
+**Setup.** None. Fully restart Pi after installation or update.
 
 ---
 

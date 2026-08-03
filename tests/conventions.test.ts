@@ -66,6 +66,7 @@ test("pi-tools registered extensions have shipping default config files where re
     "docs/README.md",
     "docs/extensions/async-shell.md",
     "docs/extensions/file-open.md",
+    "docs/extensions/manual-retry.md",
     "docs/extensions/mutation-review.md",
     "docs/extensions/native-tools.md",
     "docs/extensions/review-subagent.md",
@@ -80,6 +81,16 @@ test("pi-tools registered extensions have shipping default config files where re
   for (const file of requiredConfigs) {
     assert.ok(readText(file).length > 0, file);
   }
+});
+
+test("manual retry loads before compacter so summarizer input is filtered first", () => {
+  const extensions = packageJson().pi?.extensions ?? [];
+  const retryIndex = extensions.indexOf("extensions/manual-retry/index.ts");
+  const compacterIndex = extensions.indexOf("extensions/compacter/index.ts");
+
+  assert.ok(retryIndex >= 0, "manual-retry must be registered");
+  assert.ok(compacterIndex >= 0, "compacter must be registered");
+  assert.ok(retryIndex < compacterIndex, "manual-retry must load before compacter");
 });
 
 test("pi-tools package defaults do not own personal profile model or trust choices", () => {
