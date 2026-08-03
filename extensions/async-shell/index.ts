@@ -3,9 +3,10 @@ import { accessSync, closeSync, constants, existsSync, mkdirSync, openSync, read
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { Readable } from "node:stream";
+import { stripVTControlCharacters } from "node:util";
 import { Type, type Static } from "@earendil-works/pi-ai";
-import { defineTool, type AgentToolResult, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { DynamicBorder, defineTool, type AgentToolResult, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
+import { Container, Key, matchesKey, SelectList, Text, truncateToWidth, type Component, type SelectItem, type TUI } from "@earendil-works/pi-tui";
 import { throwIfAborted } from "../_shared/cancellation.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
@@ -30,7 +31,7 @@ type LogReadTruncation = {
   nextOffset?: number;
 };
 
-type JobMeta = {
+export type JobMeta = {
   jobId: string;
   job_name?: string;
   command: string;
@@ -118,6 +119,47 @@ type ShellReadDetails = {
   streams: LogReadStreamDetails[];
 };
 
+export type AsyncShellViewerStream = OutputStreamName | "both";
+
+export type AsyncShellViewerArgs = {
+  help: boolean;
+  jobId?: string;
+  stream: AsyncShellViewerStream;
+  tailLines: number;
+  follow: boolean;
+};
+
+export type AsyncShellViewerStreamSnapshot = {
+  stream: OutputStreamName;
+  logPath: string;
+  exists: boolean;
+  content: string;
+};
+
+export type AsyncShellViewerSnapshot = {
+  job: JobMeta;
+  projectRoot: string;
+  streams: AsyncShellViewerStreamSnapshot[];
+  outputLines: string[];
+  refreshedAt: string;
+};
+
+export type AsyncShellViewerRenderState = {
+  snapshot: AsyncShellViewerSnapshot;
+  stream: AsyncShellViewerStream;
+  tailLines: number;
+  following: boolean;
+  topLine: number;
+  pinnedToEnd: boolean;
+  error?: string;
+};
+
+export type AsyncShellViewerFrame = {
+  lines: string[];
+  topLine: number;
+  pageSize: number;
+};
+
 type StartUpdate = (partial: AgentToolResult<StartDetails>) => void;
 
 type CompletionNotificationTarget = {
@@ -147,6 +189,9 @@ const SHELL_TAIL_MIN_CHARS = 1000;
 const SHELL_TAIL_DEFAULT_MAX_CHARS = 20000;
 const SHELL_TAIL_MAX_CHARS = 120000;
 const COMPLETION_BATCH_FLUSH_DELAY_MS = 100;
+const ASYNC_SHELL_VIEWER_MAX_JOBS = 100;
+const ASYNC_SHELL_VIEWER_DEFAULT_TAIL_LINES = SHELL_TAIL_MAX_LINES;
+const ASYNC_SHELL_VIEWER_FOLLOW_INTERVAL_MS = 500;
 const CommandItem = Type.Object({
   command: Type.String({ minLength: 1, description: "Shell command to start." }),
   cwd: Type.String({ minLength: 1, description: "Working directory for this command. Use per-command cwd; shell_start has no top-level cwd." }),
@@ -203,6 +248,18 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
       description: "Show async-shell job storage and recent job diagnostics",
       handler: async (_args, context) => {
         context.ui.notify(buildAsyncShellStatusText(context), "info");
+      }
+    },
+    []
+  );
+
+  registerCommandWithAliases(
+    api,
+    "async:view",
+    {
+      description: "View live or historical async-shell stdout/stderr in a bounded read-only TUI",
+      handler: async (args, context) => {
+        await handleAsyncShellViewerCommand(context, args);
       }
     },
     []
@@ -933,7 +990,7 @@ function formatJobList(jobsList: JobMeta[]): string {
 }
 
 function requireJob(context: ExtensionContext, jobId: string): JobMeta {
-  const active = jobs.get(jobId);
+  const active = activeJobForContext(context, jobId);
   if (active !== undefined) {
     return active;
   }
@@ -951,7 +1008,7 @@ function requireJob(context: ExtensionContext, jobId: string): JobMeta {
 }
 
 function requireActiveJob(context: ExtensionContext, jobId: string): JobRuntime {
-  const job = jobs.get(jobId);
+  const job = activeJobForContext(context, jobId);
   if (job === undefined) {
     const meta = readMeta(context, jobId);
     if (meta === undefined) {
@@ -972,7 +1029,9 @@ function listJobs(context: ExtensionContext, limit: number): JobMeta[] {
       .filter((job): job is JobMeta => job !== undefined)
     : [];
 
-  const activeJobs = Array.from(jobs.values()).map(publicJob);
+  const activeJobs = Array.from(jobs.values())
+    .filter((job) => isJobInContext(context, job))
+    .map(publicJob);
   const byId = new Map<string, JobMeta>();
   for (const job of diskJobs) {
     byId.set(job.jobId, job);
@@ -984,6 +1043,15 @@ function listJobs(context: ExtensionContext, limit: number): JobMeta[] {
   return Array.from(byId.values())
     .sort((left, right) => Date.parse(right.startedAt) - Date.parse(left.startedAt))
     .slice(0, clampInteger(limit, 1, 100));
+}
+
+function activeJobForContext(context: Pick<ExtensionContext, "cwd">, jobId: string): JobRuntime | undefined {
+  const job = jobs.get(jobId);
+  return job !== undefined && isJobInContext(context, job) ? job : undefined;
+}
+
+function isJobInContext(context: Pick<ExtensionContext, "cwd">, job: Pick<JobMeta, "logDir">): boolean {
+  return path.dirname(job.logDir) === path.join(jobsRoot(context.cwd), "jobs");
 }
 
 function readMeta(context: ExtensionContext, jobId: string): JobMeta | undefined {
@@ -1201,6 +1269,455 @@ function resolveCwd(context: ExtensionContext, requestedCwd: string | undefined)
   return path.resolve(base, expandHome(requestedCwd));
 }
 
+export function parseAsyncShellViewerArgs(rawArgs: string): AsyncShellViewerArgs {
+  const tokens = rawArgs.trim() === "" ? [] : rawArgs.trim().split(/\s+/);
+  const result: AsyncShellViewerArgs = {
+    help: false,
+    stream: "both",
+    tailLines: ASYNC_SHELL_VIEWER_DEFAULT_TAIL_LINES,
+    follow: false
+  };
+
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === "--help" || token === "-h") {
+      result.help = true;
+      continue;
+    }
+    if (token === "--follow" || token === "-f") {
+      result.follow = true;
+      continue;
+    }
+    if (token === "--stream") {
+      const stream = tokens[index + 1];
+      if (stream !== "both" && stream !== "stdout" && stream !== "stderr") {
+        throw new Error(`${buildAsyncShellViewerUsage()}\n\n--stream requires one of: both, stdout, stderr.`);
+      }
+      result.stream = stream;
+      index += 1;
+      continue;
+    }
+    if (token === "--tail") {
+      const rawLines = tokens[index + 1];
+      const lines = rawLines === undefined ? Number.NaN : Number(rawLines);
+      if (!Number.isInteger(lines) || lines < 1 || lines > SHELL_TAIL_MAX_LINES) {
+        throw new Error(`${buildAsyncShellViewerUsage()}\n\n--tail requires an integer from 1 to ${SHELL_TAIL_MAX_LINES}.`);
+      }
+      result.tailLines = lines;
+      index += 1;
+      continue;
+    }
+    if (token.startsWith("-")) {
+      throw new Error(`${buildAsyncShellViewerUsage()}\n\nUnknown option: ${token}`);
+    }
+    if (result.jobId !== undefined) {
+      throw new Error(`${buildAsyncShellViewerUsage()}\n\nProvide at most one job id.`);
+    }
+    result.jobId = token;
+  }
+
+  return result;
+}
+
+export function buildAsyncShellViewerUsage(): string {
+  return [
+    "Usage: /async:view [job-id] [--stream both|stdout|stderr] [--tail 1..500] [--follow]",
+    "",
+    "Without a job id, choose from up to 100 recent jobs in the current async-shell project registry.",
+    "The viewer reads bounded tails from canonical logs. ↑/↓ and PgUp/PgDn scroll; Home/End jump; s/Tab changes stream; r refreshes; f toggles live follow; Esc/q closes without stopping the job."
+  ].join("\n");
+}
+
+export async function handleAsyncShellViewerCommand(context: ExtensionCommandContext, rawArgs: string): Promise<void> {
+  let args: AsyncShellViewerArgs;
+  try {
+    args = parseAsyncShellViewerArgs(rawArgs);
+  } catch (error) {
+    context.ui.notify(error instanceof Error ? error.message : String(error), "error");
+    return;
+  }
+
+  if (args.help) {
+    context.ui.notify(buildAsyncShellViewerUsage(), "info");
+    return;
+  }
+  if (!context.hasUI || context.mode !== "tui") {
+    context.ui.notify("/async:view requires interactive Pi TUI mode.", "warning");
+    return;
+  }
+
+  let jobId = args.jobId;
+  if (jobId === undefined) {
+    try {
+      jobId = await pickAsyncShellViewerJob(context);
+    } catch (error) {
+      context.ui.notify(`Could not list async-shell jobs: ${error instanceof Error ? error.message : String(error)}`, "error");
+      return;
+    }
+  }
+  if (jobId === undefined) {
+    return;
+  }
+
+  let initialSnapshot: AsyncShellViewerSnapshot;
+  try {
+    initialSnapshot = loadAsyncShellViewerSnapshot(context, jobId, args.stream, args.tailLines);
+  } catch (error) {
+    context.ui.notify(error instanceof Error ? error.message : String(error), "error");
+    return;
+  }
+
+  try {
+    await context.ui.custom<void>((tui, _theme, _keybindings, done) => createAsyncShellViewerComponent({
+      tui,
+      getTheme: () => context.ui.theme,
+      initialSnapshot,
+      initialStream: args.stream,
+      tailLines: args.tailLines,
+      follow: args.follow,
+      loadSnapshot: (stream, tailLines) => loadAsyncShellViewerSnapshot(context, jobId, stream, tailLines),
+      done
+    }));
+  } catch (error) {
+    context.ui.notify(error instanceof Error ? error.message : String(error), "error");
+  }
+}
+
+async function pickAsyncShellViewerJob(context: ExtensionCommandContext): Promise<string | undefined> {
+  const recentJobs = listJobs(context, ASYNC_SHELL_VIEWER_MAX_JOBS);
+  if (recentJobs.length === 0) {
+    context.ui.notify(`No async-shell jobs found under ${jobsRoot(context.cwd)}.`, "warning");
+    return undefined;
+  }
+
+  const selected = await context.ui.custom<string | undefined>((tui, theme, _keybindings, done) => {
+    return createAsyncShellViewerPicker(recentJobs, theme, tui, done);
+  });
+  return selected;
+}
+
+function createAsyncShellViewerPicker(jobsList: JobMeta[], theme: Theme, tui: TUI, done: (jobId: string | undefined) => void): Component {
+  const items: SelectItem[] = jobsList.map((job) => ({
+    value: job.jobId,
+    label: sanitizeAsyncShellViewerText(`${viewerStatusGlyph(job.status)} ${job.job_name ?? shortDisplayId(job.jobId)} · ${truncateOneLine(job.command, 72)}`),
+    description: sanitizeAsyncShellViewerText(`${job.status} · ${job.startedAt} · ${job.cwd}`)
+  }));
+  const selectList = new SelectList(items, Math.min(items.length, 14), {
+    selectedPrefix: (text: string) => theme.fg("accent", text),
+    selectedText: (text: string) => theme.fg("accent", text),
+    description: (text: string) => theme.fg("muted", text),
+    scrollInfo: (text: string) => theme.fg("dim", text),
+    noMatch: (text: string) => theme.fg("warning", text)
+  });
+  selectList.onSelect = (item) => done(item.value);
+  selectList.onCancel = () => done(undefined);
+
+  const container = new Container();
+  container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+  container.addChild(new Text(theme.fg("accent", theme.bold("View async-shell output")), 1, 0));
+  container.addChild(selectList);
+  container.addChild(new Text(theme.fg("dim", "↑↓ navigate • Enter view • Esc cancel"), 1, 0));
+  container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+
+  return {
+    render(width: number): string[] {
+      return container.render(width);
+    },
+    invalidate(): void {
+      container.invalidate();
+    },
+    handleInput(data: string): void {
+      if (matchesKey(data, Key.ctrl("c"))) {
+        done(undefined);
+        return;
+      }
+      selectList.handleInput(data);
+      tui.requestRender();
+    }
+  };
+}
+
+export function loadAsyncShellViewerSnapshot(
+  context: Pick<ExtensionContext, "cwd">,
+  jobId: string,
+  stream: AsyncShellViewerStream,
+  tailLines: number
+): AsyncShellViewerSnapshot {
+  const job = requireJob(context as ExtensionContext, jobId);
+  const boundedTailLines = clampInteger(tailLines, 1, SHELL_TAIL_MAX_LINES);
+  const selected = stream === "both" ? selectedStreams() : selectedStreams(stream);
+  const streams = selected.map((selectedStream): AsyncShellViewerStreamSnapshot => {
+    const logPath = logPathForStream(job, selectedStream);
+    const logExists = existsSync(logPath);
+    return {
+      stream: selectedStream,
+      logPath,
+      exists: logExists,
+      content: sanitizeAsyncShellViewerText(readLogTail(logPath, boundedTailLines, SHELL_TAIL_MAX_CHARS))
+    };
+  });
+
+  return {
+    job: publicJob(job),
+    projectRoot: jobsRoot(context.cwd),
+    streams,
+    outputLines: buildAsyncShellViewerOutputLines(streams),
+    refreshedAt: new Date().toISOString()
+  };
+}
+
+export function sanitizeAsyncShellViewerText(text: string): string {
+  return stripVTControlCharacters(text)
+    .replace(/\t/g, "    ")
+    .replace(/\r/g, "�")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "�");
+}
+
+function buildAsyncShellViewerOutputLines(streams: AsyncShellViewerStreamSnapshot[]): string[] {
+  const lines: string[] = [];
+  for (const stream of streams) {
+    if (lines.length > 0) {
+      lines.push("");
+    }
+    lines.push(sanitizeAsyncShellViewerText(`--- ${stream.stream} · ${stream.logPath} ---`));
+    if (!stream.exists) {
+      lines.push("(log file has not been created)");
+      continue;
+    }
+    if (stream.content.length === 0) {
+      lines.push("(no output)");
+      continue;
+    }
+    lines.push(...stream.content.split(/\r?\n/));
+  }
+  return lines;
+}
+
+export function buildAsyncShellViewerFrame(
+  theme: Theme,
+  state: AsyncShellViewerRenderState,
+  width: number,
+  height: number
+): AsyncShellViewerFrame {
+  const safeWidth = Math.max(1, width);
+  const safeHeight = Math.max(12, height);
+  const job = state.snapshot.job;
+  const border = theme.fg("borderAccent", "─".repeat(safeWidth));
+  const status = formatAsyncShellViewerStatus(job);
+  const header = [
+    border,
+    theme.fg("accent", theme.bold("Async shell output")),
+    `${theme.fg(statusColor(job.status), sanitizeAsyncShellViewerText(status))} ${theme.fg("muted", sanitizeAsyncShellViewerText(`· ${job.job_name ?? shortDisplayId(job.jobId)} · ${job.jobId}`))}`,
+    theme.fg("dim", `cwd: ${sanitizeAsyncShellViewerText(job.cwd)}`),
+    theme.fg("dim", `command: ${sanitizeAsyncShellViewerText(truncateOneLine(job.command, Math.max(20, safeWidth - 9)))}`),
+    ...(job.error === undefined ? [] : [theme.fg("error", `job note: ${sanitizeAsyncShellViewerText(job.error)}`)]),
+    theme.fg("dim", `registry: ${sanitizeAsyncShellViewerText(state.snapshot.projectRoot)}`),
+    theme.fg("muted", `stream=${state.stream} · tail≤${state.tailLines} lines/stream · follow=${state.following ? "on" : "off"} · refreshed=${state.snapshot.refreshedAt}`),
+    theme.fg("dim", "↑↓ or j/k scroll • PgUp/PgDn page • Home/End or g/G jump"),
+    theme.fg("dim", "s/Tab stream • r refresh • f follow • Esc/Ctrl+C/q close"),
+    ...(state.error === undefined ? [] : [theme.fg("error", state.error)]),
+    border
+  ];
+  const footerRows = 2;
+  const pageSize = Math.max(1, safeHeight - header.length - footerRows);
+  const maxTopLine = Math.max(0, state.snapshot.outputLines.length - pageSize);
+  const topLine = state.pinnedToEnd ? maxTopLine : Math.max(0, Math.min(state.topLine, maxTopLine));
+  const visible = state.snapshot.outputLines.slice(topLine, topLine + pageSize).map((line) => {
+    const rendered = line.startsWith("--- ")
+      ? theme.fg("toolTitle", line)
+      : line.startsWith("(") && line.endsWith(")")
+        ? theme.fg("dim", line)
+        : line;
+    return truncateToWidth(rendered, safeWidth, "", false);
+  });
+  const total = state.snapshot.outputLines.length;
+  const first = total === 0 ? 0 : topLine + 1;
+  const last = Math.min(total, topLine + visible.length);
+  const footer = [
+    border,
+    theme.fg("muted", `lines ${first}-${last} of ${total} bounded viewer lines${state.stream === "both" ? " · stdout/stderr are grouped, not chronologically merged" : ""}`)
+  ];
+
+  return {
+    lines: [...header, ...visible, ...footer].map((line) => truncateToWidth(line, safeWidth, "", false)),
+    topLine,
+    pageSize
+  };
+}
+
+type AsyncShellViewerComponentOptions = {
+  tui: TUI;
+  getTheme: () => Theme;
+  initialSnapshot: AsyncShellViewerSnapshot;
+  initialStream: AsyncShellViewerStream;
+  tailLines: number;
+  follow: boolean;
+  loadSnapshot: (stream: AsyncShellViewerStream, tailLines: number) => AsyncShellViewerSnapshot;
+  done: (result: void) => void;
+  followIntervalMs?: number;
+};
+
+export function createAsyncShellViewerComponent(options: AsyncShellViewerComponentOptions): Component & { dispose(): void } {
+  let followTimer: NodeJS.Timeout | undefined;
+  let lastPageSize = 1;
+  const state: AsyncShellViewerRenderState = {
+    snapshot: options.initialSnapshot,
+    stream: options.initialStream,
+    tailLines: options.tailLines,
+    following: false,
+    topLine: 0,
+    pinnedToEnd: true
+  };
+
+  const stopFollowing = () => {
+    if (followTimer !== undefined) {
+      clearInterval(followTimer);
+      followTimer = undefined;
+    }
+    state.following = false;
+  };
+
+  const refresh = (pinToEnd: boolean) => {
+    try {
+      state.snapshot = options.loadSnapshot(state.stream, state.tailLines);
+      state.error = undefined;
+      state.pinnedToEnd = pinToEnd;
+      if (state.following && state.snapshot.job.status !== "running") {
+        stopFollowing();
+      }
+    } catch (error) {
+      state.error = error instanceof Error ? error.message : String(error);
+      stopFollowing();
+    }
+    options.tui.requestRender();
+  };
+
+  const startFollowing = () => {
+    if (state.snapshot.job.status !== "running") {
+      state.error = "Live follow is available only while the job is running.";
+      options.tui.requestRender();
+      return;
+    }
+    if (followTimer !== undefined) {
+      return;
+    }
+    state.following = true;
+    state.pinnedToEnd = true;
+    state.error = undefined;
+    followTimer = setInterval(() => refresh(true), options.followIntervalMs ?? ASYNC_SHELL_VIEWER_FOLLOW_INTERVAL_MS);
+    followTimer.unref?.();
+    options.tui.requestRender();
+  };
+
+  const close = () => {
+    stopFollowing();
+    options.done();
+  };
+
+  const move = (delta: number) => {
+    state.pinnedToEnd = false;
+    state.topLine = Math.max(0, state.topLine + delta);
+    options.tui.requestRender();
+  };
+
+  const cycleStream = () => {
+    const order: AsyncShellViewerStream[] = ["both", "stdout", "stderr"];
+    state.stream = order[(order.indexOf(state.stream) + 1) % order.length];
+    state.topLine = 0;
+    state.pinnedToEnd = true;
+    refresh(true);
+  };
+
+  const component: Component & { dispose(): void } = {
+    render(width: number): string[] {
+      const frame = buildAsyncShellViewerFrame(options.getTheme(), state, width, options.tui.terminal.rows);
+      state.topLine = frame.topLine;
+      lastPageSize = frame.pageSize;
+      return frame.lines;
+    },
+    invalidate(): void {},
+    handleInput(data: string): void {
+      if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c")) || data === "q" || data === "Q") {
+        close();
+        return;
+      }
+      if (matchesKey(data, Key.up) || data === "k" || data === "K") {
+        move(-1);
+        return;
+      }
+      if (matchesKey(data, Key.down) || data === "j" || data === "J") {
+        move(1);
+        return;
+      }
+      if (matchesKey(data, Key.pageUp)) {
+        move(-lastPageSize);
+        return;
+      }
+      if (matchesKey(data, Key.pageDown)) {
+        move(lastPageSize);
+        return;
+      }
+      if (matchesKey(data, Key.home) || data === "g") {
+        state.pinnedToEnd = false;
+        state.topLine = 0;
+        options.tui.requestRender();
+        return;
+      }
+      if (matchesKey(data, Key.end) || data === "G") {
+        state.pinnedToEnd = true;
+        options.tui.requestRender();
+        return;
+      }
+      if (matchesKey(data, Key.tab) || data === "s" || data === "S") {
+        cycleStream();
+        return;
+      }
+      if (data === "r" || data === "R") {
+        refresh(state.pinnedToEnd);
+        return;
+      }
+      if (data === "f" || data === "F") {
+        if (state.following) {
+          stopFollowing();
+          options.tui.requestRender();
+        } else {
+          startFollowing();
+        }
+      }
+    },
+    dispose(): void {
+      stopFollowing();
+    }
+  };
+
+  if (options.follow) {
+    startFollowing();
+  }
+  return component;
+}
+
+function formatAsyncShellViewerStatus(job: JobMeta): string {
+  const duration = job.durationMs === undefined ? "" : ` · ${formatDuration(job.durationMs)}`;
+  const exit = job.exitCode === undefined || job.exitCode === null ? "" : ` · exit ${job.exitCode}`;
+  const signal = job.signal === undefined || job.signal === null ? "" : ` · ${job.signal}`;
+  return `${job.status}${duration}${exit}${signal}`;
+}
+
+function viewerStatusGlyph(status: JobStatus): string {
+  if (status === "exited") return "✓";
+  if (status === "failed") return "✗";
+  if (status === "cancelled") return "■";
+  if (status === "running") return "●";
+  return "?";
+}
+
+function statusColor(status: JobStatus): "success" | "error" | "warning" | "muted" {
+  if (status === "exited") return "success";
+  if (status === "failed") return "error";
+  if (status === "running") return "warning";
+  return "muted";
+}
+
 export function buildAsyncShellStatusText(context: Pick<ExtensionContext, "cwd">): string {
   const root = jobsRoot(context.cwd);
   const recentJobs = listJobs(context as ExtensionContext, 20);
@@ -1212,7 +1729,7 @@ export function buildAsyncShellStatusText(context: Pick<ExtensionContext, "cwd">
     `Job root: ${root}`,
     `Job root state: ${describePathAccess(root)}`,
     `Recent jobs: ${recentJobs.length} (${running} running, ${terminal} terminal or detached)`,
-    running > 0 ? "Use shell_status without a jobId to list jobs, shell_read mode=tail for recent output, shell_read mode=range for exact log lines, or shell_cancel to stop a running job. Do not poll; completion notices will be batched into history and resume the agent." : "No running jobs in the recent async-shell registry.",
+    running > 0 ? "Use /async:view for provider-free human viewing, shell_status without a jobId to list jobs, shell_read for model inspection, or shell_cancel to stop a running job. Do not poll; completion notices will be batched into history and resume the agent." : "No running jobs in the recent async-shell registry. Use /async:view to inspect historical output.",
     recentJobs.some((job) => job.status === "unknown") ? "Some jobs were started by a previous Pi process and are no longer attached." : undefined
   ].filter((line): line is string => line !== undefined).join("\n");
 }

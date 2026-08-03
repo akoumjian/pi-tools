@@ -13,9 +13,10 @@ LLM-callable tools:
 - `shell_read({ jobId, mode?, stream?, lines?, maxChars?, offset?, limit? })`
 - `shell_cancel({ jobId, signal? })`
 
-Command:
+Commands:
 
 - `/async:status` — reports job-root state and recent-job diagnostics.
+- `/async:view [job-id] [--stream both|stdout|stderr] [--tail 1..500] [--follow]` — opens a provider-free, read-only TUI over canonical live or historical job logs. Without a job id, it presents up to 100 recent jobs from the current project registry.
 
 Side effects:
 
@@ -140,6 +141,19 @@ Completion notice content deliberately points at log paths rather than embedding
 }
 ```
 
+## Output viewer
+
+`/async:view` is user-only and requires interactive Pi UI mode. It does not add a tool, provider request, session message, or assistant turn.
+
+- The picker includes current, recent, and historical jobs from the active `.pi/async-shell` registry and displays each job's status, start time, command, and execution `cwd` so child-project identity remains visible.
+- The viewer reads the existing `stdout.log` and `stderr.log` files without modifying them. `both` mode groups stdout then stderr because separate canonical streams have no reliable cross-stream chronology.
+- Reads are bounded to at most 500 tail lines and 120 KB per selected stream. Missing/not-yet-created logs, empty output, cancelled jobs, failures, detached/unknown jobs, and pruned/unknown job ids are reported explicitly.
+- Terminal control sequences are stripped, tabs are expanded, and remaining unsafe controls (including bare carriage returns from progress output) are replaced in the rendered copy; canonical log bytes remain unchanged.
+- Controls: ↑/↓ or j/k scroll, PgUp/PgDn page, Home/End or g/G jump, s/Tab cycles streams, r refreshes, f toggles optional 500 ms live follow for a running job, and Esc/Ctrl+C/q closes.
+- Live follow reads only while the viewer is open and stops automatically when the job becomes terminal. Viewer disposal always clears its timer and never cancels or otherwise changes the durable job.
+- Viewing does not acknowledge, suppress, deliver, or otherwise change normal `notifyOnExit` completion handling. A job that completes while the viewer is open may still produce its existing completion batch; the viewer itself never injects output or starts an assistant turn.
+- Non-TUI hosts, including RPC, JSON, and print modes, fail closed with an interactive-TUI warning instead of silently no-oping or dumping output to stdout/model context.
+
 ## TUI rendering
 
 - Call row: `⏺ Call(<n shell commands>: <preview>)…` — always `Call(...)`, including single-command calls.
@@ -160,10 +174,10 @@ Defaults (constants, not configurable):
 - `shell_read` tail mode cap: max **500 lines / 120 KB** per selected stream. Range mode uses explicit `offset`/`limit` and has no fixed line cap.
 - Maximum commands per call: **12**.
 
-If you need to inspect storage health, run `/async:status`.
+If you need to inspect storage health, run `/async:status`. To inspect output yourself without adding it to model context, run `/async:view`.
 
 ## Notes
 
 - There is intentionally no model-facing `shell_wait` or polling tool. Continue useful work while jobs run; if there is no useful work, stop after reporting that jobs are running. Completion notices will resume the agent.
 - Do not paste raw stdout/stderr unless the user explicitly asks. Use `shell_read` tail mode for recent inspection after a completion notice, `shell_read` range mode for exact line ranges/continuation, and `search_many`/`read_many` on `stdout_log` or `stderr_log` for targeted file inspection.
-- Tests cover spawn, durable logs, pre-start interruption, interruption during the grace period without job termination, batched completions, `notifyOnExit:false`, cancel suppression, `shell_read` tail/range reads, compact rendering, and error fallback (`tests/async-shell.test.ts`, `tests/native-tools.test.ts`).
+- Tests cover spawn, durable logs, pre-start interruption, interruption during the grace period without job termination, batched completions, `notifyOnExit:false`, cancel suppression, `shell_read` tail/range reads, compact rendering, error fallback, viewer parsing/bounds/history/sanitization/headless behavior, and live-follow cleanup (`tests/async-shell.test.ts`, `tests/native-tools.test.ts`).

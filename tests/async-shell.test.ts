@@ -3,8 +3,18 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import asyncShellExtension, { buildAsyncShellStatusText } from "../extensions/async-shell/index.js";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { visibleWidth, type TUI } from "@earendil-works/pi-tui";
+import asyncShellExtension, {
+  buildAsyncShellStatusText,
+  buildAsyncShellViewerFrame,
+  buildAsyncShellViewerUsage,
+  createAsyncShellViewerComponent,
+  loadAsyncShellViewerSnapshot,
+  parseAsyncShellViewerArgs,
+  sanitizeAsyncShellViewerText,
+  type AsyncShellViewerSnapshot
+} from "../extensions/async-shell/index.js";
 
 type SentMessage = {
   message: unknown;
@@ -80,6 +90,42 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const plainTheme = {
+  fg(_color: string, text: string): string {
+    return text;
+  },
+  bold(text: string): string {
+    return text;
+  }
+} as unknown as Theme;
+
+function viewerSnapshot(overrides: Partial<AsyncShellViewerSnapshot> = {}): AsyncShellViewerSnapshot {
+  const jobId = "job_20260803170000_viewtest";
+  const logDir = "/tmp/viewer/.pi/async-shell/jobs/job_20260803170000_viewtest";
+  return {
+    job: {
+      jobId,
+      job_name: "viewer-test",
+      command: "printf output",
+      cwd: "/tmp/viewer",
+      shell: "/bin/zsh",
+      status: "running",
+      startedAt: "2026-08-03T21:00:00.000Z",
+      notifyOnExit: true,
+      completionNotified: false,
+      logDir,
+      stdoutLog: path.join(logDir, "stdout.log"),
+      stderrLog: path.join(logDir, "stderr.log"),
+      outputBytes: { stdout: 12, stderr: 0 }
+    },
+    projectRoot: "/tmp/viewer/.pi/async-shell",
+    streams: [],
+    outputLines: ["--- stdout ---", "one", "two"],
+    refreshedAt: "2026-08-03T21:00:01.000Z",
+    ...overrides
+  };
+}
+
 async function writeJobMeta(contextDir: string, jobId: string, meta: Record<string, unknown>): Promise<void> {
   const logDir = path.join(contextDir, ".pi", "async-shell", "jobs", jobId);
   await mkdir(logDir, { recursive: true });
@@ -132,6 +178,221 @@ test("async-shell-status reports job root and recent jobs", async () => {
   });
 });
 
+test("async-shell viewer registers a user-only command and rejects headless mode", async () => {
+  await withTempDir(async (dir) => {
+    const api = createFakeApi();
+    asyncShellExtension(api);
+
+    const command = required(api.commands.get("async:view"), "async:view command");
+    assert.match(command.description, /read-only TUI/);
+    const notifications: Array<{ message: string; type?: string }> = [];
+    let customCalls = 0;
+    const context = {
+      ...createContext(dir),
+      mode: "print",
+      hasUI: false,
+      ui: {
+        notify(message: string, type?: string): void {
+          notifications.push({ message, type });
+        },
+        async custom(): Promise<void> {
+          customCalls += 1;
+        }
+      }
+    } as unknown as ExtensionCommandContext;
+
+    await command.handler("", context);
+
+    assert.equal(customCalls, 0);
+    assert.deepEqual(notifications, [{ message: "/async:view requires interactive Pi TUI mode.", type: "warning" }]);
+
+    await command.handler("", { ...context, mode: "rpc", hasUI: true } as unknown as ExtensionCommandContext);
+    assert.equal(customCalls, 0);
+    assert.deepEqual(notifications[1], { message: "/async:view requires interactive Pi TUI mode.", type: "warning" });
+    assert.equal(api.sentMessages.length, 0, "viewer never injects a message or triggers an assistant turn");
+  });
+});
+
+test("async-shell viewer opens an explicit historical job without mutating its log", async () => {
+  await withTempDir(async (dir) => {
+    const api = createFakeApi();
+    asyncShellExtension(api);
+    const jobId = "job_20260803165900_explicit";
+    await writeJobMeta(dir, jobId, { status: "exited", exitCode: 0 });
+    const stdoutLog = path.join(dir, ".pi", "async-shell", "jobs", jobId, "stdout.log");
+    await writeFile(stdoutLog, "viewer output\n", "utf8");
+    let rendered = "";
+    let customCalls = 0;
+    const tui = {
+      terminal: { rows: 20 },
+      requestRender(): void {}
+    } as unknown as TUI;
+    const context = {
+      ...createContext(dir),
+      mode: "tui",
+      hasUI: true,
+      ui: {
+        theme: plainTheme,
+        notify(): void {},
+        async custom<T>(factory: Function): Promise<T> {
+          customCalls += 1;
+          return await new Promise<T>((resolve) => {
+            const component = factory(tui, plainTheme, {}, resolve) as { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void };
+            rendered = component.render(80).join("\n");
+            component.handleInput?.("q");
+            component.dispose?.();
+          });
+        }
+      }
+    } as unknown as ExtensionCommandContext;
+
+    await required(api.commands.get("async:view"), "async:view command").handler(`${jobId} --stream stdout`, context);
+
+    assert.equal(customCalls, 1);
+    assert.match(rendered, /viewer output/);
+    assert.equal(await readFile(stdoutLog, "utf8"), "viewer output\n");
+    assert.equal(api.sentMessages.length, 0);
+  });
+});
+
+test("async-shell viewer arguments are explicit and bounded", () => {
+  assert.deepEqual(parseAsyncShellViewerArgs(""), {
+    help: false,
+    stream: "both",
+    tailLines: 500,
+    follow: false
+  });
+  assert.deepEqual(parseAsyncShellViewerArgs("job_123 --stream stderr --tail 42 --follow"), {
+    help: false,
+    jobId: "job_123",
+    stream: "stderr",
+    tailLines: 42,
+    follow: true
+  });
+  assert.equal(parseAsyncShellViewerArgs("--help").help, true);
+  assert.match(buildAsyncShellViewerUsage(), /Esc\/q closes without stopping the job/);
+  assert.throws(() => parseAsyncShellViewerArgs("--stream merged"), /both, stdout, stderr/);
+  assert.throws(() => parseAsyncShellViewerArgs("--tail 501"), /integer from 1 to 500/);
+  assert.throws(() => parseAsyncShellViewerArgs("one two"), /at most one job id/);
+  assert.throws(() => parseAsyncShellViewerArgs("--unknown"), /Unknown option/);
+});
+
+test("async-shell viewer reads bounded canonical historical logs and sanitizes terminal controls", async () => {
+  await withTempDir(async (dir) => {
+    const jobId = "job_20260803170100_history";
+    await writeJobMeta(dir, jobId, {
+      status: "cancelled",
+      signal: "SIGTERM",
+      cwd: path.join(dir, "child-project")
+    });
+    const logDir = path.join(dir, ".pi", "async-shell", "jobs", jobId);
+    await writeFile(path.join(logDir, "stdout.log"), "first\nsecond\nthird\n", "utf8");
+    await writeFile(path.join(logDir, "stderr.log"), "\u001b]0;owned\u0007warn\u001b[31m red\u001b[0m\u0000\n", "utf8");
+
+    const snapshot = loadAsyncShellViewerSnapshot(createContext(dir), jobId, "both", 2);
+
+    assert.equal(snapshot.job.status, "cancelled");
+    assert.equal(snapshot.job.cwd, path.join(dir, "child-project"));
+    assert.equal(snapshot.projectRoot, path.join(dir, ".pi", "async-shell"));
+    assert.deepEqual(snapshot.streams.map((stream) => [stream.stream, stream.exists]), [["stdout", true], ["stderr", true]]);
+    assert.equal(snapshot.streams[0].content, "second\nthird");
+    assert.equal(snapshot.streams[1].content, "warn red�");
+    assert.doesNotMatch(snapshot.outputLines.join("\n"), /\u001b|owned/);
+    assert.equal(sanitizeAsyncShellViewerText("a\tb\rrewind\u0000"), "a    b�rewind�");
+
+    const detachedId = "job_20260803170200_detached";
+    await writeJobMeta(dir, detachedId, { status: "running", pid: 2_147_483_647 });
+    const detached = loadAsyncShellViewerSnapshot(createContext(dir), detachedId, "stdout", 20);
+    assert.equal(detached.job.status, "unknown");
+    assert.match(detached.job.error ?? "", /previous Pi process/);
+    assert.match(detached.outputLines.join("\n"), /log file has not been created/);
+    assert.match(buildAsyncShellViewerFrame(plainTheme, {
+      snapshot: detached,
+      stream: "stdout",
+      tailLines: 20,
+      following: false,
+      topLine: 0,
+      pinnedToEnd: true
+    }, 100, 20).lines.join("\n"), /job note: Job was running in a previous Pi process/);
+    assert.throws(() => loadAsyncShellViewerSnapshot(createContext(dir), "job_missing", "both", 20), /Unknown async shell job/);
+  });
+});
+
+test("async-shell viewer frame is viewport-bounded and keeps streams separate", () => {
+  const snapshot = viewerSnapshot({
+    job: { ...viewerSnapshot().job, status: "failed", exitCode: 7, durationMs: 2000 },
+    outputLines: ["--- stdout ---", ...Array.from({ length: 20 }, (_, index) => `line-${index + 1}`), "", "--- stderr ---", "failure"]
+  });
+  const frame = buildAsyncShellViewerFrame(plainTheme, {
+    snapshot,
+    stream: "both",
+    tailLines: 500,
+    following: false,
+    topLine: 0,
+    pinnedToEnd: true
+  }, 72, 16);
+  const rendered = frame.lines.join("\n");
+
+  assert.equal(frame.lines.length, 16);
+  assert.equal(frame.topLine, snapshot.outputLines.length - frame.pageSize);
+  assert.match(rendered, /failed · 2\.0s · exit 7/);
+  assert.match(rendered, /stdout\/stderr are grouped/);
+  assert.ok(frame.lines.every((line) => visibleWidth(line) <= 72));
+});
+
+test("async-shell viewer follow refreshes and dispose stops refresh without touching jobs", async () => {
+  let loadCount = 0;
+  let renderCount = 0;
+  let doneCount = 0;
+  let resolveFirstRefresh: (() => void) | undefined;
+  const firstRefresh = new Promise<void>((resolve) => {
+    resolveFirstRefresh = resolve;
+  });
+  const tui = {
+    terminal: { rows: 20 },
+    requestRender(): void {
+      renderCount += 1;
+    }
+  } as unknown as TUI;
+  const component = createAsyncShellViewerComponent({
+    tui,
+    getTheme: () => plainTheme,
+    initialSnapshot: viewerSnapshot(),
+    initialStream: "both",
+    tailLines: 500,
+    follow: false,
+    loadSnapshot: () => {
+      loadCount += 1;
+      resolveFirstRefresh?.();
+      return viewerSnapshot({ outputLines: ["--- stdout ---", `refresh-${loadCount}`] });
+    },
+    done: () => {
+      doneCount += 1;
+    },
+    followIntervalMs: 5
+  });
+
+  component.render(80);
+  component.handleInput?.("f");
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("viewer follow did not refresh within 500 ms")), 500);
+    void firstRefresh.then(() => {
+      clearTimeout(timeout);
+      resolve();
+    }, reject);
+  });
+  assert.ok(loadCount >= 1);
+  assert.ok(renderCount >= 1);
+  component.dispose();
+  const countAfterDispose = loadCount;
+  await delay(20);
+  assert.equal(loadCount, countAfterDispose, "dispose clears the follow timer");
+  assert.equal(doneCount, 0);
+
+  component.handleInput?.("q");
+  assert.equal(doneCount, 1, "closing the viewer only resolves its UI");
+});
+
 test("shell_status lists recent jobs when jobId is omitted", async () => {
   await withTempDir(async (dir) => {
     const api = createFakeApi();
@@ -165,6 +426,49 @@ test("shell_status lists recent jobs when jobId is omitted", async () => {
     assert.equal(details.jobs[0].command, "printf listed");
     assert.equal(details.jobs[0].status, "exited");
     assert.match(JSON.stringify(result.content), /printf listed/);
+  });
+});
+
+test("async-shell active jobs remain scoped to their project registry", async () => {
+  await withTempDir(async (dir) => {
+    const projectA = path.join(dir, "project-a");
+    const projectB = path.join(dir, "project-b");
+    await mkdir(projectA, { recursive: true });
+    await mkdir(projectB, { recursive: true });
+    const api = createFakeApi();
+    asyncShellExtension(api);
+    const shellStart = required(api.registeredTools.find((tool) => tool.name === "shell_start"), "shell_start tool");
+    const shellStatus = required(api.registeredTools.find((tool) => tool.name === "shell_status"), "shell_status tool");
+    assert.ok(shellStart.execute);
+    assert.ok(shellStatus.execute);
+
+    const started = await shellStart.execute(
+      "tool-call-id",
+      { commands: [{ command: "printf scoped", cwd: projectA, notifyOnExit: false }] } as never,
+      new AbortController().signal,
+      undefined,
+      createContext(projectA)
+    );
+    const jobId = (started.details as { jobs: Array<{ jobId: string }> }).jobs[0].jobId;
+    const foreignList = await shellStatus.execute(
+      "tool-call-id",
+      { limit: 20 } as never,
+      new AbortController().signal,
+      undefined,
+      createContext(projectB)
+    );
+
+    assert.deepEqual((foreignList.details as { jobs: unknown[] }).jobs, []);
+    await assert.rejects(
+      shellStatus.execute(
+        "tool-call-id",
+        { jobId } as never,
+        new AbortController().signal,
+        undefined,
+        createContext(projectB)
+      ),
+      /Unknown async shell job/
+    );
   });
 });
 

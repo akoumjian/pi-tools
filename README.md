@@ -68,7 +68,7 @@ Commands:
 
 - `/scrollback:status`, `/tmux-scrollback:status`
 - `/safety:setup`, `/safety:status`, `/safety:model`, `/safety:toggle`
-- `/async:status`
+- `/async:status`, `/async:view [job-id] [--stream both|stdout|stderr] [--tail 1..500] [--follow]`
 - `/native:status`
 - `/retry`
 - `/compacter [--model provider/model] [instructions]`, `/compacter status|on|off|toggle`
@@ -125,7 +125,7 @@ Each extension below documents what it does, what it provides, and how to set it
 
 **Purpose.** Durable async shell jobs instead of blocking the agent. Each `shell_start` call accepts a list of commands; finished jobs return in-band within a fixed 6 s grace period, and background jobs deliver batched completion notices that resume the agent exactly once per batch.
 
-**Provides.** `shell_start`, `shell_status`, `shell_read`, `shell_cancel`; `/async:status`; durable per-job logs and metadata under `.pi/async-shell/jobs/<jobId>/`. `shell_start` and completion notices point at `stdout_log`/`stderr_log` without embedding output samples; use `shell_read` tail mode for recent output, `shell_read` range mode for exact log lines, and `search_many`/`read_many` on log paths for targeted file inspection.
+**Provides.** `shell_start`, `shell_status`, `shell_read`, `shell_cancel`; `/async:status`; and the interactive read-only `/async:view` selector/viewer for live or historical job output. Durable per-job logs and metadata remain under `.pi/async-shell/jobs/<jobId>/`. `shell_start` and completion notices point at `stdout_log`/`stderr_log` without embedding output samples; use `shell_read` tail mode for model inspection, or `/async:view` for provider-free human viewing. The viewer bounds reads to the existing 500-line/120 KB tail limits per stream, strips terminal control sequences for safe rendering, and closes without stopping jobs.
 
 **Setup.** None. No polling/wait tool: continue useful work; completion notices will resume the agent.
 
