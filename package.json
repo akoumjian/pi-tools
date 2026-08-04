@@ -26,6 +26,7 @@
       "extensions/tmux-scrollback/index.ts",
       "extensions/tool-safety/index.ts",
       "extensions/async-shell/index.ts",
+      "extensions/completion-notifications/index.ts",
       "extensions/native-tools/index.ts",
       "extensions/manual-retry/index.ts",
       "extensions/context-export/index.ts",

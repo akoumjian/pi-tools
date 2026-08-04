@@ -3,6 +3,7 @@
 Reusable extensions for the [Pi coding agent](https://pi.dev/). The package focuses on compact agent-oriented tooling:
 
 - async shell jobs with batched completion notices
+- opt-in privacy-safe settled-run terminal notifications
 - batch-native text/image file and search tools that replace stock single-file/shell tools
 - safety review hooks (rule + model + human) and a mutation-review reviewer
 - web research (SearXNG, web fetch with readability + document parse handoff)
@@ -70,6 +71,7 @@ Commands:
 - `/scrollback:status`, `/tmux-scrollback:status`
 - `/safety:setup`, `/safety:status`, `/safety:model`, `/safety:toggle`
 - `/async:status`, `/async:view [job-id] [--stream both|stdout|stderr] [--tail 1..500] [--follow]`
+- `/notify [on|off|status|test]`
 - `/native:status`
 - `/retry`
 - `/context:copy [--raw]`
@@ -83,7 +85,7 @@ Commands:
 - `/docparser:doctor`
 - `/orchestrator:setup`, `/orchestrator:status`
 
-The load order in `package.json#pi.extensions` is intentional: terminal patches first, safety before async shell, native batch tools before manual-retry, manual-retry before context-export and compacter so both copied and summarized context use the same retry filtering, and optional display overrides last.
+The load order in `package.json#pi.extensions` is intentional: terminal patches first, safety before async shell, completion-notifications after async shell so it can read completion barriers, native batch tools before manual-retry, manual-retry before context-export and compacter so both copied and summarized context use the same retry filtering, and optional display overrides last.
 
 ## Extensions
 
@@ -130,6 +132,18 @@ Each extension below documents what it does, what it provides, and how to set it
 **Provides.** `shell_start`, `shell_status`, `shell_read`, `shell_cancel`; `/async:status`; and the interactive read-only `/async:view` selector/viewer for live or historical job output. Durable per-job logs and metadata remain under `.pi/async-shell/jobs/<jobId>/`. `shell_start` and completion notices point at `stdout_log`/`stderr_log` without embedding output samples; use `shell_read` tail mode for model inspection, or `/async:view` for provider-free human viewing. The viewer bounds reads to the existing 500-line/120 KB tail limits per stream, strips terminal control sequences for safe rendering, and closes without stopping jobs.
 
 **Setup.** None. No polling/wait tool: continue useful work; completion notices will resume the agent.
+
+---
+
+### completion-notifications
+
+[Full docs](docs/extensions/completion-notifications.md).
+
+**Purpose.** Emit one generic terminal notification after an opted-in interactive run has settled successfully and at least 30 seconds elapsed. The extension makes no provider call, adds no session message, and includes no prompt, path, repository, session, model, or assistant content.
+
+**Provides.** `/notify [on|off|status|test]`. Automatic notifications use `agent_settled`, require a final normal assistant stop, suppress headless/RPC/extension/error/abort/queued paths, and coordinate with related async-shell `notifyOnExit:true` jobs so one toast follows their completion delivery. Detached `notifyOnExit:false` jobs never block or get terminated.
+
+**Setup.** Default off. Run `/notify on` in TUI mode to persist a per-machine opt-in; `/notify off` opts out and `/notify test` checks the detected transport. Tested iTerm2/Ghostty/WezTerm/rxvt, Kitty, and Windows Terminal paths use one native protocol; tmux, Zellij, Warp, non-TTY, and unknown hosts no-op conservatively without BEL or external fallback.
 
 ---
 

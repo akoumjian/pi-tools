@@ -32,6 +32,9 @@ type FakeApi = ExtensionAPI & {
 function createContext(cwd: string, isIdle: boolean | (() => boolean) = true): ExtensionContext {
   return {
     cwd,
+    sessionManager: {
+      getSessionId: () => `test-session:${cwd}`
+    },
     isIdle: typeof isIdle === "function" ? isIdle : () => isIdle,
     hasPendingMessages: () => false
   } as ExtensionContext;

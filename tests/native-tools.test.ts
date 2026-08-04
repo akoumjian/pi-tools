@@ -44,6 +44,9 @@ const renderTheme = {
 function createContext(cwd: string, imageSupport?: boolean): ExtensionContext {
   return {
     cwd,
+    sessionManager: {
+      getSessionId: () => `test-session:${cwd}`
+    },
     model: imageSupport === undefined ? undefined : {
       id: imageSupport ? "fixture-vision" : "fixture-text",
       provider: "fixture",

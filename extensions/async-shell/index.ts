@@ -12,7 +12,7 @@ import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 
-type JobStatus = "running" | "exited" | "failed" | "cancelled" | "unknown";
+export type JobStatus = "running" | "exited" | "failed" | "cancelled" | "unknown";
 type OutputStreamName = "stdout" | "stderr";
 type ShellReadMode = "tail" | "range";
 
@@ -83,6 +83,11 @@ type JobRuntime = JobMeta & {
   startResultPending: boolean;
   cancelRequested: boolean;
   completionContext: CompletionDeliveryContext;
+  originProjectCwd: string;
+  originSessionId: string;
+  // Stays true after sendMessage succeeds. Completion-notifications matches the
+  // resulting custom message by jobId; its run-start filter excludes old jobs.
+  completionFollowUpQueued: boolean;
 };
 
 type JobSummaryDetails = {
@@ -158,6 +163,10 @@ export type AsyncShellViewerFrame = {
   lines: string[];
   topLine: number;
   pageSize: number;
+};
+
+export type AsyncShellCompletionBarrier = {
+  jobIds: string[];
 };
 
 type StartUpdate = (partial: AgentToolResult<StartDetails>) => void;
@@ -239,6 +248,31 @@ const scheduledCompletionNotifications = new WeakSet<CompletionNotificationTarge
 const pendingCompletionNotifications = new Map<string, JobRuntime>();
 let completionBatchFlushTimer: NodeJS.Timeout | undefined;
 let latestCompletionContext: CompletionDeliveryContext | undefined;
+
+export function getAsyncShellCompletionBarrier(
+  context: Pick<ExtensionContext, "cwd" | "sessionManager">,
+  startedAtMs: number
+): AsyncShellCompletionBarrier {
+  const sessionId = context.sessionManager.getSessionId();
+  const jobIds = Array.from(jobs.values())
+    .filter((job) =>
+      job.originProjectCwd === context.cwd &&
+      job.originSessionId === sessionId &&
+      Date.parse(job.startedAt) >= startedAtMs &&
+      isAsyncShellCompletionBarrierTarget(job)
+    )
+    .map((job) => job.jobId);
+  return { jobIds };
+}
+
+export function isAsyncShellCompletionBarrierTarget(target: {
+  status: JobStatus;
+  notifyOnExit: boolean;
+  completionNotified: boolean;
+  completionFollowUpQueued: boolean;
+}): boolean {
+  return target.notifyOnExit && (!target.completionNotified || target.completionFollowUpQueued);
+}
 
 export default function asyncShellExtension(api: ExtensionAPI): void {
   registerCommandWithAliases(
@@ -482,6 +516,9 @@ function startJob(
     startResultPending: true,
     cancelRequested: false,
     completionContext: createCompletionDeliveryContext(context),
+    originProjectCwd: context.cwd,
+    originSessionId: context.sessionManager.getSessionId(),
+    completionFollowUpQueued: false,
     pid: child.pid
   };
 
@@ -598,6 +635,7 @@ function scheduleCompletionFollowUp(target: CompletionNotificationTarget, option
 }
 
 function queueCompletionNotification(api: ExtensionAPI, job: JobRuntime): void {
+  job.completionFollowUpQueued = true;
   pendingCompletionNotifications.set(job.jobId, job);
   scheduleCompletionBatchFlush(api, job.completionContext);
 }
@@ -1131,6 +1169,7 @@ function normalizeCommandSpecs(input: StartInput): CommandSpec[] {
 function finishStartGracePeriod(jobsList: JobRuntime[]): void {
   for (const job of jobsList.filter((candidate) => isTerminal(candidate.status))) {
     job.completionNotified = true;
+    job.completionFollowUpQueued = false;
     pendingCompletionNotifications.delete(job.jobId);
     writeMeta(job);
   }
@@ -1147,6 +1186,7 @@ function acknowledgeObservedJobCompletion(job: JobMeta): void {
   }
 
   runtime.completionNotified = true;
+  runtime.completionFollowUpQueued = false;
   pendingCompletionNotifications.delete(runtime.jobId);
   writeMeta(runtime);
 }

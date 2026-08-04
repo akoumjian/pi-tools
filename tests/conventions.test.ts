@@ -57,6 +57,7 @@ test("pi-tools registered extensions have shipping default config files where re
   const requiredConfigs = [
     "config/tool-safety-policy.md",
     "config/tool-safety-settings.json",
+    "config/completion-notifications-settings.json",
     "config/mutation-review-settings.json",
     "config/mutation-review-guidance.md",
     "config/review-subagent-settings.json",
@@ -65,6 +66,7 @@ test("pi-tools registered extensions have shipping default config files where re
     "config/file-open-settings.json",
     "docs/README.md",
     "docs/extensions/async-shell.md",
+    "docs/extensions/completion-notifications.md",
     "docs/extensions/context-export.md",
     "docs/extensions/file-open.md",
     "docs/extensions/manual-retry.md",
@@ -84,12 +86,17 @@ test("pi-tools registered extensions have shipping default config files where re
   }
 });
 
-test("manual retry loads before context export and compacter so derived context is filtered first", () => {
+test("extension load order preserves async-shell and context dependencies", () => {
   const extensions = packageJson().pi?.extensions ?? [];
+  const asyncShellIndex = extensions.indexOf("extensions/async-shell/index.ts");
+  const completionNotificationsIndex = extensions.indexOf("extensions/completion-notifications/index.ts");
   const retryIndex = extensions.indexOf("extensions/manual-retry/index.ts");
   const contextExportIndex = extensions.indexOf("extensions/context-export/index.ts");
   const compacterIndex = extensions.indexOf("extensions/compacter/index.ts");
 
+  assert.ok(asyncShellIndex >= 0, "async-shell must be registered");
+  assert.ok(completionNotificationsIndex >= 0, "completion-notifications must be registered");
+  assert.ok(asyncShellIndex < completionNotificationsIndex, "async-shell must load before completion-notifications");
   assert.ok(retryIndex >= 0, "manual-retry must be registered");
   assert.ok(contextExportIndex >= 0, "context-export must be registered");
   assert.ok(compacterIndex >= 0, "compacter must be registered");

@@ -98,7 +98,8 @@ Cancel implicitly suppresses the completion notice for that job (`notifyOnExit` 
    `shell_start` deliberately does not return stdout/stderr samples. Use `shell_read` with `mode: "tail"` for recent output, `shell_read` with `mode: "range"` for exact log lines, or `search_many`/`read_many` on log paths for targeted file inspection.
 4. For each background job that finishes later (with `notifyOnExit !== false`), the extension queues a completion notice. A ~100 ms debounce coalesces near-simultaneous completions into one batch.
 5. When the agent is idle, the batch is delivered as a custom message of type `async-shell` with `triggerTurn: true, deliverAs: "steer"`, so Pi resumes exactly once for the whole batch. When the agent is active, the flush is deferred to the next `turn_end`/`message_end (user)`/`agent_end` safe point.
-6. `shell_status` and `shell_read` acknowledge an observed completion: if you inspect a job after it finished, no further notice is sent for that job.
+6. `shell_read` acknowledges an observed completion: if you read a job after it finished, no further notice is sent for that job. `shell_status` remains metadata-only and does not acknowledge delivery.
+7. The optional default-off `completion-notifications` extension reads only in-memory origin and delivery state for jobs from the same session. Related `notifyOnExit:true` jobs defer one generic terminal toast until their completion follow-up settles; in-band, observed, and `notifyOnExit:false` jobs do not block. This coordination never changes job metadata, logs, cancellation, or delivery behavior.
 
 ## Completion notice shape
 
