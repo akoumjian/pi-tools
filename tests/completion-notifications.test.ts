@@ -392,9 +392,11 @@ test("async-shell barrier includes only notify-on-exit work that still owes a fo
 test("transport detection is conservative and chooses exactly one tested path", () => {
   assert.deepEqual(detectCompletionNotificationTransport({ TERM_PROGRAM: "iTerm.app" }, "darwin", true), {
     supported: true,
-    kind: "osc777",
-    label: "iTerm.app OSC 777"
+    kind: "osc9",
+    label: "iTerm.app OSC 9"
   });
+  assert.equal(detectCompletionNotificationTransport({ TERM_PROGRAM: "WezTerm" }, "linux", true).kind, "osc777");
+  assert.equal(detectCompletionNotificationTransport({ TERM_PROGRAM: "ghostty" }, "darwin", true).kind, "osc777");
   assert.equal(detectCompletionNotificationTransport({ KITTY_WINDOW_ID: "1" }, "linux", true).kind, "osc99");
   assert.equal(detectCompletionNotificationTransport({ WT_SESSION: "1", WSL_DISTRO_NAME: "Ubuntu" }, "linux", true).kind, "windows-toast");
   assert.equal(detectCompletionNotificationTransport({ TERM_PROGRAM: "iTerm.app", TMUX: "/tmp/tmux" }, "darwin", true).supported, false);
@@ -405,6 +407,15 @@ test("transport detection is conservative and chooses exactly one tested path", 
 
 test("delivery emits fixed generic OSC payloads and reports transport failures", () => {
   const output: string[] = [];
+  const osc9 = deliverCompletionNotification(
+    { supported: true, kind: "osc9", label: "test iTerm2" },
+    (text) => output.push(text)
+  );
+  assert.equal(osc9.sent, true);
+  assert.equal(output.join(""), `\x1b]9;${COMPLETION_NOTIFICATION_TITLE}: ${COMPLETION_NOTIFICATION_BODY}\x07`);
+  assert.doesNotMatch(output.join(""), /private prompt|repository|session/i);
+
+  output.length = 0;
   const osc777 = deliverCompletionNotification(
     { supported: true, kind: "osc777", label: "test 777" },
     (text) => output.push(text)

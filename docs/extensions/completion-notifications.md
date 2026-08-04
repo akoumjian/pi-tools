@@ -49,13 +49,14 @@ Automatic and test notifications use exactly:
 - title: `Pi`
 - body: `Ready for input`
 
-Prompt text, assistant text, repository/path, session title, model/provider, tool output, job command, and filenames are never included. The command status is shown only through Pi's user UI and is not injected into session/model context.
+The iTerm2 OSC 9 protocol has one message field, so it combines those fixed values as `Pi: Ready for input`. Prompt text, assistant text, repository/path, session title, model/provider, tool output, job command, and filenames are never included. The command status is shown only through Pi's user UI and is not injected into session/model context.
 
 ## Transports
 
 Exactly one transport is selected; there is no BEL fallback and no fan-out to multiple host integrations.
 
-- iTerm2, Ghostty, WezTerm, and rxvt/urxvt: OSC 777.
+- iTerm2 (`TERM_PROGRAM=iTerm.app`): documented proprietary OSC 9.
+- Ghostty, WezTerm, and rxvt/urxvt: OSC 777.
 - Kitty: OSC 99.
 - Windows Terminal on Windows or WSL: native PowerShell toast using fixed generic strings.
 - tmux and Zellij: conservative no-op because passthrough is not assumed.
@@ -63,6 +64,8 @@ Exactly one transport is selected; there is no BEL fallback and no fan-out to mu
 - non-TTY or unknown terminals: conservative no-op.
 
 `/notify status` reports the detected transport and reason for any no-op. `/notify test` explicitly attempts the detected transport even while automatic notifications are disabled; it never starts a provider turn.
+
+For iTerm2, enable **Settings → Profiles → Terminal → Notification Center alerts** and ensure its **Filter Alerts** rules allow proprietary escape-sequence notifications. macOS System Settings must also allow notifications for iTerm2. The protocol choice follows [iTerm2's proprietary escape-code documentation](https://iterm2.com/documentation-escape-codes.html), which specifies `OSC 9 ; message ST`.
 
 ## Settings
 

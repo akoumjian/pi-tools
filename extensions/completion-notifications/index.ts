@@ -36,7 +36,7 @@ export type CompletionNotificationSettings = {
 export type CompletionNotificationTransport =
   | {
     supported: true;
-    kind: "osc777" | "osc99" | "windows-toast";
+    kind: "osc9" | "osc777" | "osc99" | "windows-toast";
     label: string;
   }
   | {
@@ -297,7 +297,10 @@ export function detectCompletionNotificationTransport(
   }
 
   const terminalProgram = environment.TERM_PROGRAM?.toLowerCase();
-  if (terminalProgram === "iterm.app" || terminalProgram === "wezterm" || terminalProgram === "ghostty") {
+  if (terminalProgram === "iterm.app") {
+    return { supported: true, kind: "osc9", label: `${environment.TERM_PROGRAM} OSC 9` };
+  }
+  if (terminalProgram === "wezterm" || terminalProgram === "ghostty") {
     return { supported: true, kind: "osc777", label: `${environment.TERM_PROGRAM} OSC 777` };
   }
   if (/^(?:rxvt|urxvt)/i.test(environment.TERM ?? "")) {
@@ -321,6 +324,10 @@ export function deliverCompletionNotification(
   }
 
   try {
+    if (transport.kind === "osc9") {
+      write(`\x1b]9;${COMPLETION_NOTIFICATION_TITLE}: ${COMPLETION_NOTIFICATION_BODY}\x07`);
+      return { sent: true, transport: transport.label };
+    }
     if (transport.kind === "osc777") {
       write(`\x1b]777;notify;${COMPLETION_NOTIFICATION_TITLE};${COMPLETION_NOTIFICATION_BODY}\x07`);
       return { sent: true, transport: transport.label };

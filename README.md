@@ -143,7 +143,7 @@ Each extension below documents what it does, what it provides, and how to set it
 
 **Provides.** `/notify [on|off|status|test]`. Automatic notifications use `agent_settled`, require a final normal assistant stop, suppress headless/RPC/extension/error/abort/queued paths, and coordinate with related async-shell `notifyOnExit:true` jobs so one toast follows their completion delivery. Detached `notifyOnExit:false` jobs never block or get terminated.
 
-**Setup.** Default off. Run `/notify on` in TUI mode to persist a per-machine opt-in; `/notify off` opts out and `/notify test` checks the detected transport. Tested iTerm2/Ghostty/WezTerm/rxvt, Kitty, and Windows Terminal paths use one native protocol; tmux, Zellij, Warp, non-TTY, and unknown hosts no-op conservatively without BEL or external fallback.
+**Setup.** Default off. Run `/notify on` in TUI mode to persist a per-machine opt-in; `/notify off` opts out and `/notify test` checks the detected transport. iTerm2 uses its documented OSC 9 path and requires Settings → Profiles → Terminal → Notification Center alerts; Ghostty/WezTerm/rxvt use OSC 777, Kitty uses OSC 99, and Windows Terminal uses a native toast. tmux, Zellij, Warp, non-TTY, and unknown hosts no-op conservatively without BEL or external fallback.
 
 ---
 
