@@ -316,7 +316,8 @@ const SearxngSearchDetailsSchema = Type.Object({
   query: Type.String(),
   resultCount: Type.Integer({ minimum: 0, maximum: 20 }),
   page: PositiveNumberSchema,
-  baseUrl: Type.String({ minLength: 1 })
+  baseUrl: Type.String({ minLength: 1 }),
+  unresponsiveEngines: Type.Optional(Type.Array(Type.String()))
 }, { additionalProperties: false });
 
 const DocumentParseHintSchema = Type.Object({
