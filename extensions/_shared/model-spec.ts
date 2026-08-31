@@ -4,7 +4,7 @@ import { clampThinkingLevel as clampModelThinkingLevel, type Api, type Model } f
 export type ExtensionModelRegistry = {
   hasConfiguredAuth(model: Model<Api>): boolean;
   getAll(): Model<Api>[];
-  refresh?(): void | Promise<void>;
+  refresh?(): unknown | Promise<unknown>;
 };
 
 export type ResolvedExtensionModel = {

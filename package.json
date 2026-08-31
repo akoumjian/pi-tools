@@ -44,20 +44,20 @@
   "dependencies": {
     "@mozilla/readability": "^0.6.0",
     "jsdom": "^27.0.1",
-    "pi-docparser": "github:akoumjian/pi-docparser#pi-0.81-peer-range",
+    "pi-docparser": "github:akoumjian/pi-docparser#pi-0.84-peer-range",
     "turndown": "^7.2.4"
   },
   "peerDependencies": {
-    "@earendil-works/pi-agent-core": "^0.81.1",
-    "@earendil-works/pi-ai": "^0.81.1",
-    "@earendil-works/pi-coding-agent": "^0.81.1",
-    "@earendil-works/pi-tui": "^0.81.1"
+    "@earendil-works/pi-agent-core": "^0.81.1 || ^0.84.4",
+    "@earendil-works/pi-ai": "^0.81.1 || ^0.84.4",
+    "@earendil-works/pi-coding-agent": "^0.81.1 || ^0.84.4",
+    "@earendil-works/pi-tui": "^0.81.1 || ^0.84.4"
   },
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "0.81.1",
-    "@earendil-works/pi-ai": "0.81.1",
-    "@earendil-works/pi-coding-agent": "0.81.1",
-    "@earendil-works/pi-tui": "0.81.1",
+    "@earendil-works/pi-agent-core": "0.84.4",
+    "@earendil-works/pi-ai": "0.84.4",
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@earendil-works/pi-tui": "0.84.4",
     "@types/jsdom": "^28.0.1",
     "@types/node": "^24.0.0",
     "@types/turndown": "^5.0.6",

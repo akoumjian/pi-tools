@@ -71,7 +71,7 @@ export async function withChildAgentSession<T>(
   if (await services.modelRuntime.getAuth(options.model) === undefined) {
     const parentAuth = await context.modelRegistry.getApiKeyAndHeaders(options.model);
     if (parentAuth.ok && parentAuth.apiKey) {
-      await services.modelRuntime.setRuntimeApiKey(options.model.provider, parentAuth.apiKey, { allowNetwork: false });
+      await services.modelRuntime.setRuntimeApiKey(options.model.provider, parentAuth.apiKey);
     }
   }
 

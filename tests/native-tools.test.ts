@@ -121,7 +121,7 @@ function renderToolResult(tool: ToolDefinition, result: unknown, expanded = fals
 
 function renderCustomMessage(api: FakeApi, customType: string, message: unknown): string {
   const renderer = required(api.messageRenderers.get(customType), `${customType} message renderer`);
-  return renderer(message as never, { expanded: false }, renderTheme as never)?.render(200).join("\n") ?? "";
+  return renderer(message as never, { expanded: false, outputPad: 0 }, renderTheme as never)?.render(200).join("\n") ?? "";
 }
 
 function schemaFor(tool: ToolDefinition): SchemaNode {

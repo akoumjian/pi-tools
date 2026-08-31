@@ -1,5 +1,5 @@
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { type Api, type AssistantMessage, type Model, type Provider, type SimpleStreamOptions } from "@earendil-works/pi-ai";
+import { type Api, type AssistantMessage, type Model, type Provider, type ProviderHeaders, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import {
   convertToLlm,
   estimateTokens,
@@ -163,7 +163,7 @@ type CompletionOptions = {
   model: Model<Api>;
   provider: Provider;
   apiKey?: string;
-  headers?: Record<string, string>;
+  headers?: ProviderHeaders;
   env?: Record<string, string>;
   signal: AbortSignal;
   thinkingLevel: ThinkingLevel;
