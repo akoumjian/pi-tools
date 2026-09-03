@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Context, Message, Model, UserMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Context, Message, Model, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
 import { stream as streamAnthropic } from "@earendil-works/pi-ai/api/anthropic-messages";
 import { stream as streamOpenAICodexResponses } from "@earendil-works/pi-ai/api/openai-codex-responses";
 import { stream as streamPiMessages } from "@earendil-works/pi-ai/api/pi-messages";
@@ -17,10 +17,13 @@ import {
   type SessionBeforeCompactEvent
 } from "@earendil-works/pi-coding-agent";
 import manualRetryExtension, {
+  AUTOMATIC_RETRY_MAX_ATTEMPTS,
   filterManualRetryMessages,
   getManualRetryEligibility,
   MANUAL_RETRY_COMMAND_NAME,
   MANUAL_RETRY_MESSAGE_TYPE,
+  matchesAutomaticRetryError,
+  runAutomaticRetry,
   type ManualRetryMarkerDetails
 } from "../extensions/manual-retry/index.js";
 
@@ -55,16 +58,19 @@ const usage = {
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
 };
 
+const immediateSleep = async (): Promise<void> => undefined;
+
 function assistant(options: {
   stopReason: AssistantMessage["stopReason"];
   errorMessage?: string;
   timestamp?: number;
   provider?: string;
   model?: string;
+  content?: AssistantMessage["content"];
 }): AssistantMessage {
   return {
     role: "assistant",
-    content: [],
+    content: options.content ?? [],
     api: "anthropic-messages",
     provider: options.provider ?? "anthropic",
     model: options.model ?? "claude-sonnet-4-5",
@@ -75,17 +81,29 @@ function assistant(options: {
   };
 }
 
+function toolCallAssistant(toolCallId: string, stopReason: AssistantMessage["stopReason"] = "toolUse", timestamp?: number): AssistantMessage {
+  return assistant({
+    stopReason,
+    timestamp,
+    content: [{ type: "toolCall", id: toolCallId, name: "read", arguments: { path: "file.txt" } }]
+  });
+}
+
+function toolResult(toolCallId: string, text = "tool output", timestamp = Date.now()): ToolResultMessage {
+  return { role: "toolResult", toolCallId, toolName: "read", content: [{ type: "text", text }], isError: false, timestamp };
+}
+
 function user(text = "Original request", timestamp = Date.now() - 1): UserMessage {
   return { role: "user", content: text, timestamp };
 }
 
-function marker(attempt = 1, timestamp = Date.now()): AgentMessage {
+function marker(attempt = 1, timestamp = Date.now(), trigger: "manual" | "automatic" = "manual"): AgentMessage {
   return {
     role: "custom",
     customType: MANUAL_RETRY_MESSAGE_TYPE,
     content: [],
     display: false,
-    details: { version: 1, attempt },
+    details: { version: 2, attempt, trigger },
     timestamp
   };
 }
@@ -113,9 +131,16 @@ function createFakeApi(onSend?: (message: SentMessage["message"]) => void): Fake
   return { api, handlers, commands, sentMessages };
 }
 
+/** Mirrors AgentSession's message_end persistence so emitted markers land in the session. */
+function persistingFakeApi(sessionManager: SessionManager): FakeApi {
+  return createFakeApi((message) => {
+    sessionManager.appendCustomMessageEntry(message.customType, message.content as [], message.display, message.details);
+  });
+}
+
 function commandContext(options: {
   sessionManager: SessionManager;
-  idle?: boolean;
+  idle?: boolean | (() => boolean);
   pending?: boolean;
   model?: Model<any>;
   mode?: "tui" | "rpc" | "json" | "print";
@@ -127,7 +152,7 @@ function commandContext(options: {
     cwd: options.sessionManager.getCwd(),
     sessionManager: options.sessionManager,
     model: options.model ?? fakeModel(),
-    isIdle: () => options.idle ?? true,
+    isIdle: () => (typeof options.idle === "function" ? options.idle() : options.idle ?? true),
     hasPendingMessages: () => options.pending ?? false,
     ui: {
       notify(message: string, type: string): void {
@@ -153,6 +178,15 @@ async function emit(fake: FakeApi, event: string, data: unknown, context: unknow
     result = await handler(data, context);
   }
   return result;
+}
+
+function reason(eligibility: ReturnType<typeof getManualRetryEligibility>): string {
+  assert.equal(eligibility.eligible, false);
+  return eligibility.eligible ? "" : eligibility.reason;
+}
+
+function sentDetails(fake: FakeApi, index = 0): ManualRetryMarkerDetails {
+  return fake.sentMessages[index].message.details as ManualRetryMarkerDetails;
 }
 
 async function captureAnthropicPayload(context: Context): Promise<unknown> {
@@ -234,18 +268,21 @@ async function captureOpenAIPayload(context: Context): Promise<unknown> {
   return payload;
 }
 
-test("manual retry context filtering removes markers and failed attempts without mutating history", () => {
-  const original = [
+test("retry context filtering removes markers, failed attempts, and their orphaned tool results without mutating history", () => {
+  const original: AgentMessage[] = [
     user(),
+    toolCallAssistant("call-ok", "toolUse"),
+    toolResult("call-ok"),
     assistant({ stopReason: "error", errorMessage: "503 service unavailable" }),
     marker(),
-    assistant({ stopReason: "aborted" }),
+    toolCallAssistant("call-aborted", "aborted"),
+    toolResult("call-aborted", "Operation aborted"),
     assistant({ stopReason: "stop" })
   ];
 
   const filtered = filterManualRetryMessages(original);
-  assert.deepEqual(filtered, [original[0], original[4]]);
-  assert.equal(original.length, 5);
+  assert.deepEqual(filtered, [original[0], original[1], original[2], original[7]]);
+  assert.equal(original.length, 8);
 });
 
 test("filtered provider context reaches Anthropic, OpenAI, and pi-messages payloads without retry state", async () => {
@@ -277,20 +314,12 @@ test("filtered provider context reaches Anthropic, OpenAI, and pi-messages paylo
   }
 });
 
-test("/retry persists one empty hidden marker and starts a fresh follow-up turn", async () => {
+test("/retry after any settled error persists one empty hidden marker and starts a fresh follow-up turn", async () => {
   await withSession(async (sessionManager) => {
     sessionManager.appendMessage(user());
-    const failureId = sessionManager.appendMessage(assistant({
-      stopReason: "error",
-      errorMessage: "Provider overloaded with HTTP 503",
-      timestamp: 100
-    }));
+    const failureId = sessionManager.appendMessage(assistant({ stopReason: "error", errorMessage: "Not Found", timestamp: 100 }));
 
-    // The fake mirrors AgentSession's message_end persistence listener; this test
-    // verifies the marker emitted through that runtime-owned persistence path.
-    const fake = createFakeApi((message) => {
-      sessionManager.appendCustomMessageEntry(message.customType, message.content as [], message.display, message.details);
-    });
+    const fake = persistingFakeApi(sessionManager);
     manualRetryExtension(fake.api);
     const { context, notifications } = commandContext({ sessionManager });
     const command = fake.commands.get(MANUAL_RETRY_COMMAND_NAME);
@@ -304,15 +333,94 @@ test("/retry persists one empty hidden marker and starts a fresh follow-up turn"
     assert.equal(sent.message.customType, MANUAL_RETRY_MESSAGE_TYPE);
     assert.deepEqual(sent.message.content, []);
     assert.equal(sent.message.display, false);
-    const details = sent.message.details as ManualRetryMarkerDetails;
-    assert.deepEqual(
-      { version: details.version, attempt: details.attempt, failedAssistantEntryId: details.failedAssistantEntryId, api: details.api, provider: details.provider, model: details.model, failedAt: details.failedAt },
-      { version: 1, attempt: 1, failedAssistantEntryId: failureId, api: "anthropic-messages", provider: "anthropic", model: "claude-sonnet-4-5", failedAt: 100 }
-    );
-    assert.match(details.requestedAt, /^\d{4}-\d{2}-\d{2}T/);
+    const { requestedAt, ...details } = sentDetails(fake);
+    assert.deepEqual(details, {
+      version: 2,
+      attempt: 1,
+      trigger: "manual",
+      kind: "error",
+      errorMessage: "Not Found",
+      failedAssistantEntryId: failureId,
+      failedAt: 100,
+      api: "anthropic-messages",
+      provider: "anthropic",
+      model: "claude-sonnet-4-5"
+    });
+    assert.match(requestedAt, /^\d{4}-\d{2}-\d{2}T/);
     assert.equal(sessionManager.getBranch().at(-1)?.type, "custom_message");
     assert.equal(sessionManager.getBranch().filter((entry) => entry.type === "message" && entry.message.role === "user").length, 1);
-    assert.match(notifications.at(-1)?.message ?? "", /Manual retry attempt 1 requested/);
+    assert.match(notifications.at(-1)?.message ?? "", /Retry attempt 1: resending the current context to anthropic\/claude-sonnet-4-5 after error "Not Found"/);
+  });
+});
+
+test("/retry resends the context after a cancelled attempt and after cancelled tool execution", async () => {
+  await withSession(async (sessionManager) => {
+    sessionManager.appendMessage(user());
+    const abortedId = sessionManager.appendMessage(assistant({ stopReason: "aborted", timestamp: 50 }));
+    const eligibility = getManualRetryEligibility(commandContext({ sessionManager }).context);
+    assert.equal(eligibility.eligible, true);
+    if (!eligibility.eligible) return;
+    assert.equal(eligibility.kind, "aborted");
+    assert.equal(eligibility.failedAssistantEntryId, abortedId);
+
+    const fake = persistingFakeApi(sessionManager);
+    manualRetryExtension(fake.api);
+    const { context, notifications } = commandContext({ sessionManager });
+    await fake.commands.get(MANUAL_RETRY_COMMAND_NAME)!("", context);
+    assert.equal(sentDetails(fake).kind, "aborted");
+    assert.match(notifications.at(-1)?.message ?? "", /after a cancelled attempt/);
+  });
+
+  await withSession(async (sessionManager) => {
+    sessionManager.appendMessage(user());
+    sessionManager.appendMessage(toolCallAssistant("call-1"));
+    sessionManager.appendMessage(toolResult("call-1", "Operation aborted"));
+    const eligibility = getManualRetryEligibility(commandContext({ sessionManager }).context);
+    assert.equal(eligibility.eligible, true);
+    if (!eligibility.eligible) return;
+    assert.equal(eligibility.kind, "continuation");
+    assert.equal(eligibility.failedAssistantEntryId, undefined);
+  });
+});
+
+test("/retry follows an explicit model or thinking switch and records the target model", async () => {
+  await withSession(async (sessionManager) => {
+    sessionManager.appendMessage(user());
+    sessionManager.appendMessage(assistant({ stopReason: "error", errorMessage: "Not Found", provider: "openai-codex", model: "gpt-5.6-sol" }));
+    sessionManager.appendModelChange("anthropic", "claude-sonnet-4-5");
+    sessionManager.appendThinkingLevelChange("high");
+
+    const fake = persistingFakeApi(sessionManager);
+    manualRetryExtension(fake.api);
+    const { context } = commandContext({ sessionManager, model: fakeModel("anthropic", "claude-sonnet-4-5") });
+    await fake.commands.get(MANUAL_RETRY_COMMAND_NAME)!("", context);
+
+    assert.equal(fake.sentMessages.length, 1);
+    const details = sentDetails(fake);
+    assert.equal(details.provider, "anthropic");
+    assert.equal(details.model, "claude-sonnet-4-5");
+    assert.equal(details.errorMessage, "Not Found");
+  });
+});
+
+test("repeated retries stay available and the attempt ordinal keeps counting persisted markers", async () => {
+  await withSession(async (sessionManager) => {
+    sessionManager.appendMessage(user());
+    sessionManager.appendMessage(assistant({ stopReason: "error", errorMessage: "503 service unavailable", timestamp: 10 }));
+    sessionManager.appendCustomMessageEntry(MANUAL_RETRY_MESSAGE_TYPE, [], false, { version: 2, attempt: 1, trigger: "manual" });
+
+    const dangling = getManualRetryEligibility(commandContext({ sessionManager }).context);
+    assert.equal(dangling.eligible, true);
+    if (!dangling.eligible) return;
+    assert.equal(dangling.attempt, 2);
+    assert.equal(dangling.kind, "error");
+
+    const secondFailureId = sessionManager.appendMessage(assistant({ stopReason: "error", errorMessage: "connection lost", timestamp: 20 }));
+    const eligibility = getManualRetryEligibility(commandContext({ sessionManager }).context);
+    assert.equal(eligibility.eligible, true);
+    if (!eligibility.eligible) return;
+    assert.equal(eligibility.attempt, 2);
+    assert.equal(eligibility.failedAssistantEntryId, secondFailureId);
   });
 });
 
@@ -327,7 +435,7 @@ test("/retry rejects print and JSON modes because their hosts cannot await sendM
 
     for (const mode of ["print", "json"] as const) {
       const { context } = commandContext({ sessionManager, mode });
-      assert.match((getManualRetryEligibility(context) as { reason: string }).reason, /only in TUI and RPC/);
+      assert.match(reason(getManualRetryEligibility(context)), /only in TUI and RPC/);
       await assert.rejects(command("", context), /cannot await ExtensionAPI.sendMessage/);
     }
     assert.equal(fake.sentMessages.length, 0);
@@ -342,10 +450,7 @@ test("/retry does not persist or dispatch when queues appear or sendMessage thro
 
     const queued = createFakeApi();
     manualRetryExtension(queued.api);
-    const queuedCommand = queued.commands.get(MANUAL_RETRY_COMMAND_NAME);
-    assert.ok(queuedCommand);
-    const queuedContext = commandContext({ sessionManager, pending: true });
-    await queuedCommand("", queuedContext.context);
+    await queued.commands.get(MANUAL_RETRY_COMMAND_NAME)!("", commandContext({ sessionManager, pending: true }).context);
     assert.equal(queued.sentMessages.length, 0);
     assert.equal(sessionManager.getBranch().length, branchLength);
 
@@ -354,79 +459,186 @@ test("/retry does not persist or dispatch when queues appear or sendMessage thro
       throw new Error("fixture injection failure");
     };
     manualRetryExtension(failing.api);
-    const failingCommand = failing.commands.get(MANUAL_RETRY_COMMAND_NAME);
-    assert.ok(failingCommand);
     const failingContext = commandContext({ sessionManager });
-    await failingCommand("", failingContext.context);
+    await failing.commands.get(MANUAL_RETRY_COMMAND_NAME)!("", failingContext.context);
     assert.equal(sessionManager.getBranch().length, branchLength);
     assert.match(failingContext.notifications.at(-1)?.message ?? "", /fixture injection failure/);
   });
 });
 
-test("repeated retry remains eligible only after a new retryable failure completes", async () => {
-  await withSession(async (sessionManager) => {
-    sessionManager.appendMessage(user());
-    sessionManager.appendMessage(assistant({ stopReason: "error", errorMessage: "503 service unavailable", timestamp: 10 }));
-    sessionManager.appendCustomMessageEntry(MANUAL_RETRY_MESSAGE_TYPE, [], false, { version: 1, attempt: 1 });
-
-    const dangling = commandContext({ sessionManager });
-    assert.deepEqual(getManualRetryEligibility(dangling.context), {
-      eligible: false,
-      reason: "a previous retry marker has no completed assistant attempt"
-    });
-
-    const secondFailureId = sessionManager.appendMessage(assistant({ stopReason: "error", errorMessage: "connection lost", timestamp: 20 }));
-    const eligibility = getManualRetryEligibility(commandContext({ sessionManager }).context);
-    assert.equal(eligibility.eligible, true);
-    if (!eligibility.eligible) return;
-    assert.equal(eligibility.attempt, 2);
-    assert.equal(eligibility.failedAssistantEntryId, secondFailureId);
-  });
-});
-
-test("/retry fails closed for active, queued, in-memory, cancelled, non-retryable, and model-changed states", async () => {
+test("/retry fails closed for active, queued, in-memory, completed, and unanswered-tool-call states", async () => {
   await withSession(async (sessionManager) => {
     sessionManager.appendMessage(user());
     sessionManager.appendMessage(assistant({ stopReason: "error", errorMessage: "503 service unavailable" }));
-
-    assert.match((getManualRetryEligibility(commandContext({ sessionManager, idle: false }).context) as { reason: string }).reason, /still active/);
-    assert.match((getManualRetryEligibility(commandContext({ sessionManager, pending: true }).context) as { reason: string }).reason, /pending/);
-    assert.match((getManualRetryEligibility(commandContext({ sessionManager, model: fakeModel("anthropic", "different") }).context) as { reason: string }).reason, /provider, API, or model changed/);
-    assert.match((getManualRetryEligibility(commandContext({ sessionManager, model: fakeModel("anthropic", "claude-sonnet-4-5", "pi-messages") }).context) as { reason: string }).reason, /provider, API, or model changed/);
-
-    sessionManager.appendThinkingLevelChange("high");
-    assert.match((getManualRetryEligibility(commandContext({ sessionManager }).context) as { reason: string }).reason, /thinking level changed/);
+    assert.match(reason(getManualRetryEligibility(commandContext({ sessionManager, idle: false }).context)), /still active/);
+    assert.match(reason(getManualRetryEligibility(commandContext({ sessionManager, pending: true }).context)), /pending/);
   });
 
   const inMemory = SessionManager.inMemory("/retry-test");
   inMemory.appendMessage(user());
   inMemory.appendMessage(assistant({ stopReason: "error", errorMessage: "503 service unavailable" }));
-  assert.match((getManualRetryEligibility(commandContext({ sessionManager: inMemory }).context) as { reason: string }).reason, /not persisted/);
+  assert.match(reason(getManualRetryEligibility(commandContext({ sessionManager: inMemory }).context)), /not persisted/);
 
-  await withSession(async (cancelled) => {
-    cancelled.appendMessage(user());
-    cancelled.appendMessage(assistant({ stopReason: "aborted" }));
-    assert.match((getManualRetryEligibility(commandContext({ sessionManager: cancelled }).context) as { reason: string }).reason, /cancelled/);
+  await withSession(async (completed) => {
+    completed.appendMessage(user());
+    completed.appendMessage(assistant({ stopReason: "stop" }));
+    assert.match(reason(getManualRetryEligibility(commandContext({ sessionManager: completed }).context)), /response completed/);
   });
 
+  await withSession(async (unanswered) => {
+    unanswered.appendMessage(user());
+    unanswered.appendMessage(toolCallAssistant("call-1"));
+    assert.match(reason(getManualRetryEligibility(commandContext({ sessionManager: unanswered }).context)), /tool calls without results/);
+  });
+
+  await withSession(async (empty) => {
+    assert.match(reason(getManualRetryEligibility(commandContext({ sessionManager: empty }).context)), /nothing to send/);
+  });
+});
+
+test("/retry stays available for quota errors and after compaction because the user chooses when to resend", async () => {
   await withSession(async (quota) => {
     quota.appendMessage(user());
     quota.appendMessage(assistant({ stopReason: "error", errorMessage: "insufficient_quota billing limit" }));
-    assert.match((getManualRetryEligibility(commandContext({ sessionManager: quota }).context) as { reason: string }).reason, /not classified/);
-  });
-
-  await withSession(async (modelChanged) => {
-    modelChanged.appendMessage(user());
-    modelChanged.appendMessage(assistant({ stopReason: "error", errorMessage: "503 service unavailable" }));
-    modelChanged.appendModelChange("anthropic", "different-model");
-    assert.match((getManualRetryEligibility(commandContext({ sessionManager: modelChanged }).context) as { reason: string }).reason, /selected model changed/);
+    assert.equal(getManualRetryEligibility(commandContext({ sessionManager: quota }).context).eligible, true);
   });
 
   await withSession(async (compacted) => {
     compacted.appendMessage(user());
     const failureId = compacted.appendMessage(assistant({ stopReason: "error", errorMessage: "503 service unavailable" }));
     compacted.appendCompaction("Compacted summary", failureId, 1_000);
-    assert.match((getManualRetryEligibility(commandContext({ sessionManager: compacted }).context) as { reason: string }).reason, /session was compacted/);
+    const eligibility = getManualRetryEligibility(commandContext({ sessionManager: compacted }).context);
+    assert.equal(eligibility.eligible, true);
+    if (!eligibility.eligible) return;
+    assert.equal(eligibility.kind, "error");
+    assert.equal(eligibility.failedAssistantEntryId, failureId);
+  });
+});
+
+test("automatic retry patterns cover bare HTTP reason phrases core does not classify", () => {
+  for (const message of ["Not Found", "not found", "Bad Gateway", "HTTP 404 Not Found", "502 Bad Gateway"]) {
+    assert.equal(matchesAutomaticRetryError(message), true, message);
+  }
+  for (const message of [undefined, "", "Model not found: gpt-x", "Forbidden", "503 service unavailable", "insufficient_quota"]) {
+    assert.equal(matchesAutomaticRetryError(message), false, String(message));
+  }
+});
+
+test("automatic retry dispatches an automatic marker with exponential backoff for listed errors", async () => {
+  await withSession(async (sessionManager) => {
+    sessionManager.appendMessage(user());
+    const failureId = sessionManager.appendMessage(assistant({ stopReason: "error", errorMessage: "Not Found", timestamp: 100 }));
+    const fake = persistingFakeApi(sessionManager);
+    const slept: number[] = [];
+    const sleep = async (ms: number): Promise<void> => {
+      slept.push(ms);
+    };
+    const { context, notifications } = commandContext({ sessionManager });
+
+    const first = await runAutomaticRetry(fake.api, context, { sleep });
+    assert.deepEqual(first, { status: "dispatched", attempt: 1, delayMs: 2_000 });
+    assert.deepEqual(slept, [2_000]);
+    const details = sentDetails(fake);
+    assert.equal(details.trigger, "automatic");
+    assert.equal(details.kind, "error");
+    assert.equal(details.failedAssistantEntryId, failureId);
+    assert.match(notifications.at(-1)?.message ?? "", /Automatic retry 1\/3 in 2s after error "Not Found"/);
+
+    sessionManager.appendMessage(assistant({ stopReason: "error", errorMessage: "Not Found", timestamp: 200 }));
+    const second = await runAutomaticRetry(fake.api, context, { sleep });
+    assert.deepEqual(second, { status: "dispatched", attempt: 2, delayMs: 4_000 });
+
+    sessionManager.appendMessage(assistant({ stopReason: "error", errorMessage: "Not Found", timestamp: 300 }));
+    const third = await runAutomaticRetry(fake.api, context, { sleep });
+    assert.deepEqual(third, { status: "dispatched", attempt: 3, delayMs: 8_000 });
+
+    sessionManager.appendMessage(assistant({ stopReason: "error", errorMessage: "Not Found", timestamp: 400 }));
+    const exhausted = await runAutomaticRetry(fake.api, context, { sleep });
+    assert.deepEqual(exhausted, { status: "exhausted", attempts: AUTOMATIC_RETRY_MAX_ATTEMPTS });
+    assert.equal(fake.sentMessages.length, 3);
+    assert.match(notifications.at(-1)?.message ?? "", /Automatic retry stopped after 3 attempts/);
+    assert.equal(notifications.at(-1)?.type, "warning");
+
+    // An explicit /retry starts a fresh bounded chain.
+    manualRetryExtension(fake.api, { sleep });
+    await fake.commands.get(MANUAL_RETRY_COMMAND_NAME)!("", context);
+    assert.equal(sentDetails(fake, 3).trigger, "manual");
+    sessionManager.appendMessage(assistant({ stopReason: "error", errorMessage: "Not Found", timestamp: 500 }));
+    const renewed = await runAutomaticRetry(fake.api, context, { sleep });
+    assert.deepEqual(renewed, { status: "dispatched", attempt: 5, delayMs: 2_000 });
+  });
+});
+
+test("automatic retry skips cancellations, core-retryable errors, unlisted errors, ineligible states, and non-TUI modes", async () => {
+  await withSession(async (sessionManager) => {
+    const fake = createFakeApi();
+    sessionManager.appendMessage(user());
+
+    sessionManager.appendMessage(assistant({ stopReason: "aborted" }));
+    assert.deepEqual(await runAutomaticRetry(fake.api, commandContext({ sessionManager }).context, { sleep: immediateSleep }), {
+      status: "skipped",
+      reason: "only settled provider errors are retried automatically"
+    });
+
+    sessionManager.appendMessage(assistant({ stopReason: "error", errorMessage: "503 service unavailable" }));
+    assert.deepEqual(await runAutomaticRetry(fake.api, commandContext({ sessionManager }).context, { sleep: immediateSleep }), {
+      status: "skipped",
+      reason: "Pi core classifies this error as transient and already retried it"
+    });
+
+    sessionManager.appendMessage(assistant({ stopReason: "error", errorMessage: "insufficient_quota billing limit" }));
+    assert.deepEqual(await runAutomaticRetry(fake.api, commandContext({ sessionManager }).context, { sleep: immediateSleep }), {
+      status: "skipped",
+      reason: "the error is not in the automatic retry list"
+    });
+
+    sessionManager.appendMessage(assistant({ stopReason: "error", errorMessage: "Not Found" }));
+    assert.equal((await runAutomaticRetry(fake.api, commandContext({ sessionManager, pending: true }).context, { sleep: immediateSleep })).status, "skipped");
+    assert.equal((await runAutomaticRetry(fake.api, commandContext({ sessionManager, mode: "print" }).context, { sleep: immediateSleep })).status, "skipped");
+
+    sessionManager.appendMessage(assistant({ stopReason: "stop" }));
+    assert.equal((await runAutomaticRetry(fake.api, commandContext({ sessionManager }).context, { sleep: immediateSleep })).status, "skipped");
+    assert.equal(fake.sentMessages.length, 0);
+  });
+});
+
+test("automatic retry aborts without dispatching when the session changes during backoff", async () => {
+  await withSession(async (sessionManager) => {
+    sessionManager.appendMessage(user());
+    sessionManager.appendMessage(assistant({ stopReason: "error", errorMessage: "Not Found" }));
+    const fake = createFakeApi();
+
+    const newPromptDuringSleep = async (): Promise<void> => {
+      sessionManager.appendMessage(user("A newer request"));
+    };
+    assert.deepEqual(await runAutomaticRetry(fake.api, commandContext({ sessionManager }).context, { sleep: newPromptDuringSleep }), { status: "stale" });
+
+    let idle = true;
+    const becomesActiveDuringSleep = async (): Promise<void> => {
+      idle = false;
+    };
+    sessionManager.appendMessage(assistant({ stopReason: "error", errorMessage: "Not Found" }));
+    assert.deepEqual(
+      await runAutomaticRetry(fake.api, commandContext({ sessionManager, idle: () => idle }).context, { sleep: becomesActiveDuringSleep }),
+      { status: "stale" }
+    );
+    assert.equal(fake.sentMessages.length, 0);
+  });
+});
+
+test("agent_settled handler runs the automatic retry without blocking the event", async () => {
+  await withSession(async (sessionManager) => {
+    sessionManager.appendMessage(user());
+    sessionManager.appendMessage(assistant({ stopReason: "error", errorMessage: "Not Found" }));
+    const fake = persistingFakeApi(sessionManager);
+    manualRetryExtension(fake.api, { sleep: immediateSleep });
+    const { context } = commandContext({ sessionManager });
+
+    const result = await emit(fake, "agent_settled", { type: "agent_settled" }, context);
+    assert.equal(result, undefined);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(fake.sentMessages.length, 1);
+    assert.equal(sentDetails(fake).trigger, "automatic");
   });
 });
 

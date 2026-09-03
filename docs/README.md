@@ -14,7 +14,7 @@ Index (extensions load in this order; see `package.json#pi.extensions`):
 4. [async-shell](extensions/async-shell.md) — durable async shell jobs with batched completion notices.
 5. [completion-notifications](extensions/completion-notifications.md) — opt-in privacy-safe terminal notification after a settled long run.
 6. [native-tools](extensions/native-tools.md) — batch-native `read_many`, `search_many`, `write_many`, `edit_many` and strict-replacement.
-7. [manual-retry](extensions/manual-retry.md) — provider-safe `/retry` for a settled transient failure without duplicate user text.
+7. [manual-retry](extensions/manual-retry.md) — provider-safe `/retry` that resends the current context after any failure or cancellation, plus bounded automatic retry of outage-class errors.
 8. [context-export](extensions/context-export.md) — provider-free `/context:copy` for an active, compaction-aware clipboard snapshot.
 9. [compacter](extensions/compacter.md) — robust chunked replacement for Pi compaction with `/compacter` controls.
 10. [mutation-review](extensions/mutation-review.md) — file-mutation reuse reviewer with cached re-apply via `apply_reviewed_mutation`.

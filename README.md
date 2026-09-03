@@ -7,7 +7,7 @@ Reusable extensions for the [Pi coding agent](https://pi.dev/). The package focu
 - batch-native text/image file and search tools that replace stock single-file/shell tools
 - safety review hooks (rule + model + human) and a mutation-review reviewer
 - web research (SearXNG, web fetch with readability + document parse handoff)
-- explicit provider-safe retry of settled transient failures via `/retry`
+- provider-safe resend of the current context after any failure or cancellation via `/retry`, plus bounded automatic retry of outage-class errors Pi core does not classify
 - provider-free active-context clipboard snapshots via `/context:copy`
 - robust chunked context compaction via `/compacter`
 - a `/review` subagent workflow
@@ -163,9 +163,9 @@ Each extension below documents what it does, what it provides, and how to set it
 
 [Full docs](docs/extensions/manual-retry.md).
 
-**Purpose.** Retry a fully settled transient provider failure without duplicating user text. The extension persists a hidden empty marker, filters retry markers and failed/aborted assistants from provider and compaction context, and starts a fresh normal run only when the persisted session is idle and queue-free.
+**Purpose.** Resend the current context to the selected model after any settled failure or cancellation without duplicating user text, so recovery never needs `/tree`. The extension persists a hidden empty marker, filters retry markers, failed/aborted assistants, and their orphaned tool results from provider and compaction context, and starts a fresh normal run only when the persisted session is idle and queue-free. An explicit model switch before `/retry` is honored. After `agent_settled`, errors Pi core does not classify as transient but that are outage symptoms (bare `Not Found`/`Bad Gateway` reason phrases) are retried automatically with 2s/4s/8s backoff, bounded at three consecutive attempts.
 
-**Provides.** `/retry`; provider-context and pre-compaction filtering. Failed attempts and markers remain auditable in durable session history. This is an explicit provider-facing approximation, not Pi core's private unchanged-state retry transaction.
+**Provides.** `/retry`; bounded automatic retry; provider-context and pre-compaction filtering. Failed attempts and markers remain auditable in durable session history. This is an explicit provider-facing approximation, not Pi core's private unchanged-state retry transaction.
 
 **Setup.** None. Fully restart Pi after installation or update.
 
