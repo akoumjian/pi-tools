@@ -35,6 +35,10 @@ const truncation = {
   totalBytes: 4,
   outputBytes: 4
 };
+const readTruncation = {
+  ...truncation,
+  partialLine: false
+};
 const mutationReview = {
   pendingId: "mr_01234567",
   blocked: [{ id: "m_0123456789ab", path: "a.ts", kind: "replace" as const }],
@@ -75,11 +79,12 @@ const samples: Record<RetainedToolName, unknown> = {
     details: {
       files: [{
         kind: "text",
+        mode: "lines",
         path: "a.ts",
         resolvedPath: "/repo/a.ts",
         offset: 1,
         requestedLimit: 10,
-        truncation,
+        truncation: readTruncation,
         previewLines: ["const a = 1;"]
       }]
     }
@@ -243,9 +248,34 @@ test("conditional output variants preserve runtime-only boundaries", () => {
   const shellByteTruncation = structuredClone(samples.shell_read) as { details: { streams: Array<{ truncation: { truncatedBy: string | null } }> } };
   shellByteTruncation.details.streams[0]!.truncation.truncatedBy = "bytes";
   assert.equal(Check(RetainedToolOutputSchemas.shell_read, shellByteTruncation), false, "shell log ranges truncate only by lines");
-  const readByteTruncation = structuredClone(samples.read_many) as { details: { files: Array<{ truncation: { truncatedBy: string | null } }> } };
-  readByteTruncation.details.files[0]!.truncation.truncatedBy = "bytes";
-  assert.equal(Check(RetainedToolOutputSchemas.read_many, readByteTruncation), true, "read_many retains byte-truncation support");
+  const byteContinuedRead = {
+    content: [text("partial UTF-8 line")],
+    details: {
+      files: [{
+        kind: "text",
+        mode: "bytes",
+        path: "large.txt",
+        resolvedPath: "/repo/large.txt",
+        byteStart: 0,
+        byteEndExclusive: 50,
+        truncation: {
+          truncated: true,
+          truncatedBy: "bytes",
+          totalLines: 1,
+          outputLines: 1,
+          totalBytes: 100,
+          outputBytes: 50,
+          partialLine: true,
+          continuation: { path: "large.txt", cursor: "opaque" }
+        },
+        previewLines: ["partial"]
+      }]
+    }
+  };
+  assert.equal(Check(RetainedToolOutputSchemas.read_many, byteContinuedRead), true, "read_many accepts byte-mode cursor continuations");
+  const impossibleByteRead = structuredClone(byteContinuedRead) as { details: { files: Array<{ truncation: { partialLine: boolean } }> } };
+  impossibleByteRead.details.files[0]!.truncation.partialLine = false;
+  assert.equal(Check(RetainedToolOutputSchemas.read_many, impossibleByteRead), false, "byte-mode reads must identify partial-line output");
   assert.equal(Check(RetainedToolOutputSchemas.read_many, {
     content: [text("Read image"), { type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
     details: {

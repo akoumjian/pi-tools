@@ -151,7 +151,7 @@ Each extension below documents what it does, what it provides, and how to set it
 
 [Full docs](docs/extensions/native-tools.md).
 
-**Purpose.** Replace stock single-file `read`/`grep`/`find`/`write`/`edit` tools with batch-native equivalents. `read_many` preserves text ranges and directly delivers byte-detected JPEG/PNG/GIF/WebP/BMP content to the active vision model; image ranges, unsupported binaries, and non-vision use fail loudly. Strict-replacement enforcement removes banned tools and adds required replacements at session start, while slim prompt guidance steers search-vs-read, edit-vs-write, shell log inspection, and research/document workflows.
+**Purpose.** Replace stock single-file `read`/`grep`/`find`/`write`/`edit` tools with batch-native equivalents. `read_many` bounds text by lines, per-file bytes, fair batch bytes, and a final serialization ceiling while preserving complete retrieval through exact line or UTF-8-safe opaque-cursor continuations; it also directly delivers byte-detected JPEG/PNG/GIF/WebP/BMP content to the active vision model. Image ranges, unsupported binaries, stale cursors, and non-vision use fail loudly. Strict-replacement enforcement removes banned tools and adds required replacements at session start, while slim prompt guidance steers search-vs-read, edit-vs-write, shell log inspection, and research/document workflows.
 
 **Provides.** `read_many`, `search_many`, `write_many`, `edit_many`; disabled `bash` stub redirecting to `shell_start`; `/native:status`; compact renderers with `⎿ error: …` fallback on validation/exec errors.
 

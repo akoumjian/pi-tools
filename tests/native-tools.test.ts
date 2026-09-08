@@ -28,8 +28,10 @@ type FakeApi = ExtensionAPI & {
 type SchemaNode = {
   properties?: Record<string, SchemaNode>;
   items?: SchemaNode;
+  anyOf?: SchemaNode[];
   minimum?: number;
   maximum?: number;
+  minLength?: number;
   minItems?: number;
   additionalProperties?: boolean;
   default?: unknown;
@@ -138,6 +140,8 @@ function required<T>(value: T | undefined, name: string): T {
 
 type ReadManyResultFile = Awaited<ReturnType<typeof readMany>>["details"]["files"][number];
 type TextReadManyResultFile = Extract<ReadManyResultFile, { kind: "text" }>;
+type LineTextReadManyResultFile = Extract<TextReadManyResultFile, { mode: "lines" }>;
+type ByteTextReadManyResultFile = Extract<TextReadManyResultFile, { mode: "bytes" }>;
 type ImageReadManyResultFile = Extract<ReadManyResultFile, { kind: "image" }>;
 
 function requiredTextReadFile(file: ReadManyResultFile): TextReadManyResultFile {
@@ -145,6 +149,22 @@ function requiredTextReadFile(file: ReadManyResultFile): TextReadManyResultFile 
     throw new Error(`expected text result, got ${file.kind}`);
   }
   return file;
+}
+
+function requiredLineTextReadFile(file: ReadManyResultFile): LineTextReadManyResultFile {
+  const textFile = requiredTextReadFile(file);
+  if (textFile.mode !== "lines") {
+    throw new Error(`expected line-mode text result, got ${textFile.mode}`);
+  }
+  return textFile;
+}
+
+function requiredByteTextReadFile(file: ReadManyResultFile): ByteTextReadManyResultFile {
+  const textFile = requiredTextReadFile(file);
+  if (textFile.mode !== "bytes") {
+    throw new Error(`expected byte-mode text result, got ${textFile.mode}`);
+  }
+  return textFile;
 }
 
 function requiredImageReadFile(file: ReadManyResultFile): ImageReadManyResultFile {
@@ -187,14 +207,19 @@ test("native extension registers batch file tools but not single read/edit/write
   assert.match(readManyTool.description, /Batch independent file reads/);
   assert.match(readManyTool.description, /offset/);
   assert.match(readManyTool.description, /limit/);
+  assert.match(readManyTool.description, /cursor/);
   assert.match(readManyTool.description, /JPEG, PNG, GIF, WebP, BMP/);
   assert.match(readManyTool.description, /no extra model call/);
   assert.match(readManyTool.promptGuidelines?.join("\n") ?? "", /does not support image input|models without image input/);
   assert.match(readManyTool.promptGuidelines?.join("\n") ?? "", /at most 20 images and 18 MiB/);
   const filesSchema = required(schemaFor(readManyTool).properties?.files, "read_many files schema");
   const fileItemSchema = required(filesSchema.items, "read_many file item schema");
-  assert.equal(fileItemSchema.properties?.offset.minimum, 1);
-  assert.equal(fileItemSchema.properties?.limit.maximum, undefined);
+  const fileItemVariants = required(fileItemSchema.anyOf, "read_many file item variants");
+  const lineItemSchema = required(fileItemVariants.find((variant) => variant.properties?.offset !== undefined), "read_many line item schema");
+  const cursorItemSchema = required(fileItemVariants.find((variant) => variant.properties?.cursor !== undefined), "read_many cursor item schema");
+  assert.equal(lineItemSchema.properties?.offset.minimum, 1);
+  assert.equal(lineItemSchema.properties?.limit.maximum, undefined);
+  assert.equal(cursorItemSchema.properties?.cursor.minLength, 1);
 
   const searchManyTool = api.registeredTools.find((tool) => tool.name === "search_many");
   assert.ok(searchManyTool);
@@ -882,17 +907,17 @@ test("read_many reads independent files with per-file offset and limit", async (
       ]
     });
 
-    const alpha = requiredTextReadFile(result.details.files[0]);
-    const beta = requiredTextReadFile(result.details.files[1]);
+    const alpha = requiredLineTextReadFile(result.details.files[0]);
+    const beta = requiredLineTextReadFile(result.details.files[1]);
     assert.equal(alpha.offset, 2);
     assert.equal(alpha.requestedLimit, 2);
-    assert.equal(alpha.truncation.nextOffset, 4);
+    assert.deepEqual(alpha.truncation.continuation, { path: "@alpha.txt", offset: 4 });
     assert.deepEqual(alpha.previewLines, ["a2", "a3"]);
-    assert.equal(beta.truncation.nextOffset, 2);
+    assert.deepEqual(beta.truncation.continuation, { path: "beta.txt", offset: 2 });
 
     const text = textFromResult(result);
     assert.match(text, /--- @alpha\.txt \(lines 2-3 of 5\) ---\na2\na3/);
-    assert.match(text, /continue with offset=4/);
+    assert.match(text, /continue with \{"path":"@alpha\.txt","offset":4\}/);
     assert.match(text, /--- beta\.txt \(lines 1-1 of 3\) ---\nb1/);
 
     const api = createFakeApi([], []);
@@ -1012,7 +1037,7 @@ test("read_many rejects image ranges, unsupported binaries, processing failures,
 
     await assert.rejects(
       readMany(createContext(dir, true), { files: [{ path: "image.png", offset: 1 }] }),
-      /does not accept offset or limit/
+      /does not accept cursor, offset, or limit/
     );
     await assert.rejects(
       readMany(createContext(dir, false), { files: [{ path: "image.png" }] }),
@@ -1056,7 +1081,7 @@ test("read_many preserves UTF-8 text beginning with GIF and enforces aggregate i
   });
 });
 
-test("read_many keeps uncapped model-facing reads separate from minimal display", async () => {
+test("read_many bounds line reads and returns an exact continuation while keeping display minimal", async () => {
   await withTempDir(async (dir) => {
     const lines = Array.from({ length: 6000 }, (_value, index) => `line-${index + 1}`);
     await writeFile(path.join(dir, "long.txt"), lines.join("\n"), "utf8");
@@ -1065,17 +1090,32 @@ test("read_many keeps uncapped model-facing reads separate from minimal display"
       files: [{ path: "long.txt", limit: 6000 }]
     });
 
-    const file = requiredTextReadFile(result.details.files[0]);
-    assert.equal(file.truncation.outputLines, 6000);
-    assert.equal(file.truncation.truncated, false);
-    assert.match(textFromResult(result), /line-6000/);
+    const file = requiredLineTextReadFile(result.details.files[0]);
+    assert.equal(file.truncation.outputLines, 2000);
+    assert.equal(file.truncation.truncated, true);
+    assert.equal(file.truncation.partialLine, false);
+    assert.deepEqual(file.truncation.continuation, { path: "long.txt", offset: 2001, limit: 4000 });
+    assert.match(textFromResult(result), /line-2000/);
+    assert.doesNotMatch(textFromResult(result), /line-2001/);
+
+    const secondResult = await readMany(createContext(dir), { files: [required(file.truncation.continuation, "line continuation")] });
+    const second = requiredLineTextReadFile(secondResult.details.files[0]);
+    assert.equal(second.offset, 2001);
+    assert.equal(second.truncation.outputLines, 2000);
+    assert.deepEqual(second.truncation.continuation, { path: "long.txt", offset: 4001, limit: 2000 });
+    const finalResult = await readMany(createContext(dir), { files: [required(second.truncation.continuation, "final line continuation")] });
+    const final = requiredLineTextReadFile(finalResult.details.files[0]);
+    assert.equal(final.offset, 4001);
+    assert.equal(final.truncation.outputLines, 2000);
+    assert.equal(final.truncation.truncated, false);
+    assert.match(textFromResult(finalResult), /line-6000/);
 
     const api = createFakeApi([], []);
     nativeToolsExtension(api);
     const readManyTool = required(api.registeredTools.find((tool) => tool.name === "read_many"), "read_many tool");
     const renderedResult = renderToolResult(readManyTool, result);
-    assert.match(renderedResult, /⎿ Read long\.txt:1:6000/);
-    assert.doesNotMatch(renderedResult, /line-6000/);
+    assert.match(renderedResult, /⎿ Read long\.txt:1:2000/);
+    assert.doesNotMatch(renderedResult, /line-2000/);
   });
 });
 
@@ -1092,19 +1132,101 @@ test("read_many rejects offsets beyond the file", async () => {
   });
 });
 
-test("read_many returns content beyond the previous byte display cap", async () => {
+test("read_many pages oversized lines with UTF-8-safe cursors and rejects stale cursors", async () => {
   await withTempDir(async (dir) => {
-    await writeFile(path.join(dir, "long.txt"), `${"x".repeat(60 * 1024)}\nnext`, "utf8");
+    const filePath = path.join(dir, "unicode.txt");
+    const source = "αβγδεζηθ";
+    const limits = {
+      maxLinesPerFile: 10,
+      maxBytesPerFile: 10,
+      maxBytesPerBatch: 10,
+      maxResultBytes: 2048,
+      maxPreviewLineChars: 5
+    };
+    await writeFile(filePath, source, "utf8");
+
+    const firstResult = await readMany(createContext(dir), { files: [{ path: "unicode.txt" }] }, undefined, limits);
+    const first = requiredByteTextReadFile(firstResult.details.files[0]);
+    assert.equal(first.byteStart, 0);
+    assert.equal(first.byteEndExclusive, 10);
+    assert.equal(first.truncation.outputBytes, 10);
+    assert.equal(first.truncation.partialLine, true);
+    assert.deepEqual(first.previewLines, ["αβγδε"]);
+    assert.match(textFromResult(firstResult), /\nαβγδε\n\[truncated by bytes/);
+    const continuation = required(first.truncation.continuation, "oversized-line continuation");
+    assert.ok("cursor" in continuation);
+    if (!("cursor" in continuation)) throw new Error("expected cursor continuation");
+
+    await writeFile(filePath, `${source}!`, "utf8");
+    await assert.rejects(
+      readMany(createContext(dir), { files: [continuation] }, undefined, limits),
+      /cursor is stale/
+    );
+
+    await writeFile(filePath, source, "utf8");
+    const finalResult = await readMany(createContext(dir), { files: [continuation] }, undefined, limits);
+    const final = requiredByteTextReadFile(finalResult.details.files[0]);
+    assert.equal(final.byteStart, 10);
+    assert.equal(final.byteEndExclusive, 16);
+    assert.equal(final.truncation.truncated, false);
+    assert.equal(final.truncation.continuation, undefined);
+    assert.match(textFromResult(finalResult), /\nζηθ$/);
+  });
+});
+
+test("read_many allocates its aggregate text budget fairly and bounds previews", async () => {
+  await withTempDir(async (dir) => {
+    await Promise.all([
+      writeFile(path.join(dir, "one.txt"), "a", "utf8"),
+      writeFile(path.join(dir, "two.txt"), "eeee\nffff\ngggg\nhhhh", "utf8"),
+      writeFile(path.join(dir, "three.txt"), "iiii\njjjj\nkkkk\nllll", "utf8")
+    ]);
+    const limits = {
+      maxLinesPerFile: 10,
+      maxBytesPerFile: 20,
+      maxBytesPerBatch: 20,
+      maxResultBytes: 2048,
+      maxPreviewLineChars: 3
+    };
 
     const result = await readMany(createContext(dir), {
-      files: [{ path: "long.txt" }]
-    });
+      files: [{ path: "one.txt" }, { path: "two.txt" }, { path: "three.txt" }]
+    }, undefined, limits);
+    const files = result.details.files.map(requiredLineTextReadFile);
+    assert.deepEqual(files.map((file) => file.path), ["one.txt", "two.txt", "three.txt"]);
+    assert.deepEqual(files.map((file) => file.truncation.outputBytes), [1, 9, 9]);
+    assert.ok(files.reduce((total, file) => total + file.truncation.outputBytes, 0) <= limits.maxBytesPerBatch);
+    assert.deepEqual(files.map((file) => file.truncation.continuation !== undefined), [false, true, true]);
+    assert.ok(files.every((file) => file.previewLines.every((line) => line.length <= limits.maxPreviewLineChars)));
+  });
+});
 
-    const file = requiredTextReadFile(result.details.files[0]);
-    assert.equal(file.truncation.truncated, false);
-    assert.equal(file.truncation.outputLines, 2);
-    assert.ok(file.truncation.outputBytes > 50 * 1024);
-    assert.match(textFromResult(result), /next/);
+test("read_many keeps generated 100 KiB single-line output below the provider-visible ceiling", async () => {
+  await withTempDir(async (dir) => {
+    await writeFile(path.join(dir, "generated.txt"), "🙂".repeat(25 * 1024), "utf8");
+
+    const result = await readMany(createContext(dir), { files: [{ path: "generated.txt" }] });
+    const file = requiredByteTextReadFile(result.details.files[0]);
+    assert.equal(file.truncation.outputBytes, 50 * 1024);
+    assert.ok(file.truncation.continuation !== undefined && "cursor" in file.truncation.continuation);
+    assert.ok(Buffer.byteLength(textFromResult(result), "utf8") < 128 * 1024);
+    assert.ok(file.previewLines.every((line) => line.length <= 500));
+  });
+});
+
+test("read_many fails loudly if formatted text would exceed its final safety ceiling", async () => {
+  await withTempDir(async (dir) => {
+    await writeFile(path.join(dir, "tiny.txt"), "tiny", "utf8");
+    await assert.rejects(
+      readMany(createContext(dir), { files: [{ path: "tiny.txt" }] }, undefined, {
+        maxLinesPerFile: 10,
+        maxBytesPerFile: 10,
+        maxBytesPerBatch: 10,
+        maxResultBytes: 20,
+        maxPreviewLineChars: 10
+      }),
+      /provider-visible text exceeded its 20-byte safety ceiling/
+    );
   });
 });
 

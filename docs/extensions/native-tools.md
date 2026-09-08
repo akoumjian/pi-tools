@@ -10,7 +10,7 @@ The extension also enforces strict replacement: when active, the stock tools are
 
 LLM-callable tools:
 
-- `read_many({ files: [{ path, offset?, limit? }, ...] })`
+- `read_many({ files: [{ path, offset?, limit? } | { path, cursor }, ...] })`
 - `search_many({ searches: [{ kind, pattern?, path?, glob?, context?, maxResults?, ignoreCase?, literal? }, ...] })`
 - `write_many({ writes: [{ path, content }, ...] })`
 - `edit_many({ files: [{ path, edits: [{ oldText, newText }, ...] }, ...] })`
@@ -35,8 +35,11 @@ read_many({
   files: [
     {
       path: string,                 // relative to active cwd or absolute
-      offset?: number,              // 1-indexed line, for continuation
+      offset?: number,              // 1-indexed line
       limit?: number                // max lines from offset
+    } | {
+      path: string,
+      cursor: string                // opaque oversized-line continuation
     },
     ...
   ]                                // 1..24 items
@@ -44,8 +47,9 @@ read_many({
 ```
 
 - Reads UTF-8 text plus byte-detected JPEG, PNG, GIF, WebP, and BMP images. File extensions do not control detection.
-- Use `offset`/`limit` to read precise text ranges; image items reject both parameters.
-- Omit `limit` to read text from `offset` to end of file. For huge text files, follow `truncation.nextOffset`.
+- Use `offset`/`limit` to read precise text ranges. Text results are bounded to 2,000 lines and 50 KiB per file, share an approximately 50 KiB batch body budget fairly, and enforce a 128 KiB final provider-visible text ceiling.
+- Follow the returned `truncation.continuation` object exactly. Normal pagination returns `{ path, offset, limit? }`; a single line that exceeds its allocation returns opaque `{ path, cursor }` pages at valid UTF-8 boundaries. Cursors are tied to the resolved path and source contents and fail if the source changes.
+- `offset`/`limit` and `cursor` are mutually exclusive. Image items reject all three parameters.
 - Images are processed by the host's built-in read pipeline, auto-resized to at most 2000x2000 and below the 4.5 MB per-image base64 inline limit, and attached directly to the current model with no extra completion.
 - One call may contain at most 20 images and 18 MiB of aggregate base64 image data; split larger sets into smaller batches.
 - A text-only active model, missing model, limit violation, processing failure, or unsupported binary causes a loud batch error rather than silently omitting pixels. Use `document_parse` for PDFs, Office files, spreadsheets, OCR, and other document formats.
@@ -122,7 +126,9 @@ The slim prompt removes Pi's default `Available tools`/`Guidelines` prose and in
 
 ### read_many
 
-- UTF-8 text keeps the existing line-level pagination behavior, returning the requested slice and a `truncation` block with `nextOffset` when continuation is needed.
+- UTF-8 text returns complete lines when they fit. Per-file line/byte limits and deterministic fair batch allocation produce exact line continuations; allocation unused by smaller files is redistributed in input order.
+- When the next line cannot fit, `read_many` returns a UTF-8-safe byte page with `partialLine: true` and an opaque cursor. Completing that line switches back to a line continuation when more lines remain. Preview entries are capped at 500 characters.
+- Provider-visible text is checked after headers and continuation notices are formatted and fails loudly above 128 KiB; there is no unbounded-read flag.
 - Supported images are detected from file bytes, not suffixes, then passed through the exported built-in read image pipeline. Input summaries and image attachments preserve request order; provider-visible content is one ordered text summary followed by ordered image blocks.
 - Text-only batches retain one text content block. Mixed/image batches add one image content block per image; no hidden vision model or secondary completion is used.
 - Image `offset`/`limit`, more than 20 images, more than 18 MiB aggregate base64 image data, unsupported binary data, image-processing omission, and non-vision models fail the entire batch. Independent siblings are awaited, but no partial success result is delivered.
@@ -162,10 +168,24 @@ If a profile or extension re-adds a banned stock tool, strict mode reports the c
   details: {
     files: [
       {
-        kind: "text",
-        path, resolvedPath, offset,
-        requestedLimit?,
-        truncation: { truncated, truncatedBy: "lines" | "bytes" | null, totalLines, outputLines, totalBytes, outputBytes, nextOffset? },
+        kind: "text", mode: "lines",
+        path, resolvedPath, offset, requestedLimit?,
+        truncation: {
+          truncated, truncatedBy: "lines" | "bytes" | null,
+          totalLines, outputLines, totalBytes, outputBytes,
+          partialLine: false,
+          continuation?: { path, offset, limit? }
+        },
+        previewLines: string[]
+      } | {
+        kind: "text", mode: "bytes",
+        path, resolvedPath, byteStart, byteEndExclusive,
+        truncation: {
+          truncated, truncatedBy: "lines" | "bytes" | null,
+          totalLines, outputLines, totalBytes, outputBytes,
+          partialLine: true,
+          continuation?: { path, cursor } | { path, offset, limit? }
+        },
         previewLines: string[]
       } | {
         kind: "image",
@@ -245,4 +265,4 @@ None. The extension is automatic at load. Run `/native:status` to confirm strict
 - `read_many`, `search_many`, `write_many`, `edit_many` are designed to encourage batching. Active-tool prompt steering tells the agent to prefer one call with a list over multiple single-item calls.
 - When a supported custom base system prompt is active, the adapter appends the structured active-tool snippets and guidelines that the core custom-prompt branch omits while preserving the assembled prompt as an opaque prefix.
 - For repository-scale discovery, `search_many` is the right entry point; `read_many` should be reserved for reading specific ranges discovered via search.
-- Tests cover schemas, strict replacement, custom-prompt guidance, text behavior, single/multiple/mixed images, ordering, MIME/fidelity, resizing, temporary drag/drop-style paths, image and binary errors, provider serialization, renderers, and integration with `mutation-review` (`tests/native-tools.test.ts`, `tests/tool-output.test.ts`, `tests/provider-context-review.test.ts`).
+- Tests cover bounded line continuations, oversized UTF-8 lines, stale cursors, fair allocation, preview/final serialization ceilings, schemas, strict replacement, custom-prompt guidance, single/multiple/mixed images, ordering, MIME/fidelity, resizing, temporary drag/drop-style paths, image and binary errors, provider serialization, renderers, and integration with `mutation-review` (`tests/native-tools.test.ts`, `tests/tool-output.test.ts`, `tests/provider-context-review.test.ts`).

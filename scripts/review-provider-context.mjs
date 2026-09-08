@@ -114,11 +114,11 @@ const resultContracts = {
     content: "cancellation outcome and where/how to inspect remaining output"
   },
   read_many: {
-    success: "content groups exact UTF-8 text ranges and directly attaches byte-detected supported images in input order without another model call",
+    success: "content groups bounded UTF-8 text pages with exact line or opaque cursor continuations and directly attaches byte-detected supported images in input order without another model call",
     progress: "not applicable: independent text/image reads and image processing complete as one batch",
-    error: "any path/range/read failure, unsupported binary, image range, image-count/aggregate-payload limit, image-processing failure, or non-vision model rejects the batch; no sibling success result is delivered",
-    details: "internal discriminated text range/truncation or image MIME/byte/attachment metadata",
-    content: "known path, text range and nextOffset, plus ordered text image summaries and provider-visible image content"
+    error: "any path/range/read failure, unsupported binary, stale cursor, image range, text/image limit, image-processing failure, or non-vision model rejects the batch; no sibling success result is delivered",
+    details: "internal discriminated line/byte-page truncation and continuation metadata or image MIME/byte/attachment metadata",
+    content: "bounded known-path text pages with exact line or cursor continuations, plus ordered image summaries and provider-visible image content"
   },
   search_many: {
     success: "content groups rg-backed file/content matches with line/column context and caps",

@@ -19,6 +19,19 @@ import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 
+type ReadLineContinuation = {
+  path: string;
+  offset: number;
+  limit?: number;
+};
+
+type ReadCursorContinuation = {
+  path: string;
+  cursor: string;
+};
+
+type ReadContinuation = ReadLineContinuation | ReadCursorContinuation;
+
 type TruncationDetails = {
   truncated: boolean;
   truncatedBy: "lines" | "bytes" | null;
@@ -26,7 +39,8 @@ type TruncationDetails = {
   outputLines: number;
   totalBytes: number;
   outputBytes: number;
-  nextOffset?: number;
+  partialLine: boolean;
+  continuation?: ReadContinuation;
 };
 
 type ToolContent = AgentToolResult<unknown>["content"][number];
@@ -38,12 +52,23 @@ type ReadFileBaseDetails = {
   previewLines: string[];
 };
 
-type ReadTextFileDetails = ReadFileBaseDetails & {
+type ReadLineTextFileDetails = ReadFileBaseDetails & {
   kind: "text";
+  mode: "lines";
   offset: number;
   requestedLimit?: number;
   truncation: TruncationDetails;
 };
+
+type ReadByteTextFileDetails = ReadFileBaseDetails & {
+  kind: "text";
+  mode: "bytes";
+  byteStart: number;
+  byteEndExclusive: number;
+  truncation: TruncationDetails;
+};
+
+type ReadTextFileDetails = ReadLineTextFileDetails | ReadByteTextFileDetails;
 
 type ReadImageFileDetails = ReadFileBaseDetails & {
   kind: "image";
@@ -72,6 +97,45 @@ type PreparedReadFile = {
   bytes: Buffer;
   imageMimeType: SupportedImageMimeType | null;
 };
+
+type ReadCursorPayload = {
+  version: 1;
+  pathHash: string;
+  sourceHash: string;
+  byteOffset: number;
+  lineEndByteExclusive: number;
+  nextOffset?: number;
+  nextLimit?: number;
+};
+
+type PreparedLineRead = {
+  mode: "lines";
+  path: string;
+  resolvedPath: string;
+  bytes: Buffer;
+  lines: string[];
+  totalLines: number;
+  offset: number;
+  requestedLimit?: number;
+  selectionEndIndex: number;
+  demandBytes: number;
+};
+
+type PreparedByteRead = {
+  mode: "bytes";
+  path: string;
+  resolvedPath: string;
+  bytes: Buffer;
+  totalLines: number;
+  sourceHash: string;
+  byteStart: number;
+  lineEndByteExclusive: number;
+  nextOffset?: number;
+  nextLimit?: number;
+  demandBytes: number;
+};
+
+type PreparedTextRead = PreparedLineRead | PreparedByteRead;
 
 type ReadManyDetails = {
   files: ReadFileDetails[];
@@ -176,20 +240,48 @@ const MAX_BATCH_ITEMS = 24;
 const MAX_READ_MANY_IMAGES = 20;
 const MAX_READ_MANY_IMAGE_BASE64_BYTES = 18 * 1024 * 1024;
 
-const ReadItem = Type.Object({
-  path: Type.String({
-    minLength: 1,
-    description: "File path to read, relative to the active session cwd or absolute."
-  }),
-  offset: Type.Optional(Type.Number({
+export type ReadManyLimits = {
+  maxLinesPerFile: number;
+  maxBytesPerFile: number;
+  maxBytesPerBatch: number;
+  maxResultBytes: number;
+  maxPreviewLineChars: number;
+};
+
+const DEFAULT_READ_MANY_LIMITS: ReadManyLimits = {
+  maxLinesPerFile: 2_000,
+  maxBytesPerFile: 50 * 1024,
+  maxBytesPerBatch: 50 * 1024,
+  maxResultBytes: 128 * 1024,
+  maxPreviewLineChars: 500
+};
+
+const ReadPath = Type.String({
+  minLength: 1,
+  description: "File path to read, relative to the active session cwd or absolute."
+});
+
+const ReadLineItem = Type.Object({
+  path: ReadPath,
+  offset: Type.Optional(Type.Integer({
     minimum: 1,
-    description: "Text files only: 1-indexed line number to start from. Use returned nextOffset to continue a truncated file. Do not pass for images."
+    description: "Text files only: 1-indexed line number to start from. Follow the returned continuation when the requested content is paged. Do not pass for images."
   })),
-  limit: Type.Optional(Type.Number({
+  limit: Type.Optional(Type.Integer({
     minimum: 1,
     description: "Text files only: maximum lines to read from this file. Omit to read from offset through the end. Do not pass for images."
   }))
 }, { additionalProperties: false });
+
+const ReadCursorItem = Type.Object({
+  path: ReadPath,
+  cursor: Type.String({
+    minLength: 1,
+    description: "Opaque continuation returned by a prior read_many result for a partial UTF-8 line. Do not combine with offset or limit, and do not pass for images."
+  })
+}, { additionalProperties: false });
+
+const ReadItem = Type.Union([ReadLineItem, ReadCursorItem]);
 
 const ReadManyParams = Type.Object({
   files: Type.Array(ReadItem, {
@@ -389,15 +481,15 @@ function registerBatchTools(api: ExtensionAPI): void {
     description: [
       "Read known UTF-8 text file ranges and supported local images in one parallel-capable tool call. Always pass files: [...]; use a one-item list for a single file when batch shape is convenient. Batch independent file reads together instead of making serial read_many calls.",
       "Do not use read_many to discover files, scan a repository, or load many large files speculatively. Use search_many first for structured rg-backed file discovery/content search, or shell_start with rg/rg --files/find/git grep when custom shell inspection is needed.",
-      "Each item accepts { path, offset?, limit? }. offset and limit apply only to text and are rejected for images. Supported images are detected from bytes (JPEG, PNG, GIF, WebP, BMP), resized through the host image pipeline to at most 2000x2000 and below the per-image inline limit, and returned directly as image content to the active model with no extra model call.",
-      "Text output is grouped by input file and preserves current range/truncation behavior. Image summaries and attachments preserve input order, with at most 20 images and 18 MiB of aggregate base64 image data per call. Unsupported binaries, limit violations, image-processing failures, and image reads under a model without image input fail loudly."
+      "Text reads are bounded per file and across the batch. Follow the exact returned { path, offset, limit? } or opaque { path, cursor } continuation to retrieve the rest; offset/limit and cursor are mutually exclusive and apply only to text.",
+      "Supported images are detected from bytes (JPEG, PNG, GIF, WebP, BMP), resized through the host image pipeline to at most 2000x2000 and below the per-image inline limit, and returned directly as image content to the active model with no extra model call. Input order is preserved, with at most 20 images and 18 MiB of aggregate base64 image data per call. Unsupported binaries, limit violations, stale cursors, image-processing failures, and image reads under a model without image input fail loudly."
     ].join(" "),
-    promptSnippet: "Read known UTF-8 text paths/ranges and supported filesystem images in one batched files:[...] call; images go directly to the active model.",
+    promptSnippet: "Read known UTF-8 text paths/ranges and supported filesystem images in one batched files:[...] call; bounded text uses exact line or opaque cursor continuations and images go directly to the active model.",
     promptGuidelines: [
       "read_many use: Use read_many for known UTF-8 text paths/ranges and supported filesystem images; use search_many first for repository, file, symbol, definition, reference, call-site, or likely edit-location discovery. Image bytes become image content for the active model without an extra completion.",
       inputJsonSchemaGuideline("read_many", ReadManyParams),
       outputJsonSchemaGuideline("read_many", RetainedToolOutputSchemas.read_many),
-      "read_many constraints: offset/limit are text-only and image items reject them. Supported byte-detected images are JPEG, PNG, GIF, WebP, and BMP; the host pipeline auto-resizes to at most 2000x2000 and below its 4.5MB per-image base64 inline limit. A call accepts at most 20 images and 18 MiB of aggregate base64 image data. Text summaries and image attachments preserve input order. Unsupported binaries, limit violations, processing failures, and models without image input fail loudly. Do not speculatively scan or load many large files, and do not make serial single-file calls when one batch can cover independent reads. Only result content is provider-visible; details are internal, and thrown errors use the host's out-of-band error result."
+      "read_many constraints: Text reads are bounded to 2,000 lines and 50 KiB per file, share an approximately 50 KiB batch body budget fairly, and enforce a 128 KiB provider-visible text ceiling. Follow a returned line continuation exactly, or pass the opaque cursor unchanged when a single line is paged by bytes; changed sources invalidate cursors. offset/limit and cursor are mutually exclusive and image items reject all three. Supported byte-detected images are JPEG, PNG, GIF, WebP, and BMP; the host pipeline auto-resizes to at most 2000x2000 and below its 4.5MB per-image base64 inline limit. A call accepts at most 20 images and 18 MiB of aggregate base64 image data. Text summaries and image attachments preserve input order. Unsupported binaries, limit violations, stale cursors, processing failures, and models without image input fail loudly. Do not speculatively scan or load many large files, and do not make serial single-file calls when one batch can cover independent reads. Only result content is provider-visible; details are internal, and thrown errors use the host's out-of-band error result."
     ],
     parameters: ReadManyParams,
     executionMode: "parallel",
@@ -764,14 +856,37 @@ function escapeXml(text: string): string {
     .replace(/'/g, "&apos;");
 }
 
-export async function readMany(context: ExtensionContext, input: ReadManyInput, signal?: AbortSignal): Promise<AgentToolResult<ReadManyDetails>> {
+export async function readMany(
+  context: ExtensionContext,
+  input: ReadManyInput,
+  signal?: AbortSignal,
+  limits: ReadManyLimits = DEFAULT_READ_MANY_LIMITS
+): Promise<AgentToolResult<ReadManyDetails>> {
   throwIfAborted(signal);
+  validateReadManyLimits(limits);
   const prepared = await settleAllOrThrow(input.files.map((item) => prepareRead(context, item, signal)), signal);
   const imageCount = prepared.filter((file) => file.imageMimeType !== null).length;
   if (imageCount > MAX_READ_MANY_IMAGES) {
     throw new Error(`read_many accepts at most ${MAX_READ_MANY_IMAGES} images per call; received ${imageCount}. Split the images across smaller batches.`);
   }
-  const results = await settleAllOrThrow(prepared.map((file) => readPreparedOne(context, file, signal)), signal);
+
+  const textPlans = prepared.map((file) => file.imageMimeType === null ? prepareTextRead(file, limits) : undefined);
+  const textBudgets = allocateFairReadBudgets(
+    textPlans.filter((plan): plan is PreparedTextRead => plan !== undefined).map((plan) => plan.demandBytes),
+    limits.maxBytesPerBatch
+  );
+  let textBudgetIndex = 0;
+  const reads: Array<Promise<ReadFileResult>> = prepared.map((file, index) => {
+    if (file.imageMimeType !== null) {
+      return readImageOne(context, file, signal);
+    }
+    const plan = textPlans[index];
+    if (plan === undefined) {
+      throw new Error("read_many internal error: missing text plan");
+    }
+    return Promise.resolve(readPreparedText(plan, textBudgets[textBudgetIndex++] ?? 0, limits));
+  });
+  const results = await settleAllOrThrow(reads, signal);
   validateReadManyImagePayload(results);
   const details: ReadFileDetails[] = results.map((result) => readFileDetails(result));
   const text = [
@@ -779,6 +894,10 @@ export async function readMany(context: ExtensionContext, input: ReadManyInput, 
     "",
     results.map((file) => formatReadFile(file)).join("\n\n")
   ].join("\n");
+  const serializedTextBytes = Buffer.byteLength(text, "utf8");
+  if (serializedTextBytes > limits.maxResultBytes) {
+    throw new Error(`read_many provider-visible text exceeded its ${limits.maxResultBytes}-byte safety ceiling (${serializedTextBytes} bytes)`);
+  }
   const images = results.flatMap((file) => file.kind === "image" ? [file.imageContent] : []);
 
   return {
@@ -994,48 +1113,327 @@ async function prepareRead(context: ExtensionContext, item: ReadManyInput["files
   };
 }
 
-async function readPreparedOne(context: ExtensionContext, prepared: PreparedReadFile, signal?: AbortSignal): Promise<ReadFileResult> {
-  throwIfAborted(signal);
-  const { item, resolvedPath, bytes, imageMimeType } = prepared;
-  if (imageMimeType !== null) {
-    return readImageOne(context, item, resolvedPath, bytes, imageMimeType, signal);
-  }
-
+function prepareTextRead(prepared: PreparedReadFile, limits: ReadManyLimits): PreparedTextRead {
+  const { item, resolvedPath, bytes } = prepared;
   const content = decodeUtf8Text(bytes, item.path);
   const lines = content.split("\n");
   const totalLines = lines.length;
+
+  if (isReadCursorItem(item)) {
+    const cursor = decodeReadCursor(item.cursor);
+    const pathHash = hashReadSource(resolvedPath);
+    const sourceHash = hashReadSource(bytes);
+    if (cursor.pathHash !== pathHash || cursor.sourceHash !== sourceHash) {
+      throw new Error(`Cannot continue reading ${item.path}: the cursor is stale because the path or file contents changed.`);
+    }
+    if (
+      cursor.byteOffset < 0
+      || cursor.lineEndByteExclusive > bytes.byteLength
+      || cursor.byteOffset >= cursor.lineEndByteExclusive
+      || !isUtf8Boundary(bytes, cursor.byteOffset)
+      || !isUtf8Boundary(bytes, cursor.lineEndByteExclusive)
+      || cursor.lineEndByteExclusive < bytes.byteLength && bytes[cursor.lineEndByteExclusive] !== 0x0a
+      || bytes.subarray(cursor.byteOffset, cursor.lineEndByteExclusive).includes(0x0a)
+      || cursor.nextOffset !== undefined && (cursor.nextOffset < 1 || cursor.nextOffset > totalLines)
+      || cursor.nextLimit !== undefined && cursor.nextLimit < 1
+    ) {
+      throw new Error(`Cannot continue reading ${item.path}: the cursor is invalid for this file.`);
+    }
+    return {
+      mode: "bytes",
+      path: item.path,
+      resolvedPath,
+      bytes,
+      totalLines,
+      sourceHash,
+      byteStart: cursor.byteOffset,
+      lineEndByteExclusive: cursor.lineEndByteExclusive,
+      nextOffset: cursor.nextOffset,
+      nextLimit: cursor.nextLimit,
+      demandBytes: Math.min(cursor.lineEndByteExclusive - cursor.byteOffset, limits.maxBytesPerFile)
+    };
+  }
+
   const offset = item.offset ?? 1;
   if (offset > totalLines) {
     throw new Error(`Offset ${offset} is beyond end of file ${item.path} (${totalLines} lines total).`);
   }
-
-  const start = offset - 1;
-  const selected = item.limit === undefined ? lines.slice(start) : lines.slice(start, start + item.limit);
-  const outputContent = selected.join("\n");
-  const truncated = buildReadTruncation(selected, outputContent, totalLines, bytes.byteLength, start);
-
+  const startIndex = offset - 1;
+  const selectionEndIndex = Math.min(totalLines, startIndex + (item.limit ?? totalLines));
+  const cappedEndIndex = Math.min(selectionEndIndex, startIndex + limits.maxLinesPerFile);
+  const demandBytes = Math.min(
+    Buffer.byteLength(lines.slice(startIndex, cappedEndIndex).join("\n"), "utf8"),
+    limits.maxBytesPerFile
+  );
   return {
-    kind: "text",
+    mode: "lines",
     path: item.path,
     resolvedPath,
+    bytes,
+    lines,
+    totalLines,
     offset,
     requestedLimit: item.limit,
-    truncation: truncated,
-    previewLines: previewLines(outputContent, 2),
+    selectionEndIndex,
+    demandBytes
+  };
+}
+
+function readPreparedText(plan: PreparedTextRead, budgetBytes: number, limits: ReadManyLimits): ReadTextFileResult {
+  if (plan.mode === "bytes") {
+    return readBytePage(plan, budgetBytes, limits);
+  }
+
+  const startIndex = plan.offset - 1;
+  const cappedEndIndex = Math.min(plan.selectionEndIndex, startIndex + limits.maxLinesPerFile);
+  const outputLines: string[] = [];
+  let outputBytes = 0;
+  let stoppedByBytes = false;
+
+  for (let index = startIndex; index < cappedEndIndex; index += 1) {
+    const line = plan.lines[index] ?? "";
+    const lineBytes = Buffer.byteLength(line, "utf8") + (outputLines.length === 0 ? 0 : 1);
+    if (outputBytes + lineBytes > budgetBytes) {
+      stoppedByBytes = true;
+      break;
+    }
+    outputLines.push(line);
+    outputBytes += lineBytes;
+  }
+
+  if (outputLines.length === 0 && stoppedByBytes) {
+    return readInitialBytePage(plan, startIndex, budgetBytes, limits);
+  }
+
+  const outputContent = outputLines.join("\n");
+  const outputEndIndex = startIndex + outputLines.length;
+  const continuation = buildLineContinuation(plan, outputEndIndex);
+  const truncated = continuation !== undefined;
+  const truncatedBy = truncated ? stoppedByBytes ? "bytes" : "lines" : null;
+  return {
+    kind: "text",
+    mode: "lines",
+    path: plan.path,
+    resolvedPath: plan.resolvedPath,
+    offset: plan.offset,
+    requestedLimit: plan.requestedLimit,
+    truncation: {
+      truncated,
+      truncatedBy,
+      totalLines: plan.totalLines,
+      outputLines: outputLines.length,
+      totalBytes: plan.bytes.byteLength,
+      outputBytes: Buffer.byteLength(outputContent, "utf8"),
+      partialLine: false,
+      continuation
+    },
+    previewLines: previewLines(outputContent, 2, limits.maxPreviewLineChars),
     text: outputContent
   };
 }
 
+function readInitialBytePage(
+  plan: PreparedLineRead,
+  lineIndex: number,
+  budgetBytes: number,
+  limits: ReadManyLimits
+): ReadTextFileResult {
+  const byteStart = lineStartByteOffset(plan.lines, lineIndex);
+  const lineEndByteExclusive = byteStart + Buffer.byteLength(plan.lines[lineIndex] ?? "", "utf8");
+  const nextOffset = lineIndex + 1 < plan.totalLines ? lineIndex + 2 : undefined;
+  const nextLimit = nextOffset === undefined || plan.requestedLimit === undefined || plan.requestedLimit <= 1
+    ? undefined
+    : plan.requestedLimit - 1;
+  return readBytePage({
+    mode: "bytes",
+    path: plan.path,
+    resolvedPath: plan.resolvedPath,
+    bytes: plan.bytes,
+    totalLines: plan.totalLines,
+    sourceHash: hashReadSource(plan.bytes),
+    byteStart,
+    lineEndByteExclusive,
+    nextOffset,
+    nextLimit,
+    demandBytes: Math.min(lineEndByteExclusive - byteStart, limits.maxBytesPerFile)
+  }, budgetBytes, limits);
+}
+
+function readBytePage(plan: PreparedByteRead, budgetBytes: number, limits: ReadManyLimits): ReadTextFileResult {
+  const byteEndExclusive = utf8SafeSliceEnd(plan.bytes, plan.byteStart, plan.lineEndByteExclusive, budgetBytes);
+  const outputContent = plan.bytes.subarray(plan.byteStart, byteEndExclusive).toString("utf8");
+  let continuation: ReadContinuation | undefined;
+  let truncatedBy: TruncationDetails["truncatedBy"] = null;
+  if (byteEndExclusive < plan.lineEndByteExclusive) {
+    continuation = {
+      path: plan.path,
+      cursor: encodeReadCursor({
+        version: 1,
+        pathHash: hashReadSource(plan.resolvedPath),
+        sourceHash: plan.sourceHash,
+        byteOffset: byteEndExclusive,
+        lineEndByteExclusive: plan.lineEndByteExclusive,
+        nextOffset: plan.nextOffset,
+        nextLimit: plan.nextLimit
+      })
+    };
+    truncatedBy = "bytes";
+  } else if (plan.nextOffset !== undefined) {
+    continuation = {
+      path: plan.path,
+      offset: plan.nextOffset,
+      limit: plan.nextLimit
+    };
+    truncatedBy = "lines";
+  }
+
+  return {
+    kind: "text",
+    mode: "bytes",
+    path: plan.path,
+    resolvedPath: plan.resolvedPath,
+    byteStart: plan.byteStart,
+    byteEndExclusive,
+    truncation: {
+      truncated: continuation !== undefined,
+      truncatedBy,
+      totalLines: plan.totalLines,
+      outputLines: outputContent === "" ? 0 : 1,
+      totalBytes: plan.bytes.byteLength,
+      outputBytes: Buffer.byteLength(outputContent, "utf8"),
+      partialLine: true,
+      continuation
+    },
+    previewLines: previewLines(outputContent, 2, limits.maxPreviewLineChars),
+    text: outputContent
+  };
+}
+
+function buildLineContinuation(plan: PreparedLineRead, outputEndIndex: number): ReadLineContinuation | undefined {
+  if (outputEndIndex < plan.selectionEndIndex) {
+    const remainingLimit = plan.requestedLimit === undefined ? undefined : plan.selectionEndIndex - outputEndIndex;
+    return { path: plan.path, offset: outputEndIndex + 1, limit: remainingLimit };
+  }
+  if (outputEndIndex < plan.totalLines) {
+    return { path: plan.path, offset: outputEndIndex + 1 };
+  }
+  return undefined;
+}
+
+function lineStartByteOffset(lines: string[], lineIndex: number): number {
+  let byteOffset = 0;
+  for (let index = 0; index < lineIndex; index += 1) {
+    byteOffset += Buffer.byteLength(lines[index] ?? "", "utf8") + 1;
+  }
+  return byteOffset;
+}
+
+function isUtf8Boundary(bytes: Buffer, offset: number): boolean {
+  return offset === bytes.byteLength || ((bytes[offset] ?? 0) >> 6) !== 0b10;
+}
+
+function utf8SafeSliceEnd(bytes: Buffer, start: number, lineEnd: number, budgetBytes: number): number {
+  if (budgetBytes <= 0) {
+    throw new Error("read_many cannot make progress because the allocated text budget is empty");
+  }
+  let end = Math.min(lineEnd, start + budgetBytes);
+  while (end > start && end < lineEnd && (bytes[end] ?? 0) >> 6 === 0b10) {
+    end -= 1;
+  }
+  if (end === start) {
+    throw new Error("read_many cannot fit one UTF-8 code point in the allocated text budget");
+  }
+  return end;
+}
+
+function isReadCursorItem(item: ReadManyInput["files"][number]): item is Extract<ReadManyInput["files"][number], { cursor: string }> {
+  return "cursor" in item;
+}
+
+function hashReadSource(source: string | Uint8Array): string {
+  return createHash("sha256").update(source).digest("hex");
+}
+
+function encodeReadCursor(cursor: ReadCursorPayload): string {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+function decodeReadCursor(encoded: string): ReadCursorPayload {
+  try {
+    const value = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as Partial<ReadCursorPayload>;
+    if (
+      value.version !== 1
+      || typeof value.pathHash !== "string"
+      || typeof value.sourceHash !== "string"
+      || !Number.isInteger(value.byteOffset)
+      || !Number.isInteger(value.lineEndByteExclusive)
+      || value.nextOffset !== undefined && !Number.isInteger(value.nextOffset)
+      || value.nextLimit !== undefined && !Number.isInteger(value.nextLimit)
+    ) {
+      throw new Error("invalid cursor payload");
+    }
+    return value as ReadCursorPayload;
+  } catch {
+    throw new Error("Cannot continue read_many: the cursor is invalid or corrupted.");
+  }
+}
+
+function allocateFairReadBudgets(demands: number[], totalBudget: number): number[] {
+  const budgets = demands.map(() => 0);
+  let remainingBudget = totalBudget;
+  let pending = demands.map((_demand, index) => index).filter((index) => demands[index]! > 0);
+
+  while (pending.length > 0 && remainingBudget > 0) {
+    const share = Math.floor(remainingBudget / pending.length);
+    const satisfied = pending.filter((index) => demands[index]! <= share);
+    if (satisfied.length > 0) {
+      for (const index of satisfied) {
+        budgets[index] = demands[index]!;
+        remainingBudget -= budgets[index]!;
+      }
+      const satisfiedSet = new Set(satisfied);
+      pending = pending.filter((index) => !satisfiedSet.has(index));
+      continue;
+    }
+
+    for (const index of pending) {
+      budgets[index] = Math.min(demands[index]!, share);
+      remainingBudget -= budgets[index]!;
+    }
+    for (const index of pending) {
+      if (remainingBudget === 0) break;
+      if (budgets[index]! < demands[index]!) {
+        budgets[index]! += 1;
+        remainingBudget -= 1;
+      }
+    }
+    break;
+  }
+  return budgets;
+}
+
+function validateReadManyLimits(limits: ReadManyLimits): void {
+  for (const [name, value] of Object.entries(limits)) {
+    if (!Number.isInteger(value) || value <= 0) {
+      throw new Error(`read_many internal limit ${name} must be a positive integer`);
+    }
+  }
+  if (limits.maxBytesPerBatch > limits.maxResultBytes) {
+    throw new Error("read_many maxBytesPerBatch must not exceed maxResultBytes");
+  }
+}
+
 async function readImageOne(
   context: ExtensionContext,
-  item: ReadManyInput["files"][number],
-  resolvedPath: string,
-  bytes: Buffer,
-  inputMimeType: SupportedImageMimeType,
+  prepared: PreparedReadFile,
   signal?: AbortSignal
 ): Promise<ReadImageFileResult> {
-  if (item.offset !== undefined || item.limit !== undefined) {
-    throw new Error(`Image file ${item.path} does not accept offset or limit; remove text-only range arguments.`);
+  const { item, resolvedPath, bytes, imageMimeType: inputMimeType } = prepared;
+  if (inputMimeType === null) {
+    throw new Error("read_many internal error: text file reached the image pipeline");
+  }
+  if (isReadCursorItem(item) || item.offset !== undefined || item.limit !== undefined) {
+    throw new Error(`Image file ${item.path} does not accept cursor, offset, or limit; remove text-only range arguments.`);
   }
   if (context.model === undefined) {
     throw new Error(`Cannot deliver image ${item.path}: no active model is available to verify image input support.`);
@@ -1123,12 +1521,12 @@ function formatReadFile(file: ReadFileResult): string {
     return `--- ${file.path} (image ${conversion}; attachment follows in input order) ---\n${file.text}`;
   }
 
-  const startLine = file.offset;
-  const endLine = file.offset + file.truncation.outputLines - 1;
-  const header = `--- ${file.path} (lines ${startLine}-${Math.max(startLine, endLine)} of ${file.truncation.totalLines}) ---`;
-  const continuation = file.truncation.nextOffset === undefined
+  const header = file.mode === "lines"
+    ? `--- ${file.path} (lines ${file.offset}-${Math.max(file.offset, file.offset + file.truncation.outputLines - 1)} of ${file.truncation.totalLines}) ---`
+    : `--- ${file.path} (UTF-8 bytes ${file.byteStart}-${file.byteEndExclusive} of ${file.truncation.totalBytes}; partial line) ---`;
+  const continuation = file.truncation.continuation === undefined
     ? ""
-    : `\n[truncated by ${file.truncation.truncatedBy}; continue with offset=${file.truncation.nextOffset}]`;
+    : `\n[truncated by ${file.truncation.truncatedBy}; continue with ${JSON.stringify(file.truncation.continuation)}]`;
 
   return `${header}\n${file.text}${continuation}`;
 }
@@ -1266,21 +1664,6 @@ function startsWithAscii(buffer: Buffer, offset: number, text: string): boolean 
     }
   }
   return true;
-}
-
-function buildReadTruncation(selected: string[], outputContent: string, totalLines: number, totalBytes: number, startIndex: number): TruncationDetails {
-  const outputLines = selected.length;
-  const hasMoreFileLines = startIndex + outputLines < totalLines;
-
-  return {
-    truncated: hasMoreFileLines,
-    truncatedBy: hasMoreFileLines ? "lines" : null,
-    totalLines,
-    outputLines,
-    totalBytes,
-    outputBytes: Buffer.byteLength(outputContent, "utf8"),
-    nextOffset: hasMoreFileLines ? startIndex + outputLines + 1 : undefined
-  };
 }
 
 const NATIVE_MUTATION_ENTRY_ID_HASH_LENGTH = 12;
@@ -1722,6 +2105,9 @@ function summarizeItems(items: string[], limit: number): string {
 }
 
 function formatReadRequest(file: ReadManyInput["files"][number]): string {
+  if (isReadCursorItem(file)) {
+    return `${compactPath(file.path)} [cursor]`;
+  }
   const offset = file.offset ?? 1;
   return file.limit === undefined
     ? `${compactPath(file.path)}:${offset}+`
@@ -1731,6 +2117,9 @@ function formatReadRequest(file: ReadManyInput["files"][number]): string {
 function formatReadResultSpan(file: ReadFileDetails): string {
   if (file.kind === "image") {
     return `${compactPath(file.path)} [image]`;
+  }
+  if (file.mode === "bytes") {
+    return `${compactPath(file.path)} [bytes ${file.byteStart}-${file.byteEndExclusive}]`;
   }
   const start = file.offset;
   const end = Math.max(start, file.offset + file.truncation.outputLines - 1);
@@ -1775,12 +2164,13 @@ function formatSearchTarget(searchPath: string, glob: string | undefined): strin
   return glob === undefined ? target : `${target} glob ${quotePreview(glob, 48)}`;
 }
 
-function previewLines(text: string, limit: number): string[] {
+function previewLines(text: string, limit: number, maxLineChars = 500): string[] {
   return text
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line !== "")
-    .slice(0, limit);
+    .slice(0, limit)
+    .map((line) => truncateEnd(line, maxLineChars));
 }
 
 function compactPath(rawPath: string): string {
@@ -1803,8 +2193,23 @@ function quotePreview(text: string, maxLength: number): string {
 }
 
 function truncateOneLine(text: string, maxLength: number): string {
-  const oneLine = text.replace(/\s+/g, " ").trim();
-  return oneLine.length <= maxLength ? oneLine : `${oneLine.slice(0, Math.max(0, maxLength - 3))}...`;
+  return truncateEnd(text.replace(/\s+/g, " ").trim(), maxLength);
+}
+
+function truncateEnd(text: string, maxLength: number): string {
+  if (text.length <= maxLength) {
+    return text;
+  }
+  if (maxLength <= 3) {
+    return ".".repeat(maxLength);
+  }
+  let prefixEnd = maxLength - 3;
+  const finalCodeUnit = text.charCodeAt(prefixEnd - 1);
+  const nextCodeUnit = text.charCodeAt(prefixEnd);
+  if (finalCodeUnit >= 0xd800 && finalCodeUnit <= 0xdbff && nextCodeUnit >= 0xdc00 && nextCodeUnit <= 0xdfff) {
+    prefixEnd -= 1;
+  }
+  return `${text.slice(0, prefixEnd)}...`;
 }
 
 function formatBytes(bytes: number): string {

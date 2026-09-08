@@ -101,16 +101,6 @@ const ShellTruncationSchema = Type.Object({
   nextOffset: Type.Optional(PositiveNumberSchema)
 }, { additionalProperties: false });
 
-const TruncationSchema = Type.Object({
-  truncated: Type.Boolean(),
-  truncatedBy: Type.Union([Type.Literal("lines"), Type.Literal("bytes"), Type.Null()]),
-  totalLines: NonNegativeIntegerSchema,
-  outputLines: NonNegativeIntegerSchema,
-  totalBytes: NonNegativeIntegerSchema,
-  outputBytes: NonNegativeIntegerSchema,
-  nextOffset: Type.Optional(PositiveNumberSchema)
-}, { additionalProperties: false });
-
 const ShellTailStreamSchema = Type.Object({
   stream: Type.Union([Type.Literal("stdout"), Type.Literal("stderr")]),
   logPath: Type.String({ minLength: 1 }),
@@ -160,19 +150,91 @@ const ShellCancelDetailsSchema = Type.Object({
   output: JobOutputSchema
 }, { additionalProperties: false });
 
+const ReadLineContinuationSchema = Type.Object({
+  path: Type.String({ minLength: 1 }),
+  offset: PositiveIntegerSchema,
+  limit: Type.Optional(PositiveIntegerSchema)
+}, { additionalProperties: false });
+
+const ReadCursorContinuationSchema = Type.Object({
+  path: Type.String({ minLength: 1 }),
+  cursor: Type.String({ minLength: 1 })
+}, { additionalProperties: false });
+
+const ReadTruncationMetrics = {
+  totalLines: NonNegativeIntegerSchema,
+  outputLines: NonNegativeIntegerSchema,
+  totalBytes: NonNegativeIntegerSchema,
+  outputBytes: NonNegativeIntegerSchema
+};
+
+const CompleteLineReadTruncationSchema = Type.Object({
+  truncated: Type.Literal(false),
+  truncatedBy: Type.Null(),
+  ...ReadTruncationMetrics,
+  partialLine: Type.Literal(false)
+}, { additionalProperties: false });
+
+const ContinuedLineReadTruncationSchema = Type.Object({
+  truncated: Type.Literal(true),
+  truncatedBy: Type.Union([Type.Literal("lines"), Type.Literal("bytes")]),
+  ...ReadTruncationMetrics,
+  partialLine: Type.Literal(false),
+  continuation: ReadLineContinuationSchema
+}, { additionalProperties: false });
+
+const CompleteByteReadTruncationSchema = Type.Object({
+  truncated: Type.Literal(false),
+  truncatedBy: Type.Null(),
+  ...ReadTruncationMetrics,
+  partialLine: Type.Literal(true)
+}, { additionalProperties: false });
+
+const CursorContinuedByteReadTruncationSchema = Type.Object({
+  truncated: Type.Literal(true),
+  truncatedBy: Type.Literal("bytes"),
+  ...ReadTruncationMetrics,
+  partialLine: Type.Literal(true),
+  continuation: ReadCursorContinuationSchema
+}, { additionalProperties: false });
+
+const LineContinuedByteReadTruncationSchema = Type.Object({
+  truncated: Type.Literal(true),
+  truncatedBy: Type.Literal("lines"),
+  ...ReadTruncationMetrics,
+  partialLine: Type.Literal(true),
+  continuation: ReadLineContinuationSchema
+}, { additionalProperties: false });
+
 const ReadFileBaseProperties = {
   path: Type.String({ minLength: 1 }),
   resolvedPath: Type.String({ minLength: 1 }),
-  previewLines: Type.Array(Type.String(), { maxItems: 2 })
+  previewLines: Type.Array(Type.String({ maxLength: 500 }), { maxItems: 2 })
 };
 
-const ReadTextFileDetailsSchema = Type.Object({
+const ReadLineTextFileDetailsSchema = Type.Object({
   ...ReadFileBaseProperties,
   kind: Type.Literal("text"),
-  offset: PositiveNumberSchema,
-  requestedLimit: Type.Optional(PositiveNumberSchema),
-  truncation: TruncationSchema
+  mode: Type.Literal("lines"),
+  offset: PositiveIntegerSchema,
+  requestedLimit: Type.Optional(PositiveIntegerSchema),
+  truncation: Type.Union([CompleteLineReadTruncationSchema, ContinuedLineReadTruncationSchema])
 }, { additionalProperties: false });
+
+const ReadByteTextFileDetailsSchema = Type.Object({
+  ...ReadFileBaseProperties,
+  kind: Type.Literal("text"),
+  mode: Type.Literal("bytes"),
+  byteStart: NonNegativeIntegerSchema,
+  byteEndExclusive: NonNegativeIntegerSchema,
+  truncation: Type.Union([
+    CompleteByteReadTruncationSchema,
+    CursorContinuedByteReadTruncationSchema,
+    LineContinuedByteReadTruncationSchema
+  ])
+}, { additionalProperties: false });
+
+const ReadTextFileDetailsSchema = Type.Union([ReadLineTextFileDetailsSchema, ReadByteTextFileDetailsSchema]);
 
 const ReadImageFileDetailsSchema = Type.Object({
   ...ReadFileBaseProperties,
@@ -223,7 +285,7 @@ const SearchResultDetailsSchema = Type.Object({
   truncated: Type.Boolean(),
   exitCode: NullableIntegerSchema,
   signal: Type.Optional(NullableStringSchema),
-  previewLines: Type.Array(Type.String(), { maxItems: 3 })
+  previewLines: Type.Array(Type.String({ maxLength: 500 }), { maxItems: 3 })
 }, { additionalProperties: false });
 
 const SearchManyDetailsSchema = Type.Object({
