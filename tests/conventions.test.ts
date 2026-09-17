@@ -79,7 +79,8 @@ test("pi-tools registered extensions have shipping default config files where re
     "docs/extensions/tool-display.md",
     "docs/extensions/tool-safety.md",
     "docs/extensions/tui-scrollback.md",
-    "docs/extensions/web-fetch.md"
+    "docs/extensions/web-fetch.md",
+    "docs/extensions/worker.md"
   ];
   for (const file of requiredConfigs) {
     assert.ok(readText(file).length > 0, file);
@@ -89,13 +90,16 @@ test("pi-tools registered extensions have shipping default config files where re
 test("extension load order preserves async-shell and context dependencies", () => {
   const extensions = packageJson().pi?.extensions ?? [];
   const asyncShellIndex = extensions.indexOf("extensions/async-shell/index.ts");
+  const workerIndex = extensions.indexOf("extensions/worker/index.ts");
   const completionNotificationsIndex = extensions.indexOf("extensions/completion-notifications/index.ts");
   const retryIndex = extensions.indexOf("extensions/manual-retry/index.ts");
   const contextExportIndex = extensions.indexOf("extensions/context-export/index.ts");
   const compacterIndex = extensions.indexOf("extensions/compacter/index.ts");
 
   assert.ok(asyncShellIndex >= 0, "async-shell must be registered");
+  assert.ok(workerIndex >= 0, "worker must be registered");
   assert.ok(completionNotificationsIndex >= 0, "completion-notifications must be registered");
+  assert.ok(asyncShellIndex < workerIndex, "async-shell must load before worker");
   assert.ok(asyncShellIndex < completionNotificationsIndex, "async-shell must load before completion-notifications");
   assert.ok(retryIndex >= 0, "manual-retry must be registered");
   assert.ok(contextExportIndex >= 0, "context-export must be registered");
@@ -154,6 +158,8 @@ test("pi-tools package files whitelist excludes tests and local runtime artifact
     "extensions/",
     "skills/",
     "scripts/dev-pi.mjs",
-    "scripts/review-provider-context.mjs"
+    "scripts/review-provider-context.mjs",
+    "scripts/worker-host.mjs",
+    "scripts/worker-shell-host.mjs"
   ]);
 });

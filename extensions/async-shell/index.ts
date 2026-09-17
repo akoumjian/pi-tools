@@ -1,18 +1,31 @@
-import { spawn, type ChildProcessByStdio } from "node:child_process";
-import { accessSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync, appendFileSync } from "node:fs";
-import path from "node:path";
+import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import type { Readable } from "node:stream";
+import { accessSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { Type, type Static } from "@earendil-works/pi-ai";
 import { DynamicBorder, defineTool, type AgentToolResult, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, SelectList, Text, truncateToWidth, type Component, type SelectItem, type TUI } from "@earendil-works/pi-tui";
+import {
+  asyncJobOutputBytes,
+  createAsyncJobId,
+  isAsyncJobExecutionAlive,
+  signalAsyncJobExecution,
+  spawnAsyncJobProcess
+} from "../_shared/async-job.js";
 import { throwIfAborted } from "../_shared/cancellation.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
+import { prepareWorkspaceSandboxProcess } from "../_shared/workspace-sandbox.js";
+import { prepareWorkerContainerProcess, signalWorkerContainerJob, workerContainerFromEnvironment } from "../_shared/worker-container.js";
 import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 
 export type JobStatus = "running" | "exited" | "failed" | "cancelled" | "unknown";
+export type AsyncShellJobOwner = {
+  kind: "worker-run";
+  workerId: string;
+  runId: string;
+};
 type OutputStreamName = "stdout" | "stderr";
 type ShellReadMode = "tail" | "range";
 
@@ -47,6 +60,8 @@ export type JobMeta = {
   error?: string;
   notifyOnExit: boolean;
   completionNotified: boolean;
+  owner?: AsyncShellJobOwner;
+  processToken?: string;
   logDir: string;
   stdoutLog: string;
   stderrLog: string;
@@ -54,6 +69,27 @@ export type JobMeta = {
     stdout: number;
     stderr: number;
   };
+};
+
+export type StartManagedAsyncJobInput = {
+  jobId?: string;
+  job_name?: string;
+  command: string;
+  cwd: string;
+  shell?: string;
+  executable?: string;
+  args?: string[];
+  env?: NodeJS.ProcessEnv;
+  notifyOnExit?: boolean;
+  settleProcessGroup?: boolean;
+  persistSpawnedMetadata?: (job: JobMeta) => void;
+};
+
+export type ManagedAsyncJobHandle = {
+  jobId: string;
+  completion: Promise<JobMeta>;
+  snapshot(): JobMeta;
+  cancel(signal?: NodeJS.Signals): void;
 };
 
 type JobStartDetails = Pick<JobMeta,
@@ -76,7 +112,7 @@ type CompletionDeliveryContext = {
 };
 
 type JobRuntime = JobMeta & {
-  process: ChildProcessByStdio<null, Readable, Readable>;
+  process: ChildProcess;
   waiters: Array<() => void>;
   activeWaiters: number;
   // Suppresses completion notices until shell_start returns its in-band result.
@@ -88,6 +124,10 @@ type JobRuntime = JobMeta & {
   // Stays true after sendMessage succeeds. Completion-notifications matches the
   // resulting custom message by jobId; its run-start filter excludes old jobs.
   completionFollowUpQueued: boolean;
+  settleProcessGroup: boolean;
+  startupError?: string;
+  cancellationEffect?: (signal: NodeJS.Signals) => void;
+  groupMonitor?: NodeJS.Timeout;
 };
 
 type JobSummaryDetails = {
@@ -217,14 +257,16 @@ const StartParams = Type.Object({
   })
 }, { additionalProperties: false });
 
+const AsyncJobIdSchema = Type.String({ pattern: "^job_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$", description: "Canonical async shell job id." });
+
 const StatusParams = Type.Object({
-  jobId: Type.Optional(Type.String({ minLength: 1, description: "Async shell job id. Omit to list active and recent jobs." })),
+  jobId: Type.Optional(Type.String({ minLength: 5, maxLength: 132, pattern: "^job_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$", description: "Async shell job id. Omit to list active and recent jobs." })),
   limit: Type.Optional(Type.Number({ minimum: 1, maximum: 100, default: 20, description: "When jobId is omitted, maximum number of recent jobs to list." })),
   tailLines: Type.Optional(Type.Number({ minimum: 1, maximum: SHELL_TAIL_MAX_LINES, default: SHELL_STATUS_DEFAULT_TAIL_LINES, description: "When jobId is set, diagnostic status tail lines per stream. Prefer shell_read mode='tail' for output reading and shell_read mode='range' for exact lines; max 500." }))
 }, { additionalProperties: false });
 
 const ReadParams = Type.Object({
-  jobId: Type.String({ minLength: 1, description: "Async shell job id." }),
+  jobId: AsyncJobIdSchema,
   mode: Type.Optional(Type.Union([Type.Literal("tail"), Type.Literal("range")], { default: "tail", description: "Output read mode. Use mode='tail' (default) for recent output after a result/notification. Use mode='range' when you know exact line numbers, when continuing with nextOffset, or after search_many finds matching log lines. If offset or limit is provided without mode, range mode is inferred." })),
   stream: Type.Optional(Type.Union([Type.Literal("stdout"), Type.Literal("stderr")], { description: "Optional stream to read. Omit to read both stdout and stderr for the selected mode." })),
   lines: Type.Optional(Type.Number({ minimum: 1, maximum: SHELL_TAIL_MAX_LINES, default: SHELL_TAIL_DEFAULT_LINES, description: "Tail mode only: maximum recent lines per selected stream. Default 80, max 500. Prefer tail mode for progress, recent failures, and completion summaries." })),
@@ -234,7 +276,7 @@ const ReadParams = Type.Object({
 }, { additionalProperties: false });
 
 const CancelParams = Type.Object({
-  jobId: Type.String({ minLength: 1, description: "Async shell job id." }),
+  jobId: AsyncJobIdSchema,
   signal: Type.Optional(Type.Union([Type.Literal("SIGTERM"), Type.Literal("SIGINT"), Type.Literal("SIGKILL")], { default: "SIGTERM", description: "Signal to send to the job process group." }))
 }, { additionalProperties: false });
 
@@ -313,6 +355,10 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
   });
   api.on("agent_end", (_event, context) => {
     scheduleCompletionBatchFlush(api, createCompletionDeliveryContext(context));
+  });
+  api.on("session_shutdown", async () => {
+    const owner = workerOwnerFromEnvironment();
+    if (owner) await cancelAsyncShellJobsForOwner(owner);
   });
 
   api.registerTool(defineTool({
@@ -454,6 +500,7 @@ async function startJobs(
   signal?: AbortSignal
 ): Promise<AgentToolResult<StartDetails>> {
   throwIfAborted(signal);
+  assertWorkerRunAcceptsSideEffects();
   const specs = normalizeCommandSpecs(input);
 
   const runtimes = specs.map((spec) => startJob(api, context, {
@@ -475,15 +522,33 @@ async function startJobs(
 function startJob(
   api: ExtensionAPI,
   context: ExtensionContext,
-  input: CommandSpec & {
+  input: StartManagedAsyncJobInput & {
     notifyOnExit: boolean;
   }
 ): JobRuntime {
   const cwd = resolveCwd(context, input.cwd);
-  const shell = input.shell?.trim() || process.env.SHELL || "/bin/zsh";
-  const jobId = createJobId();
+  const owner = workerOwnerFromEnvironment();
+  const shell = input.shell?.trim() || (owner ? "/bin/bash" : process.env.SHELL || "/bin/zsh");
+  const jobId = input.jobId ?? createAsyncJobId();
+  assertValidAsyncJobId(jobId);
   const root = jobsRoot(context.cwd);
   const logDir = path.join(root, "jobs", jobId);
+  const processToken = owner ? randomUUID() : undefined;
+  const executable = input.executable ?? shell;
+  const args = input.args ?? (owner ? managedWorkerShellArgs(executable, input.command) : ["-lc", input.command]);
+  const processEnvironment = processToken
+    ? { ...(input.env ?? process.env), PI_WORKER_JOB_TOKEN: processToken }
+    : input.env ?? process.env;
+  const processInput: { executable: string; args: string[]; env: NodeJS.ProcessEnv; cancellationEffect?: (signal: NodeJS.Signals) => void } = owner
+    ? prepareManagedWorkerProcess({
+        jobId,
+        cwd,
+        executable,
+        args,
+        env: processEnvironment,
+        workspaceRoot: workerWorkspaceRoot(context)
+      })
+    : { executable, args, env: processEnvironment };
 
   mkdirSync(logDir, { recursive: true });
 
@@ -496,16 +561,20 @@ function startJob(
     shell,
     logDir,
     startedAtMs,
-    notifyOnExit: input.notifyOnExit ?? true
+    notifyOnExit: input.notifyOnExit ?? true,
+    owner,
+    processToken
   });
 
   writeMeta(job);
 
-  const child = spawn(shell, ["-lc", input.command], {
+  const child = spawnAsyncJobProcess({
+    executable: processInput.executable,
+    args: processInput.args,
     cwd,
-    env: process.env,
-    detached: true,
-    stdio: ["ignore", "pipe", "pipe"]
+    env: processInput.env,
+    stdoutLog: job.stdoutLog,
+    stderrLog: job.stderrLog
   });
 
   const runtime: JobRuntime = {
@@ -519,23 +588,162 @@ function startJob(
     originProjectCwd: context.cwd,
     originSessionId: context.sessionManager.getSessionId(),
     completionFollowUpQueued: false,
+    settleProcessGroup: input.settleProcessGroup ?? false,
+    cancellationEffect: processInput.cancellationEffect,
     pid: child.pid
   };
 
   jobs.set(jobId, runtime);
-  writeMeta(runtime);
-
-  child.stdout.on("data", (chunk: Buffer) => appendOutput(runtime, "stdout", chunk));
-  child.stderr.on("data", (chunk: Buffer) => appendOutput(runtime, "stderr", chunk));
   child.on("error", (error) => finalizeJob(api, runtime, "failed", undefined, undefined, error.message));
   child.on("close", (code, signal) => {
-    const status = runtime.cancelRequested ? "cancelled" : code === 0 ? "exited" : "failed";
-    finalizeJob(api, runtime, status, code, signal);
+    finalizeJobAfterProcessGroupExit(api, runtime, code, signal);
   });
+  try {
+    (input.persistSpawnedMetadata ?? writeMeta)(runtime);
+  } catch (cause) {
+    runtime.startupError = `Unable to persist spawned async job metadata: ${cause instanceof Error ? cause.message : String(cause)}`;
+    runtime.notifyOnExit = false;
+    try {
+      signalAsyncJobExecution(runtime.pid, runtime.processToken, "SIGKILL");
+    } catch {}
+  }
 
   child.unref();
 
   return runtime;
+}
+
+export function startManagedAsyncJob(
+  api: ExtensionAPI,
+  context: ExtensionContext,
+  input: StartManagedAsyncJobInput
+): ManagedAsyncJobHandle {
+  const runtime = startJob(api, context, {
+    ...input,
+    notifyOnExit: input.notifyOnExit ?? false
+  });
+  runtime.startResultPending = false;
+  return {
+    jobId: runtime.jobId,
+    completion: waitForManagedJobCompletion(runtime),
+    snapshot: () => publicJob(runtime),
+    cancel: (signal = "SIGTERM") => cancelJob(runtime, signal)
+  };
+}
+
+function waitForManagedJobCompletion(job: JobRuntime): Promise<JobMeta> {
+  if (isTerminal(job.status)) return Promise.resolve(publicJob(job));
+  return new Promise((resolve) => {
+    job.waiters.push(() => resolve(publicJob(job)));
+  });
+}
+
+export function activeAsyncShellJobsForOwner(owner: AsyncShellJobOwner): JobMeta[] {
+  return Array.from(jobs.values())
+    .filter((job) => !isTerminal(job.status) && sameJobOwner(job.owner, owner))
+    .map(publicJob);
+}
+
+export function unsettledAsyncShellJobsForOwner(owner: AsyncShellJobOwner): JobMeta[] {
+  return Array.from(jobs.values())
+    .filter((job) => sameJobOwner(job.owner, owner))
+    .filter((job) => !isTerminal(job.status) || (job.notifyOnExit && !job.completionNotified))
+    .map(publicJob);
+}
+
+export async function cancelAsyncShellJobsForOwner(
+  owner: AsyncShellJobOwner,
+  signal: NodeJS.Signals = "SIGTERM",
+  graceMs = 2_000
+): Promise<JobMeta[]> {
+  const owned = Array.from(jobs.values()).filter((job) => !isTerminal(job.status) && sameJobOwner(job.owner, owner));
+  for (const job of owned) cancelJob(job, signal);
+  const settled = await Promise.all(owned.map((job) => waitForJob(job, graceMs)));
+  for (let index = 0; index < owned.length; index += 1) {
+    const job = owned[index];
+    if (!settled[index] && !isTerminal(job.status)) cancelJob(job, "SIGKILL");
+  }
+  await Promise.all(owned.map((job) => waitForManagedJobCompletion(job)));
+  return owned.map(publicJob);
+}
+
+export async function cancelPersistedAsyncShellJobsForOwner(
+  asyncJobRoot: string,
+  owner: AsyncShellJobOwner,
+  graceMs = 2_000
+): Promise<JobMeta[]> {
+  const jobsDirectory = path.join(path.resolve(asyncJobRoot), "jobs");
+  if (!existsSync(jobsDirectory)) return [];
+  const candidates = readdirSync(jobsDirectory, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && isValidAsyncJobId(entry.name))
+    .map((entry) => readMetaFile(path.join(jobsDirectory, entry.name, "meta.json"), jobsDirectory, entry.name))
+    .filter((job): job is JobMeta => job !== undefined && sameJobOwner(job.owner, owner))
+    .filter((job) => !isTerminal(job.status));
+  const unverifiable = candidates.filter((job) => !job.processToken);
+  if (unverifiable.length > 0) {
+    throw new Error(`Worker-owned async-shell jobs lack ownership tokens: ${unverifiable.map((job) => job.jobId).join(", ")}.`);
+  }
+  const owned = candidates.filter((job) => isAsyncJobExecutionAlive(job.pid, job.processToken));
+  for (const job of owned) signalPersistedJob(job, "SIGTERM");
+  await waitForPersistedJobGroups(owned, graceMs);
+  for (const job of owned.filter((candidate) => isAsyncJobExecutionAlive(candidate.pid, candidate.processToken))) {
+    signalPersistedJob(job, "SIGKILL");
+  }
+  await waitForPersistedJobGroups(owned, 2_000);
+  const survivors = owned.filter((job) => isAsyncJobExecutionAlive(job.pid, job.processToken));
+  if (survivors.length > 0) {
+    throw new Error(`Worker-owned async-shell process groups survived cancellation: ${survivors.map((job) => job.jobId).join(", ")}.`);
+  }
+  const endedAt = new Date().toISOString();
+  for (const job of owned) {
+    const updated: JobMeta = {
+      ...job,
+      status: "cancelled",
+      endedAt,
+      durationMs: Date.parse(endedAt) - Date.parse(job.startedAt),
+      signal: "SIGKILL",
+      notifyOnExit: false,
+      completionNotified: true,
+      outputBytes: asyncJobOutputBytes(job.stdoutLog, job.stderrLog)
+    };
+    writeFileSync(path.join(updated.logDir, "meta.json"), `${JSON.stringify(publicJob(updated), null, 2)}\n`);
+  }
+  return owned.map((job) => ({ ...job, status: "cancelled", endedAt, notifyOnExit: false, completionNotified: true }));
+}
+
+function signalPersistedJob(job: JobMeta, signal: NodeJS.Signals): void {
+  signalAsyncJobExecution(job.pid, job.processToken, signal);
+}
+
+async function waitForPersistedJobGroups(jobsToWait: JobMeta[], timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (jobsToWait.some((job) => isAsyncJobExecutionAlive(job.pid, job.processToken)) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+function finalizeJobAfterProcessGroupExit(
+  api: ExtensionAPI,
+  job: JobRuntime,
+  exitCode: number | null,
+  signal: NodeJS.Signals | null
+): void {
+  const finish = () => {
+    const status = job.startupError ? "failed" : job.cancelRequested ? "cancelled" : exitCode === 0 ? "exited" : "failed";
+    finalizeJob(api, job, status, exitCode, signal, job.startupError);
+  };
+  if ((!job.owner && !job.settleProcessGroup) || !isAsyncJobExecutionAlive(job.pid, job.processToken)) {
+    finish();
+    return;
+  }
+  const monitor = setInterval(() => {
+    if (isAsyncJobExecutionAlive(job.pid, job.processToken)) return;
+    clearInterval(monitor);
+    job.groupMonitor = undefined;
+    finish();
+  }, 50);
+  job.groupMonitor = monitor;
+  if (!job.owner && !job.settleProcessGroup && !job.cancelRequested) monitor.unref();
 }
 
 function createJobMeta(input: {
@@ -547,6 +755,8 @@ function createJobMeta(input: {
   logDir: string;
   startedAtMs: number;
   notifyOnExit: boolean;
+  owner?: AsyncShellJobOwner;
+  processToken?: string;
 }): JobMeta {
   return {
     jobId: input.jobId,
@@ -558,6 +768,8 @@ function createJobMeta(input: {
     startedAt: new Date(input.startedAtMs).toISOString(),
     notifyOnExit: input.notifyOnExit,
     completionNotified: false,
+    owner: input.owner,
+    processToken: input.processToken,
     logDir: input.logDir,
     stdoutLog: path.join(input.logDir, "stdout.log"),
     stderrLog: path.join(input.logDir, "stderr.log"),
@@ -566,13 +778,6 @@ function createJobMeta(input: {
       stderr: 0
     }
   };
-}
-
-function appendOutput(job: JobRuntime, stream: OutputStreamName, chunk: Buffer): void {
-  const rawLog = stream === "stdout" ? job.stdoutLog : job.stderrLog;
-
-  appendFileSync(rawLog, chunk);
-  job.outputBytes[stream] += chunk.length;
 }
 
 function finalizeJob(
@@ -594,6 +799,7 @@ function finalizeJob(
   job.exitCode = exitCode;
   job.signal = signal;
   job.error = error;
+  job.outputBytes = asyncJobOutputBytes(job.stdoutLog, job.stderrLog);
   writeMeta(job);
 
   for (const resolve of job.waiters.splice(0)) {
@@ -766,7 +972,7 @@ function startJobDetails(job: JobMeta): JobStartDetails {
     error: job.error,
     stdoutLog: job.stdoutLog,
     stderrLog: job.stderrLog,
-    outputBytes: { ...job.outputBytes }
+    outputBytes: asyncJobOutputBytes(job.stdoutLog, job.stderrLog)
   };
 }
 
@@ -829,6 +1035,8 @@ function cancelJob(job: JobRuntime, signal: NodeJS.Signals): void {
   }
 
   job.cancelRequested = true;
+  job.process.ref();
+  job.groupMonitor?.ref();
   job.notifyOnExit = false;
   writeMeta(job);
 
@@ -836,11 +1044,8 @@ function cancelJob(job: JobRuntime, signal: NodeJS.Signals): void {
     throw new Error(`Job ${job.jobId} has no process id to cancel.`);
   }
 
-  try {
-    process.kill(-job.pid, signal);
-  } catch {
-    process.kill(job.pid, signal);
-  }
+  job.cancellationEffect?.(signal);
+  signalAsyncJobExecution(job.pid, job.processToken, signal);
 }
 
 async function waitForJob(job: JobRuntime, timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
@@ -1038,7 +1243,7 @@ function requireJob(context: ExtensionContext, jobId: string): JobMeta {
     throw new Error(`Unknown async shell job: ${jobId}`);
   }
 
-  if (meta.status === "running" && !isPidAlive(meta.pid)) {
+  if (meta.status === "running" && !isAsyncJobExecutionAlive(meta.pid, meta.processToken)) {
     return { ...meta, status: "unknown", error: "Job was running in a previous Pi process and is no longer attached." };
   }
 
@@ -1062,8 +1267,8 @@ function listJobs(context: ExtensionContext, limit: number): JobMeta[] {
   const root = path.join(jobsRoot(context.cwd), "jobs");
   const diskJobs = existsSync(root)
     ? readdirSync(root, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => readMetaFile(path.join(root, entry.name, "meta.json")))
+      .filter((entry) => entry.isDirectory() && isValidAsyncJobId(entry.name))
+      .map((entry) => readMetaFile(path.join(root, entry.name, "meta.json"), root, entry.name))
       .filter((job): job is JobMeta => job !== undefined)
     : [];
 
@@ -1093,10 +1298,12 @@ function isJobInContext(context: Pick<ExtensionContext, "cwd">, job: Pick<JobMet
 }
 
 function readMeta(context: ExtensionContext, jobId: string): JobMeta | undefined {
-  return readMetaFile(path.join(jobsRoot(context.cwd), "jobs", jobId, "meta.json"));
+  assertValidAsyncJobId(jobId);
+  const root = path.join(jobsRoot(context.cwd), "jobs");
+  return readMetaFile(path.join(root, jobId, "meta.json"), root, jobId);
 }
 
-function readMetaFile(metaPath: string): JobMeta | undefined {
+function readMetaFile(metaPath: string, jobsDirectory: string, expectedJobId: string): JobMeta | undefined {
   if (!existsSync(metaPath)) {
     return undefined;
   }
@@ -1105,6 +1312,15 @@ function readMetaFile(metaPath: string): JobMeta | undefined {
   if (typeof raw.jobId !== "string" || typeof raw.command !== "string" || typeof raw.cwd !== "string") {
     return undefined;
   }
+  const expectedLogDir = path.join(path.resolve(jobsDirectory), expectedJobId);
+  if (
+    raw.jobId !== expectedJobId ||
+    path.resolve(String(raw.logDir ?? "")) !== expectedLogDir ||
+    path.resolve(String(raw.stdoutLog ?? "")) !== path.join(expectedLogDir, "stdout.log") ||
+    path.resolve(String(raw.stderrLog ?? "")) !== path.join(expectedLogDir, "stderr.log")
+  ) return undefined;
+  const owner = workerOwnerFromEnvironment();
+  if (owner && !sameJobOwner(raw.owner, owner)) return undefined;
 
   const legacyName = raw.job_name === undefined && typeof raw.label === "string" && raw.label.trim() !== ""
     ? raw.label
@@ -1113,6 +1329,14 @@ function readMetaFile(metaPath: string): JobMeta | undefined {
     ...raw,
     job_name: raw.job_name ?? legacyName
   } as JobMeta);
+}
+
+function isValidAsyncJobId(jobId: string): boolean {
+  return /^job_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(jobId);
+}
+
+function assertValidAsyncJobId(jobId: string): void {
+  if (!isValidAsyncJobId(jobId)) throw new Error(`Invalid async shell job id: ${jobId}`);
 }
 
 function writeMeta(job: JobMeta): void {
@@ -1137,10 +1361,12 @@ function publicJob(job: JobMeta): JobMeta {
     error: job.error,
     notifyOnExit: job.notifyOnExit,
     completionNotified: job.completionNotified,
+    owner: job.owner ? { ...job.owner } : undefined,
+    processToken: job.processToken,
     logDir: job.logDir,
     stdoutLog: job.stdoutLog,
     stderrLog: job.stderrLog,
-    outputBytes: { ...job.outputBytes }
+    outputBytes: asyncJobOutputBytes(job.stdoutLog, job.stderrLog)
   };
 }
 
@@ -1804,30 +2030,90 @@ function hasAccess(targetPath: string, mode: number): boolean {
   }
 }
 
-function jobsRoot(cwd: string): string {
-  return path.join(path.resolve(cwd), ".pi", "async-shell");
+function assertWorkerRunAcceptsSideEffects(): void {
+  if (!workerOwnerFromEnvironment()) return;
+  const resultFile = process.env.PI_WORKER_RESULT_FILE?.trim();
+  if (!resultFile) throw new Error("Managed worker shell_start requires PI_WORKER_RESULT_FILE.");
+  if (existsSync(path.resolve(resultFile))) {
+    throw new Error("Managed worker shell_start is sealed after worker_handoff acceptance.");
+  }
 }
 
-function createJobId(): string {
-  const timestamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
-  return `job_${timestamp}_${randomUUID().slice(0, 8)}`;
+function prepareManagedWorkerProcess(input: {
+  jobId: string;
+  cwd: string;
+  executable: string;
+  args: string[];
+  env: NodeJS.ProcessEnv;
+  workspaceRoot: string;
+}): { executable: string; args: string[]; env: NodeJS.ProcessEnv; cancellationEffect?: (signal: NodeJS.Signals) => void } {
+  const container = workerContainerFromEnvironment();
+  if (container) {
+    const dockerPath = process.env.PI_WORKER_DOCKER_PATH?.trim();
+    if (!dockerPath) throw new Error("Managed worker Docker execution requires PI_WORKER_DOCKER_PATH.");
+    return {
+      ...prepareWorkerContainerProcess({
+        dockerPath,
+        container,
+        jobId: input.jobId,
+        cwd: input.cwd,
+        executable: input.executable,
+        args: input.args,
+        env: input.env
+      }),
+      cancellationEffect: (signal) => signalWorkerContainerJob(dockerPath, container, input.jobId, signal)
+    };
+  }
+  if (process.env.PI_WORKER_NATIVE_TEST_SHELL === "1") {
+    return prepareWorkspaceSandboxProcess({
+      executable: input.executable,
+      args: input.args,
+      env: input.env,
+      workspaceRoot: input.workspaceRoot
+    });
+  }
+  throw new Error("Managed worker shell execution requires an exact Docker container identity.");
+}
+
+function managedWorkerShellArgs(executable: string, command: string): string[] {
+  const name = path.basename(executable);
+  if (name === "zsh") return ["-f", "-c", command];
+  if (name === "bash") return ["--noprofile", "--norc", "-c", command];
+  return ["-c", command];
+}
+
+function workerOwnerFromEnvironment(): AsyncShellJobOwner | undefined {
+  const workerId = process.env.PI_WORKER_ID?.trim();
+  const runId = process.env.PI_WORKER_RUN_ID?.trim();
+  return workerId && runId ? { kind: "worker-run", workerId, runId } : undefined;
+}
+
+function workerWorkspaceRoot(context: Pick<ExtensionContext, "cwd">): string {
+  const configured = process.env.PI_WORKER_WORKSPACE_ROOT?.trim();
+  if (!configured) throw new Error("Managed worker shell confinement requires PI_WORKER_WORKSPACE_ROOT.");
+  const configuredRoot = realpathSync(configured);
+  const contextRoot = realpathSync(context.cwd);
+  if (configuredRoot !== contextRoot) {
+    throw new Error(`Managed worker workspace mismatch: expected ${configuredRoot}, found ${contextRoot}.`);
+  }
+  return configuredRoot;
+}
+
+function sameJobOwner(left: AsyncShellJobOwner | undefined, right: AsyncShellJobOwner): boolean {
+  return left?.kind === right.kind && left.workerId === right.workerId && left.runId === right.runId;
+}
+
+function jobsRoot(cwd: string): string {
+  const workerRoot = process.env.PI_WORKER_ASYNC_JOB_ROOT?.trim();
+  if (workerOwnerFromEnvironment()) {
+    if (!workerRoot) throw new Error("Managed worker async-shell requires PI_WORKER_ASYNC_JOB_ROOT.");
+    return path.resolve(workerRoot);
+  }
+  return path.join(path.resolve(cwd), ".pi", "async-shell");
 }
 
 function isTerminal(status: JobStatus): boolean {
   return status === "exited" || status === "failed" || status === "cancelled" || status === "unknown";
-}
-
-function isPidAlive(pid: number | undefined): boolean {
-  if (pid === undefined) {
-    return false;
-  }
-
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 function expandHome(rawPath: string): string {

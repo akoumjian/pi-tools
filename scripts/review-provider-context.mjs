@@ -20,6 +20,7 @@ const stdoutOnly = args.includes("--stdout");
 
 const extensionPaths = [
   "extensions/async-shell/index.ts",
+  "extensions/worker/index.ts",
   "extensions/native-tools/index.ts",
   "extensions/mutation-review/index.ts",
   "extensions/searxng-search/index.ts",
@@ -168,6 +169,13 @@ const resultContracts = {
     error: "missing dependency/input/parse/OCR failures identify /docparser:doctor when applicable",
     details: "internal LiteParse output metadata used by display rendering",
     content: "saved output/screenshot paths and read_many/visual-inspection next actions"
+  },
+  worker_run: {
+    success: "content reports every stable worker/run/job/session/workspace/task/route identity and queued state",
+    progress: "partial content reports the same durable receipts before deferred post-turn launch",
+    error: "invalid routes, parent/session mismatches, active workers, launch failures, and process failures remain model-visible",
+    details: "internal structured receipts and asynchronous worker process/handoff records",
+    content: "all durable receipt identities plus asynchronous typed handoff JSON, process state, errors, and canonical log paths"
   },
   orchestrate: {
     success: "content reports every task id/role/status/routes; completed tasks add model/thinking/duration/tool calls/output and writer worktree/review data",

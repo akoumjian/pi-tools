@@ -1,0 +1,1818 @@
+import { execFileSync } from "node:child_process";
+import { chmodSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import path from "node:path";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { Type, type Static } from "@earendil-works/pi-ai";
+import {
+  defineTool,
+  type AgentToolResult,
+  type ExtensionAPI,
+  type ExtensionContext
+} from "@earendil-works/pi-coding-agent";
+import { asyncJobOutputBytes, createAsyncJobId, isAsyncJobProcessAlive, isAsyncJobProcessGroupAlive, signalAsyncJobProcessGroup } from "../_shared/async-job.js";
+import {
+  createWorkerContainer,
+  parkWorkerContainer,
+  planWorkerContainer,
+  resolveDockerPath,
+  settleWorkerContainer,
+  type WorkerContainerReference
+} from "../_shared/worker-container.js";
+import { throwIfAborted } from "../_shared/cancellation.js";
+import { formatModelName, resolveExtensionModel } from "../_shared/model-spec.js";
+import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
+import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
+import { cancelPersistedAsyncShellJobsForOwner, handleAsyncShellViewerCommand, type JobMeta, type ManagedAsyncJobHandle } from "../async-shell/index.js";
+import { launchWorkerHost, readWorkerHostProcess, readWorkerHostSettlement } from "./runner.js";
+import { readWorkerRuntimeHandoff, type AcceptedWorkerHandoff } from "./runtime.js";
+import { forkWorkerSession, verifyWorkerSession } from "./session.js";
+import {
+  WORKER_RECORD_VERSION,
+  acquireWorkerLease,
+  acquireWorkerOperationLock,
+  createWorkerId,
+  createWorkerRunId,
+  defaultWorkerRoots,
+  provisionWorkerPaths,
+  readWorkerLease,
+  readWorkerRecord,
+  releaseWorkerLease,
+  releaseWorkerOperationLock,
+  workerPaths,
+  writeWorkerRecord,
+  type WorkerLease,
+  type WorkerPaths,
+  type WorkerRecord,
+  type WorkerRoots,
+  type WorkerRoute
+} from "./state.js";
+
+const WORKER_OPERATIONAL_GUIDANCE = "Keep all writes inside the private workspace, clone local repositories with --no-hardlinks, do not push remotes, and use worker_task_update rather than shell access for assigned Beads notes. Shell commands run inside one private Docker container with all of ~/Code read-only and this workspace read-write. Process groups provide normal per-command cancellation; whole-container removal is the final run cleanup boundary. Use normal async-shell tools and finish with exactly one accepted worker_handoff after all owned jobs settle.";
+
+const InitialRepoSchema = Type.Object({
+  source: Type.String({ minLength: 1, maxLength: 2048 }),
+  revision: Type.Optional(Type.String({ minLength: 1, maxLength: 256 }))
+}, { additionalProperties: false });
+
+const NewWorkerRunSchema = Type.Object({
+  kind: Type.Literal("new"),
+  taskIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { minItems: 1, maxItems: 32 }),
+  guidance: Type.Optional(Type.String({ minLength: 1, maxLength: 12_000 })),
+  route: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
+  initialRepos: Type.Optional(Type.Array(InitialRepoSchema, { maxItems: 16 }))
+}, { additionalProperties: false });
+
+const ResumeWorkerRunSchema = Type.Object({
+  kind: Type.Literal("resume"),
+  workerId: Type.String({ minLength: 1, maxLength: 128 }),
+  message: Type.String({ minLength: 1, maxLength: 12_000 }),
+  addTaskIds: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { maxItems: 32 }))
+}, { additionalProperties: false });
+
+export const WorkerRunParams = Type.Object({
+  runs: Type.Array(Type.Union([NewWorkerRunSchema, ResumeWorkerRunSchema]), {
+    minItems: 1,
+    maxItems: 8
+  })
+}, { additionalProperties: false });
+
+export type WorkerRunInput = Static<typeof WorkerRunParams>;
+export type WorkerRunReceipt = {
+  workerId: string;
+  runId: string;
+  jobId: string;
+  sessionId: string;
+  sessionFile?: string;
+  workspaceRoot: string;
+  taskIds: string[];
+  provider: string;
+  model: string;
+  thinkingLevel: string;
+  state: "queued" | "running";
+};
+
+type WorkerRunDetails = { runs: WorkerRunReceipt[] };
+
+type PlannedWorkerRun =
+  | {
+      kind: "new";
+      input: Static<typeof NewWorkerRunSchema>;
+      parentSessionFile: string;
+      route: WorkerRoute;
+      taskIds: string[];
+    }
+  | {
+      kind: "resume";
+      input: Static<typeof ResumeWorkerRunSchema>;
+      parentSessionFile: string;
+      paths: WorkerPaths;
+      existing: WorkerRecord;
+    };
+
+type WorkerLaunchRequest = {
+  record: WorkerRecord;
+  paths: WorkerPaths;
+  prompt: string;
+  resultFile: string;
+  runDir: string;
+  parentContextSnapshot?: string;
+  processFile: string;
+  processNonce: string;
+  jobId: string;
+  container?: WorkerContainerReference;
+};
+
+type ManagedWorkerHandle = ManagedAsyncJobHandle & { container?: WorkerContainerReference };
+
+class WorkerContainerCleanupError extends AggregateError {}
+
+type WorkerExtensionDependencies = {
+  roots: WorkerRoots;
+  now(): Date;
+  random(): string;
+  planContainer?(record: WorkerRecord, runId: string, nonce: string): WorkerContainerReference;
+  parkContainer?(container: WorkerContainerReference): void;
+  removeContainer(container: WorkerContainerReference): void;
+  launch(api: ExtensionAPI, context: ExtensionContext, request: WorkerLaunchRequest): ManagedWorkerHandle;
+};
+
+type PendingWorkerRun = {
+  runId: string;
+  parentSessionId: string;
+  parentSessionFile: string;
+  recordFile: string;
+  paths: WorkerPaths;
+  prompt: string;
+  resultFile: string;
+  runDir: string;
+  parentContextSnapshot?: string;
+  processFile: string;
+  processNonce: string;
+  kind: "new" | "resume";
+};
+
+export default function workerExtension(api: ExtensionAPI): void {
+  registerWorkerExtension(api);
+}
+
+export function registerWorkerExtension(
+  api: ExtensionAPI,
+  overrides: Partial<WorkerExtensionDependencies> = {}
+): void {
+  const defaults = defaultDependencies();
+  const dependencies: WorkerExtensionDependencies = { ...defaults, ...overrides };
+  if (overrides.launch && !overrides.planContainer) dependencies.planContainer = undefined;
+  const pending = new Map<string, PendingWorkerRun>();
+  const active = new Map<string, { runId: string; handle: ManagedWorkerHandle }>();
+  const monitors = new Map<string, NodeJS.Timeout>();
+
+  api.on("session_start", async (_event, context) => {
+    acknowledgePersistedWorkerDeliveries(context, dependencies);
+    await adoptWorkerRuns(api, context, dependencies, active, monitors);
+  });
+  api.on("session_shutdown", () => {
+    for (const monitor of monitors.values()) clearInterval(monitor);
+    monitors.clear();
+  });
+
+  api.registerCommand("worker:status", {
+    description: "Show one managed worker's exact session, workspace, route, tasks, and active/last run state",
+    handler: async (args, context) => {
+      const workerId = args.trim();
+      if (!workerId) {
+        context.ui.notify("Usage: /worker:status <worker-id>", "info");
+        return;
+      }
+      const paths = workerPaths(dependencies.roots, workerId);
+      const record = readWorkerRecord(paths.recordFile);
+      assertWorkerParentSession(record, context);
+      context.ui.notify(formatWorkerRecord(record), "info");
+    }
+  });
+
+  api.registerCommand("worker:view", {
+    description: "Open the bounded provider-free async log viewer for one managed worker's active or last run",
+    handler: async (args, context) => {
+      const [workerId, ...viewerArgs] = args.trim().split(/\s+/).filter(Boolean);
+      if (!workerId) {
+        context.ui.notify("Usage: /worker:view <worker-id> [--stream both|stdout|stderr] [--tail 1..500] [--follow]", "info");
+        return;
+      }
+      const record = readWorkerRecord(workerPaths(dependencies.roots, workerId).recordFile);
+      assertWorkerParentSession(record, context);
+      const jobId = record.activeRun?.jobId ?? record.lastRun?.jobId;
+      if (!jobId) {
+        context.ui.notify(`Worker ${workerId} has no run logs.`, "info");
+        return;
+      }
+      await handleAsyncShellViewerCommand(context, [jobId, ...viewerArgs].join(" "));
+    }
+  });
+
+  api.registerCommand("worker:discard", {
+    description: "Permanently remove one settled managed worker's private workspace and durable runtime record",
+    handler: async (args, context) => {
+      const [workerId, confirmation, ...extra] = args.trim().split(/\s+/).filter(Boolean);
+      if (!workerId || confirmation !== "--confirm" || extra.length > 0) {
+        context.ui.notify("Usage: /worker:discard <worker-id> --confirm", "info");
+        return;
+      }
+      const paths = workerPaths(dependencies.roots, workerId);
+      const discarded = withWorkerOperationLock(paths, () => {
+        const record = readWorkerRecord(paths.recordFile);
+        assertWorkerParentSession(record, context);
+        if (record.activeRun || readWorkerLease(paths.leaseFile)) return false;
+        if (record.container) dependencies.removeContainer(record.container);
+        rmSync(paths.workspaceRoot, { recursive: true, force: true });
+        rmSync(paths.stateDir, { recursive: true, force: true });
+        return true;
+      });
+      context.ui.notify(
+        discarded ? `Discarded settled worker ${workerId}.` : `Worker ${workerId} became active before discard; cancel it first.`,
+        discarded ? "info" : "warning"
+      );
+    }
+  });
+
+  api.registerCommand("worker:cancel", {
+    description: "Cancel one exact active managed worker run and its owned async-shell process groups",
+    handler: async (args, context) => {
+      const workerId = args.trim();
+      if (!workerId) {
+        context.ui.notify("Usage: /worker:cancel <worker-id>", "info");
+        return;
+      }
+      const paths = workerPaths(dependencies.roots, workerId);
+      const record = readWorkerRecord(paths.recordFile);
+      assertWorkerParentSession(record, context);
+      if (!record.activeRun) {
+        context.ui.notify(`Worker ${workerId} has no active run.`, "info");
+        return;
+      }
+      const runId = record.activeRun.runId;
+      if (record.activeRun.status === "queued") {
+        withWorkerOperationLock(paths, () => {
+          const current = readWorkerRecord(paths.recordFile);
+          const lease = readWorkerLease(paths.leaseFile);
+          if (current.activeRun?.runId !== runId || current.activeRun.status !== "queued") {
+            throw new Error(`Worker ${workerId}/${runId} changed state before queued cancellation; retry the command.`);
+          }
+          if (!lease || lease.workerId !== workerId || lease.runId !== runId || lease.parentPid !== process.pid) {
+            throw new Error(`Worker ${workerId}/${runId} is queued under another live parent and cannot be cancelled from this session.`);
+          }
+          pending.delete(runId);
+          if (current.container) {
+            try {
+              dependencies.removeContainer(current.container);
+            } catch (cause) {
+              writeWorkerRecord(paths.recordFile, {
+                ...current,
+                status: "running",
+                activeRun: {
+                  ...current.activeRun,
+                  status: "running",
+                  hostProcessSettled: true,
+                  recoveryError: cause instanceof Error ? cause.message : String(cause)
+                },
+                updatedAt: dependencies.now().toISOString()
+              });
+              throw cause;
+            }
+          }
+          writeWorkerRecord(paths.recordFile, cancelledWorkerRecord(current, dependencies.now()));
+          releaseWorkerLease(paths.leaseFile, workerId, runId);
+        });
+        context.ui.notify(`Cancelled queued worker ${workerId}/${runId}.`, "info");
+        return;
+      }
+      const attached = active.get(workerId);
+      if (attached?.runId === runId) {
+        const cleanupOwner = claimWorkerCancellationOwnership(paths, record, runId, dependencies);
+        if (!cleanupOwner) throw new Error(`Worker ${workerId}/${runId} cleanup is owned by another live parent.`);
+        try {
+          await cancelAttachedWorker(attached.handle, readWorkerRecord(paths.recordFile), paths, dependencies);
+          finalizeRecoveredWorkerCancellation(api, paths, readWorkerRecord(paths.recordFile), runId, dependencies, true, cleanupOwner);
+        } catch (cause) {
+          const status = attached.handle.snapshot().status;
+          persistWorkerCleanupUncertainty(
+            paths,
+            runId,
+            cause instanceof Error ? cause.message : String(cause),
+            ["exited", "failed", "cancelled", "unknown"].includes(status),
+            dependencies
+          );
+          releaseWorkerCancellationOwnership(paths, runId, cleanupOwner, dependencies);
+          throw cause;
+        }
+        context.ui.notify(`Cancelled running worker ${workerId}/${runId}.`, "info");
+        return;
+      }
+      if (record.activeRun.hostProcessSettled && record.activeRun.recoveryError) {
+        if (!ensureWorkerRecoveryLease(paths, record, runId, dependencies)) {
+          throw new Error(`Worker ${workerId}/${runId} cleanup is owned by another live parent.`);
+        }
+        const cleanupOwner = claimWorkerCancellationOwnership(paths, record, runId, dependencies);
+        if (!cleanupOwner) throw new Error(`Worker ${workerId}/${runId} cleanup is owned by another live parent.`);
+        try {
+          await settlePersistedWorkerShells(paths, workerId, runId, dependencies);
+        } catch (error) {
+          persistWorkerCleanupUncertainty(
+            paths,
+            runId,
+            error instanceof Error ? error.message : String(error),
+            true,
+            dependencies
+          );
+          releaseWorkerCancellationOwnership(paths, runId, cleanupOwner, dependencies);
+          throw error;
+        }
+        finalizeRecoveredWorkerCancellation(api, paths, readWorkerRecord(paths.recordFile), runId, dependencies, true, cleanupOwner);
+        context.ui.notify(`Cancelled recovered worker ${workerId}/${runId}.`, "info");
+        return;
+      }
+      const cleanupOwner = claimWorkerCancellationOwnership(paths, record, runId, dependencies);
+      if (!cleanupOwner) throw new Error(`Worker ${workerId}/${runId} cleanup is owned by another live parent.`);
+      try {
+        const current = readWorkerRecord(paths.recordFile);
+        if (isWorkerHostProcessSettled(current)) {
+          await settlePersistedWorkerShells(paths, workerId, runId, dependencies);
+        } else {
+          await cancelDetachedWorker(current, paths, dependencies);
+        }
+        finalizeRecoveredWorkerCancellation(api, paths, readWorkerRecord(paths.recordFile), runId, dependencies, true, cleanupOwner);
+      } catch (cause) {
+        const current = readWorkerRecord(paths.recordFile);
+        persistWorkerCleanupUncertainty(
+          paths,
+          runId,
+          cause instanceof Error ? cause.message : String(cause),
+          isWorkerHostProcessSettled(current),
+          dependencies
+        );
+        releaseWorkerCancellationOwnership(paths, runId, cleanupOwner, dependencies);
+        throw cause;
+      }
+      context.ui.notify(`Cancelled detached worker ${workerId}/${runId}.`, "info");
+    }
+  });
+
+  api.registerTool(defineTool({
+    name: "worker_run",
+    label: "Worker Run",
+    description: "Start one or more durable engineering workers or resume exact existing workers. New workers receive stable worker/run/job/session/workspace/task identities immediately, then fork the completed parent session after the current turn is durable. Resume always reuses the exact recorded worker session, workspace, provider, model, and thinking route. Worker processes run asynchronously through the shared async-shell job machinery and return typed semantic handoffs when settled.",
+    promptSnippet: "Start or resume durable context-rich workers with runs:[...]; returns stable queued receipts immediately and typed asynchronous completion handoffs later.",
+    promptGuidelines: [
+      "worker_run use: Use worker_run for substantive engineering that benefits from an independent durable agent session and private workspace; use kind=new with assigned Beads and kind=resume for the exact same worker after feedback or a checkpoint.",
+      inputJsonSchemaGuideline("worker_run", WorkerRunParams),
+      outputJsonSchemaGuideline("worker_run", RetainedToolOutputSchemas.worker_run),
+      "worker_run constraints: The parent owns grounding, task acceptance, integration, and promotion. A new worker forks the completed current parent turn; a resume cannot change session/workspace/provider/model. Receipts are immediate, process exit is not semantic completion, and cancellation must settle all shell jobs owned by the worker. Only result content is provider-visible; details are internal."
+    ],
+    parameters: WorkerRunParams,
+    executionMode: "parallel",
+    async execute(_toolCallId, params, signal, onUpdate, context): Promise<AgentToolResult<WorkerRunDetails>> {
+      throwIfAborted(signal);
+      acknowledgePersistedWorkerDeliveries(context, dependencies);
+      const plans = planWorkerRuns(params.runs, context, dependencies);
+      const receipts = prepareWorkerPlans(plans, context, dependencies, pending);
+      const formattedReceipts = receipts.map(formatWorkerRunReceipt).join("\n\n");
+      onUpdate?.({ content: [{ type: "text", text: formattedReceipts }], details: { runs: receipts } });
+      return {
+        content: [{ type: "text", text: formattedReceipts }],
+        details: { runs: receipts }
+      };
+    }
+  }));
+
+  api.on("turn_end", async (_event, context) => {
+    const parentSessionId = context.sessionManager.getSessionId();
+    const launches = Array.from(pending.entries()).filter(([, value]) => value.parentSessionId === parentSessionId);
+    for (const [runId, value] of launches) {
+      pending.delete(runId);
+      await startPendingWorker(api, context, value, dependencies, active);
+    }
+    acknowledgePersistedWorkerDeliveries(context, dependencies);
+  });
+}
+
+function planWorkerRuns(
+  inputs: WorkerRunInput["runs"],
+  context: ExtensionContext,
+  dependencies: WorkerExtensionDependencies
+): PlannedWorkerRun[] {
+  const currentParentSessionFile = context.sessionManager.getSessionFile();
+  if (!currentParentSessionFile) throw new Error("worker_run requires a persisted parent session before it can fork or resume a worker.");
+  const parentSessionFile = path.resolve(currentParentSessionFile);
+  const resumed = new Set<string>();
+  return inputs.map((input): PlannedWorkerRun => {
+    if (input.kind === "new") {
+      const taskIds = uniqueStrings(input.taskIds);
+      if (taskIds.length === 0) throw new Error("A new worker requires at least one non-blank task ID.");
+      validatePersonalTaskIds(taskIds);
+      return {
+        kind: "new",
+        input,
+        parentSessionFile,
+        route: resolveWorkerRoute(input.route, context),
+        taskIds
+      };
+    }
+    if (resumed.has(input.workerId)) throw new Error(`Worker ${input.workerId} cannot be resumed twice in one worker_run call.`);
+    resumed.add(input.workerId);
+    const paths = workerPaths(dependencies.roots, input.workerId);
+    const existing = readWorkerRecord(paths.recordFile);
+    if (parentSessionFile !== path.resolve(existing.parentSessionFile)) {
+      throw new Error(`Worker ${existing.workerId} can only resume from its exact parent session ${existing.parentSessionFile}.`);
+    }
+    if (existing.activeRun) throw new Error(`Worker ${existing.workerId} already has active run ${existing.activeRun.runId}.`);
+    if (existing.lastRun?.delivery === "pending") {
+      throw new Error(`Worker ${existing.workerId} completion delivery is not yet persisted in the parent session.`);
+    }
+    validatePersonalTaskIds([...existing.taskIds, ...(input.addTaskIds ?? [])]);
+    if (!existing.sessionFile) throw new Error(`Worker ${existing.workerId} has no forked session to resume.`);
+    verifyWorkerSession({
+      sessionFile: existing.sessionFile,
+      sessionId: existing.sessionId,
+      workspaceRoot: existing.workspaceRoot,
+      parentSessionFile: existing.parentSessionFile
+    });
+    return { kind: "resume", input, parentSessionFile, paths, existing };
+  });
+}
+
+function prepareWorkerPlans(
+  plans: PlannedWorkerRun[],
+  context: ExtensionContext,
+  dependencies: WorkerExtensionDependencies,
+  pending: Map<string, PendingWorkerRun>
+): WorkerRunReceipt[] {
+  const prepared: Array<{ plan: PlannedWorkerRun; receipt: WorkerRunReceipt }> = [];
+  try {
+    for (const plan of plans) {
+      const receipt = plan.kind === "new"
+        ? prepareNewWorker(plan, context, dependencies, pending)
+        : prepareResumedWorker(plan, context, dependencies, pending);
+      prepared.push({ plan, receipt });
+    }
+    return prepared.map(({ receipt }) => receipt);
+  } catch (error) {
+    for (const { plan, receipt } of prepared.reverse()) {
+      pending.delete(receipt.runId);
+      const paths = workerPaths(dependencies.roots, receipt.workerId);
+      if (plan.kind === "resume") writeWorkerRecord(paths.recordFile, plan.existing);
+      releaseWorkerLease(paths.leaseFile, receipt.workerId, receipt.runId);
+      if (plan.kind === "new") {
+        rmSync(paths.workspaceRoot, { recursive: true, force: true });
+        rmSync(paths.stateDir, { recursive: true, force: true });
+      }
+    }
+    throw error;
+  }
+}
+
+function prepareNewWorker(
+  plan: Extract<PlannedWorkerRun, { kind: "new" }>,
+  context: ExtensionContext,
+  dependencies: WorkerExtensionDependencies,
+  pending: Map<string, PendingWorkerRun>
+): WorkerRunReceipt {
+  const now = dependencies.now();
+  const workerId = createWorkerId(now, dependencies.random());
+  const runId = createWorkerRunId(now, dependencies.random());
+  const jobId = createAsyncJobId(now, dependencies.random());
+  const sessionId = dependencies.random();
+  const paths = workerPaths(dependencies.roots, workerId);
+  if (existsSync(paths.stateDir) || existsSync(paths.workspaceRoot)) {
+    throw new Error(`Generated worker identity already exists: ${workerId}.`);
+  }
+  provisionWorkerPaths(paths);
+  const record: WorkerRecord = {
+    version: WORKER_RECORD_VERSION,
+    workerId,
+    sessionId,
+    parentSessionFile: plan.parentSessionFile,
+    workspaceRoot: paths.workspaceRoot,
+    taskIds: plan.taskIds,
+    route: plan.route,
+    status: "queued",
+    activeRun: { runId, jobId, status: "queued" },
+    updatedAt: now.toISOString()
+  };
+  acquireWorkerRunLease(paths, record.workerId, runId, now);
+  try {
+    writeWorkerRecord(paths.recordFile, record);
+    const runDir = path.join(paths.stateDir, "runs", runId);
+    const resultFile = path.join(runDir, "result.json");
+    pending.set(runId, {
+      runId,
+      parentSessionId: context.sessionManager.getSessionId(),
+      parentSessionFile: plan.parentSessionFile,
+      recordFile: paths.recordFile,
+      paths,
+      prompt: buildNewWorkerPrompt(record, plan.input.guidance, plan.input.initialRepos),
+      resultFile,
+      runDir,
+      processFile: path.join(runDir, "host-process.json"),
+      processNonce: randomUUID(),
+      kind: "new"
+    });
+  } catch (error) {
+    releaseWorkerLease(paths.leaseFile, record.workerId, runId);
+    rmSync(paths.workspaceRoot, { recursive: true, force: true });
+    rmSync(paths.stateDir, { recursive: true, force: true });
+    throw error;
+  }
+  return receipt(record);
+}
+
+function prepareResumedWorker(
+  plan: Extract<PlannedWorkerRun, { kind: "resume" }>,
+  context: ExtensionContext,
+  dependencies: WorkerExtensionDependencies,
+  pending: Map<string, PendingWorkerRun>
+): WorkerRunReceipt {
+  const { paths } = plan;
+  const input = plan.input;
+  const now = dependencies.now();
+  const runId = createWorkerRunId(now, dependencies.random());
+  const jobId = createAsyncJobId(now, dependencies.random());
+  return withWorkerOperationLock(paths, () => {
+    const existing = readWorkerRecord(paths.recordFile);
+    if (existing.activeRun) throw new Error(`Worker ${existing.workerId} became active before resume preparation.`);
+    if (existing.lastRun?.delivery === "pending") {
+      throw new Error(`Worker ${existing.workerId} completion delivery became pending before resume preparation.`);
+    }
+    if (path.resolve(existing.parentSessionFile) !== plan.parentSessionFile) {
+      throw new Error(`Worker ${existing.workerId} parent session changed before resume preparation.`);
+    }
+    plan.existing = existing;
+    const record: WorkerRecord = {
+      ...existing,
+      taskIds: uniqueStrings([...existing.taskIds, ...(input.addTaskIds ?? [])]),
+      status: "queued",
+      activeRun: { runId, jobId, status: "queued" },
+      updatedAt: now.toISOString()
+    };
+    acquireWorkerRunLease(paths, record.workerId, runId, now);
+    try {
+      writeWorkerRecord(paths.recordFile, record);
+      const runDir = path.join(paths.stateDir, "runs", runId);
+      const resultFile = path.join(runDir, "result.json");
+      const parentContextSnapshot = path.join(paths.artifactsDir, `parent-context-${runId}.jsonl`);
+      pending.set(runId, {
+        runId,
+        parentSessionId: context.sessionManager.getSessionId(),
+        parentSessionFile: plan.parentSessionFile,
+        recordFile: paths.recordFile,
+        paths,
+        prompt: buildResumeWorkerPrompt(record, input.message, parentContextSnapshot),
+        resultFile,
+        runDir,
+        parentContextSnapshot,
+        processFile: path.join(runDir, "host-process.json"),
+        processNonce: randomUUID(),
+        kind: "resume"
+      });
+    } catch (error) {
+      writeWorkerRecord(paths.recordFile, existing);
+      releaseWorkerLease(paths.leaseFile, record.workerId, runId);
+      throw error;
+    }
+    return receipt(record);
+  });
+}
+
+function writeParentContextSnapshot(paths: WorkerPaths, sourceFile: string, destinationFile: string): void {
+  const workspaceRoot = realpathSync(paths.workspaceRoot);
+  const artifacts = lstatSync(paths.artifactsDir);
+  if (!artifacts.isDirectory() || artifacts.isSymbolicLink()) {
+    throw new Error(`Worker artifacts path is not a canonical directory: ${paths.artifactsDir}`);
+  }
+  const artifactsRoot = realpathSync(paths.artifactsDir);
+  const expectedArtifactsRoot = path.join(workspaceRoot, "artifacts");
+  if (artifactsRoot !== expectedArtifactsRoot || realpathSync(path.dirname(path.resolve(destinationFile))) !== artifactsRoot) {
+    throw new Error(`Worker parent-context snapshot destination escapes the canonical artifacts directory: ${destinationFile}`);
+  }
+  copyFileSync(path.resolve(sourceFile), path.resolve(destinationFile), constants.COPYFILE_EXCL);
+  const snapshot = lstatSync(destinationFile);
+  if (!snapshot.isFile() || snapshot.isSymbolicLink()) {
+    throw new Error(`Worker parent-context snapshot is not a regular file: ${destinationFile}`);
+  }
+  chmodSync(destinationFile, 0o400);
+}
+
+function withWorkerOperationLock<T>(paths: WorkerPaths, operation: () => T): T {
+  const lock = acquireWorkerOperationLock(paths.operationLockFile);
+  try {
+    return operation();
+  } finally {
+    releaseWorkerOperationLock(lock);
+  }
+}
+
+function acquireWorkerRunLease(paths: WorkerPaths, workerId: string, runId: string, now: Date): void {
+  const lease: WorkerLease = { version: 1, workerId, runId, parentPid: process.pid, acquiredAt: now.toISOString() };
+  acquireWorkerLease(paths.leaseFile, lease);
+}
+
+async function startPendingWorker(
+  api: ExtensionAPI,
+  context: ExtensionContext,
+  pending: PendingWorkerRun,
+  dependencies: WorkerExtensionDependencies,
+  active: Map<string, { runId: string; handle: ManagedWorkerHandle }>
+): Promise<void> {
+  let record = readWorkerRecord(pending.recordFile);
+  let launchedHandle: ManagedWorkerHandle | undefined;
+  try {
+    const currentParentSessionFile = context.sessionManager.getSessionFile();
+    if (!currentParentSessionFile || path.resolve(currentParentSessionFile) !== pending.parentSessionFile) {
+      throw new Error(`Worker ${record.workerId} launch parent session changed before the queued run became durable.`);
+    }
+    mkdirSync(pending.runDir, { recursive: true, mode: 0o700 });
+    if (pending.kind === "new") {
+      const forked = forkWorkerSession({
+        parentSessionFile: pending.parentSessionFile,
+        workspaceRoot: pending.paths.workspaceRoot,
+        sessionDir: pending.paths.sessionDir,
+        sessionId: record.sessionId
+      });
+      record = { ...record, sessionFile: forked.sessionFile };
+    } else if (record.sessionFile) {
+      if (!pending.parentContextSnapshot) throw new Error(`Worker ${record.workerId} resume lost its parent-context snapshot path.`);
+      writeParentContextSnapshot(pending.paths, pending.parentSessionFile, pending.parentContextSnapshot);
+      verifyWorkerSession({
+        sessionFile: record.sessionFile,
+        sessionId: record.sessionId,
+        workspaceRoot: record.workspaceRoot,
+        parentSessionFile: record.parentSessionFile
+      });
+    }
+    const preparedSessionFile = record.sessionFile;
+    let activeRun!: NonNullable<WorkerRecord["activeRun"]>;
+    let handle!: ManagedWorkerHandle;
+    withWorkerOperationLock(pending.paths, () => {
+      record = { ...readWorkerRecord(pending.recordFile), sessionFile: preparedSessionFile };
+      const lease = readWorkerLease(pending.paths.leaseFile);
+      if (!record.activeRun || record.activeRun.status !== "queued" || record.activeRun.runId !== pending.runId) {
+        throw new Error(`Worker ${record.workerId} lost the exact queued run ${pending.runId} before launch.`);
+      }
+      if (!lease || lease.workerId !== record.workerId || lease.runId !== pending.runId || lease.parentPid !== process.pid) {
+        throw new Error(`Worker ${record.workerId}/${pending.runId} lost its exact launch lease.`);
+      }
+      const plannedContainer = record.container ?? dependencies.planContainer?.(record, pending.runId, pending.processNonce);
+      activeRun = {
+        ...record.activeRun,
+        status: "running",
+        resultFile: pending.resultFile,
+        settledFile: path.join(pending.runDir, "settled.json"),
+        hostConfigFile: path.join(pending.runDir, "host.json"),
+        processFile: pending.processFile,
+        processNonce: pending.processNonce,
+        container: plannedContainer
+      };
+      record = {
+        ...record,
+        status: "running",
+        container: plannedContainer,
+        activeRun,
+        updatedAt: dependencies.now().toISOString()
+      };
+      writeWorkerRecord(pending.recordFile, record);
+      handle = dependencies.launch(api, context, {
+        record,
+        paths: pending.paths,
+        prompt: pending.prompt,
+        resultFile: pending.resultFile,
+        runDir: pending.runDir,
+        parentContextSnapshot: pending.parentContextSnapshot,
+        processFile: pending.processFile,
+        processNonce: pending.processNonce,
+        jobId: activeRun.jobId,
+        container: activeRun.container
+      });
+      launchedHandle = handle;
+      const processMeta = handle.snapshot();
+      const container = handle.container ?? activeRun.container;
+      record = {
+        ...record,
+        container,
+        activeRun: {
+          ...activeRun,
+          pid: processMeta.pid,
+          logDir: processMeta.logDir,
+          stdoutLog: processMeta.stdoutLog,
+          stderrLog: processMeta.stderrLog,
+          container
+        },
+        updatedAt: dependencies.now().toISOString()
+      };
+      writeWorkerRecord(pending.recordFile, record);
+    });
+    active.set(record.workerId, { runId: activeRun.runId, handle });
+    void handle.completion
+      .then(async (job) => {
+        await settlePersistedWorkerShells(pending.paths, record.workerId, activeRun.runId, dependencies, false);
+        await completeWorkerRun(api, pending, job, dependencies);
+      })
+      .catch((error) => {
+        try {
+          markWorkerCleanupUncertain(api, pending, error, true, dependencies);
+        } catch (reportError) {
+          process.stderr.write(`Worker ${record.workerId} cleanup recovery recording failed: ${reportError instanceof Error ? reportError.message : String(reportError)}\n`);
+        }
+      })
+      .finally(() => {
+        if (active.get(record.workerId)?.runId === activeRun.runId) active.delete(record.workerId);
+      });
+  } catch (error) {
+    if (launchedHandle) {
+      try {
+        await cancelAttachedWorker(launchedHandle, record, pending.paths, dependencies);
+      } catch (cancellationError) {
+        markWorkerCleanupUncertain(
+          api,
+          pending,
+          new AggregateError([error, cancellationError], `Worker ${record.workerId} launch failed and cancellation did not settle cleanly.`),
+          false,
+          dependencies
+        );
+        return;
+      }
+    } else if (record.container) {
+      try {
+        dependencies.removeContainer(record.container);
+      } catch (cleanupError) {
+        markWorkerCleanupUncertain(
+          api,
+          pending,
+          new AggregateError([error, cleanupError], `Worker ${record.workerId} failed before host launch and its persistent container could not be removed.`),
+          true,
+          dependencies
+        );
+        return;
+      }
+    } else if (error instanceof WorkerContainerCleanupError) {
+      markWorkerCleanupUncertain(api, pending, error, true, dependencies);
+      return;
+    }
+    failWorkerLaunch(api, pending, record, error, dependencies);
+  }
+}
+
+async function completeWorkerRun(
+  api: ExtensionAPI,
+  pending: PendingWorkerRun,
+  job: JobMeta,
+  dependencies: WorkerExtensionDependencies
+): Promise<void> {
+  const current = readWorkerRecord(pending.recordFile);
+  const activeRun = current.activeRun;
+  if (!activeRun || activeRun.jobId !== job.jobId || activeRun.runId !== pending.runId || activeRun.cleanupOwner) return;
+  const runId = activeRun.runId;
+  let handoff: AcceptedWorkerHandoff | undefined;
+  let status: "handed_off" | "failed" | "cancelled" = job.status === "cancelled" ? "cancelled" : "failed";
+  let error: string | undefined;
+  if (job.status === "exited" && job.exitCode === 0 && existsSync(pending.resultFile)) {
+    try {
+      readMatchingHostSettlement(path.join(pending.runDir, "settled.json"), current, runId, pending.resultFile);
+      handoff = readMatchingWorkerHandoff(pending.resultFile, current.workerId, runId);
+      status = "handed_off";
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : String(cause);
+    }
+  } else if (job.status !== "cancelled") {
+    error = job.error ?? `Worker host exited with status ${job.status}${job.exitCode === undefined ? "" : ` (${job.exitCode})`}.`;
+  }
+  revokeWorkerHostAuthorization(pending.paths, runId);
+  if (status === "handed_off" && current.container) {
+    if (!dependencies.parkContainer) throw new Error(`Worker ${current.workerId}/${runId} has no trusted container parking implementation.`);
+    dependencies.parkContainer(current.container);
+  } else if (status !== "handed_off") {
+    await settlePersistedWorkerShells(pending.paths, current.workerId, runId, dependencies);
+  }
+  finalizeWorkerRunRecord({
+    api,
+    paths: pending.paths,
+    recordFile: pending.recordFile,
+    record: current,
+    runId,
+    job,
+    status,
+    handoff,
+    error,
+    resultFile: pending.resultFile,
+    dependencies
+  });
+}
+
+function finalizeWorkerRunRecord(input: {
+  api: ExtensionAPI;
+  paths: WorkerPaths;
+  recordFile: string;
+  record: WorkerRecord;
+  runId: string;
+  job: JobMeta;
+  status: "handed_off" | "failed" | "cancelled";
+  handoff?: AcceptedWorkerHandoff;
+  error?: string;
+  resultFile: string;
+  preserveContainer?: boolean;
+  dependencies: WorkerExtensionDependencies;
+}): void {
+  const updated = withWorkerOperationLock(input.paths, () => {
+    const current = readWorkerRecord(input.recordFile);
+    const lease = readWorkerLease(input.paths.leaseFile);
+    if (
+      current.activeRun?.runId !== input.runId ||
+      !lease ||
+      lease.workerId !== current.workerId ||
+      lease.runId !== input.runId ||
+      lease.parentPid !== process.pid
+    ) return undefined;
+    const next: WorkerRecord = {
+      ...current,
+      status: input.status,
+      container: input.status === "handed_off" && input.preserveContainer !== false ? current.container : undefined,
+      activeRun: undefined,
+      lastRun: {
+        runId: input.runId,
+        jobId: input.job.jobId,
+        status: input.status,
+        resultFile: input.handoff ? input.resultFile : undefined,
+        delivery: "pending",
+        processStatus: input.job.status,
+        exitCode: input.job.exitCode,
+        pid: input.job.pid,
+        logDir: input.job.logDir,
+        stdoutLog: input.job.stdoutLog,
+        stderrLog: input.job.stderrLog,
+        error: input.error
+      },
+      updatedAt: input.dependencies.now().toISOString()
+    };
+    writeWorkerRecord(input.recordFile, next);
+    releaseWorkerLease(input.paths.leaseFile, next.workerId, input.runId);
+    return next;
+  });
+  if (!updated) return;
+  sendWorkerCompletion(input.api, updated, input.job, input.handoff, input.error);
+}
+
+function markWorkerCleanupUncertain(
+  api: ExtensionAPI,
+  pending: PendingWorkerRun,
+  cause: unknown,
+  hostProcessSettled: boolean,
+  dependencies: WorkerExtensionDependencies
+): void {
+  const error = cause instanceof Error ? cause.message : String(cause);
+  const updated = persistWorkerCleanupUncertainty(
+    pending.paths,
+    pending.runId,
+    error,
+    hostProcessSettled,
+    dependencies
+  );
+  if (!updated) return;
+  api.sendMessage({
+    customType: "worker-run-recovery",
+    content: `worker cleanup requires recovery: ${updated.workerId}/${pending.runId}\nerror: ${error}\nUse /worker:status and retry /worker:cancel; the run remains active and leased.`,
+    display: true,
+    details: { workerId: updated.workerId, runId: pending.runId, error }
+  }, { triggerTurn: true, deliverAs: "steer" });
+}
+
+function persistWorkerCleanupUncertainty(
+  paths: WorkerPaths,
+  runId: string,
+  error: string,
+  hostProcessSettled: boolean,
+  dependencies: WorkerExtensionDependencies
+): WorkerRecord | undefined {
+  return withWorkerOperationLock(paths, () => {
+    const record = readWorkerRecord(paths.recordFile);
+    const lease = readWorkerLease(paths.leaseFile);
+    if (
+      !record.activeRun ||
+      record.activeRun.runId !== runId ||
+      !lease ||
+      lease.workerId !== record.workerId ||
+      lease.runId !== runId ||
+      lease.parentPid !== process.pid
+    ) return undefined;
+    const next: WorkerRecord = {
+      ...record,
+      status: "running",
+      activeRun: { ...record.activeRun, status: "running", recoveryError: error, hostProcessSettled },
+      updatedAt: dependencies.now().toISOString()
+    };
+    writeWorkerRecord(paths.recordFile, next);
+    return next;
+  });
+}
+
+function failWorkerLaunch(
+  api: ExtensionAPI,
+  pending: PendingWorkerRun,
+  record: WorkerRecord,
+  cause: unknown,
+  dependencies: WorkerExtensionDependencies
+): void {
+  const error = cause instanceof Error ? cause.message : String(cause);
+  let runId = pending.runId;
+  let jobId = "unknown";
+  const updated = withWorkerOperationLock(pending.paths, () => {
+    const latest = readWorkerRecord(pending.recordFile);
+    const activeRun = latest.activeRun;
+    const lease = readWorkerLease(pending.paths.leaseFile);
+    if (
+      !activeRun ||
+      activeRun.runId !== pending.runId ||
+      !lease ||
+      lease.workerId !== latest.workerId ||
+      lease.runId !== pending.runId ||
+      lease.parentPid !== process.pid
+    ) return undefined;
+    record = latest;
+    runId = activeRun.runId;
+    jobId = activeRun.jobId;
+    const next: WorkerRecord = {
+      ...record,
+      status: "failed",
+      container: undefined,
+      activeRun: undefined,
+      lastRun: {
+        runId,
+        jobId,
+        status: "failed",
+        delivery: "pending",
+        processStatus: "failed",
+        logDir: pending.runDir,
+        stdoutLog: path.join(pending.runDir, "stdout.log"),
+        stderrLog: path.join(pending.runDir, "stderr.log"),
+        error
+      },
+      updatedAt: dependencies.now().toISOString()
+    };
+    writeWorkerRecord(pending.recordFile, next);
+    releaseWorkerLease(pending.paths.leaseFile, next.workerId, runId);
+    return next;
+  });
+  if (!updated) return;
+  const job: JobMeta = {
+    jobId,
+    job_name: `worker ${updated.workerId}`,
+    command: `Failed worker launch ${updated.workerId}/${runId}`,
+    cwd: updated.workspaceRoot,
+    shell: process.execPath,
+    status: "failed",
+    startedAt: updated.updatedAt,
+    endedAt: updated.updatedAt,
+    notifyOnExit: false,
+    completionNotified: true,
+    logDir: pending.runDir,
+    stdoutLog: path.join(pending.runDir, "stdout.log"),
+    stderrLog: path.join(pending.runDir, "stderr.log"),
+    outputBytes: { stdout: 0, stderr: 0 }
+  };
+  sendWorkerCompletion(api, updated, job, undefined, error);
+}
+
+function sendWorkerCompletion(
+  api: ExtensionAPI,
+  record: WorkerRecord,
+  job: JobMeta,
+  handoff: AcceptedWorkerHandoff | undefined,
+  error: string | undefined
+): boolean {
+  const runId = record.lastRun?.runId ?? "unknown";
+  const lines = [
+    `worker result: ${record.workerId}/${runId}`,
+    `process: ${job.status}${job.exitCode === undefined ? "" : ` exit=${job.exitCode}`}`,
+    `semantic: ${record.status}`,
+    handoff ? `handoff: ${handoff.handoff.state} — ${handoff.handoff.summary}` : undefined,
+    handoff ? `handoff_json: ${JSON.stringify(handoff.handoff)}` : undefined,
+    error ? `error: ${error}` : undefined,
+    `workspace: ${record.workspaceRoot}`,
+    `session: ${record.sessionId}`,
+    `stdout_log: ${job.stdoutLog}`,
+    `stderr_log: ${job.stderrLog}`
+  ].filter((line): line is string => line !== undefined);
+  try {
+    api.sendMessage({
+      customType: "worker-run",
+      content: lines.join("\n"),
+      display: true,
+      details: { deliveryId: workerCompletionDeliveryId(record.workerId, runId), record, job, handoff, error }
+    }, { triggerTurn: true, deliverAs: "steer" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function workerCompletionDeliveryId(workerId: string, runId: string): string {
+  return `worker-run:${workerId}:${runId}`;
+}
+
+function acknowledgePersistedWorkerDeliveries(
+  context: ExtensionContext,
+  dependencies: WorkerExtensionDependencies
+): void {
+  if (!existsSync(dependencies.roots.stateRoot)) return;
+  const parentSessionFile = context.sessionManager.getSessionFile();
+  if (!parentSessionFile) return;
+  const persisted = new Set(context.sessionManager.getEntries()
+    .flatMap((entry) => {
+      if (entry.type !== "custom_message" || entry.customType !== "worker-run" || !("details" in entry)) return [];
+      const deliveryId = (entry.details as { deliveryId?: unknown } | undefined)?.deliveryId;
+      return typeof deliveryId === "string" ? [deliveryId] : [];
+    }));
+  if (persisted.size === 0) return;
+  for (const entry of readdirSync(dependencies.roots.stateRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !entry.name.startsWith("worker_")) continue;
+    const paths = workerPaths(dependencies.roots, entry.name);
+    if (!existsSync(paths.recordFile)) continue;
+    const record = readWorkerRecord(paths.recordFile);
+    if (path.resolve(record.parentSessionFile) !== path.resolve(parentSessionFile)) continue;
+    const last = record.lastRun;
+    if (!last || last.delivery !== "pending") continue;
+    if (!persisted.has(workerCompletionDeliveryId(record.workerId, last.runId))) continue;
+    markWorkerCompletionDelivered(paths, last.runId, dependencies);
+  }
+}
+
+function markWorkerCompletionDelivered(
+  paths: WorkerPaths,
+  runId: string,
+  dependencies: WorkerExtensionDependencies
+): void {
+  withWorkerOperationLock(paths, () => {
+    if (!existsSync(paths.recordFile)) return;
+    const record = readWorkerRecord(paths.recordFile);
+    if (record.lastRun?.runId !== runId || record.lastRun.delivery !== "pending") return;
+    writeWorkerRecord(paths.recordFile, {
+      ...record,
+      lastRun: { ...record.lastRun, delivery: "delivered" },
+      updatedAt: dependencies.now().toISOString()
+    });
+  });
+}
+
+async function adoptWorkerRuns(
+  api: ExtensionAPI,
+  context: ExtensionContext,
+  dependencies: WorkerExtensionDependencies,
+  active: Map<string, { runId: string; handle: ManagedWorkerHandle }>,
+  monitors: Map<string, NodeJS.Timeout>
+): Promise<void> {
+  const parentSessionFile = context.sessionManager.getSessionFile();
+  if (!parentSessionFile || !existsSync(dependencies.roots.stateRoot)) return;
+  for (const entry of readdirSync(dependencies.roots.stateRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !entry.name.startsWith("worker_")) continue;
+    try {
+      const paths = workerPaths(dependencies.roots, entry.name);
+      if (!existsSync(paths.recordFile)) {
+        recoverOrphanedWorkerPreparation(paths);
+        continue;
+      }
+      const record = readWorkerRecord(paths.recordFile);
+      if (path.resolve(record.parentSessionFile) !== path.resolve(parentSessionFile)) continue;
+      if (!record.activeRun) {
+        releaseStaleCompletedLease(paths);
+        redeliverPendingWorkerCompletion(api, paths, readWorkerRecord(paths.recordFile), dependencies);
+        continue;
+      }
+      if (active.has(record.workerId)) continue;
+      if (await reconcileRecoveredWorkerRun(api, paths, record, dependencies)) continue;
+      let reconciling = false;
+      const monitor = setInterval(async () => {
+        if (reconciling) return;
+        reconciling = true;
+        try {
+          const current = readWorkerRecord(paths.recordFile);
+          if (!current.activeRun) {
+            releaseStaleCompletedLease(paths);
+            redeliverPendingWorkerCompletion(api, paths, readWorkerRecord(paths.recordFile), dependencies);
+            clearInterval(monitor);
+            monitors.delete(record.workerId);
+            return;
+          }
+          if (await reconcileRecoveredWorkerRun(api, paths, current, dependencies)) {
+            clearInterval(monitor);
+            monitors.delete(record.workerId);
+          }
+        } catch {
+          clearInterval(monitor);
+          monitors.delete(record.workerId);
+        } finally {
+          reconciling = false;
+        }
+      }, 500);
+      monitor.unref();
+      monitors.set(record.workerId, monitor);
+    } catch (error) {
+      context.ui.notify(`Unable to adopt managed worker ${entry.name}: ${error instanceof Error ? error.message : String(error)}`, "warning");
+    }
+  }
+}
+
+function releaseStaleCompletedLease(paths: WorkerPaths): void {
+  withWorkerOperationLock(paths, () => {
+    if (!existsSync(paths.recordFile)) return;
+    const record = readWorkerRecord(paths.recordFile);
+    const lease = readWorkerLease(paths.leaseFile);
+    if (record.activeRun || !record.lastRun || !lease) return;
+    if (lease.workerId !== record.workerId || lease.runId !== record.lastRun.runId) {
+      throw new Error(`Worker ${record.workerId} has a mismatched completed-run lease.`);
+    }
+    if (isAsyncJobProcessAlive(lease.parentPid)) return;
+    releaseWorkerLease(paths.leaseFile, lease.workerId, lease.runId);
+  });
+}
+
+function recoverOrphanedWorkerPreparation(paths: WorkerPaths): void {
+  withWorkerOperationLock(paths, () => {
+    if (existsSync(paths.recordFile)) return;
+    const lease = readWorkerLease(paths.leaseFile);
+    if (!lease || isAsyncJobProcessAlive(lease.parentPid)) return;
+    releaseWorkerLease(paths.leaseFile, lease.workerId, lease.runId);
+    rmSync(paths.workspaceRoot, { recursive: true, force: true });
+    rmSync(paths.stateDir, { recursive: true, force: true });
+  });
+}
+
+function redeliverPendingWorkerCompletion(
+  api: ExtensionAPI,
+  paths: WorkerPaths,
+  record: WorkerRecord,
+  dependencies: WorkerExtensionDependencies
+): void {
+  const last = record.lastRun;
+  if (!last || last.delivery !== "pending") return;
+  const logDir = last.logDir ?? path.join(paths.stateDir, "runs", last.runId);
+  const stdoutLog = last.stdoutLog ?? path.join(logDir, "stdout.log");
+  const stderrLog = last.stderrLog ?? path.join(logDir, "stderr.log");
+  const allowedStatuses: JobMeta["status"][] = ["running", "exited", "failed", "cancelled", "unknown"];
+  const processStatus = allowedStatuses.includes(last.processStatus as JobMeta["status"])
+    ? last.processStatus as JobMeta["status"]
+    : "unknown";
+  const job: JobMeta = {
+    jobId: last.jobId,
+    job_name: `worker ${record.workerId}`,
+    command: `Redelivered worker ${record.workerId}/${last.runId}`,
+    cwd: record.workspaceRoot,
+    shell: process.execPath,
+    status: processStatus,
+    pid: last.pid,
+    startedAt: record.updatedAt,
+    endedAt: record.updatedAt,
+    exitCode: last.exitCode,
+    notifyOnExit: false,
+    completionNotified: true,
+    logDir,
+    stdoutLog,
+    stderrLog,
+    outputBytes: asyncJobOutputBytes(stdoutLog, stderrLog)
+  };
+  const handoff = last.resultFile
+    ? readMatchingWorkerHandoff(last.resultFile, record.workerId, last.runId)
+    : undefined;
+  sendWorkerCompletion(api, record, job, handoff, last.error);
+}
+
+async function reconcileRecoveredWorkerRun(
+  api: ExtensionAPI,
+  paths: WorkerPaths,
+  record: WorkerRecord,
+  dependencies: WorkerExtensionDependencies
+): Promise<boolean> {
+  const run = record.activeRun;
+  if (!run) return true;
+  if (run.status === "running") {
+    const recoveredPid = verifiedWorkerHostPid(record);
+    if (recoveredPid !== undefined) {
+      if (run.pid !== recoveredPid) {
+        withWorkerOperationLock(paths, () => {
+          const current = readWorkerRecord(paths.recordFile);
+          const lease = readWorkerLease(paths.leaseFile);
+          if (current.activeRun?.runId !== run.runId || current.activeRun.status !== "running") return;
+          if (lease && (lease.workerId !== current.workerId || lease.runId !== run.runId)) {
+            throw new Error(`Worker ${current.workerId}/${run.runId} has a mismatched recovery lease.`);
+          }
+          if (lease && lease.parentPid !== process.pid && isAsyncJobProcessAlive(lease.parentPid)) return;
+          writeWorkerRecord(paths.recordFile, {
+            ...current,
+            activeRun: { ...current.activeRun, pid: recoveredPid },
+            updatedAt: dependencies.now().toISOString()
+          });
+        });
+      }
+      return false;
+    }
+    if (run.pid !== undefined && isAsyncJobProcessGroupAlive(run.pid)) return false;
+    if (dependencies.now().getTime() - Date.parse(record.updatedAt) < 5_000) return false;
+    if (!isWorkerHostProcessSettled(record)) {
+      revokeWorkerHostAuthorization(paths, run.runId);
+      return false;
+    }
+  }
+
+  if (!claimWorkerRecoveryLease(paths, record, run.runId, dependencies)) return false;
+  try {
+    await settlePersistedWorkerShells(paths, record.workerId, run.runId, dependencies);
+  } catch (cause) {
+    persistWorkerCleanupUncertainty(
+      paths,
+      run.runId,
+      cause instanceof Error ? cause.message : String(cause),
+      isWorkerHostProcessSettled(readWorkerRecord(paths.recordFile)),
+      dependencies
+    );
+    return false;
+  }
+  const resultFile = run.resultFile ?? path.join(paths.stateDir, "runs", run.runId, "result.json");
+  const settledFile = run.settledFile ?? path.join(paths.stateDir, "runs", run.runId, "settled.json");
+  let handoff: AcceptedWorkerHandoff | undefined;
+  let status: "handed_off" | "failed" = "failed";
+  let error: string | undefined;
+  if (existsSync(resultFile) && existsSync(settledFile)) {
+    try {
+      readMatchingHostSettlement(settledFile, record, run.runId, resultFile);
+      handoff = readMatchingWorkerHandoff(resultFile, record.workerId, run.runId);
+      status = "handed_off";
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : String(cause);
+    }
+  } else {
+    error = run.status === "queued"
+      ? `Parent exited before queued worker ${record.workerId}/${run.runId} launched.`
+      : existsSync(resultFile)
+        ? `Worker ${record.workerId}/${run.runId} exited before the host verified final session identity and quiescence.`
+        : `Worker ${record.workerId}/${run.runId} exited without a typed handoff.`;
+  }
+  const logDir = run.logDir ?? path.join(paths.stateDir, "runs", run.runId);
+  const stdoutLog = run.stdoutLog ?? path.join(logDir, "stdout.log");
+  const stderrLog = run.stderrLog ?? path.join(logDir, "stderr.log");
+  const recoveredJob: JobMeta = {
+    jobId: run.jobId,
+    job_name: `worker ${record.workerId}`,
+    command: `Recovered worker ${record.workerId}/${run.runId}`,
+    cwd: record.workspaceRoot,
+    shell: process.execPath,
+    status: handoff ? "exited" : "unknown",
+    pid: run.pid,
+    startedAt: record.updatedAt,
+    endedAt: dependencies.now().toISOString(),
+    notifyOnExit: false,
+    completionNotified: true,
+    logDir,
+    stdoutLog,
+    stderrLog,
+    outputBytes: asyncJobOutputBytes(stdoutLog, stderrLog)
+  };
+  finalizeWorkerRunRecord({
+    api,
+    paths,
+    recordFile: paths.recordFile,
+    record,
+    runId: run.runId,
+    job: recoveredJob,
+    status,
+    handoff,
+    error,
+    resultFile,
+    preserveContainer: false,
+    dependencies
+  });
+  return true;
+}
+
+function claimWorkerRecoveryLease(
+  paths: WorkerPaths,
+  record: WorkerRecord,
+  runId: string,
+  dependencies: WorkerExtensionDependencies
+): boolean {
+  try {
+    return withWorkerOperationLock(paths, () => {
+      const current = readWorkerRecord(paths.recordFile);
+      if (current.activeRun?.runId !== runId) return false;
+      const lease = readWorkerLease(paths.leaseFile);
+      if (lease) {
+        if (lease.workerId !== record.workerId || lease.runId !== runId) {
+          throw new Error(`Worker ${record.workerId}/${runId} has a mismatched recovery lease.`);
+        }
+        if (lease.parentPid === process.pid) return true;
+        if (isAsyncJobProcessAlive(lease.parentPid)) return false;
+        releaseWorkerLease(paths.leaseFile, record.workerId, runId);
+      }
+      acquireWorkerRunLease(paths, record.workerId, runId, dependencies.now());
+      if (current.activeRun?.cleanupOwner) {
+        writeWorkerRecord(paths.recordFile, {
+          ...current,
+          activeRun: { ...current.activeRun, cleanupOwner: undefined },
+          updatedAt: dependencies.now().toISOString()
+        });
+      }
+      return true;
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("lifecycle operation is already active")) return false;
+    throw error;
+  }
+}
+
+function readMatchingHostSettlement(
+  settledFile: string,
+  record: WorkerRecord,
+  runId: string,
+  resultFile: string
+): void {
+  const settlement = readWorkerHostSettlement(settledFile);
+  if (
+    settlement.workerId !== record.workerId ||
+    settlement.runId !== runId ||
+    settlement.sessionId !== record.sessionId ||
+    path.resolve(settlement.resultFile) !== path.resolve(resultFile)
+  ) {
+    throw new Error(`Worker host settlement identity mismatch for ${record.workerId}/${runId}.`);
+  }
+}
+
+function readMatchingWorkerHandoff(
+  resultFile: string,
+  workerId: string,
+  runId: string
+): AcceptedWorkerHandoff {
+  const handoff = readWorkerRuntimeHandoff(resultFile);
+  if (handoff.workerId !== workerId || handoff.runId !== runId) {
+    throw new Error(`Worker handoff identity mismatch for ${workerId}/${runId}.`);
+  }
+  return handoff;
+}
+
+function cancelledWorkerRecord(record: WorkerRecord, now: Date): WorkerRecord {
+  if (!record.activeRun) return record;
+  return {
+    ...record,
+    status: "cancelled",
+    container: undefined,
+    activeRun: undefined,
+    lastRun: {
+      runId: record.activeRun.runId,
+      jobId: record.activeRun.jobId,
+      status: "cancelled"
+    },
+    updatedAt: now.toISOString()
+  };
+}
+
+function ensureWorkerRecoveryLease(
+  paths: WorkerPaths,
+  record: WorkerRecord,
+  runId: string,
+  dependencies: WorkerExtensionDependencies
+): boolean {
+  const lease = readWorkerLease(paths.leaseFile);
+  if (lease?.workerId === record.workerId && lease.runId === runId && lease.parentPid === process.pid) return true;
+  return claimWorkerRecoveryLease(paths, record, runId, dependencies);
+}
+
+function finalizeRecoveredWorkerCancellation(
+  api: ExtensionAPI,
+  paths: WorkerPaths,
+  record: WorkerRecord,
+  runId: string,
+  dependencies: WorkerExtensionDependencies,
+  requireCurrentLeaseOwner = true,
+  cleanupOwner?: string
+): void {
+  const run = record.activeRun;
+  if (!run || run.runId !== runId) return;
+  const logDir = run.logDir ?? path.join(paths.stateDir, "runs", runId);
+  const stdoutLog = run.stdoutLog ?? path.join(logDir, "stdout.log");
+  const stderrLog = run.stderrLog ?? path.join(logDir, "stderr.log");
+  const endedAt = dependencies.now().toISOString();
+  const job: JobMeta = {
+    jobId: run.jobId,
+    job_name: `worker ${record.workerId}`,
+    command: `Recovered cancellation ${record.workerId}/${runId}`,
+    cwd: record.workspaceRoot,
+    shell: process.execPath,
+    status: "cancelled",
+    pid: run.pid,
+    startedAt: record.updatedAt,
+    endedAt,
+    notifyOnExit: false,
+    completionNotified: true,
+    logDir,
+    stdoutLog,
+    stderrLog,
+    outputBytes: asyncJobOutputBytes(stdoutLog, stderrLog)
+  };
+  const updated = withWorkerOperationLock(paths, () => {
+    const current = readWorkerRecord(paths.recordFile);
+    const lease = readWorkerLease(paths.leaseFile);
+    if (current.activeRun?.runId !== runId || !lease || lease.workerId !== current.workerId || lease.runId !== runId) {
+      return undefined;
+    }
+    if (requireCurrentLeaseOwner && lease.parentPid !== process.pid) return undefined;
+    if (cleanupOwner && current.activeRun.cleanupOwner !== cleanupOwner) return undefined;
+    const next: WorkerRecord = {
+      ...current,
+      status: "cancelled",
+      container: undefined,
+      activeRun: undefined,
+      lastRun: {
+        runId,
+        jobId: job.jobId,
+        status: "cancelled",
+        delivery: "pending",
+        processStatus: "cancelled",
+        pid: job.pid,
+        logDir,
+        stdoutLog,
+        stderrLog,
+        error: run.recoveryError
+      },
+      updatedAt: endedAt
+    };
+    writeWorkerRecord(paths.recordFile, next);
+    releaseWorkerLease(paths.leaseFile, current.workerId, runId);
+    return next;
+  });
+  if (updated) sendWorkerCompletion(api, updated, job, undefined, run.recoveryError);
+}
+
+function claimWorkerCancellationOwnership(
+  paths: WorkerPaths,
+  record: WorkerRecord,
+  runId: string,
+  dependencies: WorkerExtensionDependencies
+): string | undefined {
+  if (!ensureWorkerRecoveryLease(paths, record, runId, dependencies)) return undefined;
+  return withWorkerOperationLock(paths, () => {
+    const current = readWorkerRecord(paths.recordFile);
+    const lease = readWorkerLease(paths.leaseFile);
+    if (
+      current.activeRun?.runId !== runId ||
+      current.activeRun.cleanupOwner ||
+      !lease ||
+      lease.workerId !== current.workerId ||
+      lease.runId !== runId ||
+      lease.parentPid !== process.pid
+    ) return undefined;
+    const cleanupOwner = randomUUID();
+    writeWorkerRecord(paths.recordFile, {
+      ...current,
+      activeRun: { ...current.activeRun, cleanupOwner },
+      updatedAt: dependencies.now().toISOString()
+    });
+    return cleanupOwner;
+  });
+}
+
+function releaseWorkerCancellationOwnership(
+  paths: WorkerPaths,
+  runId: string,
+  cleanupOwner: string,
+  dependencies: WorkerExtensionDependencies
+): void {
+  withWorkerOperationLock(paths, () => {
+    const current = readWorkerRecord(paths.recordFile);
+    if (current.activeRun?.runId !== runId || current.activeRun.cleanupOwner !== cleanupOwner) return;
+    writeWorkerRecord(paths.recordFile, {
+      ...current,
+      activeRun: { ...current.activeRun, cleanupOwner: undefined },
+      updatedAt: dependencies.now().toISOString()
+    });
+  });
+}
+
+async function cancelAttachedWorker(
+  handle: ManagedWorkerHandle,
+  record: WorkerRecord,
+  paths: WorkerPaths,
+  dependencies: WorkerExtensionDependencies
+): Promise<void> {
+  const pid = handle.snapshot().pid;
+  if (pid === undefined) handle.cancel("SIGTERM");
+  else await terminateWorkerProcessGroup(pid, (signal) => handle.cancel(signal), record);
+  const settled = await handle.completion;
+  await settlePersistedWorkerShells(paths, record.workerId, record.activeRun?.runId ?? "unknown", dependencies);
+  if (settled.status !== "cancelled" && settled.status !== "exited") {
+    throw new Error(`Worker ${record.workerId}/${record.activeRun?.runId ?? "unknown"} did not settle after cancellation: ${settled.status}.`);
+  }
+}
+
+async function cancelDetachedWorker(
+  record: WorkerRecord,
+  paths: WorkerPaths,
+  dependencies: WorkerExtensionDependencies
+): Promise<void> {
+  const pid = verifiedWorkerHostPid(record);
+  if (pid === undefined) {
+    throw new Error(`Worker ${record.workerId}/${record.activeRun?.runId ?? "unknown"} is not attached and has no verified host process.`);
+  }
+  await terminateWorkerProcessGroup(pid, (signal) => signalRecordedProcess(pid, signal), record);
+  await settlePersistedWorkerShells(paths, record.workerId, record.activeRun?.runId ?? "unknown", dependencies);
+}
+
+async function settlePersistedWorkerShells(
+  paths: WorkerPaths,
+  workerId: string,
+  runId: string,
+  dependencies: WorkerExtensionDependencies,
+  removeContainer = true
+): Promise<void> {
+  revokeWorkerHostAuthorization(paths, runId);
+  const owner = { kind: "worker-run" as const, workerId, runId };
+  let shellError: unknown;
+  try {
+    await cancelPersistedAsyncShellJobsForOwner(path.join(paths.stateDir, "async-shell"), owner);
+  } catch (error) {
+    shellError = error;
+  }
+
+  let containerError: unknown;
+  const current = readWorkerRecord(paths.recordFile);
+  const container = current.activeRun?.runId === runId ? current.activeRun.container ?? current.container : undefined;
+  if (removeContainer && container) {
+    try {
+      dependencies.removeContainer(container);
+    } catch (error) {
+      containerError = error;
+    }
+  }
+
+  if (shellError && !containerError) {
+    try {
+      await cancelPersistedAsyncShellJobsForOwner(path.join(paths.stateDir, "async-shell"), owner);
+      shellError = undefined;
+    } catch (error) {
+      shellError = error;
+    }
+  }
+  if (removeContainer && container && !containerError) {
+    withWorkerOperationLock(paths, () => {
+      const latest = readWorkerRecord(paths.recordFile);
+      if (latest.activeRun?.runId !== runId) return;
+      const recorded = latest.activeRun.container ?? latest.container;
+      if (!recorded || !sameWorkerContainer(recorded, container)) return;
+      writeWorkerRecord(paths.recordFile, {
+        ...latest,
+        container: undefined,
+        activeRun: { ...latest.activeRun, container: undefined }
+      });
+    });
+  }
+  if (shellError || containerError) {
+    const errors = [shellError, containerError].filter((error) => error !== undefined);
+    const reasons = errors.map((error) => error instanceof Error ? error.message : String(error)).join("; ");
+    throw new AggregateError(
+      errors,
+      `Worker ${workerId}/${runId} shell or container cleanup could not be verified: ${reasons}`
+    );
+  }
+}
+
+function revokeWorkerHostAuthorization(paths: WorkerPaths, runId: string): void {
+  rmSync(path.join(paths.stateDir, "runs", runId, "host-authorization.json"), { force: true });
+}
+
+function sameWorkerContainer(left: WorkerContainerReference, right: WorkerContainerReference): boolean {
+  return left.workerId === right.workerId &&
+    left.runId === right.runId &&
+    left.name === right.name &&
+    left.nonce === right.nonce &&
+    left.containerId === right.containerId;
+}
+
+async function terminateWorkerProcessGroup(
+  pid: number,
+  signal: (signal: NodeJS.Signals) => void,
+  record: WorkerRecord
+): Promise<void> {
+  signal("SIGTERM");
+  if (await waitForRecordedProcessExit(pid, 4_000)) return;
+  signal("SIGKILL");
+  if (!(await waitForRecordedProcessExit(pid, 2_000))) {
+    throw new Error(`Worker ${record.workerId}/${record.activeRun?.runId ?? "unknown"} survived SIGKILL.`);
+  }
+}
+
+function signalRecordedProcess(pid: number, signal: NodeJS.Signals): void {
+  try {
+    signalAsyncJobProcessGroup(pid, signal);
+  } catch (error) {
+    if (isAsyncJobProcessGroupAlive(pid)) throw error;
+  }
+}
+
+function verifiedWorkerHostPid(record: WorkerRecord): number | undefined {
+  const run = record.activeRun;
+  if (!run?.processFile || !run.processNonce || !run.hostConfigFile) return undefined;
+  if (!existsSync(run.processFile)) {
+    if (run.pid !== undefined && isAsyncJobProcessGroupAlive(run.pid) && recordedWorkerHostCommandMatches(run.pid, run.hostConfigFile)) {
+      return run.pid;
+    }
+    return undefined;
+  }
+  let marker: ReturnType<typeof readWorkerHostProcess>;
+  try {
+    marker = readWorkerHostProcess(run.processFile);
+  } catch {
+    return undefined;
+  }
+  if (
+    marker.workerId !== record.workerId ||
+    marker.runId !== run.runId ||
+    marker.nonce !== run.processNonce ||
+    path.resolve(marker.hostConfigFile) !== path.resolve(run.hostConfigFile) ||
+    (run.pid !== undefined && run.pid !== marker.pid) ||
+    !isAsyncJobProcessGroupAlive(marker.pid)
+  ) return undefined;
+  if (isAsyncJobProcessAlive(marker.pid) && !recordedWorkerHostCommandMatches(marker.pid, run.hostConfigFile)) return undefined;
+  return marker.pid;
+}
+
+function recordedWorkerHostCommandMatches(pid: number, hostConfigFile: string): boolean {
+  try {
+    const command = execFileSync("/bin/ps", ["-ww", "-p", String(pid), "-o", "command="], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    }).trim();
+    return command.includes(path.resolve(hostConfigFile));
+  } catch {
+    return false;
+  }
+}
+
+function isWorkerHostProcessSettled(record: WorkerRecord): boolean {
+  const run = record.activeRun;
+  if (!run) return true;
+  const pids = new Set<number>();
+  if (run.pid !== undefined) pids.add(run.pid);
+  if (run.processFile && existsSync(run.processFile)) {
+    try {
+      const marker = readWorkerHostProcess(run.processFile);
+      if (marker.workerId === record.workerId && marker.runId === run.runId) pids.add(marker.pid);
+    } catch {
+      if (pids.size === 0) return false;
+    }
+  }
+  return pids.size > 0 && Array.from(pids).every((pid) => !isAsyncJobProcessGroupAlive(pid));
+}
+
+async function waitForRecordedProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (isAsyncJobProcessGroupAlive(pid) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return !isAsyncJobProcessGroupAlive(pid);
+}
+
+function assertWorkerParentSession(record: WorkerRecord, context: ExtensionContext): void {
+  const sessionFile = context.sessionManager.getSessionFile();
+  if (!sessionFile || path.resolve(sessionFile) !== path.resolve(record.parentSessionFile)) {
+    throw new Error(`Worker ${record.workerId} belongs to a different parent session.`);
+  }
+}
+
+function resolveWorkerRoute(requested: string | undefined, context: ExtensionContext): WorkerRoute {
+  const fallbackThinkingLevel = (context.thinkingLevel ?? "xhigh") as ThinkingLevel;
+  const resolved = resolveExtensionModel({
+    registry: context.modelRegistry,
+    requested,
+    currentModel: requested ? undefined : context.model,
+    fallbackThinkingLevel,
+    label: "Worker",
+    noModelMessage: "No worker model is selected. Pass route or select a model."
+  });
+  return {
+    provider: resolved.model.provider,
+    model: resolved.model.id,
+    thinkingLevel: resolved.thinkingLevel
+  };
+}
+
+function receipt(record: WorkerRecord): WorkerRunReceipt {
+  if (!record.activeRun) throw new Error(`Worker ${record.workerId} has no active run receipt.`);
+  return {
+    workerId: record.workerId,
+    runId: record.activeRun.runId,
+    jobId: record.activeRun.jobId,
+    sessionId: record.sessionId,
+    sessionFile: record.sessionFile,
+    workspaceRoot: record.workspaceRoot,
+    taskIds: [...record.taskIds],
+    provider: record.route.provider,
+    model: record.route.model,
+    thinkingLevel: record.route.thinkingLevel,
+    state: record.activeRun.status
+  };
+}
+
+function buildNewWorkerPrompt(
+  record: WorkerRecord,
+  guidance: string | undefined,
+  initialRepos: Array<{ source: string; revision?: string }> | undefined
+): string {
+  return [
+    `You are managed worker ${record.workerId} in workspace ${record.workspaceRoot}.`,
+    `Assigned Beads: ${record.taskIds.join(", ")}.`,
+    "The parent session was forked into this exact worker session. Work only on the assigned scope.",
+    WORKER_OPERATIONAL_GUIDANCE,
+    initialRepos?.length ? `Initial repositories requested:\n${initialRepos.map((repo) => `- ${repo.source}${repo.revision ? ` @ ${repo.revision}` : ""}`).join("\n")}` : undefined,
+    guidance?.trim() ? `Parent guidance:\n${guidance.trim()}` : undefined
+  ].filter((part): part is string => part !== undefined).join("\n\n");
+}
+
+function buildResumeWorkerPrompt(record: WorkerRecord, message: string, parentContextSnapshot: string): string {
+  return [
+    `Resume managed worker ${record.workerId} in the exact existing session and workspace.`,
+    `Assigned Beads: ${record.taskIds.join(", ")}.`,
+    `A fresh mode-0400 snapshot of the completed parent session for this resume is available at ${parentContextSnapshot}.`,
+    WORKER_OPERATIONAL_GUIDANCE,
+    `Parent update:\n${message.trim()}`
+  ].join("\n\n");
+}
+
+function formatWorkerRunReceipt(value: WorkerRunReceipt): string {
+  return [
+    `worker_id: ${value.workerId}`,
+    `run_id: ${value.runId}`,
+    `job_id: ${value.jobId}`,
+    `session_id: ${value.sessionId}`,
+    value.sessionFile ? `session_file: ${value.sessionFile}` : "session_file: pending exact post-turn fork",
+    `workspace_root: ${value.workspaceRoot}`,
+    `task_ids: ${value.taskIds.join(", ")}`,
+    `route: ${value.provider}/${value.model}:${value.thinkingLevel}`,
+    `state: ${value.state}`
+  ].join("\n");
+}
+
+function formatWorkerRecord(record: WorkerRecord): string {
+  return [
+    `Worker ${record.workerId}: ${record.status}`,
+    `Session: ${record.sessionId}${record.sessionFile ? ` · ${record.sessionFile}` : " · fork pending"}`,
+    `Workspace: ${record.workspaceRoot}`,
+    `Route: ${formatModelName({ provider: record.route.provider, id: record.route.model })}:${record.route.thinkingLevel}`,
+    `Tasks: ${record.taskIds.join(", ")}`,
+    record.container ? `Container: ${record.container.name} · ${record.container.containerId?.slice(0, 12) ?? "planned"} · created for ${record.container.runId}` : "Container: not created",
+    record.activeRun ? `Active run: ${record.activeRun.runId} · ${record.activeRun.jobId} · ${record.activeRun.status}` : undefined,
+    record.activeRun?.recoveryError ? `Recovery required: ${record.activeRun.recoveryError}` : undefined,
+    record.lastRun ? `Last run: ${record.lastRun.runId} · ${record.lastRun.status}` : undefined
+  ].filter((line): line is string => line !== undefined).join("\n");
+}
+
+function uniqueStrings(values: readonly string[]): string[] {
+  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
+}
+
+function validatePersonalTaskIds(taskIds: readonly string[]): void {
+  const invalid = taskIds.find((taskId) => !/^personal-[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)*$/.test(taskId.trim()));
+  if (invalid) throw new Error(`Managed worker task IDs must use the central personal prefix: ${invalid}`);
+}
+
+function defaultDependencies(): WorkerExtensionDependencies {
+  return {
+    roots: defaultWorkerRoots(),
+    now: () => new Date(),
+    random: () => randomUUID(),
+    planContainer: (record, runId, nonce) => planWorkerContainer({
+      workerId: record.workerId,
+      runId,
+      nonce,
+      workspaceRoot: record.workspaceRoot
+    }),
+    parkContainer: (container) => parkWorkerContainer(resolveDockerPath(), container),
+    removeContainer: (container) => settleWorkerContainer(resolveDockerPath(), container),
+    launch: (api, context, request) => {
+      if (!request.container) throw new Error(`Worker ${request.record.workerId}/${request.record.activeRun?.runId ?? "unknown"} lost its planned Docker identity.`);
+      const dockerPath = resolveDockerPath();
+      let container = request.container;
+      try {
+        container = createWorkerContainer(dockerPath, request.container);
+        const launched = launchWorkerHost(api, context, {
+          ...request,
+          shellExecution: { kind: "docker", dockerPath, container }
+        });
+        return Object.assign(launched.handle, { container });
+      } catch (cause) {
+        rmSync(path.join(request.runDir, "host-authorization.json"), { force: true });
+        try {
+          settleWorkerContainer(dockerPath, container);
+        } catch (cleanupError) {
+          throw new WorkerContainerCleanupError(
+            [cause, cleanupError],
+            `Worker ${request.record.workerId} host launch failed and its Docker container could not be removed.`
+          );
+        }
+        throw cause;
+      }
+    }
+  };
+}

@@ -4,11 +4,12 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "strict": true,
+    "allowJs": true,
     "noImplicitAny": true,
     "noEmit": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["extensions/**/*.ts", "tests/**/*.ts"]
+  "include": ["extensions/**/*.ts", "extensions/**/*.js", "tests/**/*.ts"]
 }

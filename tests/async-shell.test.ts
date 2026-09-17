@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -6,13 +8,17 @@ import test from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import asyncShellExtension, {
+  activeAsyncShellJobsForOwner,
   buildAsyncShellStatusText,
   buildAsyncShellViewerFrame,
   buildAsyncShellViewerUsage,
+  cancelAsyncShellJobsForOwner,
+  cancelPersistedAsyncShellJobsForOwner,
   createAsyncShellViewerComponent,
   loadAsyncShellViewerSnapshot,
   parseAsyncShellViewerArgs,
   sanitizeAsyncShellViewerText,
+  startManagedAsyncJob,
   type AsyncShellViewerSnapshot
 } from "../extensions/async-shell/index.js";
 
@@ -91,6 +97,22 @@ function required<T>(value: T | undefined, name: string): T {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withEnv(values: Record<string, string | undefined>, run: () => Promise<void>): Promise<void> {
+  const previous = new Map(Object.keys(values).map((name) => [name, process.env[name]]));
+  for (const [name, value] of Object.entries(values)) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+  try {
+    await run();
+  } finally {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
 }
 
 const plainTheme = {
@@ -938,6 +960,421 @@ test("shell_cancel transitions a running job to cancelled and suppresses complet
     assert.equal(job.signal, "SIGTERM");
     await delay(50);
     assert.equal(api.sentMessages.length, 0);
+  });
+});
+
+test("managed worker shell launch fails closed without an exact Docker identity", async () => {
+  await withTempDir(async (dir) => {
+    await Promise.all([
+      mkdir(path.join(dir, "cache", "config"), { recursive: true }),
+      mkdir(path.join(dir, "cache", "data"), { recursive: true }),
+      mkdir(path.join(dir, "cache", "state"), { recursive: true }),
+      mkdir(path.join(dir, "tmp"), { recursive: true }),
+      mkdir(path.join(dir, "worker-state", "async-shell"), { recursive: true })
+    ]);
+    await withEnv({
+      PI_WORKER_ID: "worker-test",
+      PI_WORKER_RUN_ID: "run-missing-container",
+      PI_WORKER_WORKSPACE_ROOT: dir,
+      PI_WORKER_STATE_ROOT: path.join(dir, "worker-state"),
+      PI_WORKER_ASYNC_JOB_ROOT: path.join(dir, "worker-state", "async-shell")
+    }, async () => {
+      const api = createFakeApi();
+      asyncShellExtension(api);
+      assert.throws(() => startManagedAsyncJob(api, createContext(dir), {
+        jobId: "job_20260917150000_nocontainer",
+        command: "must not run",
+        cwd: dir,
+        executable: process.execPath,
+        args: ["-e", "process.exit(0)"],
+        notifyOnExit: false
+      }), /requires an exact Docker container identity/);
+    });
+  });
+});
+
+test("managed worker owner cancellation settles every owned async-shell job", async () => {
+  await withTempDir(async (dir) => {
+    await Promise.all([
+      mkdir(path.join(dir, "cache", "config"), { recursive: true }),
+      mkdir(path.join(dir, "cache", "data"), { recursive: true }),
+      mkdir(path.join(dir, "cache", "state"), { recursive: true }),
+      mkdir(path.join(dir, "tmp"), { recursive: true }),
+      mkdir(path.join(dir, "worker-state", "async-shell"), { recursive: true })
+    ]);
+    await withEnv({
+      PI_WORKER_ID: "worker-test",
+      PI_WORKER_RUN_ID: "run-test",
+      PI_WORKER_NATIVE_TEST_SHELL: "1",
+      PI_WORKER_WORKSPACE_ROOT: dir,
+      PI_WORKER_STATE_ROOT: path.join(dir, "worker-state"),
+      PI_WORKER_ASYNC_JOB_ROOT: path.join(dir, "worker-state", "async-shell")
+    }, async () => {
+      const api = createFakeApi();
+      asyncShellExtension(api);
+      const context = createContext(dir);
+      const handle = startManagedAsyncJob(api, context, {
+        jobId: "job_20260910193000_ownedtest",
+        command: "long owned job",
+        cwd: dir,
+        executable: process.execPath,
+        args: ["-e", "setInterval(() => {}, 1000)"],
+        notifyOnExit: false
+      });
+      const owner = { kind: "worker-run" as const, workerId: "worker-test", runId: "run-test" };
+      assert.deepEqual(activeAsyncShellJobsForOwner(owner).map((job) => job.jobId), [handle.jobId]);
+
+      const cancelled = await cancelAsyncShellJobsForOwner(owner, "SIGTERM", 1_000);
+      assert.equal(cancelled.length, 1);
+      assert.equal(cancelled[0].status, "cancelled");
+      assert.equal((await handle.completion).status, "cancelled");
+      assert.deepEqual(activeAsyncShellJobsForOwner(owner), []);
+
+      const marker = path.join(dir, "persisted-owned.pid");
+      const persistedHandle = startManagedAsyncJob(api, context, {
+        jobId: "job_20260910193000_persisted",
+        command: "persisted owned job",
+        cwd: dir,
+        executable: process.execPath,
+        args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)},String(process.pid));process.on('SIGTERM',()=>{});setInterval(()=>{},1000)`],
+        notifyOnExit: false
+      });
+      for (let attempt = 0; attempt < 200 && !existsSync(marker); attempt += 1) await delay(10);
+      assert.ok(existsSync(marker));
+      const persistedPid = Number.parseInt(await readFile(marker, "utf8"), 10);
+      const persisted = await cancelPersistedAsyncShellJobsForOwner(path.join(dir, "worker-state", "async-shell"), owner, 100);
+      assert.equal(persisted.map((job) => job.jobId).includes(persistedHandle.jobId), true);
+      const persistedKeepAlive = setInterval(() => {}, 20);
+      const persistedCompletion = await persistedHandle.completion.finally(() => clearInterval(persistedKeepAlive));
+      assert.ok(["failed", "cancelled"].includes(persistedCompletion.status));
+      let persistedAlive = true;
+      for (let attempt = 0; attempt < 200 && persistedAlive; attempt += 1) {
+        try { process.kill(persistedPid, 0); await delay(10); } catch { persistedAlive = false; }
+      }
+      assert.equal(persistedAlive, false);
+    });
+  });
+});
+
+test("persisted owner cancellation never signals a terminal job's reused pid", async () => {
+  await withTempDir(async (directory) => {
+    const asyncRoot = path.join(directory, "async-shell");
+    const jobId = "job_20260910193000_terminalpid";
+    const logDir = path.join(asyncRoot, "jobs", jobId);
+    await mkdir(logDir, { recursive: true });
+    const victim = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], {
+      detached: true,
+      stdio: "ignore"
+    });
+    assert.ok(victim.pid);
+    const owner = { kind: "worker-run" as const, workerId: "worker-test", runId: "run-terminal" };
+    await Promise.all([
+      writeFile(path.join(logDir, "stdout.log"), ""),
+      writeFile(path.join(logDir, "stderr.log"), ""),
+      writeFile(path.join(logDir, "meta.json"), `${JSON.stringify({
+        jobId,
+        command: "historical terminal job",
+        cwd: directory,
+        shell: process.execPath,
+        status: "exited",
+        pid: victim.pid,
+        processToken: "historical-token-that-does-not-match",
+        startedAt: "2026-09-10T19:30:00.000Z",
+        endedAt: "2026-09-10T19:30:01.000Z",
+        notifyOnExit: false,
+        completionNotified: true,
+        owner,
+        logDir,
+        stdoutLog: path.join(logDir, "stdout.log"),
+        stderrLog: path.join(logDir, "stderr.log"),
+        outputBytes: { stdout: 0, stderr: 0 }
+      })}\n`)
+    ]);
+    const cancelled = await cancelPersistedAsyncShellJobsForOwner(asyncRoot, owner, 50);
+    assert.deepEqual(cancelled, []);
+    assert.doesNotThrow(() => process.kill(victim.pid!, 0));
+    try { process.kill(-victim.pid, "SIGKILL"); } catch {}
+  });
+});
+
+test("worker shell output is captured in trusted state outside the writable workspace", async () => {
+  await withTempDir(async (directory) => {
+    const workspace = path.join(directory, "workspace");
+    const stateRoot = path.join(directory, "state");
+    const asyncRoot = path.join(stateRoot, "async-shell");
+    await Promise.all([
+      mkdir(path.join(workspace, "cache", "config"), { recursive: true }),
+      mkdir(path.join(workspace, "cache", "data"), { recursive: true }),
+      mkdir(path.join(workspace, "cache", "state"), { recursive: true }),
+      mkdir(path.join(workspace, "tmp"), { recursive: true }),
+      mkdir(asyncRoot, { recursive: true })
+    ]);
+    await withEnv({
+      PI_WORKER_ID: "worker-test",
+      PI_WORKER_RUN_ID: "run-external-logs",
+      PI_WORKER_NATIVE_TEST_SHELL: "1",
+      PI_WORKER_WORKSPACE_ROOT: workspace,
+      PI_WORKER_STATE_ROOT: stateRoot,
+      PI_WORKER_ASYNC_JOB_ROOT: asyncRoot
+    }, async () => {
+      const api = createFakeApi();
+      asyncShellExtension(api);
+      const handle = startManagedAsyncJob(api, createContext(workspace), {
+        jobId: "job_20260910193000_extlogs",
+        command: "trusted external log probe",
+        cwd: workspace,
+        executable: process.execPath,
+        args: ["-e", "console.log('TRUSTED_EXTERNAL_LOG')"],
+        notifyOnExit: false
+      });
+      const keepAlive = setInterval(() => {}, 20);
+      const job = await handle.completion.finally(() => clearInterval(keepAlive));
+      assert.equal(job.status, "exited", await readFile(job.stderrLog, "utf8"));
+      assert.equal(await readFile(job.stdoutLog, "utf8"), "TRUSTED_EXTERNAL_LOG\n");
+      assert.equal(job.stdoutLog.startsWith(workspace), false);
+    });
+  });
+});
+
+test("worker shell_read rejects traversal IDs and forged metadata log paths", async () => {
+  await withTempDir(async (dir) => {
+    const stateRoot = path.join(dir, "worker-state");
+    const asyncRoot = path.join(stateRoot, "async-shell");
+    const forgedDir = path.join(asyncRoot, "jobs", "job_forged");
+    await Promise.all([
+      mkdir(path.join(dir, "cache", "config"), { recursive: true }),
+      mkdir(path.join(dir, "cache", "data"), { recursive: true }),
+      mkdir(path.join(dir, "cache", "state"), { recursive: true }),
+      mkdir(path.join(dir, "tmp"), { recursive: true }),
+      mkdir(forgedDir, { recursive: true })
+    ]);
+    const secret = path.join(stateRoot, "host.json");
+    await writeFile(secret, "trusted-secret");
+    await writeFile(path.join(forgedDir, "meta.json"), `${JSON.stringify({
+      jobId: "job_forged",
+      command: "forged",
+      cwd: dir,
+      shell: "/bin/zsh",
+      status: "exited",
+      startedAt: "2026-09-10T19:30:00.000Z",
+      notifyOnExit: false,
+      completionNotified: true,
+      owner: { kind: "worker-run", workerId: "worker-test", runId: "run-forged" },
+      logDir: forgedDir,
+      stdoutLog: secret,
+      stderrLog: path.join(forgedDir, "stderr.log"),
+      outputBytes: { stdout: 0, stderr: 0 }
+    })}\n`);
+    await withEnv({
+      PI_WORKER_ID: "worker-test",
+      PI_WORKER_RUN_ID: "run-forged",
+      PI_WORKER_WORKSPACE_ROOT: dir,
+      PI_WORKER_STATE_ROOT: stateRoot,
+      PI_WORKER_ASYNC_JOB_ROOT: asyncRoot
+    }, async () => {
+      const api = createFakeApi();
+      asyncShellExtension(api);
+      const read = api.registeredTools.find((tool) => tool.name === "shell_read");
+      assert.ok(read?.execute);
+      await assert.rejects(read.execute("read-traversal", { jobId: "../host" } as never, undefined, undefined, createContext(dir)), /Invalid async shell job id/);
+      await assert.rejects(read.execute("read-forged", { jobId: "job_forged" } as never, undefined, undefined, createContext(dir)), /Unknown async shell job/);
+    });
+  });
+});
+
+test("owned jobs remain active until background process-group descendants settle", async () => {
+  await withTempDir(async (dir) => {
+    await Promise.all([
+      mkdir(path.join(dir, "cache", "config"), { recursive: true }),
+      mkdir(path.join(dir, "cache", "data"), { recursive: true }),
+      mkdir(path.join(dir, "cache", "state"), { recursive: true }),
+      mkdir(path.join(dir, "tmp"), { recursive: true }),
+      mkdir(path.join(dir, "worker-state", "async-shell"), { recursive: true })
+    ]);
+    await withEnv({
+      PI_WORKER_ID: "worker-test",
+      PI_WORKER_RUN_ID: "run-background",
+      PI_WORKER_NATIVE_TEST_SHELL: "1",
+      PI_WORKER_WORKSPACE_ROOT: dir,
+      PI_WORKER_STATE_ROOT: path.join(dir, "worker-state"),
+      PI_WORKER_ASYNC_JOB_ROOT: path.join(dir, "worker-state", "async-shell")
+    }, async () => {
+      const api = createFakeApi();
+      asyncShellExtension(api);
+      const marker = path.join(dir, "background.pid");
+      const childSource = "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)";
+      const source = `const{spawn}=require('node:child_process'),fs=require('node:fs');const child=spawn(process.execPath,['-e',${JSON.stringify(childSource)}],{stdio:'ignore'});fs.writeFileSync(${JSON.stringify(marker)},String(child.pid));child.unref();`;
+      const handle = startManagedAsyncJob(api, createContext(dir), {
+        jobId: "job_20260910193000_background",
+        command: "background descendant probe",
+        cwd: dir,
+        executable: process.execPath,
+        args: ["-e", source],
+        notifyOnExit: false
+      });
+      for (let attempt = 0; attempt < 200 && !existsSync(marker); attempt += 1) await delay(10);
+      assert.ok(existsSync(marker));
+      const descendantPid = Number.parseInt(await readFile(marker, "utf8"), 10);
+      await delay(100);
+      const owner = { kind: "worker-run" as const, workerId: "worker-test", runId: "run-background" };
+      assert.deepEqual(activeAsyncShellJobsForOwner(owner).map((job) => job.jobId), [handle.jobId]);
+      const cancelled = await cancelAsyncShellJobsForOwner(owner, "SIGTERM", 100);
+      assert.equal(cancelled[0].status, "cancelled");
+      let alive = true;
+      for (let attempt = 0; attempt < 200 && alive; attempt += 1) {
+        try {
+          process.kill(descendantPid, 0);
+          await delay(10);
+        } catch {
+          alive = false;
+        }
+      }
+      assert.equal(alive, false, `background descendant ${descendantPid} survived process-group cancellation`);
+    });
+  });
+});
+
+test("managed spawn metadata failure retains and settles the spawned process", async () => {
+  await withTempDir(async (dir) => {
+    const api = createFakeApi();
+    asyncShellExtension(api);
+    const handle = startManagedAsyncJob(api, createContext(dir), {
+      jobId: "job_20260910193000_metafail",
+      command: "post-spawn metadata failure probe",
+      cwd: dir,
+      executable: process.execPath,
+      args: ["-e", "setInterval(()=>{},1000)"],
+      notifyOnExit: false,
+      settleProcessGroup: true,
+      persistSpawnedMetadata: () => { throw new Error("injected metadata write failure"); }
+    });
+    const pid = handle.snapshot().pid;
+    assert.ok(pid);
+    const keepAlive = setInterval(() => {}, 20);
+    const job = await handle.completion.finally(() => clearInterval(keepAlive));
+    assert.equal(job.status, "failed");
+    assert.match(job.error ?? "", /injected metadata write failure/);
+    let alive = true;
+    for (let attempt = 0; attempt < 200 && alive; attempt += 1) {
+      try { process.kill(pid, 0); await delay(10); } catch { alive = false; }
+    }
+    assert.equal(alive, false);
+  });
+});
+
+test("managed process-group settlement waits when the host leader exits before its descendant", async () => {
+  await withTempDir(async (dir) => {
+    const api = createFakeApi();
+    asyncShellExtension(api);
+    const marker = path.join(dir, "managed-host-descendant.pid");
+    const childSource = "setInterval(()=>{},1000)";
+    const source = `const{spawn}=require('node:child_process'),fs=require('node:fs');const child=spawn(process.execPath,['-e',${JSON.stringify(childSource)}],{stdio:'ignore'});fs.writeFileSync(${JSON.stringify(marker)},String(child.pid));`;
+    const handle = startManagedAsyncJob(api, createContext(dir), {
+      jobId: "job_20260910193000_hostgroup",
+      command: "managed host descendant settlement probe",
+      cwd: dir,
+      executable: process.execPath,
+      args: ["-e", source],
+      notifyOnExit: false,
+      settleProcessGroup: true
+    });
+    for (let attempt = 0; attempt < 200 && !existsSync(marker); attempt += 1) await delay(10);
+    assert.ok(existsSync(marker));
+    let completed = false;
+    void handle.completion.then(() => { completed = true; });
+    await delay(100);
+    assert.equal(completed, false, "managed host completion must wait for its original process group");
+    handle.cancel("SIGTERM");
+    const keepAlive = setInterval(() => {}, 20);
+    const job = await handle.completion.finally(() => clearInterval(keepAlive));
+    assert.equal(job.status, "cancelled");
+    const pid = Number.parseInt(await readFile(marker, "utf8"), 10);
+    let alive = true;
+    for (let attempt = 0; attempt < 200 && alive; attempt += 1) {
+      try { process.kill(pid, 0); await delay(10); } catch { alive = false; }
+    }
+    assert.equal(alive, false);
+  });
+});
+
+test("ordinary async-shell completion remains tied to the requested command leader", async () => {
+  await withTempDir(async (dir) => {
+    const api = createFakeApi();
+    asyncShellExtension(api);
+    const marker = path.join(dir, "ordinary-background.pid");
+    const childSource = "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)";
+    const source = `const{spawn}=require('node:child_process'),fs=require('node:fs');const child=spawn(process.execPath,['-e',${JSON.stringify(childSource)}],{detached:true,stdio:'ignore'});fs.writeFileSync(${JSON.stringify(marker)},String(child.pid));child.unref();`;
+    const handle = startManagedAsyncJob(api, createContext(dir), {
+      jobId: "job_20260910193000_ordinary",
+      command: "ordinary background compatibility probe",
+      cwd: dir,
+      executable: process.execPath,
+      args: ["-e", source],
+      notifyOnExit: false
+    });
+    const keepAlive = setInterval(() => {}, 20);
+    const job = await handle.completion.finally(() => clearInterval(keepAlive));
+    assert.equal(job.status, "exited");
+    const pid = Number.parseInt(await readFile(marker, "utf8"), 10);
+    assert.doesNotThrow(() => process.kill(pid, 0));
+    try { process.kill(pid, "SIGKILL"); } catch {}
+  });
+});
+
+test("worker ownership token tracks and cancels children that create a detached process group", async () => {
+  await withTempDir(async (dir) => {
+    const stateRoot = path.join(dir, "worker-state");
+    const asyncRoot = path.join(stateRoot, "async-shell");
+    await Promise.all([
+      mkdir(path.join(dir, "cache", "config"), { recursive: true }),
+      mkdir(path.join(dir, "cache", "data"), { recursive: true }),
+      mkdir(path.join(dir, "cache", "state"), { recursive: true }),
+      mkdir(path.join(dir, "tmp"), { recursive: true }),
+      mkdir(asyncRoot, { recursive: true })
+    ]);
+    await withEnv({
+      PI_WORKER_ID: "worker-test",
+      PI_WORKER_RUN_ID: "run-detached",
+      PI_WORKER_NATIVE_TEST_SHELL: "1",
+      PI_WORKER_WORKSPACE_ROOT: dir,
+      PI_WORKER_STATE_ROOT: stateRoot,
+      PI_WORKER_ASYNC_JOB_ROOT: asyncRoot
+    }, async () => {
+      const api = createFakeApi();
+      asyncShellExtension(api);
+      const marker = path.join(dir, "detached.pid");
+      const childSource = "setInterval(()=>{},1000)";
+      const source = `const{spawn}=require('node:child_process'),fs=require('node:fs');const child=spawn(process.execPath,['-e',${JSON.stringify(childSource)}],{detached:true,stdio:'ignore'});fs.writeFileSync(${JSON.stringify(marker)},String(child.pid));child.unref();`;
+      const handle = startManagedAsyncJob(api, createContext(dir), {
+        jobId: "job_20260910193000_detached",
+        command: "detached escape probe",
+        cwd: dir,
+        executable: process.execPath,
+        args: ["-e", source],
+        notifyOnExit: false
+      });
+      for (let attempt = 0; attempt < 200 && !existsSync(marker); attempt += 1) await delay(10);
+      assert.ok(existsSync(marker));
+      const pid = Number.parseInt(await readFile(marker, "utf8"), 10);
+      const owner = { kind: "worker-run" as const, workerId: "worker-test", runId: "run-detached" };
+      await delay(100);
+      assert.deepEqual(activeAsyncShellJobsForOwner(owner).map((job) => job.jobId), [handle.jobId]);
+      await cancelAsyncShellJobsForOwner(owner, "SIGTERM", 100);
+      await handle.completion;
+      let alive = true;
+      for (let attempt = 0; attempt < 200 && alive; attempt += 1) {
+        try {
+          process.kill(pid, 0);
+          await delay(10);
+        } catch {
+          alive = false;
+        }
+      }
+      if (alive) {
+        try { process.kill(pid, "SIGKILL"); } catch {}
+      }
+      assert.equal(alive, false, `detached worker child ${pid} escaped ownership-token cancellation`);
+    });
   });
 });
 

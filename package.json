@@ -4,6 +4,9 @@
   "license": "MIT",
   "type": "module",
   "description": "Reusable Pi coding-agent extensions: async shell jobs, batch file tools, web research, tool safety, review workflows, and compact TUI rendering.",
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -26,6 +29,7 @@
       "extensions/tmux-scrollback/index.ts",
       "extensions/tool-safety/index.ts",
       "extensions/async-shell/index.ts",
+      "extensions/worker/index.ts",
       "extensions/completion-notifications/index.ts",
       "extensions/native-tools/index.ts",
       "extensions/manual-retry/index.ts",
@@ -70,6 +74,8 @@
     "extensions/",
     "skills/",
     "scripts/dev-pi.mjs",
-    "scripts/review-provider-context.mjs"
+    "scripts/review-provider-context.mjs",
+    "scripts/worker-host.mjs",
+    "scripts/worker-shell-host.mjs"
   ]
 }

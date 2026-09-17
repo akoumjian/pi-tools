@@ -64,6 +64,12 @@ const JobStartSchema = Type.Object({
   outputBytes: OutputBytesSchema
 }, { additionalProperties: false });
 
+const AsyncShellJobOwnerSchema = Type.Object({
+  kind: Type.Literal("worker-run"),
+  workerId: Type.String({ minLength: 1 }),
+  runId: Type.String({ minLength: 1 })
+}, { additionalProperties: false });
+
 const JobMetaSchema = Type.Object({
   jobId: Type.String({ minLength: 1 }),
   job_name: Type.Optional(Type.String({ minLength: 1 })),
@@ -80,6 +86,8 @@ const JobMetaSchema = Type.Object({
   error: Type.Optional(Type.String()),
   notifyOnExit: Type.Boolean(),
   completionNotified: Type.Boolean(),
+  owner: Type.Optional(AsyncShellJobOwnerSchema),
+  processToken: Type.Optional(Type.String({ minLength: 1 })),
   logDir: Type.String({ minLength: 1 }),
   stdoutLog: Type.String({ minLength: 1 }),
   stderrLog: Type.String({ minLength: 1 }),
@@ -540,6 +548,24 @@ const ReconcileSharedProperties = {
   cleanedBranches: Type.Array(Type.String(), { maxItems: 8 })
 };
 
+const WorkerRunReceiptSchema = Type.Object({
+  workerId: Type.String({ minLength: 1 }),
+  runId: Type.String({ minLength: 1 }),
+  jobId: Type.String({ minLength: 1 }),
+  sessionId: Type.String({ minLength: 1 }),
+  sessionFile: Type.Optional(Type.String({ minLength: 1 })),
+  workspaceRoot: Type.String({ minLength: 1 }),
+  taskIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
+  provider: Type.String({ minLength: 1 }),
+  model: Type.String({ minLength: 1 }),
+  thinkingLevel: Type.String({ minLength: 1 }),
+  state: Type.Union([Type.Literal("queued"), Type.Literal("running")])
+}, { additionalProperties: false });
+
+const WorkerRunDetailsSchema = Type.Object({
+  runs: Type.Array(WorkerRunReceiptSchema, { minItems: 1, maxItems: 8 })
+}, { additionalProperties: false });
+
 const ReconcileDetailsSchema = Type.Union([
   Type.Object({
     status: Type.Literal("merged"),
@@ -573,6 +599,7 @@ export const RetainedToolOutputSchemas = {
   searxng_search: finalResultSchema(SearxngSearchDetailsSchema),
   web_fetch_many: finalResultSchema(WebFetchManyDetailsSchema),
   document_parse: finalResultSchema(DocumentParseDetailsSchema),
+  worker_run: finalResultSchema(WorkerRunDetailsSchema),
   orchestrate: finalResultSchema(OrchestrateDetailsSchema),
   reconcile: finalResultSchema(ReconcileDetailsSchema)
 } satisfies Record<string, TSchema>;

@@ -3,6 +3,7 @@
 Reusable extensions for the [Pi coding agent](https://pi.dev/). The package focuses on compact agent-oriented tooling:
 
 - async shell jobs with batched completion notices
+- durable exact-session Pi workers with private workspaces, scoped task updates, and typed handoffs
 - opt-in privacy-safe settled-run terminal notifications
 - batch-native text/image file and search tools that replace stock single-file/shell tools
 - safety review hooks (rule + model + human) and a mutation-review reviewer
@@ -58,6 +59,7 @@ Do not use `npm install @akoumjian/pi-tools@<git+ssh url>`: that form rewrites `
 Tools (LLM-callable):
 
 - `shell_start`, `shell_status`, `shell_read`, `shell_cancel` — async shell jobs
+- `worker_run` — start or exactly resume durable private-workspace Pi workers
 - `read_many`, `search_many`, `write_many`, `edit_many` — batch-native file tools (`read_many` delivers UTF-8 text and supported filesystem images)
 - `apply_reviewed_mutation` — cheap re-apply of a previously-reviewed edit/write
 - `searxng_search` — search through a configured SearXNG instance
@@ -71,6 +73,7 @@ Commands:
 - `/scrollback:status`, `/tmux-scrollback:status`
 - `/safety:setup`, `/safety:status`, `/safety:model`, `/safety:toggle`
 - `/async:status`, `/async:view [job-id] [--stream both|stdout|stderr] [--tail 1..500] [--follow]`
+- `/worker:status <worker-id>`, `/worker:view <worker-id> [...]`, `/worker:cancel <worker-id>`, `/worker:discard <worker-id> --confirm`
 - `/notify [on|off|status|test]`
 - `/native:status`
 - `/retry`
@@ -85,7 +88,7 @@ Commands:
 - `/docparser:doctor`
 - `/orchestrator:setup`, `/orchestrator:status`
 
-The load order in `package.json#pi.extensions` is intentional: terminal patches first, safety before async shell, completion-notifications after async shell so it can read completion barriers, native batch tools before manual-retry, manual-retry before context-export and compacter so both copied and summarized context use the same retry filtering, and optional display overrides last.
+The load order in `package.json#pi.extensions` is intentional: terminal patches first, safety before async shell, workers immediately after their shared async-shell runtime, completion-notifications after async shell so it can read completion barriers, native batch tools before manual-retry, manual-retry before context-export and compacter so both copied and summarized context use the same retry filtering, and optional display overrides last.
 
 ## Extensions
 
@@ -132,6 +135,18 @@ Each extension below documents what it does, what it provides, and how to set it
 **Provides.** `shell_start`, `shell_status`, `shell_read`, `shell_cancel`; `/async:status`; and the interactive read-only `/async:view` selector/viewer for live or historical job output. Durable per-job logs and metadata remain under `.pi/async-shell/jobs/<jobId>/`. `shell_start` and completion notices point at `stdout_log`/`stderr_log` without embedding output samples; use `shell_read` tail mode for model inspection, or `/async:view` for provider-free human viewing. The viewer bounds reads to the existing 500-line/120 KB tail limits per stream, strips terminal control sequences for safe rendering, and closes without stopping jobs.
 
 **Setup.** None. No polling/wait tool: continue useful work; completion notices will resume the agent.
+
+---
+
+### worker
+
+[Full docs](docs/extensions/worker.md).
+
+**Purpose.** Start durable engineering workers as exact forks of the completed parent Pi session, or resume one exact recorded worker session with a fresh mode-`0400` parent-context snapshot. Each worker has stable identity, one private multi-repository workspace, a fixed provider/model/thinking route, and ephemeral asynchronous runs.
+
+**Provides.** `worker_run`; `/worker:status <worker-id>`; `/worker:view <worker-id> [...]`; `/worker:cancel <worker-id>`; `/worker:discard <worker-id> --confirm`. Worker RPC exposes only normal async-shell tools, exact-route `worker_task_update`, and typed quiescent `worker_handoff`. Exclusive run and lifecycle-operation locks, trusted process/settlement markers, cooperative command-group cancellation, exact Docker container cleanup, fail-closed survivor sweeps, and session-confirmed completion redelivery protect lifecycle recovery. Each worker identity gets one Linux container that is authoritatively stopped after successful handoff and restarted for resume, with all of `~/Code` read-only and only its private workspace read-write; provider credentials, host control sockets/state, sibling workspaces, and central Beads stay on the trusted macOS host.
+
+**Setup.** macOS, Node, Pi, a running Docker Desktop/Engine plus CLI, the pinned worker image documented in the full guide, and a correctly routed central `bd` executable. The parent remains responsible for grounding, review, integration, promotion, and task closure.
 
 ---
 

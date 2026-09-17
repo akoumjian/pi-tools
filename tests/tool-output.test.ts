@@ -188,6 +188,23 @@ const samples: Record<RetainedToolName, unknown> = {
       screenshotCount: 0
     }
   },
+  worker_run: {
+    content: [text("worker queued")],
+    details: {
+      runs: [{
+        workerId: "worker_20260910190000_12345678",
+        runId: "run_20260910190000_87654321",
+        jobId: "job_20260910190000_abcdefgh",
+        sessionId: "019c0000-0000-7000-8000-000000000001",
+        workspaceRoot: "/tmp/workspaces/worker_20260910190000_12345678",
+        taskIds: ["personal-test"],
+        provider: "openai-codex",
+        model: "gpt-test",
+        thinkingLevel: "xhigh",
+        state: "queued"
+      }]
+    }
+  },
   orchestrate: {
     content: [text("Orchestrate: 0/1 tasks succeeded")],
     details: {

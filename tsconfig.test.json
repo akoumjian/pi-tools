@@ -7,5 +7,5 @@
     "declaration": false,
     "sourceMap": false
   },
-  "include": ["extensions/**/*.ts", "tests/**/*.ts"]
+  "include": ["extensions/**/*.ts", "extensions/**/*.js", "tests/**/*.ts"]
 }
