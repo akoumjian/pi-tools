@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { isAsyncJobProcessAlive } from "../_shared/async-job.js";
+import type { CompletionDelivery } from "../_shared/completion-delivery.js";
 import type { WorkerContainerReference } from "../_shared/worker-container.js";
 
 export const WORKER_RECORD_VERSION = 1;
@@ -36,6 +37,7 @@ export type WorkerRecord = {
     runId: string;
     jobId: string;
     status: "queued" | "running";
+    completionDelivery?: CompletionDelivery;
     pid?: number;
     logDir?: string;
     stdoutLog?: string;
@@ -56,6 +58,7 @@ export type WorkerRecord = {
     status: "handed_off" | "failed" | "cancelled";
     resultFile?: string;
     delivery?: "pending" | "delivered";
+    completionDelivery?: CompletionDelivery;
     processStatus?: string;
     exitCode?: number | null;
     pid?: number;

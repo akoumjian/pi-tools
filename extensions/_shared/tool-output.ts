@@ -1,4 +1,5 @@
 import { Type, type TSchema } from "@earendil-works/pi-ai";
+import { CompletionDeliverySchema } from "./completion-delivery.js";
 
 const NonNegativeIntegerSchema = Type.Integer({ minimum: 0 });
 const PositiveIntegerSchema = Type.Integer({ minimum: 1 });
@@ -559,6 +560,7 @@ const WorkerRunReceiptSchema = Type.Object({
   provider: Type.String({ minLength: 1 }),
   model: Type.String({ minLength: 1 }),
   thinkingLevel: Type.String({ minLength: 1 }),
+  completionDelivery: CompletionDeliverySchema,
   state: Type.Union([Type.Literal("queued"), Type.Literal("running")])
 }, { additionalProperties: false });
 

@@ -32,8 +32,8 @@ Repeated `agent_end` events from automatic retries or continuations remain one t
 
 The extension queries in-memory async-shell provenance for `notifyOnExit:true` jobs started by the same session during the tracked run.
 
-- A still-running job or a job whose async-shell follow-up has been queued defers the notification.
-- Completion custom messages are matched by their canonical job IDs. Multiple jobs or batches produce one final toast only after every related completion follow-up settles successfully.
+- A still-running job or a job whose async-shell completion delivery has not received its exact same-session message receipt defers the notification.
+- Completion custom messages are matched by their canonical job IDs. Multiple jobs or delivery-mode batches produce one final toast only after every related completion follow-up settles successfully.
 - A completion already delivered inside the original run does not add another wait.
 - Jobs that completed in-band, were cancelled through async-shell, or whose completion was explicitly observed do not block. If one leaves a previously created barrier, it is pruned on the next settled run; the extension intentionally creates no polling timer.
 - `notifyOnExit:false` jobs are intentionally detached from completion delivery: they never block the toast and are never cancelled or terminated by this extension.

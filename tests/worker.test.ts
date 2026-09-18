@@ -201,14 +201,20 @@ test("worker_run queues immediately, then forks the completed parent turn before
     assert.ok(tool?.execute);
 
     const result = await tool.execute("call-1", {
-      runs: [{ kind: "new", taskIds: ["personal-test"], guidance: "Implement the focused slice." }]
+      runs: [{
+        kind: "new",
+        taskIds: ["personal-test"],
+        guidance: "Implement the focused slice.",
+        completionDelivery: "followUp"
+      }]
     } as never, undefined, undefined, context);
-    const receipt = (result.details as { runs: Array<{ workerId: string; runId: string; jobId: string; sessionId: string; sessionFile?: string; state: string }> }).runs[0];
+    const receipt = (result.details as { runs: Array<{ workerId: string; runId: string; jobId: string; sessionId: string; sessionFile?: string; completionDelivery: string; state: string }> }).runs[0];
     assert.equal(receipt.workerId, "worker_20260910193000_11111111");
     assert.equal(receipt.runId, "run_20260910193000_22222222");
     assert.equal(receipt.jobId, "job_20260910193000_33333333");
     assert.equal(receipt.sessionId, "44444444-4444-4444-8444-444444444444");
     assert.equal(receipt.sessionFile, undefined);
+    assert.equal(receipt.completionDelivery, "followUp");
     assert.equal(receipt.state, "queued");
     assert.equal(launches.length, 0, "launch waits for the parent turn to be durable");
 
@@ -240,6 +246,18 @@ test("worker_run queues immediately, then forks the completed parent turn before
     assert.deepEqual(parkedContainer, plannedContainer, "successful handoff parks the exact worker container");
     assert.equal(api.messages.length, 1);
     assert.match(JSON.stringify(api.messages[0].message), /assignment_complete/);
+    assert.deepEqual(api.messages[0].options, { triggerTurn: true, deliverAs: "followUp" });
+    assert.equal(record.lastRun?.delivery, "pending");
+
+    await api.emit(
+      "message_end",
+      { message: { role: "custom", ...(api.messages[0].message as object) } },
+      parentContext(parentCwd, path.join(directory, "different-parent.jsonl"))
+    );
+    assert.equal(readWorkerRecord(workerPaths(roots, receipt.workerId).recordFile).lastRun?.delivery, "pending");
+
+    await api.emit("message_end", { message: { role: "custom", ...(api.messages[0].message as object) } }, context);
+    assert.equal(readWorkerRecord(workerPaths(roots, receipt.workerId).recordFile).lastRun?.delivery, "delivered");
   });
 });
 
@@ -927,7 +945,7 @@ test("session restart rejects an unverified handoff without a host settlement ma
   });
 });
 
-test("session restart redelivers a settled worker completion left pending by a stale API", async () => {
+test("session restart does not redeliver an uncertain worker completion and explicit acknowledgment resolves it", async () => {
   await withTempDir(async (directory) => {
     const parentCwd = path.join(directory, "parent");
     const parentSessionFile = path.join(directory, "parent.jsonl");
@@ -971,8 +989,7 @@ test("session restart redelivers a settled worker completion left pending by a s
       updatedAt: "2026-09-10T19:31:01.000Z"
     });
     const api = fakeApi();
-    const entries: unknown[] = [];
-    const context = parentContext(parentCwd, parentSessionFile, entries);
+    const context = parentContext(parentCwd, parentSessionFile);
     registerWorkerExtension(api, { roots, now: () => new Date("2026-09-10T19:32:00.000Z") });
     const status = api.commands.get("worker:status");
     assert.ok(status);
@@ -981,12 +998,12 @@ test("session restart redelivers a settled worker completion left pending by a s
       /different parent session/
     );
     await api.emit("session_start", {}, context);
-    assert.equal(api.messages.length, 1);
-    assert.match(JSON.stringify(api.messages[0].message), /redeliver me/);
+    assert.equal(api.messages.length, 0, "an ambiguous prior delivery must not be replayed after restart");
     assert.equal(readWorkerRecord(paths.recordFile).lastRun?.delivery, "pending");
-    const message = api.messages[0].message as { details: { deliveryId: string } };
-    entries.push({ type: "custom_message", customType: "worker-run", details: { deliveryId: message.details.deliveryId } });
-    await api.emit("turn_end", {}, context);
+
+    const acknowledge = api.commands.get("worker:ack");
+    assert.ok(acknowledge);
+    await acknowledge.handler(workerId, context);
     assert.equal(readWorkerRecord(paths.recordFile).lastRun?.delivery, "delivered");
   });
 });

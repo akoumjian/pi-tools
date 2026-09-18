@@ -575,25 +575,27 @@ test("shell_start suppresses deferred completion notices when jobs complete in-b
   });
 });
 
-test("shell_start sends one deferred completion batch for notified completed jobs", async () => {
+test("shell_start batches deferred completions by the requested delivery mode and acknowledges exact receipts", async () => {
   await withTempDir(async (dir) => {
     const api = createFakeApi();
     asyncShellExtension(api);
     const shellStart = required(api.registeredTools.find((tool) => tool.name === "shell_start"), "shell_start tool");
     assert.ok(shellStart.execute);
+    const context = createContext(dir);
 
     const startResult = await shellStart.execute(
       "tool-call-id",
       {
         commands: [
-          { command: "sleep 7; printf one", cwd: dir, job_name: "one" },
+          { command: "sleep 7; printf one", cwd: dir, job_name: "one", completionDelivery: "followUp" },
           { command: "sleep 7; printf ignored", cwd: dir, job_name: "ignored", notifyOnExit: false },
-          { command: "sleep 7; printf three", cwd: dir, job_name: "three" }
+          { command: "sleep 7; printf three", cwd: dir, job_name: "three", completionDelivery: "followUp" },
+          { command: "sleep 7; printf four", cwd: dir, job_name: "four", completionDelivery: "steer" }
         ]
       } as never,
       new AbortController().signal,
       undefined,
-      createContext(dir)
+      context
     );
 
     const startText = JSON.stringify(startResult.content);
@@ -608,13 +610,26 @@ test("shell_start sends one deferred completion batch for notified completed job
 
     await delay(2500);
 
-    assert.equal(api.sentMessages.length, 1);
-    const sentMessage = api.sentMessages[0];
-    assert.deepEqual(sentMessage.options, { triggerTurn: true, deliverAs: "steer" });
+    assert.equal(api.sentMessages.length, 2);
+    const sentMessage = required(
+      api.sentMessages.find((candidate) => (candidate.options as { deliverAs?: string }).deliverAs === "followUp"),
+      "followUp completion batch"
+    );
+    const steerMessage = required(
+      api.sentMessages.find((candidate) => (candidate.options as { deliverAs?: string }).deliverAs === "steer"),
+      "steer completion batch"
+    );
+    assert.deepEqual(sentMessage.options, { triggerTurn: true, deliverAs: "followUp" });
+    assert.deepEqual(steerMessage.options, { triggerTurn: true, deliverAs: "steer" });
     assert.doesNotMatch(JSON.stringify(sentMessage.message), /Job completed\./);
     assert.doesNotMatch(JSON.stringify(sentMessage.message), /async-shell notification/);
 
-    const message = sentMessage.message as { content?: unknown; details?: { jobs?: Array<{ job_name?: string }> } };
+    const message = sentMessage.message as {
+      role?: string;
+      customType?: string;
+      content?: unknown;
+      details?: { deliveryId?: string; jobs?: Array<{ jobId?: string; job_name?: string; logDir?: string }> };
+    };
     assert.equal(typeof message.content, "string");
     const content = message.content as string;
     assert.match(content, /^async shell results: 2 jobs completed/);
@@ -629,16 +644,39 @@ test("shell_start sends one deferred completion batch for notified completed job
       .map((job) => job.job_name)
       .sort();
     assert.deepEqual(notifiedNames, ["one", "three"]);
-    assert.doesNotMatch(JSON.stringify(sentMessage.message), /ignored/);
+    assert.doesNotMatch(JSON.stringify(sentMessage.message), /ignored|four/);
+    assert.match(JSON.stringify(steerMessage.message), /four/);
+    assert.doesNotMatch(JSON.stringify(steerMessage.message), /ignored|one|three/);
+    const steerDetails = (steerMessage.message as { details?: { deliveryId?: string; logDir?: string } }).details;
+    assert.equal(typeof steerDetails?.deliveryId, "string");
+    assert.equal(typeof message.details?.deliveryId, "string");
+    for (const job of message.details?.jobs ?? []) {
+      const persisted = JSON.parse(await readFile(path.join(job.logDir!, "meta.json"), "utf8")) as { completionNotified: boolean };
+      assert.equal(persisted.completionNotified, false, "sendMessage alone must not acknowledge completion delivery");
+    }
+
+    const steerBefore = JSON.parse(await readFile(path.join(steerDetails!.logDir!, "meta.json"), "utf8")) as { completionNotified: boolean };
+    assert.equal(steerBefore.completionNotified, false);
+
+    await api.emit("message_end", { message: { role: "custom", ...(sentMessage.message as object) } }, context);
+    await api.emit("message_end", { message: { role: "custom", ...(steerMessage.message as object) } }, context);
+    for (const job of message.details?.jobs ?? []) {
+      const persisted = JSON.parse(await readFile(path.join(job.logDir!, "meta.json"), "utf8")) as { completionNotified: boolean };
+      assert.equal(persisted.completionNotified, true, "the exact message lifecycle receipt acknowledges delivery");
+    }
+    const steerAfter = JSON.parse(await readFile(path.join(steerDetails!.logDir!, "meta.json"), "utf8")) as { completionNotified: boolean };
+    assert.equal(steerAfter.completionNotified, true);
   });
 });
 
-test("shell_start keeps completions queued when its captured context becomes stale", async () => {
+test("shell_start does not replay an unacknowledged completion after session shutdown", async () => {
   await withTempDir(async (dir) => {
     const api = createFakeApi();
     asyncShellExtension(api);
     const shellStart = required(api.registeredTools.find((tool) => tool.name === "shell_start"), "shell_start tool");
+    const shellRead = required(api.registeredTools.find((tool) => tool.name === "shell_read"), "shell_read tool");
     assert.ok(shellStart.execute);
+    assert.ok(shellRead.execute);
     let stale = false;
     const context = createContext(dir, () => {
       if (stale) {
@@ -647,7 +685,7 @@ test("shell_start keeps completions queued when its captured context becomes sta
       return false;
     });
 
-    await shellStart.execute(
+    const startResult = await shellStart.execute(
       "tool-call-id",
       {
         commands: [
@@ -659,21 +697,27 @@ test("shell_start keeps completions queued when its captured context becomes sta
       undefined,
       context
     );
+    const jobs = (startResult.details as { jobs: Array<{ jobId: string; logDir?: string }> }).jobs;
 
     stale = true;
+    await api.emit("session_shutdown", { reason: "reload" }, context);
     await delay(2500);
     assert.equal(api.sentMessages.length, 0);
 
     const replacementContext = createContext(dir);
     await api.emit("turn_end", { type: "turn_end", turnIndex: 0, timestamp: Date.now(), message: {}, toolResults: [] }, replacementContext);
-    assert.equal(api.sentMessages.length, 1);
-    assert.deepEqual(api.sentMessages[0].options, { triggerTurn: true, deliverAs: "steer" });
-    const message = api.sentMessages[0].message as { content?: string; details?: { jobs?: Array<{ job_name?: string }> } };
-    assert.match(message.content ?? "", /^async shell results: 2 jobs completed/);
-    assert.deepEqual((message.details?.jobs ?? []).map((job) => job.job_name).sort(), ["one", "two"]);
-
     await delay(50);
-    assert.equal(api.sentMessages.length, 1);
+    assert.equal(api.sentMessages.length, 0, "a replacement lifecycle must not replay the old runtime's ambiguous completion");
+
+    await shellRead.execute(
+      "read-observed-completion",
+      { jobId: jobs[0].jobId, mode: "tail" } as never,
+      new AbortController().signal,
+      undefined,
+      replacementContext
+    );
+    const observed = JSON.parse(await readFile(path.join(dir, ".pi", "async-shell", "jobs", jobs[0].jobId, "meta.json"), "utf8")) as { completionNotified: boolean };
+    assert.equal(observed.completionNotified, true, "explicit historical observation safely acknowledges uncertain delivery");
   });
 });
 
@@ -875,6 +919,35 @@ test("shell_read tail mode reads stdout and stderr separately", async () => {
     assert.doesNotMatch(stdoutText, /stderr tail/);
     assert.match(stderrText, /--- stderr tail .*last up to 80 lines, 20 KB max\) ---\\nerr/);
     assert.doesNotMatch(stderrText, /stdout tail/);
+  });
+});
+
+test("shell_read explicitly acknowledges a historical uncertain completion", async () => {
+  await withTempDir(async (dir) => {
+    const api = createFakeApi();
+    asyncShellExtension(api);
+    const shellRead = required(api.registeredTools.find((tool) => tool.name === "shell_read"), "shell_read tool");
+    assert.ok(shellRead.execute);
+    const jobId = "job_20260918010000_observed";
+    await writeJobMeta(dir, jobId, {
+      status: "exited",
+      notifyOnExit: true,
+      completionNotified: false
+    });
+    const logDir = path.join(dir, ".pi", "async-shell", "jobs", jobId);
+    await writeFile(path.join(logDir, "stdout.log"), "reviewed\n");
+    await writeFile(path.join(logDir, "stderr.log"), "");
+
+    await shellRead.execute(
+      "read-historical-completion",
+      { jobId, mode: "tail" } as never,
+      new AbortController().signal,
+      undefined,
+      createContext(dir)
+    );
+
+    const meta = JSON.parse(await readFile(path.join(logDir, "meta.json"), "utf8")) as { completionNotified: boolean };
+    assert.equal(meta.completionNotified, true);
   });
 });
 

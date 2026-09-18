@@ -20,6 +20,10 @@ import {
   type WorkerContainerReference
 } from "../_shared/worker-container.js";
 import { throwIfAborted } from "../_shared/cancellation.js";
+import {
+  CompletionDeliverySchema,
+  resolveCompletionDelivery
+} from "../_shared/completion-delivery.js";
 import { formatModelName, resolveExtensionModel } from "../_shared/model-spec.js";
 import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
@@ -60,6 +64,7 @@ const NewWorkerRunSchema = Type.Object({
   taskIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { minItems: 1, maxItems: 32 }),
   guidance: Type.Optional(Type.String({ minLength: 1, maxLength: 12_000 })),
   route: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
+  completionDelivery: Type.Optional(CompletionDeliverySchema),
   initialRepos: Type.Optional(Type.Array(InitialRepoSchema, { maxItems: 16 }))
 }, { additionalProperties: false });
 
@@ -67,7 +72,8 @@ const ResumeWorkerRunSchema = Type.Object({
   kind: Type.Literal("resume"),
   workerId: Type.String({ minLength: 1, maxLength: 128 }),
   message: Type.String({ minLength: 1, maxLength: 12_000 }),
-  addTaskIds: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { maxItems: 32 }))
+  addTaskIds: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { maxItems: 32 })),
+  completionDelivery: Type.Optional(CompletionDeliverySchema)
 }, { additionalProperties: false });
 
 export const WorkerRunParams = Type.Object({
@@ -89,6 +95,7 @@ export type WorkerRunReceipt = {
   provider: string;
   model: string;
   thinkingLevel: string;
+  completionDelivery: "steer" | "followUp";
   state: "queued" | "running";
 };
 
@@ -168,7 +175,6 @@ export function registerWorkerExtension(
   const monitors = new Map<string, NodeJS.Timeout>();
 
   api.on("session_start", async (_event, context) => {
-    acknowledgePersistedWorkerDeliveries(context, dependencies);
     await adoptWorkerRuns(api, context, dependencies, active, monitors);
   });
   api.on("session_shutdown", () => {
@@ -207,6 +213,27 @@ export function registerWorkerExtension(
         return;
       }
       await handleAsyncShellViewerCommand(context, [jobId, ...viewerArgs].join(" "));
+    }
+  });
+
+  api.registerCommand("worker:ack", {
+    description: "Explicitly acknowledge one settled worker completion whose automatic same-session delivery remained uncertain",
+    handler: async (args, context) => {
+      const workerId = args.trim();
+      if (!workerId) {
+        context.ui.notify("Usage: /worker:ack <worker-id>", "info");
+        return;
+      }
+      const paths = workerPaths(dependencies.roots, workerId);
+      const record = readWorkerRecord(paths.recordFile);
+      assertWorkerParentSession(record, context);
+      const runId = record.lastRun?.runId;
+      if (!runId || record.lastRun?.delivery !== "pending") {
+        context.ui.notify(`Worker ${workerId} has no pending completion delivery.`, "info");
+        return;
+      }
+      markWorkerCompletionDelivered(paths, runId, dependencies);
+      context.ui.notify(`Acknowledged worker completion ${workerId}/${runId}.`, "info");
     }
   });
 
@@ -372,7 +399,6 @@ export function registerWorkerExtension(
     executionMode: "parallel",
     async execute(_toolCallId, params, signal, onUpdate, context): Promise<AgentToolResult<WorkerRunDetails>> {
       throwIfAborted(signal);
-      acknowledgePersistedWorkerDeliveries(context, dependencies);
       const plans = planWorkerRuns(params.runs, context, dependencies);
       const receipts = prepareWorkerPlans(plans, context, dependencies, pending);
       const formattedReceipts = receipts.map(formatWorkerRunReceipt).join("\n\n");
@@ -391,7 +417,10 @@ export function registerWorkerExtension(
       pending.delete(runId);
       await startPendingWorker(api, context, value, dependencies, active);
     }
-    acknowledgePersistedWorkerDeliveries(context, dependencies);
+  });
+
+  api.on("message_end", (event, context) => {
+    acknowledgeWorkerCompletionMessage(event.message, context, dependencies);
   });
 }
 
@@ -426,7 +455,7 @@ function planWorkerRuns(
     }
     if (existing.activeRun) throw new Error(`Worker ${existing.workerId} already has active run ${existing.activeRun.runId}.`);
     if (existing.lastRun?.delivery === "pending") {
-      throw new Error(`Worker ${existing.workerId} completion delivery is not yet persisted in the parent session.`);
+      throw new Error(`Worker ${existing.workerId} completion delivery is still pending; inspect it and use /worker:ack before resuming.`);
     }
     validatePersonalTaskIds([...existing.taskIds, ...(input.addTaskIds ?? [])]);
     if (!existing.sessionFile) throw new Error(`Worker ${existing.workerId} has no forked session to resume.`);
@@ -495,7 +524,12 @@ function prepareNewWorker(
     taskIds: plan.taskIds,
     route: plan.route,
     status: "queued",
-    activeRun: { runId, jobId, status: "queued" },
+    activeRun: {
+      runId,
+      jobId,
+      status: "queued",
+      completionDelivery: resolveCompletionDelivery(plan.input.completionDelivery)
+    },
     updatedAt: now.toISOString()
   };
   acquireWorkerRunLease(paths, record.workerId, runId, now);
@@ -540,7 +574,7 @@ function prepareResumedWorker(
     const existing = readWorkerRecord(paths.recordFile);
     if (existing.activeRun) throw new Error(`Worker ${existing.workerId} became active before resume preparation.`);
     if (existing.lastRun?.delivery === "pending") {
-      throw new Error(`Worker ${existing.workerId} completion delivery became pending before resume preparation.`);
+      throw new Error(`Worker ${existing.workerId} completion delivery became pending before resume preparation; inspect it and use /worker:ack.`);
     }
     if (path.resolve(existing.parentSessionFile) !== plan.parentSessionFile) {
       throw new Error(`Worker ${existing.workerId} parent session changed before resume preparation.`);
@@ -550,7 +584,12 @@ function prepareResumedWorker(
       ...existing,
       taskIds: uniqueStrings([...existing.taskIds, ...(input.addTaskIds ?? [])]),
       status: "queued",
-      activeRun: { runId, jobId, status: "queued" },
+      activeRun: {
+        runId,
+        jobId,
+        status: "queued",
+        completionDelivery: resolveCompletionDelivery(input.completionDelivery)
+      },
       updatedAt: now.toISOString()
     };
     acquireWorkerRunLease(paths, record.workerId, runId, now);
@@ -841,6 +880,7 @@ function finalizeWorkerRunRecord(input: {
         status: input.status,
         resultFile: input.handoff ? input.resultFile : undefined,
         delivery: "pending",
+        completionDelivery: resolveCompletionDelivery(current.activeRun.completionDelivery),
         processStatus: input.job.status,
         exitCode: input.job.exitCode,
         pid: input.job.pid,
@@ -947,6 +987,7 @@ function failWorkerLaunch(
         jobId,
         status: "failed",
         delivery: "pending",
+        completionDelivery: resolveCompletionDelivery(activeRun.completionDelivery),
         processStatus: "failed",
         logDir: pending.runDir,
         stdoutLog: path.join(pending.runDir, "stdout.log"),
@@ -1004,8 +1045,19 @@ function sendWorkerCompletion(
       customType: "worker-run",
       content: lines.join("\n"),
       display: true,
-      details: { deliveryId: workerCompletionDeliveryId(record.workerId, runId), record, job, handoff, error }
-    }, { triggerTurn: true, deliverAs: "steer" });
+      details: {
+        deliveryId: workerCompletionDeliveryId(record.workerId, runId),
+        workerId: record.workerId,
+        runId,
+        record,
+        job,
+        handoff,
+        error
+      }
+    }, {
+      triggerTurn: true,
+      deliverAs: resolveCompletionDelivery(record.lastRun?.completionDelivery)
+    });
     return true;
   } catch {
     return false;
@@ -1016,31 +1068,29 @@ function workerCompletionDeliveryId(workerId: string, runId: string): string {
   return `worker-run:${workerId}:${runId}`;
 }
 
-function acknowledgePersistedWorkerDeliveries(
+function acknowledgeWorkerCompletionMessage(
+  message: unknown,
   context: ExtensionContext,
   dependencies: WorkerExtensionDependencies
 ): void {
-  if (!existsSync(dependencies.roots.stateRoot)) return;
+  if (!isRecord(message) || message.role !== "custom" || message.customType !== "worker-run") return;
+  const details = message.details;
+  if (
+    !isRecord(details) ||
+    typeof details.deliveryId !== "string" ||
+    typeof details.workerId !== "string" ||
+    typeof details.runId !== "string"
+  ) return;
+  if (details.deliveryId !== workerCompletionDeliveryId(details.workerId, details.runId)) return;
+  if (!/^worker_[0-9]{14}_[a-zA-Z0-9-]{8}$/.test(details.workerId)) return;
+
+  const paths = workerPaths(dependencies.roots, details.workerId);
+  if (!existsSync(paths.recordFile)) return;
+  const record = readWorkerRecord(paths.recordFile);
   const parentSessionFile = context.sessionManager.getSessionFile();
-  if (!parentSessionFile) return;
-  const persisted = new Set(context.sessionManager.getEntries()
-    .flatMap((entry) => {
-      if (entry.type !== "custom_message" || entry.customType !== "worker-run" || !("details" in entry)) return [];
-      const deliveryId = (entry.details as { deliveryId?: unknown } | undefined)?.deliveryId;
-      return typeof deliveryId === "string" ? [deliveryId] : [];
-    }));
-  if (persisted.size === 0) return;
-  for (const entry of readdirSync(dependencies.roots.stateRoot, { withFileTypes: true })) {
-    if (!entry.isDirectory() || !entry.name.startsWith("worker_")) continue;
-    const paths = workerPaths(dependencies.roots, entry.name);
-    if (!existsSync(paths.recordFile)) continue;
-    const record = readWorkerRecord(paths.recordFile);
-    if (path.resolve(record.parentSessionFile) !== path.resolve(parentSessionFile)) continue;
-    const last = record.lastRun;
-    if (!last || last.delivery !== "pending") continue;
-    if (!persisted.has(workerCompletionDeliveryId(record.workerId, last.runId))) continue;
-    markWorkerCompletionDelivered(paths, last.runId, dependencies);
-  }
+  if (!parentSessionFile || path.resolve(parentSessionFile) !== path.resolve(record.parentSessionFile)) return;
+  if (record.lastRun?.runId !== details.runId || record.lastRun.delivery !== "pending") return;
+  markWorkerCompletionDelivered(paths, details.runId, dependencies);
 }
 
 function markWorkerCompletionDelivered(
@@ -1081,7 +1131,6 @@ async function adoptWorkerRuns(
       if (path.resolve(record.parentSessionFile) !== path.resolve(parentSessionFile)) continue;
       if (!record.activeRun) {
         releaseStaleCompletedLease(paths);
-        redeliverPendingWorkerCompletion(api, paths, readWorkerRecord(paths.recordFile), dependencies);
         continue;
       }
       if (active.has(record.workerId)) continue;
@@ -1094,7 +1143,6 @@ async function adoptWorkerRuns(
           const current = readWorkerRecord(paths.recordFile);
           if (!current.activeRun) {
             releaseStaleCompletedLease(paths);
-            redeliverPendingWorkerCompletion(api, paths, readWorkerRecord(paths.recordFile), dependencies);
             clearInterval(monitor);
             monitors.delete(record.workerId);
             return;
@@ -1141,45 +1189,6 @@ function recoverOrphanedWorkerPreparation(paths: WorkerPaths): void {
     rmSync(paths.workspaceRoot, { recursive: true, force: true });
     rmSync(paths.stateDir, { recursive: true, force: true });
   });
-}
-
-function redeliverPendingWorkerCompletion(
-  api: ExtensionAPI,
-  paths: WorkerPaths,
-  record: WorkerRecord,
-  dependencies: WorkerExtensionDependencies
-): void {
-  const last = record.lastRun;
-  if (!last || last.delivery !== "pending") return;
-  const logDir = last.logDir ?? path.join(paths.stateDir, "runs", last.runId);
-  const stdoutLog = last.stdoutLog ?? path.join(logDir, "stdout.log");
-  const stderrLog = last.stderrLog ?? path.join(logDir, "stderr.log");
-  const allowedStatuses: JobMeta["status"][] = ["running", "exited", "failed", "cancelled", "unknown"];
-  const processStatus = allowedStatuses.includes(last.processStatus as JobMeta["status"])
-    ? last.processStatus as JobMeta["status"]
-    : "unknown";
-  const job: JobMeta = {
-    jobId: last.jobId,
-    job_name: `worker ${record.workerId}`,
-    command: `Redelivered worker ${record.workerId}/${last.runId}`,
-    cwd: record.workspaceRoot,
-    shell: process.execPath,
-    status: processStatus,
-    pid: last.pid,
-    startedAt: record.updatedAt,
-    endedAt: record.updatedAt,
-    exitCode: last.exitCode,
-    notifyOnExit: false,
-    completionNotified: true,
-    logDir,
-    stdoutLog,
-    stderrLog,
-    outputBytes: asyncJobOutputBytes(stdoutLog, stderrLog)
-  };
-  const handoff = last.resultFile
-    ? readMatchingWorkerHandoff(last.resultFile, record.workerId, last.runId)
-    : undefined;
-  sendWorkerCompletion(api, record, job, handoff, last.error);
 }
 
 async function reconcileRecoveredWorkerRun(
@@ -1430,6 +1439,7 @@ function finalizeRecoveredWorkerCancellation(
         jobId: job.jobId,
         status: "cancelled",
         delivery: "pending",
+        completionDelivery: resolveCompletionDelivery(current.activeRun.completionDelivery),
         processStatus: "cancelled",
         pid: job.pid,
         logDir,
@@ -1711,6 +1721,7 @@ function receipt(record: WorkerRecord): WorkerRunReceipt {
     provider: record.route.provider,
     model: record.route.model,
     thinkingLevel: record.route.thinkingLevel,
+    completionDelivery: resolveCompletionDelivery(record.activeRun.completionDelivery),
     state: record.activeRun.status
   };
 }
@@ -1750,6 +1761,7 @@ function formatWorkerRunReceipt(value: WorkerRunReceipt): string {
     `workspace_root: ${value.workspaceRoot}`,
     `task_ids: ${value.taskIds.join(", ")}`,
     `route: ${value.provider}/${value.model}:${value.thinkingLevel}`,
+    `completion_delivery: ${value.completionDelivery}`,
     `state: ${value.state}`
   ].join("\n");
 }
@@ -1764,8 +1776,12 @@ function formatWorkerRecord(record: WorkerRecord): string {
     record.container ? `Container: ${record.container.name} · ${record.container.containerId?.slice(0, 12) ?? "planned"} · created for ${record.container.runId}` : "Container: not created",
     record.activeRun ? `Active run: ${record.activeRun.runId} · ${record.activeRun.jobId} · ${record.activeRun.status}` : undefined,
     record.activeRun?.recoveryError ? `Recovery required: ${record.activeRun.recoveryError}` : undefined,
-    record.lastRun ? `Last run: ${record.lastRun.runId} · ${record.lastRun.status}` : undefined
+    record.lastRun ? `Last run: ${record.lastRun.runId} · ${record.lastRun.status} · delivery ${record.lastRun.delivery ?? "not required"} · ${resolveCompletionDelivery(record.lastRun.completionDelivery)}` : undefined
   ].filter((line): line is string => line !== undefined).join("\n");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 function uniqueStrings(values: readonly string[]): string[] {

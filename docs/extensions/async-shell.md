@@ -36,7 +36,8 @@ shell_start({
       cwd: string,                      // required, per-command
       job_name?: string,                // short human-readable name
       shell?: string,                   // defaults to $SHELL or /bin/zsh
-      notifyOnExit?: boolean            // default true; set false to silence completion notice
+      notifyOnExit?: boolean,           // default true; set false to silence completion notice
+      completionDelivery?: "steer" | "followUp" // default steer
     },
     ...
   ]
@@ -46,6 +47,7 @@ shell_start({
 - `commands.minItems: 1`, `maxItems: 12`.
 - `cwd` is resolved against the active project root and is required per command.
 - Standard input is ignored: `shell_start` does not feed stdin, so interactive commands are not supported.
+- Use `completionDelivery: "steer"` to get results as soon as they are ready. Use `"followUp"` for lower-priority tasks that should be investigated after other work is finished. Completions with different modes are batched separately.
 
 ### shell_status
 
@@ -96,10 +98,11 @@ Cancel implicitly suppresses the completion notice for that job (`notifyOnExit` 
    { jobs: [{ jobId, job_name?, command, cwd, status, durationMs?, exitCode?, signal?, error?, stdoutLog, stderrLog, outputBytes }, ...] }
    ```
    `shell_start` deliberately does not return stdout/stderr samples. Use `shell_read` with `mode: "tail"` for recent output, `shell_read` with `mode: "range"` for exact log lines, or `search_many`/`read_many` on log paths for targeted file inspection.
-4. For each background job that finishes later (with `notifyOnExit !== false`), the extension queues a completion notice. A ~100 ms debounce coalesces near-simultaneous completions into one batch.
-5. When the agent is idle, the batch is delivered as a custom message of type `async-shell` with `triggerTurn: true, deliverAs: "steer"`, so Pi resumes exactly once for the whole batch. When the agent is active, the flush is deferred to the next `turn_end`/`message_end (user)`/`agent_end` safe point.
-6. `shell_read` acknowledges an observed completion: if you read a job after it finished, no further notice is sent for that job. `shell_status` remains metadata-only and does not acknowledge delivery.
-7. The optional default-off `completion-notifications` extension reads only in-memory origin and delivery state for jobs from the same session. Related `notifyOnExit:true` jobs defer one generic terminal toast until their completion follow-up settles; in-band, observed, and `notifyOnExit:false` jobs do not block. This coordination never changes job metadata, logs, cancellation, or delivery behavior.
+4. For each background job that finishes later (with `notifyOnExit !== false`), the extension queues a completion notice. A ~100 ms debounce coalesces near-simultaneous completions with the same delivery mode into one batch.
+5. The batch is delivered as a custom message of type `async-shell` with `triggerTurn: true` and the command's selected `completionDelivery`. `steer` is the default. When the agent is active, Pi applies its normal safe queue ordering for the selected mode.
+6. Calling `sendMessage` is only a delivery attempt. The job remains unacknowledged until Pi emits the exact same-session custom `message_end` receipt carrying the batch's unique delivery ID. The extension never scans or replays session history on reload; an ambiguous cross-lifecycle attempt remains pending rather than risking a duplicate turn.
+7. `shell_read` acknowledges an explicitly observed completion: if you read a job after it finished, no further notice is sent for that job. `shell_status` remains metadata-only and does not acknowledge delivery.
+8. The optional default-off `completion-notifications` extension reads only in-memory origin and delivery state for jobs from the same session. Related `notifyOnExit:true` jobs defer one generic terminal toast until their completion follow-up settles; in-band, observed, and `notifyOnExit:false` jobs do not block. This coordination never changes job metadata, logs, cancellation, or delivery behavior.
 
 ## Completion notice shape
 

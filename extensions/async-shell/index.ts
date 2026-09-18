@@ -14,6 +14,11 @@ import {
   spawnAsyncJobProcess
 } from "../_shared/async-job.js";
 import { throwIfAborted } from "../_shared/cancellation.js";
+import {
+  CompletionDeliverySchema,
+  resolveCompletionDelivery,
+  type CompletionDelivery
+} from "../_shared/completion-delivery.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 import { prepareWorkspaceSandboxProcess } from "../_shared/workspace-sandbox.js";
 import { prepareWorkerContainerProcess, signalWorkerContainerJob, workerContainerFromEnvironment } from "../_shared/worker-container.js";
@@ -109,6 +114,17 @@ type JobStartDetails = Pick<JobMeta,
 
 type CompletionDeliveryContext = {
   isIdle: () => boolean;
+  sessionId: () => string | undefined;
+};
+
+type CompletionDeliveryRuntime = {
+  active: boolean;
+};
+
+type CompletionDeliveryBatch = {
+  deliveryId: string;
+  originSessionId: string;
+  jobIds: Set<string>;
 };
 
 type JobRuntime = JobMeta & {
@@ -121,8 +137,10 @@ type JobRuntime = JobMeta & {
   completionContext: CompletionDeliveryContext;
   originProjectCwd: string;
   originSessionId: string;
-  // Stays true after sendMessage succeeds. Completion-notifications matches the
-  // resulting custom message by jobId; its run-start filter excludes old jobs.
+  completionDelivery: CompletionDelivery;
+  completionRuntime: CompletionDeliveryRuntime;
+  // Stays true after sendMessage accepts a delivery attempt and until Pi emits
+  // the exact custom-message receipt for this job.
   completionFollowUpQueued: boolean;
   settleProcessGroup: boolean;
   startupError?: string;
@@ -218,7 +236,6 @@ type CompletionNotificationTarget = {
 
 type CompletionNotificationOptions = {
   isReady: () => boolean;
-  markNotified: () => void;
   queue: () => void;
 };
 
@@ -228,6 +245,7 @@ type CommandSpec = {
   job_name?: string;
   shell?: string;
   notifyOnExit?: boolean;
+  completionDelivery?: CompletionDelivery;
 };
 
 const START_WAIT_FOR_COMPLETION_SECONDS = 6;
@@ -246,14 +264,15 @@ const CommandItem = Type.Object({
   cwd: Type.String({ minLength: 1, description: "Working directory for this command. Use per-command cwd; shell_start has no top-level cwd." }),
   job_name: Type.Optional(Type.String({ minLength: 1, description: "Optional human-readable name for this job." })),
   shell: Type.Optional(Type.String({ description: "Shell executable for this command. Defaults to $SHELL or /bin/zsh." })),
-  notifyOnExit: Type.Optional(Type.Boolean({ default: true, description: "Defaults to true. When this command is still running after shell_start returns, append a per-job completion notice when it exits. Set false only when you do not care about this command's result." }))
+  notifyOnExit: Type.Optional(Type.Boolean({ default: true, description: "Notify when the command completes. Defaults to true." })),
+  completionDelivery: Type.Optional(CompletionDeliverySchema)
 }, { additionalProperties: false });
 
 const StartParams = Type.Object({
   commands: Type.Array(CommandItem, {
     minItems: 1,
     maxItems: 12,
-    description: "Required list of shell commands to start from one tool call. Each item is an object with command and per-command cwd, and optional job_name, shell, or notifyOnExit. Multiple commands start in parallel, each command receives its own jobId, and a single call accepts at most 12 commands."
+    description: "Required list of shell commands to start from one tool call. Each item is an object with command and per-command cwd, and optional job_name, shell, notifyOnExit, or completionDelivery. Multiple commands start in parallel, each command receives its own jobId, and a single call accepts at most 12 commands."
   })
 }, { additionalProperties: false });
 
@@ -288,6 +307,7 @@ type CancelInput = Static<typeof CancelParams>;
 const jobs = new Map<string, JobRuntime>();
 const scheduledCompletionNotifications = new WeakSet<CompletionNotificationTarget>();
 const pendingCompletionNotifications = new Map<string, JobRuntime>();
+const completionDeliveryBatches = new Map<string, CompletionDeliveryBatch>();
 let completionBatchFlushTimer: NodeJS.Timeout | undefined;
 let latestCompletionContext: CompletionDeliveryContext | undefined;
 
@@ -317,6 +337,8 @@ export function isAsyncShellCompletionBarrierTarget(target: {
 }
 
 export default function asyncShellExtension(api: ExtensionAPI): void {
+  const completionRuntime: CompletionDeliveryRuntime = { active: true };
+
   registerCommandWithAliases(
     api,
     "async:status",
@@ -346,6 +368,7 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
   });
 
   api.on("message_end", (event, context) => {
+    acknowledgeCompletionMessage(event.message, context);
     if (event.message.role === "user") {
       flushCompletionNotificationBatch(api, createCompletionDeliveryContext(context), { allowActive: true });
     }
@@ -357,6 +380,8 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     scheduleCompletionBatchFlush(api, createCompletionDeliveryContext(context));
   });
   api.on("session_shutdown", async () => {
+    completionRuntime.active = false;
+    abandonCompletionRuntime(completionRuntime);
     const owner = workerOwnerFromEnvironment();
     if (owner) await cancelAsyncShellJobsForOwner(owner);
   });
@@ -372,7 +397,7 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
       `shell_start waits only for a fixed ${START_WAIT_FOR_COMPLETION_SECONDS}s grace period: jobs that finish quickly return status/log metadata in-band; unfinished jobs continue in the background and, by default, append completion notices when they exit.`,
       "In-band shell_start results include compact job fields plus stdout_log/stderr_log paths only. Completion notices are short result notices with log paths, batched into history/TUI, then the host triggers one assistant turn for each flushed batch; use shell_read mode='tail' for recent output, shell_read mode='range' for exact line ranges, or search_many/read_many on log paths for targeted output.",
       "Continue useful work while jobs run. If there is no useful work, stop after reporting that jobs are running; completion notices will appear in history and resume the agent. Do not poll or wait.",
-      "Set per-command notifyOnExit:false only when the result is unimportant.",
+      "Per-command notifyOnExit defaults to true. Use completionDelivery:steer to get results as soon as they are ready. Use completionDelivery:followUp for lower-priority tasks that should be investigated after other work is finished.",
       "Use shell_status to inspect jobs and shell_read to read stdout/stderr. Prefer shell_read mode='tail' after a result/notification or for progress/failure summaries; use shell_read mode='range' only when you know line numbers, are continuing nextOffset, or searched log paths first. Use search_many/read_many on stdout_log/stderr_log for targeted file inspection. Do not use status/read for polling."
     ].join(" "),
     promptSnippet: "Run shell commands as durable async jobs. Start independent shell work together in one commands list, keep doing useful work, and rely on per-job completion notices instead of polling.",
@@ -386,7 +411,7 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     executionMode: "parallel",
     renderShell: "self",
     async execute(_toolCallId, params, signal, onUpdate, context): Promise<AgentToolResult<StartDetails>> {
-      return startJobs(api, context, params, onUpdate, signal);
+      return startJobs(api, context, params, onUpdate, signal, completionRuntime);
     },
     renderCall(args, theme) {
       return renderShellStartCall(args, theme);
@@ -497,7 +522,8 @@ async function startJobs(
   context: ExtensionContext,
   input: StartInput,
   onUpdate: StartUpdate | undefined,
-  signal?: AbortSignal
+  signal: AbortSignal | undefined,
+  completionRuntime: CompletionDeliveryRuntime
 ): Promise<AgentToolResult<StartDetails>> {
   throwIfAborted(signal);
   assertWorkerRunAcceptsSideEffects();
@@ -508,7 +534,9 @@ async function startJobs(
     cwd: spec.cwd,
     job_name: spec.job_name,
     shell: spec.shell,
-    notifyOnExit: spec.notifyOnExit ?? true
+    notifyOnExit: spec.notifyOnExit ?? true,
+    completionDelivery: resolveCompletionDelivery(spec.completionDelivery),
+    completionRuntime
   }));
 
   onUpdate?.(partialStartResult(runtimes));
@@ -524,6 +552,8 @@ function startJob(
   context: ExtensionContext,
   input: StartManagedAsyncJobInput & {
     notifyOnExit: boolean;
+    completionDelivery?: CompletionDelivery;
+    completionRuntime?: CompletionDeliveryRuntime;
   }
 ): JobRuntime {
   const cwd = resolveCwd(context, input.cwd);
@@ -587,6 +617,8 @@ function startJob(
     completionContext: createCompletionDeliveryContext(context),
     originProjectCwd: context.cwd,
     originSessionId: context.sessionManager.getSessionId(),
+    completionDelivery: resolveCompletionDelivery(input.completionDelivery),
+    completionRuntime: input.completionRuntime ?? { active: true },
     completionFollowUpQueued: false,
     settleProcessGroup: input.settleProcessGroup ?? false,
     cancellationEffect: processInput.cancellationEffect,
@@ -811,8 +843,7 @@ function finalizeJob(
 
 function scheduleCompletionNotification(api: ExtensionAPI, job: JobRuntime): void {
   scheduleCompletionFollowUp(job, {
-    isReady: () => !job.startResultPending && job.activeWaiters === 0,
-    markNotified: () => writeMeta(job),
+    isReady: () => job.completionRuntime.active && !job.startResultPending && job.activeWaiters === 0,
     queue: () => queueCompletionNotification(api, job)
   });
 }
@@ -834,14 +865,12 @@ function scheduleCompletionFollowUp(target: CompletionNotificationTarget, option
       return;
     }
 
-    target.completionNotified = true;
-    options.markNotified();
     options.queue();
   }, 0);
 }
 
 function queueCompletionNotification(api: ExtensionAPI, job: JobRuntime): void {
-  job.completionFollowUpQueued = true;
+  if (!job.completionRuntime.active || job.completionNotified) return;
   pendingCompletionNotifications.set(job.jobId, job);
   scheduleCompletionBatchFlush(api, job.completionContext);
 }
@@ -859,44 +888,108 @@ function scheduleCompletionBatchFlush(api: ExtensionAPI, context: CompletionDeli
 }
 
 function flushCompletionNotificationBatch(api: ExtensionAPI, context: CompletionDeliveryContext | undefined, options: { allowActive: boolean }): void {
-  if (pendingCompletionNotifications.size === 0) {
-    return;
-  }
-  if (!options.allowActive && context !== undefined && !context.isIdle()) {
-    return;
-  }
+  if (pendingCompletionNotifications.size === 0 || context === undefined) return;
+  if (!options.allowActive && !context.isIdle()) return;
+  const sessionId = context.sessionId();
+  if (!sessionId) return;
 
-  const completedJobs = Array.from(pendingCompletionNotifications.values()).map(publicJob);
-  pendingCompletionNotifications.clear();
+  const eligible = Array.from(pendingCompletionNotifications.values()).filter((job) =>
+    job.completionRuntime.active &&
+    job.originSessionId === sessionId &&
+    !job.completionNotified &&
+    !job.completionFollowUpQueued
+  );
+  const byMode = new Map<CompletionDelivery, JobRuntime[]>();
+  for (const job of eligible) {
+    byMode.set(job.completionDelivery, [...(byMode.get(job.completionDelivery) ?? []), job]);
+  }
+  for (const [mode, groupedJobs] of byMode) {
+    const deliveryId = `async-shell:${randomUUID()}`;
+    const batch: CompletionDeliveryBatch = {
+      deliveryId,
+      originSessionId: sessionId,
+      jobIds: new Set(groupedJobs.map((job) => job.jobId))
+    };
+    completionDeliveryBatches.set(deliveryId, batch);
+    for (const job of groupedJobs) job.completionFollowUpQueued = true;
+    const completedJobs = groupedJobs.map(publicJob);
+    const deliveryDetails = completedJobs.length === 1
+      ? { ...completedJobs[0], deliveryId, originSessionId: sessionId }
+      : { jobs: completedJobs, deliveryId, originSessionId: sessionId };
 
-  try {
-    api.sendMessage(
-      {
-        customType: "async-shell",
-        content: formatCompletionBatchMessage(completedJobs),
-        display: true,
-        details: completedJobs.length === 1 ? completedJobs[0] : { jobs: completedJobs }
-      },
-      { triggerTurn: true, deliverAs: "steer" }
-    );
-  } catch {
-    // Pi may be shutting down; the persisted logs still hold the result.
+    try {
+      api.sendMessage(
+        {
+          customType: "async-shell",
+          content: formatCompletionBatchMessage(completedJobs),
+          display: true,
+          details: deliveryDetails
+        },
+        { triggerTurn: true, deliverAs: mode }
+      );
+    } catch {
+      completionDeliveryBatches.delete(deliveryId);
+      for (const job of groupedJobs) job.completionFollowUpQueued = false;
+    }
   }
 }
 
-function createCompletionDeliveryContext(context: Partial<Pick<ExtensionContext, "isIdle">> | undefined): CompletionDeliveryContext {
-  if (typeof context?.isIdle !== "function") {
-    return { isIdle: () => true };
-  }
+function acknowledgeCompletionMessage(message: unknown, context: ExtensionContext): void {
+  if (!isRecord(message) || message.role !== "custom" || message.customType !== "async-shell") return;
+  const details = message.details;
+  if (!isRecord(details) || typeof details.deliveryId !== "string") return;
+  const batch = completionDeliveryBatches.get(details.deliveryId);
+  if (
+    !batch ||
+    batch.originSessionId !== context.sessionManager.getSessionId() ||
+    details.originSessionId !== batch.originSessionId
+  ) return;
 
+  completionDeliveryBatches.delete(batch.deliveryId);
+  for (const jobId of batch.jobIds) {
+    const job = jobs.get(jobId);
+    if (!job || job.originSessionId !== batch.originSessionId || !isTerminal(job.status)) continue;
+    job.completionNotified = true;
+    job.completionFollowUpQueued = false;
+    pendingCompletionNotifications.delete(job.jobId);
+    writeMeta(job);
+  }
+}
+
+function abandonCompletionRuntime(runtime: CompletionDeliveryRuntime): void {
+  if (completionBatchFlushTimer !== undefined) {
+    clearTimeout(completionBatchFlushTimer);
+    completionBatchFlushTimer = undefined;
+    latestCompletionContext = undefined;
+  }
+  for (const [jobId, job] of pendingCompletionNotifications) {
+    if (job.completionRuntime !== runtime) continue;
+    job.completionFollowUpQueued = false;
+    pendingCompletionNotifications.delete(jobId);
+  }
+  for (const [deliveryId, batch] of completionDeliveryBatches) {
+    if (Array.from(batch.jobIds).some((jobId) => jobs.get(jobId)?.completionRuntime === runtime)) {
+      completionDeliveryBatches.delete(deliveryId);
+    }
+  }
+}
+
+function createCompletionDeliveryContext(
+  context: Partial<Pick<ExtensionContext, "isIdle" | "sessionManager">> | undefined
+): CompletionDeliveryContext {
   return {
     isIdle: () => {
       try {
-        return context.isIdle?.() === true;
+        return typeof context?.isIdle !== "function" || context.isIdle() === true;
       } catch {
-        // Session replacement and reload deliberately make captured contexts
-        // stale. Keep the completion queued for a fresh lifecycle event.
         return false;
+      }
+    },
+    sessionId: () => {
+      try {
+        return context?.sessionManager?.getSessionId();
+      } catch {
+        return undefined;
       }
     }
   };
@@ -1387,7 +1480,8 @@ function normalizeCommandSpecs(input: StartInput): CommandSpec[] {
       cwd,
       job_name: item.job_name,
       shell: item.shell,
-      notifyOnExit: item.notifyOnExit
+      notifyOnExit: item.notifyOnExit,
+      completionDelivery: item.completionDelivery
     };
   });
 }
@@ -1396,6 +1490,7 @@ function finishStartGracePeriod(jobsList: JobRuntime[]): void {
   for (const job of jobsList.filter((candidate) => isTerminal(candidate.status))) {
     job.completionNotified = true;
     job.completionFollowUpQueued = false;
+    forgetCompletionDelivery(job.jobId);
     pendingCompletionNotifications.delete(job.jobId);
     writeMeta(job);
   }
@@ -1407,14 +1502,23 @@ function finishStartGracePeriod(jobsList: JobRuntime[]): void {
 
 function acknowledgeObservedJobCompletion(job: JobMeta): void {
   const runtime = jobs.get(job.jobId);
-  if (runtime === undefined || !isTerminal(runtime.status)) {
-    return;
-  }
+  const target = runtime ?? job;
+  if (!isTerminal(target.status)) return;
 
-  runtime.completionNotified = true;
-  runtime.completionFollowUpQueued = false;
-  pendingCompletionNotifications.delete(runtime.jobId);
-  writeMeta(runtime);
+  target.completionNotified = true;
+  if (runtime) {
+    runtime.completionFollowUpQueued = false;
+    forgetCompletionDelivery(runtime.jobId);
+    pendingCompletionNotifications.delete(runtime.jobId);
+  }
+  writeMeta(target);
+}
+
+function forgetCompletionDelivery(jobId: string): void {
+  for (const [deliveryId, batch] of completionDeliveryBatches) {
+    batch.jobIds.delete(jobId);
+    if (batch.jobIds.size === 0) completionDeliveryBatches.delete(deliveryId);
+  }
 }
 
 function readLogTail(logFile: string, lines: number, maxChars: number): string {

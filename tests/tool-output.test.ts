@@ -201,6 +201,7 @@ const samples: Record<RetainedToolName, unknown> = {
         provider: "openai-codex",
         model: "gpt-test",
         thinkingLevel: "xhigh",
+        completionDelivery: "steer",
         state: "queued"
       }]
     }
