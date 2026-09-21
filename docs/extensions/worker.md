@@ -58,7 +58,7 @@ worker_control({
 })
 ```
 
-`status` without a worker ID lists at most 100 workers belonging to the exact parent session; with an ID it returns one canonical summary. `result` requires a settled run, validates the persisted worker/run handoff identity, returns its typed handoff in model-visible content, and atomically marks pending delivery observed only after validation succeeds. `cancel` uses the same authoritative cleanup path as the user command; because its synchronous tool result already reports settlement, it does not queue a duplicate completion turn. `discard` refuses active/leased workers, requires literal `confirm:true`, and remains routed through tool-safety review. Use `shell_read` with returned job IDs for logs rather than duplicating log streaming in `worker_control`.
+`status` without a worker ID lists at most 100 workers belonging to the exact parent session; with an ID it returns one canonical summary. `result` requires a settled run, validates the persisted worker/run handoff identity, returns its typed handoff in model-visible content, and atomically marks pending delivery observed only after validation succeeds. `cancel` uses the same authoritative cleanup path as the user command; because its synchronous tool result already reports settlement, it does not queue a duplicate completion turn. `discard` refuses active/leased workers and requires literal `confirm:true`. Tool-safety deterministically allows every valid `worker_control` action without model or human review, while malformed IDs, missing confirmation, and unsupported fields remain reviewed. Use `shell_read` with returned job IDs for logs rather than duplicating log streaming in `worker_control`.
 
 ## Lifecycle
 

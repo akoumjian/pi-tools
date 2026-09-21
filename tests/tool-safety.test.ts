@@ -983,28 +983,56 @@ test("web_fetch_many private or credentialed URLs require review", () => {
   assert.equal(credentialUrl.ruleId, "web-fetch-credential-url");
 });
 
-test("worker_control allows exact-session observation and cancellation but reviews destructive discard", () => {
+test("worker_control allows every valid exact-session lifecycle action without safety review", () => {
   const workerId = "worker_20260910190000_12345678";
-  assert.equal(evaluateWorkerControl({ action: "status" }).action, "allow");
-  assert.equal(evaluateWorkerControl({ action: "status", workerId }).action, "allow");
-  assert.equal(evaluateWorkerControl({ action: "result", workerId }).action, "allow");
-  assert.equal(evaluateWorkerControl({ action: "cancel", workerId }).action, "allow");
+  const criteria = ["conservative", "production-or-unapproved-environment"] as const;
+  const validInputs: unknown[] = [
+    { action: "status" },
+    { action: "status", workerId },
+    { action: "result", workerId },
+    { action: "cancel", workerId },
+    { action: "discard", workerId, confirm: true }
+  ];
+
+  for (const input of validInputs) {
+    const decision = evaluateWorkerControl(input);
+    assert.equal(decision.action, "allow");
+    for (const reviewCriteria of criteria) {
+      assert.equal(
+        applyReviewCriteria(toolCall("worker_control", input), decision, reviewCriteria).action,
+        "allow",
+        `valid worker_control input stays allowed under ${reviewCriteria}`
+      );
+    }
+  }
 
   const discard = evaluateWorkerControl({ action: "discard", workerId, confirm: true });
-  assert.equal(discard.action, "review");
-  assert.equal(discard.ruleId, "worker-control-discard-review");
-  assert.equal(
-    applyReviewCriteria(toolCall("worker_control", { action: "discard", workerId, confirm: true }), discard, "production-or-unapproved-environment").action,
-    "review",
-    "destructive worker discard remains reviewed under the deployment-focused profile"
-  );
-  assert.equal(evaluateWorkerControl({ action: "discard", workerId, confirm: false }).action, "review");
-  assert.equal(evaluateWorkerControl({ action: "result", workerId: "wrong" }).action, "review");
-  assert.equal(evaluateWorkerControl({ action: "status", unexpected: true }).action, "review");
-  assert.equal(
-    applyReviewCriteria(toolCall("worker_control", { action: "status" }), evaluateWorkerControl({ action: "status" }), "production-or-unapproved-environment").action,
-    "allow"
-  );
+  assert.equal(discard.risk, "medium");
+  assert.equal(discard.ruleId, "worker-control-discard");
+
+  const malformedInputs: unknown[] = [
+    null,
+    {},
+    { action: "unknown" },
+    { action: "status", unexpected: true },
+    { action: "result", workerId: "wrong" },
+    { action: "result", workerId, confirm: true },
+    { action: "cancel" },
+    { action: "discard", workerId, confirm: false },
+    { action: "discard", workerId },
+    { action: "discard", workerId: "wrong", confirm: true }
+  ];
+  for (const input of malformedInputs) {
+    const decision = evaluateWorkerControl(input);
+    assert.equal(decision.action, "review");
+    for (const reviewCriteria of criteria) {
+      assert.equal(
+        applyReviewCriteria(toolCall("worker_control", input), decision, reviewCriteria).action,
+        "review",
+        `malformed worker_control input stays reviewed under ${reviewCriteria}`
+      );
+    }
+  }
 });
 
 test("read-only orchestrate tasks are allowed but future writer shapes require review", () => {

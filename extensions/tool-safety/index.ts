@@ -332,8 +332,9 @@ export function applyReviewCriteria(
   if (criteria === "conservative" || decision.action === "deny") {
     return decision;
   }
-  const eventInput: unknown = event.input;
-  if (getToolName(event) === "worker_control" && isRecord(eventInput) && eventInput["action"] === "discard") {
+  if (getToolName(event) === "worker_control") {
+    // Preserve exact worker lifecycle validation before generic environment narrowing:
+    // valid shapes are allowed, while malformed IDs, fields, actions, and confirmation stay reviewed.
     return decision;
   }
 
@@ -711,11 +712,11 @@ export function evaluateWorkerControl(input: unknown): SafetyDecision {
   }
   if (input.action === "discard" && hasValidWorkerId && input.confirm === true) {
     return {
-      action: "review",
+      action: "allow",
       risk: "medium",
-      reason: "Discard permanently removes a settled worker container, workspace, and durable record.",
-      ruleId: "worker-control-discard-review",
-      tags: ["worker", "lifecycle", "destructive"]
+      reason: "Confirmed worker discard is restricted to a settled exact-session worker and uses authoritative cleanup.",
+      ruleId: "worker-control-discard",
+      tags: ["worker", "lifecycle", "discard", "destructive"]
     };
   }
   return {
