@@ -25,6 +25,8 @@ import {
   resolveCompletionDelivery
 } from "../_shared/completion-delivery.js";
 import { formatModelName, resolveExtensionModel } from "../_shared/model-spec.js";
+import { MAX_WORKER_TASK_IDS } from "../_shared/worker-contract.js";
+import { isWorkerId, WORKER_ID_PATTERN } from "../_shared/worker-id.js";
 import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 import { cancelPersistedAsyncShellJobsForOwner, handleAsyncShellViewerCommand, type JobMeta, type ManagedAsyncJobHandle } from "../async-shell/index.js";
@@ -61,7 +63,7 @@ const InitialRepoSchema = Type.Object({
 
 const NewWorkerRunSchema = Type.Object({
   kind: Type.Literal("new"),
-  taskIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { minItems: 1, maxItems: 32 }),
+  taskIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { minItems: 1, maxItems: MAX_WORKER_TASK_IDS }),
   guidance: Type.Optional(Type.String({ minLength: 1, maxLength: 12_000 })),
   route: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
   completionDelivery: Type.Optional(CompletionDeliverySchema),
@@ -72,7 +74,7 @@ const ResumeWorkerRunSchema = Type.Object({
   kind: Type.Literal("resume"),
   workerId: Type.String({ minLength: 1, maxLength: 128 }),
   message: Type.String({ minLength: 1, maxLength: 12_000 }),
-  addTaskIds: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { maxItems: 32 })),
+  addTaskIds: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { maxItems: MAX_WORKER_TASK_IDS })),
   completionDelivery: Type.Optional(CompletionDeliverySchema)
 }, { additionalProperties: false });
 
@@ -83,7 +85,25 @@ export const WorkerRunParams = Type.Object({
   })
 }, { additionalProperties: false });
 
+const WorkerIdSchema = Type.String({
+  minLength: 30,
+  maxLength: 128,
+  pattern: WORKER_ID_PATTERN
+});
+
+export const WorkerControlParams = Type.Object({
+  action: Type.Union([
+    Type.Literal("status"),
+    Type.Literal("result"),
+    Type.Literal("cancel"),
+    Type.Literal("discard")
+  ]),
+  workerId: Type.Optional(WorkerIdSchema),
+  confirm: Type.Optional(Type.Literal(true))
+}, { additionalProperties: false });
+
 export type WorkerRunInput = Static<typeof WorkerRunParams>;
+export type WorkerControlInput = Static<typeof WorkerControlParams>;
 export type WorkerRunReceipt = {
   workerId: string;
   runId: string;
@@ -100,6 +120,69 @@ export type WorkerRunReceipt = {
 };
 
 type WorkerRunDetails = { runs: WorkerRunReceipt[] };
+
+type WorkerControlSummary = {
+  workerId: string;
+  status: WorkerRecord["status"];
+  sessionId: string;
+  sessionFile?: string;
+  workspaceRoot: string;
+  taskIds: string[];
+  route: WorkerRoute;
+  container?: { name: string; containerId?: string; runId: string };
+  activeRun?: {
+    runId: string;
+    jobId: string;
+    status: "queued" | "running";
+    completionDelivery: "steer" | "followUp";
+    recoveryError?: string;
+    stdoutLog?: string;
+    stderrLog?: string;
+  };
+  lastRun?: {
+    runId: string;
+    jobId: string;
+    status: "handed_off" | "failed" | "cancelled";
+    delivery?: "pending" | "delivered";
+    completionDelivery: "steer" | "followUp";
+    resultFile?: string;
+    stdoutLog?: string;
+    stderrLog?: string;
+    error?: string;
+  };
+  updatedAt: string;
+};
+
+type WorkerControlDetails =
+  | { action: "status"; workers: WorkerControlSummary[] }
+  | {
+      action: "result";
+      workerId: string;
+      runId: string;
+      jobId: string;
+      status: "handed_off" | "failed" | "cancelled";
+      delivery?: "pending" | "delivered";
+      completionDelivery: "steer" | "followUp";
+      sessionId: string;
+      workspaceRoot: string;
+      taskIds: string[];
+      route: WorkerRoute;
+      resultFile?: string;
+      stdoutLog?: string;
+      stderrLog?: string;
+      error?: string;
+      handoff?: AcceptedWorkerHandoff;
+      acknowledgedDelivery: boolean;
+    }
+  | {
+      action: "cancel";
+      workerId: string;
+      outcome: "cancelled" | "not_active";
+      status: WorkerRecord["status"];
+      runId?: string;
+      jobId?: string;
+    }
+  | { action: "discard"; workerId: string; discarded: true };
 
 type PlannedWorkerRun =
   | {
@@ -190,9 +273,7 @@ export function registerWorkerExtension(
         context.ui.notify("Usage: /worker:status <worker-id>", "info");
         return;
       }
-      const paths = workerPaths(dependencies.roots, workerId);
-      const record = readWorkerRecord(paths.recordFile);
-      assertWorkerParentSession(record, context);
+      const record = readParentWorkerRecord(dependencies.roots, workerId, context);
       context.ui.notify(formatWorkerRecord(record), "info");
     }
   });
@@ -245,16 +326,7 @@ export function registerWorkerExtension(
         context.ui.notify("Usage: /worker:discard <worker-id> --confirm", "info");
         return;
       }
-      const paths = workerPaths(dependencies.roots, workerId);
-      const discarded = withWorkerOperationLock(paths, () => {
-        const record = readWorkerRecord(paths.recordFile);
-        assertWorkerParentSession(record, context);
-        if (record.activeRun || readWorkerLease(paths.leaseFile)) return false;
-        if (record.container) dependencies.removeContainer(record.container);
-        rmSync(paths.workspaceRoot, { recursive: true, force: true });
-        rmSync(paths.stateDir, { recursive: true, force: true });
-        return true;
-      });
+      const discarded = discardParentWorker(workerId, context, dependencies);
       context.ui.notify(
         discarded ? `Discarded settled worker ${workerId}.` : `Worker ${workerId} became active before discard; cancel it first.`,
         discarded ? "info" : "warning"
@@ -270,119 +342,95 @@ export function registerWorkerExtension(
         context.ui.notify("Usage: /worker:cancel <worker-id>", "info");
         return;
       }
-      const paths = workerPaths(dependencies.roots, workerId);
-      const record = readWorkerRecord(paths.recordFile);
-      assertWorkerParentSession(record, context);
-      if (!record.activeRun) {
-        context.ui.notify(`Worker ${workerId} has no active run.`, "info");
-        return;
-      }
-      const runId = record.activeRun.runId;
-      if (record.activeRun.status === "queued") {
-        withWorkerOperationLock(paths, () => {
-          const current = readWorkerRecord(paths.recordFile);
-          const lease = readWorkerLease(paths.leaseFile);
-          if (current.activeRun?.runId !== runId || current.activeRun.status !== "queued") {
-            throw new Error(`Worker ${workerId}/${runId} changed state before queued cancellation; retry the command.`);
-          }
-          if (!lease || lease.workerId !== workerId || lease.runId !== runId || lease.parentPid !== process.pid) {
-            throw new Error(`Worker ${workerId}/${runId} is queued under another live parent and cannot be cancelled from this session.`);
-          }
-          pending.delete(runId);
-          if (current.container) {
-            try {
-              dependencies.removeContainer(current.container);
-            } catch (cause) {
-              writeWorkerRecord(paths.recordFile, {
-                ...current,
-                status: "running",
-                activeRun: {
-                  ...current.activeRun,
-                  status: "running",
-                  hostProcessSettled: true,
-                  recoveryError: cause instanceof Error ? cause.message : String(cause)
-                },
-                updatedAt: dependencies.now().toISOString()
-              });
-              throw cause;
-            }
-          }
-          writeWorkerRecord(paths.recordFile, cancelledWorkerRecord(current, dependencies.now()));
-          releaseWorkerLease(paths.leaseFile, workerId, runId);
-        });
-        context.ui.notify(`Cancelled queued worker ${workerId}/${runId}.`, "info");
-        return;
-      }
-      const attached = active.get(workerId);
-      if (attached?.runId === runId) {
-        const cleanupOwner = claimWorkerCancellationOwnership(paths, record, runId, dependencies);
-        if (!cleanupOwner) throw new Error(`Worker ${workerId}/${runId} cleanup is owned by another live parent.`);
-        try {
-          await cancelAttachedWorker(attached.handle, readWorkerRecord(paths.recordFile), paths, dependencies);
-          finalizeRecoveredWorkerCancellation(api, paths, readWorkerRecord(paths.recordFile), runId, dependencies, true, cleanupOwner);
-        } catch (cause) {
-          const status = attached.handle.snapshot().status;
-          persistWorkerCleanupUncertainty(
-            paths,
-            runId,
-            cause instanceof Error ? cause.message : String(cause),
-            ["exited", "failed", "cancelled", "unknown"].includes(status),
-            dependencies
-          );
-          releaseWorkerCancellationOwnership(paths, runId, cleanupOwner, dependencies);
-          throw cause;
-        }
-        context.ui.notify(`Cancelled running worker ${workerId}/${runId}.`, "info");
-        return;
-      }
-      if (record.activeRun.hostProcessSettled && record.activeRun.recoveryError) {
-        if (!ensureWorkerRecoveryLease(paths, record, runId, dependencies)) {
-          throw new Error(`Worker ${workerId}/${runId} cleanup is owned by another live parent.`);
-        }
-        const cleanupOwner = claimWorkerCancellationOwnership(paths, record, runId, dependencies);
-        if (!cleanupOwner) throw new Error(`Worker ${workerId}/${runId} cleanup is owned by another live parent.`);
-        try {
-          await settlePersistedWorkerShells(paths, workerId, runId, dependencies);
-        } catch (error) {
-          persistWorkerCleanupUncertainty(
-            paths,
-            runId,
-            error instanceof Error ? error.message : String(error),
-            true,
-            dependencies
-          );
-          releaseWorkerCancellationOwnership(paths, runId, cleanupOwner, dependencies);
-          throw error;
-        }
-        finalizeRecoveredWorkerCancellation(api, paths, readWorkerRecord(paths.recordFile), runId, dependencies, true, cleanupOwner);
-        context.ui.notify(`Cancelled recovered worker ${workerId}/${runId}.`, "info");
-        return;
-      }
-      const cleanupOwner = claimWorkerCancellationOwnership(paths, record, runId, dependencies);
-      if (!cleanupOwner) throw new Error(`Worker ${workerId}/${runId} cleanup is owned by another live parent.`);
-      try {
-        const current = readWorkerRecord(paths.recordFile);
-        if (isWorkerHostProcessSettled(current)) {
-          await settlePersistedWorkerShells(paths, workerId, runId, dependencies);
-        } else {
-          await cancelDetachedWorker(current, paths, dependencies);
-        }
-        finalizeRecoveredWorkerCancellation(api, paths, readWorkerRecord(paths.recordFile), runId, dependencies, true, cleanupOwner);
-      } catch (cause) {
-        const current = readWorkerRecord(paths.recordFile);
-        persistWorkerCleanupUncertainty(
-          paths,
-          runId,
-          cause instanceof Error ? cause.message : String(cause),
-          isWorkerHostProcessSettled(current),
-          dependencies
-        );
-        releaseWorkerCancellationOwnership(paths, runId, cleanupOwner, dependencies);
-        throw cause;
-      }
-      context.ui.notify(`Cancelled detached worker ${workerId}/${runId}.`, "info");
+      const outcome = await cancelParentWorker(api, workerId, context, dependencies, pending, active, true);
+      context.ui.notify(
+        outcome === "not_active" ? `Worker ${workerId} has no active run.` : `Cancelled ${outcome} worker ${workerId}.`,
+        "info"
+      );
     }
   });
+
+  api.registerTool(defineTool({
+    name: "worker_control",
+    label: "Worker Control",
+    description: "Inspect and manage durable workers owned by this exact parent session. Status can list session workers or inspect one worker. Result returns the validated typed last handoff and acknowledges any pending completion delivery. Cancel performs authoritative run cleanup. Discard permanently removes one settled worker after explicit confirmation.",
+    promptSnippet: "Inspect exact-session workers, read and acknowledge typed results, cancel active runs, or discard settled workers with one worker_control action.",
+    promptGuidelines: [
+      "worker_control use: Use status to list or inspect exact-session workers; result to retrieve a settled typed handoff and acknowledge pending delivery; cancel for authoritative active-run cleanup; discard only for an intentionally retired settled worker.",
+      inputJsonSchemaGuideline("worker_control", WorkerControlParams),
+      outputJsonSchemaGuideline("worker_control", RetainedToolOutputSchemas.worker_control),
+      "worker_control constraints: Every action is restricted to the exact parent session. Result retrieval validates worker/run identity before acknowledging delivery. Cancel and discard reuse trusted lifecycle operations; cleanup uncertainty fails closed. Discard requires confirm:true and is permanent. Use shell_read with a returned job ID for logs. Only result content is provider-visible; details are internal."
+    ],
+    parameters: WorkerControlParams,
+    executionMode: "sequential",
+    async execute(_toolCallId, params, signal, _onUpdate, context): Promise<AgentToolResult<WorkerControlDetails>> {
+      throwIfAborted(signal);
+      if (params.action !== "discard" && params.confirm !== undefined) {
+        throw new Error(`worker_control ${params.action} does not accept confirm.`);
+      }
+      if (params.action === "status") {
+        const records = params.workerId
+          ? [readParentWorkerRecord(dependencies.roots, params.workerId, context)]
+          : listParentWorkerRecords(dependencies.roots, context);
+        const workers = records.map(workerControlSummary);
+        return {
+          content: [{ type: "text", text: workers.length > 0 ? records.map(formatWorkerRecord).join("\n\n") : "No managed workers belong to this parent session." }],
+          details: { action: "status", workers }
+        };
+      }
+      const workerId = params.workerId;
+      if (!workerId) throw new Error(`worker_control ${params.action} requires workerId.`);
+      if (params.action === "result") {
+        const result = readParentWorkerResult(workerId, context, dependencies);
+        const lastRun = result.record.lastRun;
+        if (!lastRun) throw new Error(`Worker ${params.workerId} has no settled result.`);
+        return {
+          content: [{ type: "text", text: formatWorkerControlResult(result.record, result.handoff) }],
+          details: {
+            action: "result",
+            workerId: result.record.workerId,
+            runId: lastRun.runId,
+            jobId: lastRun.jobId,
+            status: lastRun.status,
+            delivery: lastRun.delivery,
+            completionDelivery: resolveCompletionDelivery(lastRun.completionDelivery),
+            sessionId: result.record.sessionId,
+            workspaceRoot: result.record.workspaceRoot,
+            taskIds: [...result.record.taskIds],
+            route: { ...result.record.route },
+            resultFile: lastRun.resultFile,
+            stdoutLog: lastRun.stdoutLog,
+            stderrLog: lastRun.stderrLog,
+            error: lastRun.error,
+            handoff: result.handoff,
+            acknowledgedDelivery: result.acknowledgedDelivery
+          }
+        };
+      }
+      if (params.action === "cancel") {
+        const outcome = await cancelParentWorker(api, workerId, context, dependencies, pending, active, false);
+        const record = readParentWorkerRecord(dependencies.roots, workerId, context);
+        return {
+          content: [{ type: "text", text: outcome === "not_active" ? `Worker ${workerId} has no active run.\n\n${formatWorkerRecord(record)}` : `Cancelled ${outcome} worker ${workerId}.\n\n${formatWorkerRecord(record)}` }],
+          details: {
+            action: "cancel",
+            workerId: record.workerId,
+            outcome: outcome === "not_active" ? "not_active" : "cancelled",
+            status: record.status,
+            runId: record.activeRun?.runId ?? record.lastRun?.runId,
+            jobId: record.activeRun?.jobId ?? record.lastRun?.jobId
+          }
+        };
+      }
+      if (params.confirm !== true) throw new Error("worker_control discard requires confirm:true.");
+      const discarded = discardParentWorker(workerId, context, dependencies);
+      if (!discarded) throw new Error(`Worker ${workerId} became active before discard; cancel it first.`);
+      return {
+        content: [{ type: "text", text: `Discarded settled worker ${workerId}.` }],
+        details: { action: "discard", workerId, discarded: true }
+      };
+    }
+  }));
 
   api.registerTool(defineTool({
     name: "worker_run",
@@ -424,6 +472,213 @@ export function registerWorkerExtension(
   });
 }
 
+function readParentWorkerRecord(
+  roots: WorkerRoots,
+  workerId: string,
+  context: ExtensionContext
+): WorkerRecord {
+  const record = readWorkerRecord(workerPaths(roots, workerId).recordFile);
+  assertWorkerParentSession(record, context);
+  return record;
+}
+
+function listParentWorkerRecords(roots: WorkerRoots, context: ExtensionContext): WorkerRecord[] {
+  const parentSessionFile = context.sessionManager.getSessionFile();
+  if (!parentSessionFile) throw new Error("worker_control requires a persisted parent session.");
+  if (!existsSync(roots.stateRoot)) return [];
+  const records = readdirSync(roots.stateRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && isWorkerId(entry.name))
+    .map((entry) => workerPaths(roots, entry.name))
+    .filter((paths) => existsSync(paths.recordFile))
+    .map((paths) => readWorkerRecord(paths.recordFile))
+    .filter((record) => path.resolve(record.parentSessionFile) === path.resolve(parentSessionFile))
+    .sort((left, right) => left.workerId.localeCompare(right.workerId));
+  if (records.length > 100) {
+    throw new Error(`This parent session owns ${records.length} workers; worker_control status is limited to 100. Inspect one workerId at a time.`);
+  }
+  return records;
+}
+
+function readParentWorkerResult(
+  workerId: string,
+  context: ExtensionContext,
+  dependencies: WorkerExtensionDependencies
+): { record: WorkerRecord; handoff?: AcceptedWorkerHandoff; acknowledgedDelivery: boolean } {
+  const paths = workerPaths(dependencies.roots, workerId);
+  const record = readWorkerRecord(paths.recordFile);
+  assertWorkerParentSession(record, context);
+  if (record.activeRun) throw new Error(`Worker ${workerId} still has active run ${record.activeRun.runId}; wait for settlement or cancel it.`);
+  const lastRun = record.lastRun;
+  if (!lastRun) throw new Error(`Worker ${workerId} has no settled result.`);
+  let handoff: AcceptedWorkerHandoff | undefined;
+  if (lastRun.resultFile) {
+    handoff = readMatchingWorkerHandoff(lastRun.resultFile, workerId, lastRun.runId);
+  } else if (lastRun.status === "handed_off") {
+    throw new Error(`Worker ${workerId}/${lastRun.runId} is marked handed_off without a result file.`);
+  }
+
+  const observed = withWorkerOperationLock(paths, () => {
+    const current = readWorkerRecord(paths.recordFile);
+    assertWorkerParentSession(current, context);
+    if (current.activeRun || current.lastRun?.runId !== lastRun.runId) {
+      throw new Error(`Worker ${workerId} changed runs while its result was being observed; retry worker_control result.`);
+    }
+    if (current.lastRun.delivery !== "pending") return { record: current, acknowledgedDelivery: false };
+    const next: WorkerRecord = {
+      ...current,
+      lastRun: { ...current.lastRun, delivery: "delivered" },
+      updatedAt: dependencies.now().toISOString()
+    };
+    writeWorkerRecord(paths.recordFile, next);
+    return { record: next, acknowledgedDelivery: true };
+  });
+  return { record: observed.record, handoff, acknowledgedDelivery: observed.acknowledgedDelivery };
+}
+
+function discardParentWorker(
+  workerId: string,
+  context: ExtensionContext,
+  dependencies: WorkerExtensionDependencies
+): boolean {
+  const paths = workerPaths(dependencies.roots, workerId);
+  return withWorkerOperationLock(paths, () => {
+    const record = readWorkerRecord(paths.recordFile);
+    assertWorkerParentSession(record, context);
+    if (record.activeRun || readWorkerLease(paths.leaseFile)) return false;
+    if (record.container) dependencies.removeContainer(record.container);
+    rmSync(paths.workspaceRoot, { recursive: true, force: true });
+    rmSync(paths.stateDir, { recursive: true, force: true });
+    return true;
+  });
+}
+
+async function cancelParentWorker(
+  api: ExtensionAPI,
+  workerId: string,
+  context: ExtensionContext,
+  dependencies: WorkerExtensionDependencies,
+  pending: Map<string, PendingWorkerRun>,
+  active: Map<string, { runId: string; handle: ManagedWorkerHandle }>,
+  deliverCompletion: boolean
+): Promise<"not_active" | "queued" | "running" | "recovered" | "detached"> {
+  const paths = workerPaths(dependencies.roots, workerId);
+  const record = readWorkerRecord(paths.recordFile);
+  assertWorkerParentSession(record, context);
+  if (!record.activeRun) return "not_active";
+  const runId = record.activeRun.runId;
+  if (record.activeRun.status === "queued") {
+    const cancellation = withWorkerOperationLock(paths, () => {
+      const current = readWorkerRecord(paths.recordFile);
+      const lease = readWorkerLease(paths.leaseFile);
+      if (current.activeRun?.runId !== runId || current.activeRun.status !== "queued") {
+        throw new Error(`Worker ${workerId}/${runId} changed state before queued cancellation; retry the operation.`);
+      }
+      if (!lease || lease.workerId !== workerId || lease.runId !== runId || lease.parentPid !== process.pid) {
+        throw new Error(`Worker ${workerId}/${runId} is queued under another live parent and cannot be cancelled from this session.`);
+      }
+      pending.delete(runId);
+      if (current.container) {
+        try {
+          dependencies.removeContainer(current.container);
+        } catch (cause) {
+          writeWorkerRecord(paths.recordFile, {
+            ...current,
+            status: "running",
+            activeRun: {
+              ...current.activeRun,
+              status: "running",
+              hostProcessSettled: true,
+              recoveryError: cause instanceof Error ? cause.message : String(cause)
+            },
+            updatedAt: dependencies.now().toISOString()
+          });
+          throw cause;
+        }
+      }
+      const next = cancelledWorkerRecord(current, dependencies.now(), deliverCompletion);
+      writeWorkerRecord(paths.recordFile, next);
+      releaseWorkerLease(paths.leaseFile, workerId, runId);
+      return { previous: current, next };
+    });
+    if (deliverCompletion) {
+      sendWorkerCompletion(api, cancellation.next, queuedCancellationJob(paths, cancellation.previous, cancellation.next), undefined, undefined);
+    }
+    return "queued";
+  }
+  const attached = active.get(workerId);
+  if (attached?.runId === runId) {
+    const cleanupOwner = claimWorkerCancellationOwnership(paths, record, runId, dependencies);
+    if (!cleanupOwner) throw new Error(`Worker ${workerId}/${runId} cleanup is owned by another live parent.`);
+    try {
+      await cancelAttachedWorker(attached.handle, readWorkerRecord(paths.recordFile), paths, dependencies);
+      if (!finalizeRecoveredWorkerCancellation(api, paths, readWorkerRecord(paths.recordFile), runId, dependencies, true, cleanupOwner, deliverCompletion)) {
+        throw new Error(`Worker ${workerId}/${runId} changed state before cancellation finalization.`);
+      }
+    } catch (cause) {
+      const status = attached.handle.snapshot().status;
+      persistWorkerCleanupUncertainty(
+        paths,
+        runId,
+        cause instanceof Error ? cause.message : String(cause),
+        ["exited", "failed", "cancelled", "unknown"].includes(status),
+        dependencies
+      );
+      releaseWorkerCancellationOwnership(paths, runId, cleanupOwner, dependencies);
+      throw cause;
+    }
+    return "running";
+  }
+  if (record.activeRun.hostProcessSettled && record.activeRun.recoveryError) {
+    if (!ensureWorkerRecoveryLease(paths, record, runId, dependencies)) {
+      throw new Error(`Worker ${workerId}/${runId} cleanup is owned by another live parent.`);
+    }
+    const cleanupOwner = claimWorkerCancellationOwnership(paths, record, runId, dependencies);
+    if (!cleanupOwner) throw new Error(`Worker ${workerId}/${runId} cleanup is owned by another live parent.`);
+    try {
+      await settlePersistedWorkerShells(paths, workerId, runId, dependencies);
+    } catch (error) {
+      persistWorkerCleanupUncertainty(
+        paths,
+        runId,
+        error instanceof Error ? error.message : String(error),
+        true,
+        dependencies
+      );
+      releaseWorkerCancellationOwnership(paths, runId, cleanupOwner, dependencies);
+      throw error;
+    }
+    if (!finalizeRecoveredWorkerCancellation(api, paths, readWorkerRecord(paths.recordFile), runId, dependencies, true, cleanupOwner, deliverCompletion)) {
+      throw new Error(`Worker ${workerId}/${runId} changed state before cancellation finalization.`);
+    }
+    return "recovered";
+  }
+  const cleanupOwner = claimWorkerCancellationOwnership(paths, record, runId, dependencies);
+  if (!cleanupOwner) throw new Error(`Worker ${workerId}/${runId} cleanup is owned by another live parent.`);
+  try {
+    const current = readWorkerRecord(paths.recordFile);
+    if (isWorkerHostProcessSettled(current)) {
+      await settlePersistedWorkerShells(paths, workerId, runId, dependencies);
+    } else {
+      await cancelDetachedWorker(current, paths, dependencies);
+    }
+    if (!finalizeRecoveredWorkerCancellation(api, paths, readWorkerRecord(paths.recordFile), runId, dependencies, true, cleanupOwner, deliverCompletion)) {
+      throw new Error(`Worker ${workerId}/${runId} changed state before cancellation finalization.`);
+    }
+  } catch (cause) {
+    const current = readWorkerRecord(paths.recordFile);
+    persistWorkerCleanupUncertainty(
+      paths,
+      runId,
+      cause instanceof Error ? cause.message : String(cause),
+      isWorkerHostProcessSettled(current),
+      dependencies
+    );
+    releaseWorkerCancellationOwnership(paths, runId, cleanupOwner, dependencies);
+    throw cause;
+  }
+  return "detached";
+}
+
 function planWorkerRuns(
   inputs: WorkerRunInput["runs"],
   context: ExtensionContext,
@@ -455,9 +710,9 @@ function planWorkerRuns(
     }
     if (existing.activeRun) throw new Error(`Worker ${existing.workerId} already has active run ${existing.activeRun.runId}.`);
     if (existing.lastRun?.delivery === "pending") {
-      throw new Error(`Worker ${existing.workerId} completion delivery is still pending; inspect it and use /worker:ack before resuming.`);
+      throw new Error(`Worker ${existing.workerId} completion delivery is still pending; inspect it with worker_control result or use /worker:ack before resuming.`);
     }
-    validatePersonalTaskIds([...existing.taskIds, ...(input.addTaskIds ?? [])]);
+    validatePersonalTaskIds(uniqueStrings([...existing.taskIds, ...(input.addTaskIds ?? [])]));
     if (!existing.sessionFile) throw new Error(`Worker ${existing.workerId} has no forked session to resume.`);
     verifyWorkerSession({
       sessionFile: existing.sessionFile,
@@ -574,15 +829,17 @@ function prepareResumedWorker(
     const existing = readWorkerRecord(paths.recordFile);
     if (existing.activeRun) throw new Error(`Worker ${existing.workerId} became active before resume preparation.`);
     if (existing.lastRun?.delivery === "pending") {
-      throw new Error(`Worker ${existing.workerId} completion delivery became pending before resume preparation; inspect it and use /worker:ack.`);
+      throw new Error(`Worker ${existing.workerId} completion delivery became pending before resume preparation; inspect it with worker_control result or use /worker:ack.`);
     }
     if (path.resolve(existing.parentSessionFile) !== plan.parentSessionFile) {
       throw new Error(`Worker ${existing.workerId} parent session changed before resume preparation.`);
     }
     plan.existing = existing;
+    const taskIds = uniqueStrings([...existing.taskIds, ...(input.addTaskIds ?? [])]);
+    validatePersonalTaskIds(taskIds);
     const record: WorkerRecord = {
       ...existing,
-      taskIds: uniqueStrings([...existing.taskIds, ...(input.addTaskIds ?? [])]),
+      taskIds,
       status: "queued",
       activeRun: {
         runId,
@@ -1082,7 +1339,7 @@ function acknowledgeWorkerCompletionMessage(
     typeof details.runId !== "string"
   ) return;
   if (details.deliveryId !== workerCompletionDeliveryId(details.workerId, details.runId)) return;
-  if (!/^worker_[0-9]{14}_[a-zA-Z0-9-]{8}$/.test(details.workerId)) return;
+  if (!isWorkerId(details.workerId)) return;
 
   const paths = workerPaths(dependencies.roots, details.workerId);
   if (!existsSync(paths.recordFile)) return;
@@ -1362,7 +1619,7 @@ function readMatchingWorkerHandoff(
   return handoff;
 }
 
-function cancelledWorkerRecord(record: WorkerRecord, now: Date): WorkerRecord {
+function cancelledWorkerRecord(record: WorkerRecord, now: Date, deliverCompletion: boolean): WorkerRecord {
   if (!record.activeRun) return record;
   return {
     ...record,
@@ -1372,9 +1629,34 @@ function cancelledWorkerRecord(record: WorkerRecord, now: Date): WorkerRecord {
     lastRun: {
       runId: record.activeRun.runId,
       jobId: record.activeRun.jobId,
-      status: "cancelled"
+      status: "cancelled",
+      delivery: deliverCompletion ? "pending" : "delivered",
+      completionDelivery: resolveCompletionDelivery(record.activeRun.completionDelivery),
+      processStatus: "cancelled"
     },
     updatedAt: now.toISOString()
+  };
+}
+
+function queuedCancellationJob(paths: WorkerPaths, previous: WorkerRecord, cancelled: WorkerRecord): JobMeta {
+  const run = previous.activeRun;
+  if (!run) throw new Error(`Worker ${previous.workerId} has no queued run to report as cancelled.`);
+  const logDir = run.logDir ?? path.join(paths.stateDir, "runs", run.runId);
+  return {
+    jobId: run.jobId,
+    job_name: `worker ${previous.workerId}`,
+    command: `Cancelled queued worker ${previous.workerId}/${run.runId}`,
+    cwd: previous.workspaceRoot,
+    shell: process.execPath,
+    status: "cancelled",
+    startedAt: previous.updatedAt,
+    endedAt: cancelled.updatedAt,
+    notifyOnExit: false,
+    completionNotified: true,
+    logDir,
+    stdoutLog: run.stdoutLog ?? path.join(logDir, "stdout.log"),
+    stderrLog: run.stderrLog ?? path.join(logDir, "stderr.log"),
+    outputBytes: { stdout: 0, stderr: 0 }
   };
 }
 
@@ -1396,10 +1678,11 @@ function finalizeRecoveredWorkerCancellation(
   runId: string,
   dependencies: WorkerExtensionDependencies,
   requireCurrentLeaseOwner = true,
-  cleanupOwner?: string
-): void {
+  cleanupOwner?: string,
+  deliverCompletion = true
+): boolean {
   const run = record.activeRun;
-  if (!run || run.runId !== runId) return;
+  if (!run || run.runId !== runId) return false;
   const logDir = run.logDir ?? path.join(paths.stateDir, "runs", runId);
   const stdoutLog = run.stdoutLog ?? path.join(logDir, "stdout.log");
   const stderrLog = run.stderrLog ?? path.join(logDir, "stderr.log");
@@ -1438,7 +1721,7 @@ function finalizeRecoveredWorkerCancellation(
         runId,
         jobId: job.jobId,
         status: "cancelled",
-        delivery: "pending",
+        delivery: deliverCompletion ? "pending" : "delivered",
         completionDelivery: resolveCompletionDelivery(current.activeRun.completionDelivery),
         processStatus: "cancelled",
         pid: job.pid,
@@ -1453,7 +1736,8 @@ function finalizeRecoveredWorkerCancellation(
     releaseWorkerLease(paths.leaseFile, current.workerId, runId);
     return next;
   });
-  if (updated) sendWorkerCompletion(api, updated, job, undefined, run.recoveryError);
+  if (updated && deliverCompletion) sendWorkerCompletion(api, updated, job, undefined, run.recoveryError);
+  return updated !== undefined;
 }
 
 function claimWorkerCancellationOwnership(
@@ -1766,6 +2050,65 @@ function formatWorkerRunReceipt(value: WorkerRunReceipt): string {
   ].join("\n");
 }
 
+function workerControlSummary(record: WorkerRecord): WorkerControlSummary {
+  return {
+    workerId: record.workerId,
+    status: record.status,
+    sessionId: record.sessionId,
+    sessionFile: record.sessionFile,
+    workspaceRoot: record.workspaceRoot,
+    taskIds: [...record.taskIds],
+    route: { ...record.route },
+    container: record.container ? {
+      name: record.container.name,
+      containerId: record.container.containerId,
+      runId: record.container.runId
+    } : undefined,
+    activeRun: record.activeRun ? {
+      runId: record.activeRun.runId,
+      jobId: record.activeRun.jobId,
+      status: record.activeRun.status,
+      completionDelivery: resolveCompletionDelivery(record.activeRun.completionDelivery),
+      recoveryError: record.activeRun.recoveryError,
+      stdoutLog: record.activeRun.stdoutLog,
+      stderrLog: record.activeRun.stderrLog
+    } : undefined,
+    lastRun: record.lastRun ? {
+      runId: record.lastRun.runId,
+      jobId: record.lastRun.jobId,
+      status: record.lastRun.status,
+      delivery: record.lastRun.delivery,
+      completionDelivery: resolveCompletionDelivery(record.lastRun.completionDelivery),
+      resultFile: record.lastRun.resultFile,
+      stdoutLog: record.lastRun.stdoutLog,
+      stderrLog: record.lastRun.stderrLog,
+      error: record.lastRun.error
+    } : undefined,
+    updatedAt: record.updatedAt
+  };
+}
+
+function formatWorkerControlResult(record: WorkerRecord, handoff: AcceptedWorkerHandoff | undefined): string {
+  const lastRun = record.lastRun;
+  if (!lastRun) throw new Error(`Worker ${record.workerId} has no settled result.`);
+  return [
+    `worker result: ${record.workerId}/${lastRun.runId}`,
+    `job: ${lastRun.jobId}`,
+    `semantic: ${lastRun.status}`,
+    `delivery: ${lastRun.delivery ?? "not required"} · ${resolveCompletionDelivery(lastRun.completionDelivery)}`,
+    `tasks: ${record.taskIds.join(", ")}`,
+    `route: ${record.route.provider}/${record.route.model}:${record.route.thinkingLevel}`,
+    handoff ? `handoff: ${handoff.handoff.state} — ${handoff.handoff.summary}` : undefined,
+    handoff ? `handoff_json: ${JSON.stringify(handoff.handoff)}` : undefined,
+    lastRun.error ? `error: ${lastRun.error}` : undefined,
+    `workspace: ${record.workspaceRoot}`,
+    `session: ${record.sessionId}`,
+    lastRun.resultFile ? `result_file: ${lastRun.resultFile}` : undefined,
+    lastRun.stdoutLog ? `stdout_log: ${lastRun.stdoutLog}` : undefined,
+    lastRun.stderrLog ? `stderr_log: ${lastRun.stderrLog}` : undefined
+  ].filter((line): line is string => line !== undefined).join("\n");
+}
+
 function formatWorkerRecord(record: WorkerRecord): string {
   return [
     `Worker ${record.workerId}: ${record.status}`,
@@ -1789,6 +2132,9 @@ function uniqueStrings(values: readonly string[]): string[] {
 }
 
 function validatePersonalTaskIds(taskIds: readonly string[]): void {
+  if (taskIds.length > MAX_WORKER_TASK_IDS) {
+    throw new Error(`Managed workers support at most ${MAX_WORKER_TASK_IDS} assigned task IDs.`);
+  }
   const invalid = taskIds.find((taskId) => !/^personal-[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)*$/.test(taskId.trim()));
   if (invalid) throw new Error(`Managed worker task IDs must use the central personal prefix: ${invalid}`);
 }

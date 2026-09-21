@@ -6,7 +6,10 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import type { Api, Model } from "@earendil-works/pi-ai";
+import { Check } from "typebox/value";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { RetainedToolOutputSchemas } from "../extensions/_shared/tool-output.js";
+import { MAX_WORKER_TASK_IDS } from "../extensions/_shared/worker-contract.js";
 import { startManagedAsyncJob, type JobMeta } from "../extensions/async-shell/index.js";
 import type { WorkerContainerReference } from "../extensions/_shared/worker-container.js";
 import { registerWorkerExtension } from "../extensions/worker/index.js";
@@ -479,7 +482,7 @@ test("worker_run resume reopens only the exact worker session and captures fresh
       sessionFile: forked.sessionFile,
       parentSessionFile,
       workspaceRoot: paths.workspaceRoot,
-      taskIds: ["personal-existing"],
+      taskIds: Array.from({ length: MAX_WORKER_TASK_IDS - 1 }, (_, index) => `personal-existing.${index + 1}`),
       route: { provider: "openai-codex", model: "gpt-test", thinkingLevel: "xhigh" },
       status: "handed_off",
       lastRun: { runId: "run-old", jobId: "job-old", status: "handed_off" },
@@ -511,8 +514,10 @@ test("worker_run resume reopens only the exact worker session and captures fresh
       runs: [{ kind: "resume", workerId, message: "Inspect the fresh parent context.", addTaskIds: ["personal-added"] }]
     } as never, undefined, undefined, context);
     const receipt = (result.details as { runs: Array<{ runId: string; jobId: string; sessionFile?: string; taskIds: string[] }> }).runs[0];
+    assert.equal(Check(RetainedToolOutputSchemas.worker_run, result), true);
     assert.equal(receipt.sessionFile, forked.sessionFile);
-    assert.deepEqual(receipt.taskIds, ["personal-existing", "personal-added"]);
+    assert.equal(receipt.taskIds.length, MAX_WORKER_TASK_IDS);
+    assert.equal(receipt.taskIds.at(-1), "personal-added");
 
     await appendFile(parentSessionFile, `${JSON.stringify({ type: "custom", id: "parent-fresh", parentId: "parent-before", timestamp: "2026-09-10T19:30:59.000Z", customType: "FRESH_PARENT_MARKER", data: {} })}\n`);
     await api.emit("turn_end", {}, context);
@@ -533,7 +538,22 @@ test("worker_run resume reopens only the exact worker session and captures fresh
     await writeHostSettlement(launch.resultFile, workerId, receipt.runId, forked.sessionId);
     completion.resolve(completedJob(launch.jobId, parentCwd));
     await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.equal(readWorkerRecord(paths.recordFile).status, "handed_off");
+    const completed = readWorkerRecord(paths.recordFile);
+    assert.equal(completed.status, "handed_off");
+    assert.ok(completed.lastRun);
+    writeWorkerRecord(paths.recordFile, {
+      ...completed,
+      lastRun: { ...completed.lastRun, delivery: "delivered" }
+    });
+    await assert.rejects(
+      tool.execute("call-resume-over-limit", {
+        runs: [{ kind: "resume", workerId, message: "One task too many.", addTaskIds: ["personal-over-limit"] }]
+      } as never, undefined, undefined, context),
+      /at most 32 assigned task IDs/
+    );
+    const afterRejectedResume = readWorkerRecord(paths.recordFile);
+    assert.equal(afterRejectedResume.taskIds.length, MAX_WORKER_TASK_IDS);
+    assert.equal(afterRejectedResume.activeRun, undefined);
   });
 });
 
@@ -1008,7 +1028,7 @@ test("session restart does not redeliver an uncertain worker completion and expl
   });
 });
 
-test("worker:cancel terminates and settles an attached running host process", async () => {
+test("worker_control cancels and settles an attached running host without duplicate completion delivery", async () => {
   await withTempDir(async (directory) => {
     const parentCwd = path.join(directory, "parent");
     const parentSessionFile = path.join(directory, "parent.jsonl");
@@ -1046,12 +1066,15 @@ test("worker:cancel terminates and settles an attached running host process", as
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     assert.ok(existsSync(attachedMarker));
-    const cancel = api.commands.get("worker:cancel");
-    assert.ok(cancel);
-    await cancel.handler(workerId, context);
+    const control = api.tools.find((candidate) => candidate.name === "worker_control");
+    assert.ok(control?.execute);
+    const cancellation = await control.execute("control-cancel-attached", { action: "cancel", workerId } as never, undefined, undefined, context);
+    assert.equal(Check(RetainedToolOutputSchemas.worker_control, cancellation), true);
     const record = readWorkerRecord(workerPaths(roots, workerId).recordFile);
     assert.equal(record.status, "cancelled");
     assert.equal(record.activeRun, undefined);
+    assert.equal(record.lastRun?.delivery, "delivered");
+    assert.equal(api.messages.length, 0, "the synchronous control result already observes cancellation");
   });
 });
 
@@ -1291,6 +1314,195 @@ test("worker:cancel removes a queued resume container and makes cleanup failure 
   });
 });
 
+test("worker_control lists exact-session workers and validates a typed result before acknowledging delivery", async () => {
+  await withTempDir(async (directory) => {
+    const parentCwd = path.join(directory, "parent");
+    const parentSessionFile = path.join(directory, "parent.jsonl");
+    await mkdir(parentCwd);
+    await writeFile(parentSessionFile, `${JSON.stringify({ type: "session", version: 3, id: "parent-session", timestamp: "2026-09-10T19:29:00.000Z", cwd: parentCwd })}\n`);
+    const roots = { stateRoot: path.join(directory, "workers"), workspaceRoot: path.join(directory, "workspaces") };
+    const workerId = "worker_20260910190000_control1";
+    const runId = "run_20260910193000_control1";
+    const paths = workerPaths(roots, workerId);
+    provisionWorkerPaths(paths);
+    const resultFile = path.join(paths.stateDir, "runs", runId, "result.json");
+    await mkdir(path.dirname(resultFile), { recursive: true });
+    await writeFile(resultFile, `${JSON.stringify({
+      version: 1,
+      workerId,
+      runId,
+      acceptedAt: "2026-09-10T19:31:00.000Z",
+      handoff: {
+        state: "ready_for_review",
+        summary: "control result",
+        taskUpdates: [{ taskId: "personal-control", update: "implemented" }],
+        checks: [{ cwd: paths.workspaceRoot, command: "npm test", outcome: "passed" }]
+      }
+    })}\n`);
+    writeWorkerRecord(paths.recordFile, {
+      version: WORKER_RECORD_VERSION,
+      workerId,
+      sessionId: "worker-session-control",
+      sessionFile: path.join(paths.sessionDir, "session.jsonl"),
+      parentSessionFile,
+      workspaceRoot: paths.workspaceRoot,
+      taskIds: Array.from({ length: MAX_WORKER_TASK_IDS }, (_, index) => `personal-control.${index + 1}`),
+      route: { provider: "openai-codex", model: "gpt-test", thinkingLevel: "xhigh" },
+      status: "handed_off",
+      lastRun: {
+        runId,
+        jobId: "job_20260910193000_control1",
+        status: "handed_off",
+        resultFile,
+        delivery: "pending",
+        completionDelivery: "followUp",
+        stdoutLog: path.join(path.dirname(resultFile), "stdout.log"),
+        stderrLog: path.join(path.dirname(resultFile), "stderr.log")
+      },
+      updatedAt: "2026-09-10T19:31:01.000Z"
+    });
+    const otherWorkerId = "worker_20260910190000_other002";
+    const otherPaths = workerPaths(roots, otherWorkerId);
+    provisionWorkerPaths(otherPaths);
+    writeWorkerRecord(otherPaths.recordFile, {
+      version: WORKER_RECORD_VERSION,
+      workerId: otherWorkerId,
+      sessionId: "worker-session-other",
+      parentSessionFile: path.join(directory, "other-parent.jsonl"),
+      workspaceRoot: otherPaths.workspaceRoot,
+      taskIds: ["personal-other"],
+      route: { provider: "openai-codex", model: "gpt-test", thinkingLevel: "xhigh" },
+      status: "cancelled",
+      updatedAt: "2026-09-10T19:31:01.000Z"
+    });
+
+    const api = fakeApi();
+    const context = parentContext(parentCwd, parentSessionFile);
+    registerWorkerExtension(api, { roots, now: () => new Date("2026-09-10T19:32:00.000Z") });
+    const control = api.tools.find((candidate) => candidate.name === "worker_control");
+    assert.ok(control?.execute);
+
+    const status = await control.execute("control-status", { action: "status" } as never, undefined, undefined, context);
+    const statusDetails = status.details as { action: string; workers: Array<{ workerId: string }> };
+    assert.equal(Check(RetainedToolOutputSchemas.worker_control, status), true);
+    assert.equal(statusDetails.action, "status");
+    assert.deepEqual(statusDetails.workers.map((worker) => worker.workerId), [workerId]);
+
+    const result = await control.execute("control-result", { action: "result", workerId } as never, undefined, undefined, context);
+    const resultDetails = result.details as { action: string; acknowledgedDelivery: boolean; delivery?: string; handoff?: { handoff: { summary: string } } };
+    assert.equal(Check(RetainedToolOutputSchemas.worker_control, result), true);
+    assert.equal(resultDetails.action, "result");
+    assert.equal(resultDetails.acknowledgedDelivery, true);
+    assert.equal(resultDetails.handoff?.handoff.summary, "control result");
+    assert.equal(resultDetails.delivery, "delivered");
+    assert.match(JSON.stringify(result.content), /control result/);
+    assert.equal(readWorkerRecord(paths.recordFile).lastRun?.delivery, "delivered");
+    const observedAgain = await control.execute("control-result-again", { action: "result", workerId } as never, undefined, undefined, context);
+    assert.equal((observedAgain.details as { acknowledgedDelivery: boolean }).acknowledgedDelivery, false);
+
+    await assert.rejects(
+      async () => control.execute("control-wrong-parent", { action: "status", workerId } as never, undefined, undefined, parentContext(parentCwd, path.join(directory, "other-parent.jsonl"))),
+      /different parent session/
+    );
+  });
+});
+
+test("worker_control refuses a poisoned handoff without acknowledging delivery", async () => {
+  await withTempDir(async (directory) => {
+    const parentCwd = path.join(directory, "parent");
+    const parentSessionFile = path.join(directory, "parent.jsonl");
+    await mkdir(parentCwd);
+    await writeFile(parentSessionFile, "parent\n");
+    const roots = { stateRoot: path.join(directory, "workers"), workspaceRoot: path.join(directory, "workspaces") };
+    const workerId = "worker_20260910190000_poison01";
+    const runId = "run_20260910193000_poison01";
+    const paths = workerPaths(roots, workerId);
+    provisionWorkerPaths(paths);
+    const resultFile = path.join(paths.stateDir, "runs", runId, "result.json");
+    await mkdir(path.dirname(resultFile), { recursive: true });
+    await writeFile(resultFile, `${JSON.stringify({
+      version: 1,
+      workerId: "worker_20260910190000_wrong001",
+      runId,
+      acceptedAt: "2026-09-10T19:31:00.000Z",
+      handoff: { state: "checkpoint", summary: "poisoned", taskUpdates: [] }
+    })}\n`);
+    writeWorkerRecord(paths.recordFile, {
+      version: WORKER_RECORD_VERSION,
+      workerId,
+      sessionId: "worker-session-poison",
+      parentSessionFile,
+      workspaceRoot: paths.workspaceRoot,
+      taskIds: ["personal-poison"],
+      route: { provider: "openai-codex", model: "gpt-test", thinkingLevel: "xhigh" },
+      status: "handed_off",
+      lastRun: { runId, jobId: "job_20260910193000_poison01", status: "handed_off", resultFile, delivery: "pending" },
+      updatedAt: "2026-09-10T19:31:01.000Z"
+    });
+    const api = fakeApi();
+    registerWorkerExtension(api, { roots });
+    const control = api.tools.find((candidate) => candidate.name === "worker_control");
+    assert.ok(control?.execute);
+    await assert.rejects(
+      async () => control.execute("control-poison", { action: "result", workerId } as never, undefined, undefined, parentContext(parentCwd, parentSessionFile)),
+      /handoff identity mismatch/
+    );
+    assert.equal(readWorkerRecord(paths.recordFile).lastRun?.delivery, "pending");
+  });
+});
+
+test("worker_control cancels queued work and discards the settled worker", async () => {
+  await withTempDir(async (directory) => {
+    const parentCwd = path.join(directory, "parent");
+    const parentSessionFile = path.join(directory, "parent.jsonl");
+    await mkdir(parentCwd);
+    await writeFile(parentSessionFile, `${JSON.stringify({ type: "session", version: 3, id: "parent-session", timestamp: "2026-09-10T19:29:00.000Z", cwd: parentCwd })}\n`);
+    const context = parentContext(parentCwd, parentSessionFile);
+    const api = fakeApi();
+    const roots = { stateRoot: path.join(directory, "workers"), workspaceRoot: path.join(directory, "workspaces") };
+    let launches = 0;
+    registerWorkerExtension(api, {
+      roots,
+      now: () => new Date("2026-09-10T19:30:00.000Z"),
+      random: () => "22222222-2222-4222-8222-222222222222",
+      launch: () => {
+        launches += 1;
+        throw new Error("cancelled queued run must not launch");
+      }
+    });
+    const run = api.tools.find((candidate) => candidate.name === "worker_run");
+    const control = api.tools.find((candidate) => candidate.name === "worker_control");
+    assert.ok(run?.execute);
+    assert.ok(control?.execute);
+    const started = await run.execute("control-new", {
+      runs: [{ kind: "new", taskIds: ["personal-control"], completionDelivery: "followUp" }]
+    } as never, undefined, undefined, context);
+    const workerId = (started.details as { runs: Array<{ workerId: string }> }).runs[0].workerId;
+
+    await assert.rejects(
+      async () => control.execute("control-discard-active", { action: "discard", workerId, confirm: true } as never, undefined, undefined, context),
+      /became active before discard/
+    );
+    const cancelled = await control.execute("control-cancel", { action: "cancel", workerId } as never, undefined, undefined, context);
+    assert.equal(Check(RetainedToolOutputSchemas.worker_control, cancelled), true);
+    assert.equal((cancelled.details as { outcome: string }).outcome, "cancelled");
+    const cancelledRecord = readWorkerRecord(workerPaths(roots, workerId).recordFile);
+    assert.equal(cancelledRecord.lastRun?.delivery, "delivered");
+    assert.equal(cancelledRecord.lastRun?.completionDelivery, "followUp");
+    assert.equal(api.messages.length, 0, "the synchronous control result observes queued cancellation without another model message");
+    await api.emit("turn_end", {}, context);
+    assert.equal(launches, 0);
+    assert.equal(api.messages.length, 0);
+    assert.equal(readWorkerRecord(workerPaths(roots, workerId).recordFile).status, "cancelled");
+
+    const discarded = await control.execute("control-discard", { action: "discard", workerId, confirm: true } as never, undefined, undefined, context);
+    assert.equal(Check(RetainedToolOutputSchemas.worker_control, discarded), true);
+    assert.equal((discarded.details as { discarded: boolean }).discarded, true);
+    assert.equal(existsSync(workerPaths(roots, workerId).workspaceRoot), false);
+    assert.equal(existsSync(workerPaths(roots, workerId).stateDir), false);
+  });
+});
+
 test("worker:cancel removes a queued run before it can fork or launch", async () => {
   await withTempDir(async (directory) => {
     const parentCwd = path.join(directory, "parent");
@@ -1319,12 +1531,15 @@ test("worker:cancel removes a queued run before it can fork or launch", async ()
     const cancel = api.commands.get("worker:cancel");
     assert.ok(cancel);
     await cancel.handler(receipt.workerId, context);
+    assert.equal(api.messages.length, 1, "user cancellation keeps normal completion delivery");
     await api.emit("turn_end", {}, context);
 
     const record = readWorkerRecord(workerPaths(roots, receipt.workerId).recordFile);
     assert.equal(record.status, "cancelled");
     assert.equal(record.activeRun, undefined);
     assert.equal(record.lastRun?.status, "cancelled");
+    assert.equal(record.lastRun?.delivery, "pending");
+    assert.equal(record.lastRun?.completionDelivery, "steer");
     assert.equal(launches, 0);
 
     const discard = api.commands.get("worker:discard");

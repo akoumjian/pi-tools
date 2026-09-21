@@ -60,6 +60,7 @@ Tools (LLM-callable):
 
 - `shell_start`, `shell_status`, `shell_read`, `shell_cancel` — async shell jobs
 - `worker_run` — start or exactly resume durable private-workspace Pi workers
+- `worker_control` — list/status exact-session workers, retrieve and acknowledge typed results, cancel runs, or discard settled workers
 - `read_many`, `search_many`, `write_many`, `edit_many` — batch-native file tools (`read_many` delivers UTF-8 text and supported filesystem images)
 - `apply_reviewed_mutation` — cheap re-apply of a previously-reviewed edit/write
 - `searxng_search` — search through a configured SearXNG instance
@@ -73,7 +74,7 @@ Commands:
 - `/scrollback:status`, `/tmux-scrollback:status`
 - `/safety:setup`, `/safety:status`, `/safety:model`, `/safety:toggle`
 - `/async:status`, `/async:view [job-id] [--stream both|stdout|stderr] [--tail 1..500] [--follow]`
-- `/worker:status <worker-id>`, `/worker:view <worker-id> [...]`, `/worker:cancel <worker-id>`, `/worker:discard <worker-id> --confirm`
+- `/worker:status <worker-id>`, `/worker:view <worker-id> [...]`, `/worker:ack <worker-id>`, `/worker:cancel <worker-id>`, `/worker:discard <worker-id> --confirm`
 - `/notify [on|off|status|test]`
 - `/native:status`
 - `/retry`
@@ -144,7 +145,7 @@ Each extension below documents what it does, what it provides, and how to set it
 
 **Purpose.** Start durable engineering workers as exact forks of the completed parent Pi session, or resume one exact recorded worker session with a fresh mode-`0400` parent-context snapshot. Each worker has stable identity, one private multi-repository workspace, a fixed provider/model/thinking route, and ephemeral asynchronous runs.
 
-**Provides.** `worker_run`; `/worker:status <worker-id>`; `/worker:view <worker-id> [...]`; `/worker:ack <worker-id>`; `/worker:cancel <worker-id>`; `/worker:discard <worker-id> --confirm`. Worker RPC exposes only normal async-shell tools, exact-route `worker_task_update`, and typed quiescent `worker_handoff`. Exclusive run and lifecycle-operation locks, trusted process/settlement markers, cooperative command-group cancellation, exact Docker container cleanup, fail-closed survivor sweeps, and same-session completion receipts and explicit uncertain-delivery acknowledgment protect lifecycle recovery without automatic reload replay. Each worker identity gets one Linux container that is authoritatively stopped after successful handoff and restarted for resume, with all of `~/Code` read-only and only its private workspace read-write; provider credentials, host control sockets/state, sibling workspaces, and central Beads stay on the trusted macOS host.
+**Provides.** `worker_run`; model-facing `worker_control` actions `status`, `result`, `cancel`, and confirmed `discard`; `/worker:status <worker-id>`; `/worker:view <worker-id> [...]`; `/worker:ack <worker-id>`; `/worker:cancel <worker-id>`; `/worker:discard <worker-id> --confirm`. `worker_control` is exact-parent-session scoped; `result` validates the typed handoff before acknowledging pending delivery, and `discard` remains safety-reviewed. Worker RPC exposes only normal async-shell tools, exact-route `worker_task_update`, and typed quiescent `worker_handoff`. Exclusive run and lifecycle-operation locks, trusted process/settlement markers, cooperative command-group cancellation, exact Docker container cleanup, fail-closed survivor sweeps, and same-session completion receipts and explicit uncertain-delivery acknowledgment protect lifecycle recovery without automatic reload replay. Each worker identity gets one Linux container that is authoritatively stopped after successful handoff and restarted for resume, with all of `~/Code` read-only and only its private workspace read-write; provider credentials, host control sockets/state, sibling workspaces, and central Beads stay on the trusted macOS host.
 
 **Setup.** macOS, Node, Pi, a running Docker Desktop/Engine plus CLI, the pinned worker image documented in the full guide, and a correctly routed central `bd` executable. The parent remains responsible for grounding, review, integration, promotion, and task closure.
 

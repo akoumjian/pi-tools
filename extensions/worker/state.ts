@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { isAsyncJobProcessAlive } from "../_shared/async-job.js";
+import { isWorkerId } from "../_shared/worker-id.js";
 import type { CompletionDelivery } from "../_shared/completion-delivery.js";
 import type { WorkerContainerReference } from "../_shared/worker-container.js";
 
@@ -292,7 +293,5 @@ function createScopedId(prefix: string, now: Date, random: string): string {
 }
 
 function assertWorkerId(workerId: string): void {
-  if (!/^worker_[0-9]{14}_[a-zA-Z0-9-]{8}$/.test(workerId)) {
-    throw new Error(`Invalid worker id: ${workerId}`);
-  }
+  if (!isWorkerId(workerId)) throw new Error(`Invalid worker id: ${workerId}`);
 }

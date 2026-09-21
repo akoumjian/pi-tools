@@ -177,6 +177,13 @@ const resultContracts = {
     details: "internal structured receipts and asynchronous worker process/handoff records",
     content: "all durable receipt identities plus asynchronous typed handoff JSON, process state, errors, and canonical log paths"
   },
+  worker_control: {
+    success: "content reports exact-session status, validated typed result and observation state, cancellation settlement, or confirmed discard",
+    progress: "not applicable: one bounded exact-session lifecycle action settles before return",
+    error: "unknown/cross-session workers, active result reads, poisoned handoffs, cleanup uncertainty, and unsafe discard remain model-visible",
+    details: "internal bounded worker summaries and validated handoff/control outcomes",
+    content: "worker/run/job/session/workspace/task/route state, full typed handoff JSON, errors, canonical result/log paths, and cleanup outcome"
+  },
   orchestrate: {
     success: "content reports every task id/role/status/routes; completed tasks add model/thinking/duration/tool calls/output and writer worktree/review data",
     progress: "partial content reports completed/total tasks and bounded writer/provider/git-setup status",

@@ -1,5 +1,6 @@
 import { Type, type TSchema } from "@earendil-works/pi-ai";
 import { CompletionDeliverySchema } from "./completion-delivery.js";
+import { AcceptedWorkerHandoffSchema, MAX_WORKER_TASK_IDS } from "./worker-contract.js";
 
 const NonNegativeIntegerSchema = Type.Integer({ minimum: 0 });
 const PositiveIntegerSchema = Type.Integer({ minimum: 1 });
@@ -556,7 +557,7 @@ const WorkerRunReceiptSchema = Type.Object({
   sessionId: Type.String({ minLength: 1 }),
   sessionFile: Type.Optional(Type.String({ minLength: 1 })),
   workspaceRoot: Type.String({ minLength: 1 }),
-  taskIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
+  taskIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: MAX_WORKER_TASK_IDS }),
   provider: Type.String({ minLength: 1 }),
   model: Type.String({ minLength: 1 }),
   thinkingLevel: Type.String({ minLength: 1 }),
@@ -567,6 +568,95 @@ const WorkerRunReceiptSchema = Type.Object({
 const WorkerRunDetailsSchema = Type.Object({
   runs: Type.Array(WorkerRunReceiptSchema, { minItems: 1, maxItems: 8 })
 }, { additionalProperties: false });
+
+const WorkerStatusSchema = Type.Union([
+  Type.Literal("queued"),
+  Type.Literal("running"),
+  Type.Literal("handed_off"),
+  Type.Literal("failed"),
+  Type.Literal("cancelled")
+]);
+
+const WorkerRouteSchema = Type.Object({
+  provider: Type.String({ minLength: 1 }),
+  model: Type.String({ minLength: 1 }),
+  thinkingLevel: Type.String({ minLength: 1 })
+}, { additionalProperties: false });
+
+const WorkerControlSummarySchema = Type.Object({
+  workerId: Type.String({ minLength: 1 }),
+  status: WorkerStatusSchema,
+  sessionId: Type.String({ minLength: 1 }),
+  sessionFile: Type.Optional(Type.String({ minLength: 1 })),
+  workspaceRoot: Type.String({ minLength: 1 }),
+  taskIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: MAX_WORKER_TASK_IDS }),
+  route: WorkerRouteSchema,
+  container: Type.Optional(Type.Object({
+    name: Type.String({ minLength: 1 }),
+    containerId: Type.Optional(Type.String({ minLength: 1 })),
+    runId: Type.String({ minLength: 1 })
+  }, { additionalProperties: false })),
+  activeRun: Type.Optional(Type.Object({
+    runId: Type.String({ minLength: 1 }),
+    jobId: Type.String({ minLength: 1 }),
+    status: Type.Union([Type.Literal("queued"), Type.Literal("running")]),
+    completionDelivery: CompletionDeliverySchema,
+    recoveryError: Type.Optional(Type.String()),
+    stdoutLog: Type.Optional(Type.String({ minLength: 1 })),
+    stderrLog: Type.Optional(Type.String({ minLength: 1 }))
+  }, { additionalProperties: false })),
+  lastRun: Type.Optional(Type.Object({
+    runId: Type.String({ minLength: 1 }),
+    jobId: Type.String({ minLength: 1 }),
+    status: Type.Union([Type.Literal("handed_off"), Type.Literal("failed"), Type.Literal("cancelled")]),
+    delivery: Type.Optional(Type.Union([Type.Literal("pending"), Type.Literal("delivered")])),
+    completionDelivery: CompletionDeliverySchema,
+    resultFile: Type.Optional(Type.String({ minLength: 1 })),
+    stdoutLog: Type.Optional(Type.String({ minLength: 1 })),
+    stderrLog: Type.Optional(Type.String({ minLength: 1 })),
+    error: Type.Optional(Type.String())
+  }, { additionalProperties: false })),
+  updatedAt: Type.String({ minLength: 1 })
+}, { additionalProperties: false });
+
+const WorkerControlDetailsSchema = Type.Union([
+  Type.Object({
+    action: Type.Literal("status"),
+    workers: Type.Array(WorkerControlSummarySchema, { maxItems: 100 })
+  }, { additionalProperties: false }),
+  Type.Object({
+    action: Type.Literal("result"),
+    workerId: Type.String({ minLength: 1 }),
+    runId: Type.String({ minLength: 1 }),
+    jobId: Type.String({ minLength: 1 }),
+    status: Type.Union([Type.Literal("handed_off"), Type.Literal("failed"), Type.Literal("cancelled")]),
+    delivery: Type.Optional(Type.Union([Type.Literal("pending"), Type.Literal("delivered")])),
+    completionDelivery: CompletionDeliverySchema,
+    sessionId: Type.String({ minLength: 1 }),
+    workspaceRoot: Type.String({ minLength: 1 }),
+    taskIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: MAX_WORKER_TASK_IDS }),
+    route: WorkerRouteSchema,
+    resultFile: Type.Optional(Type.String({ minLength: 1 })),
+    stdoutLog: Type.Optional(Type.String({ minLength: 1 })),
+    stderrLog: Type.Optional(Type.String({ minLength: 1 })),
+    error: Type.Optional(Type.String()),
+    handoff: Type.Optional(AcceptedWorkerHandoffSchema),
+    acknowledgedDelivery: Type.Boolean()
+  }, { additionalProperties: false }),
+  Type.Object({
+    action: Type.Literal("cancel"),
+    workerId: Type.String({ minLength: 1 }),
+    outcome: Type.Union([Type.Literal("cancelled"), Type.Literal("not_active")]),
+    status: WorkerStatusSchema,
+    runId: Type.Optional(Type.String({ minLength: 1 })),
+    jobId: Type.Optional(Type.String({ minLength: 1 }))
+  }, { additionalProperties: false }),
+  Type.Object({
+    action: Type.Literal("discard"),
+    workerId: Type.String({ minLength: 1 }),
+    discarded: Type.Literal(true)
+  }, { additionalProperties: false })
+]);
 
 const ReconcileDetailsSchema = Type.Union([
   Type.Object({
@@ -602,6 +692,7 @@ export const RetainedToolOutputSchemas = {
   web_fetch_many: finalResultSchema(WebFetchManyDetailsSchema),
   document_parse: finalResultSchema(DocumentParseDetailsSchema),
   worker_run: finalResultSchema(WorkerRunDetailsSchema),
+  worker_control: finalResultSchema(WorkerControlDetailsSchema),
   orchestrate: finalResultSchema(OrchestrateDetailsSchema),
   reconcile: finalResultSchema(ReconcileDetailsSchema)
 } satisfies Record<string, TSchema>;

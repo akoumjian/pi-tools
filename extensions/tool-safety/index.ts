@@ -9,6 +9,7 @@ import { formatConfigPath, piToolsConfigCandidates, readPiToolsJsonConfig, readP
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 import { formatModelName, normalizeThinkingLevel, parseOptionalModelThinkingPair, resolveExtensionModel, type ExtensionModelRegistry } from "../_shared/model-spec.js";
 import { guidedModelSetupUsage, parseGuidedModelSetupArgs, readSetupGuidance } from "../_shared/setup-command.js";
+import { isWorkerId } from "../_shared/worker-id.js";
 
 type SafetyAction = "allow" | "review" | "deny";
 type SafetyRisk = "low" | "medium" | "high";
@@ -331,6 +332,10 @@ export function applyReviewCriteria(
   if (criteria === "conservative" || decision.action === "deny") {
     return decision;
   }
+  const eventInput: unknown = event.input;
+  if (getToolName(event) === "worker_control" && isRecord(eventInput) && eventInput["action"] === "discard") {
+    return decision;
+  }
 
   const environmentCommands = getShellCommands(event).flatMap(splitShellOperations).filter(isEnvironmentMutationCommand);
   if (environmentCommands.length === 0) {
@@ -593,6 +598,10 @@ function evaluateToolCall(event: ToolCallEvent, context: ExtensionContext): Safe
     };
   }
 
+  if (toolName === "worker_control") {
+    return evaluateWorkerControl(input);
+  }
+
   if (["write", "edit"].includes(toolName)) {
     return evaluatePathMutation(input, context, toolName);
   }
@@ -647,6 +656,74 @@ function evaluateToolCall(event: ToolCallEvent, context: ExtensionContext): Safe
     reason: `Unknown or third-party tool '${toolName}' requires review.`,
     ruleId: "unknown-tool",
     tags: ["unknown-tool"]
+  };
+}
+
+export function evaluateWorkerControl(input: unknown): SafetyDecision {
+  if (!isRecord(input) || typeof input.action !== "string") {
+    return {
+      action: "review",
+      risk: "medium",
+      reason: "Malformed worker_control input requires review.",
+      ruleId: "worker-control-shape-review",
+      tags: ["worker", "lifecycle"]
+    };
+  }
+  const allowedKeys = input.action === "status" ? new Set(["action", "workerId"]) :
+    input.action === "discard" ? new Set(["action", "workerId", "confirm"]) :
+    new Set(["action", "workerId"]);
+  const hasValidWorkerId = isWorkerId(input.workerId);
+  if (!Object.keys(input).every((key) => allowedKeys.has(key))) {
+    return {
+      action: "review",
+      risk: "medium",
+      reason: "worker_control contains unsupported fields.",
+      ruleId: "worker-control-fields-review",
+      tags: ["worker", "lifecycle"]
+    };
+  }
+  if (input.action === "status" && (input.workerId === undefined || hasValidWorkerId)) {
+    return {
+      action: "allow",
+      risk: "low",
+      reason: "Worker status only reads workers owned by the exact parent session.",
+      ruleId: "worker-control-status",
+      tags: ["worker", "read-only"]
+    };
+  }
+  if (input.action === "result" && hasValidWorkerId) {
+    return {
+      action: "allow",
+      risk: "low",
+      reason: "Worker result validates and observes one exact-session settled result.",
+      ruleId: "worker-control-result",
+      tags: ["worker", "result"]
+    };
+  }
+  if (input.action === "cancel" && hasValidWorkerId) {
+    return {
+      action: "allow",
+      risk: "low",
+      reason: "Worker cancellation is restricted to an exact-session managed run and uses authoritative cleanup.",
+      ruleId: "worker-control-cancel",
+      tags: ["worker", "lifecycle", "cancel"]
+    };
+  }
+  if (input.action === "discard" && hasValidWorkerId && input.confirm === true) {
+    return {
+      action: "review",
+      risk: "medium",
+      reason: "Discard permanently removes a settled worker container, workspace, and durable record.",
+      ruleId: "worker-control-discard-review",
+      tags: ["worker", "lifecycle", "destructive"]
+    };
+  }
+  return {
+    action: "review",
+    risk: "medium",
+    reason: "Unsupported or malformed worker_control action requires review.",
+    ruleId: "worker-control-action-review",
+    tags: ["worker", "lifecycle"]
   };
 }
 

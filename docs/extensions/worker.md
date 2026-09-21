@@ -9,6 +9,7 @@ Run durable Pi engineering workers without granting parent authority. A worker i
 Parent surface:
 
 - `worker_run({ runs: [...] })`
+- `worker_control({ action: "status" | "result" | "cancel" | "discard", ... })`
 - `/worker:status <worker-id>`
 - `/worker:view <worker-id> [--stream both|stdout|stderr] [--tail 1..500] [--follow]`
 - `/worker:ack <worker-id>`
@@ -47,7 +48,17 @@ worker_run({
 })
 ```
 
-`runs` accepts 1–8 entries. New workers use the selected parent route unless `route` is explicit. Resume cannot change the worker session, workspace, provider, model, or thinking level. `completionDelivery` defaults to `steer`: use `steer` to get results as soon as they are ready, and `followUp` for lower-priority tasks that should be investigated after other work is finished.
+`runs` accepts 1–8 entries. One durable worker may have at most 32 unique assigned task IDs across its initial run and all resumptions. New workers use the selected parent route unless `route` is explicit. Resume cannot change the worker session, workspace, provider, model, or thinking level. `completionDelivery` defaults to `steer`: use `steer` to get results as soon as they are ready, and `followUp` for lower-priority tasks that should be investigated after other work is finished.
+
+```ts
+worker_control({
+  action: "status" | "result" | "cancel" | "discard",
+  workerId?: string,
+  confirm?: true
+})
+```
+
+`status` without a worker ID lists at most 100 workers belonging to the exact parent session; with an ID it returns one canonical summary. `result` requires a settled run, validates the persisted worker/run handoff identity, returns its typed handoff in model-visible content, and atomically marks pending delivery observed only after validation succeeds. `cancel` uses the same authoritative cleanup path as the user command; because its synchronous tool result already reports settlement, it does not queue a duplicate completion turn. `discard` refuses active/leased workers, requires literal `confirm:true`, and remains routed through tool-safety review. Use `shell_read` with returned job IDs for logs rather than duplicating log streaming in `worker_control`.
 
 ## Lifecycle
 
@@ -58,7 +69,7 @@ worker_run({
 5. The trusted macOS host writes its process marker, verifies an exact run/nonce/parent-PID authorization file, and only then starts Pi RPC with an explicit session file/directory, fixed model route, no built-in tools, no discovered extensions, skills, prompts, themes, or context files, and project trust forced off. Recovery revokes authorization before failed-run cleanup, fencing a host delayed before marker creation. Host-job completion remains pending until the original host process group, including its RPC descendant, has settled.
 6. Pi stays alive through asynchronous shell completions and subsequent model turns until `worker_handoff` writes one accepted result and a later RPC `agent_settled` proves the handoff turn quiescent.
 7. The host writes a separate trusted settlement marker only after rechecking exact session identity and quiescence. The parent accepts recovery only when both the typed handoff and matching settlement marker exist.
-8. Host-side shell helpers settle normal command groups. A successful typed handoff parks the verified container in a stopped state for the same worker's next run; failed runs, cancellation, uncertain/crashed-adapter recovery, and discard extend exact stop/kill/wait through verified removal as the authoritative cleanup boundary. Completion delivery remains pending until Pi emits the exact same-session custom `message_end` receipt for the worker/run delivery ID. Reload never scans or automatically replays ambiguous history; `/worker:ack` explicitly resolves a reviewed pending completion.
+8. Host-side shell helpers settle normal command groups. A successful typed handoff parks the verified container in a stopped state for the same worker's next run; failed runs, cancellation, uncertain/crashed-adapter recovery, and discard extend exact stop/kill/wait through verified removal as the authoritative cleanup boundary. Completion delivery remains pending until Pi emits the exact same-session custom `message_end` receipt for the worker/run delivery ID. Reload never scans or automatically replays ambiguous history; model-facing `worker_control result` validates and observes the exact result, while user-facing `/worker:ack` explicitly resolves a separately reviewed pending completion.
 
 Durable state lives under `~/.local/share/agent/workers/<worker-id>/`; the private workspace lives under `~/.local/share/agent/workspaces/<worker-id>/` with `repos`, `scratch`, `cache`, `artifacts`, and `tmp` directories.
 
@@ -83,7 +94,7 @@ Workspace `.pi/settings.json`, extensions, skills, prompts, themes, `SYSTEM.md`,
 
 `worker_handoff` accepts `ready_for_review`, `assignment_complete`, `needs_input`, `blocked`, `checkpoint`, `failed`, or `cancelled`, with summary, task updates, optional repositories/checks, and optional question. It rejects while any owned async-shell job or pending completion notice remains unsettled and rejects duplicate handoffs. Once accepted, `shell_start` and `worker_task_update` are sealed; the host independently rechecks RPC and owned-job quiescence before settlement.
 
-`/worker:view` opens the existing bounded, provider-free async-shell TUI for the worker's active or last host run. `/worker:ack` explicitly acknowledges a settled pending completion after inspection; automatic delivery acknowledgment comes only from the exact same-session custom-message receipt. `/worker:cancel` removes queued runs before launch; cancelling a queued resume also removes its previously parked container, retaining recovery ownership if that removal cannot be verified. Running host and command process groups receive bounded `SIGTERM` grace followed by `SIGKILL` escalation when necessary, after which the exact Docker container receives explicit `SIGTERM`/four-second stop and verified removal. Detached host cancellation still requires a matching trusted process marker and host command identity. `/worker:discard` requires an explicit confirmation token, refuses active workers, removes the private workspace first, and removes durable state last.
+`/worker:view` opens the existing bounded, provider-free async-shell TUI for the worker's active or last host run. `/worker:ack` explicitly acknowledges a settled pending completion after inspection; automatic delivery acknowledgment comes only from the exact same-session custom-message receipt. Parent models use `worker_control result` instead of blind acknowledgment. `/worker:cancel` and `worker_control cancel` remove queued runs before launch; cancelling a queued resume also removes its previously parked container, retaining recovery ownership if that removal cannot be verified. Running host and command process groups receive bounded `SIGTERM` grace followed by `SIGKILL` escalation when necessary, after which the exact Docker container receives explicit `SIGTERM`/four-second stop and verified removal. Detached host cancellation still requires a matching trusted process marker and host command identity. Discard requires explicit confirmation, refuses active workers, removes the parked container when present, removes the private workspace, and removes durable state last.
 
 An exclusive per-worker run lease prevents concurrent resumes. Cancellation records an exact durable cleanup owner before any host/container mutation, so normal completion cannot park/release the same run or expose its container to resume concurrently. Recovery atomically clears a cleanup owner only while replacing its dead parent lease. Host settlement is proven independently from recorded process-group liveness rather than inferred from identity-verification failure. Short record/lease transitions are additionally serialized by a trusted per-worker claim-directory operation lock; dead-owner claims are pruned and concurrent reclaimers elect exactly one owner. Launch revalidates the exact queued record and lease immediately before spawning. A trusted host-process marker closes the spawn-before-parent-PID crash window and supports exact restart adoption; stale PID data alone never authorizes signaling. If cleanup cannot prove owned shells are gone, the run and lease remain active with a visible recovery error; a later verified sweep can finalize cancellation instead of making the worker resumable prematurely.
 

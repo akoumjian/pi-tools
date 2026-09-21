@@ -21,6 +21,7 @@ import toolSafetyExtension, {
   evaluatePathReads,
   evaluateReadOnlyOrchestrate,
   evaluateWebFetchMany,
+  evaluateWorkerControl,
   parseApprovalModelPreference,
   parseToolSafetyReviewCriteria,
   resolveApprovalModelPreference,
@@ -980,6 +981,30 @@ test("web_fetch_many private or credentialed URLs require review", () => {
   assert.equal(credentialUrl.action, "review");
   assert.equal(credentialUrl.risk, "high");
   assert.equal(credentialUrl.ruleId, "web-fetch-credential-url");
+});
+
+test("worker_control allows exact-session observation and cancellation but reviews destructive discard", () => {
+  const workerId = "worker_20260910190000_12345678";
+  assert.equal(evaluateWorkerControl({ action: "status" }).action, "allow");
+  assert.equal(evaluateWorkerControl({ action: "status", workerId }).action, "allow");
+  assert.equal(evaluateWorkerControl({ action: "result", workerId }).action, "allow");
+  assert.equal(evaluateWorkerControl({ action: "cancel", workerId }).action, "allow");
+
+  const discard = evaluateWorkerControl({ action: "discard", workerId, confirm: true });
+  assert.equal(discard.action, "review");
+  assert.equal(discard.ruleId, "worker-control-discard-review");
+  assert.equal(
+    applyReviewCriteria(toolCall("worker_control", { action: "discard", workerId, confirm: true }), discard, "production-or-unapproved-environment").action,
+    "review",
+    "destructive worker discard remains reviewed under the deployment-focused profile"
+  );
+  assert.equal(evaluateWorkerControl({ action: "discard", workerId, confirm: false }).action, "review");
+  assert.equal(evaluateWorkerControl({ action: "result", workerId: "wrong" }).action, "review");
+  assert.equal(evaluateWorkerControl({ action: "status", unexpected: true }).action, "review");
+  assert.equal(
+    applyReviewCriteria(toolCall("worker_control", { action: "status" }), evaluateWorkerControl({ action: "status" }), "production-or-unapproved-environment").action,
+    "allow"
+  );
 });
 
 test("read-only orchestrate tasks are allowed but future writer shapes require review", () => {

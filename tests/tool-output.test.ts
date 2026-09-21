@@ -206,6 +206,33 @@ const samples: Record<RetainedToolName, unknown> = {
       }]
     }
   },
+  worker_control: {
+    content: [text("Worker status")],
+    details: {
+      action: "status",
+      workers: [{
+        workerId: "worker_20260910190000_12345678",
+        status: "handed_off",
+        sessionId: "019c0000-0000-7000-8000-000000000001",
+        sessionFile: "/tmp/workers/worker_20260910190000_12345678/session/session.jsonl",
+        workspaceRoot: "/tmp/workspaces/worker_20260910190000_12345678",
+        taskIds: ["personal-test"],
+        route: { provider: "openai-codex", model: "gpt-test", thinkingLevel: "xhigh" },
+        container: { name: "pi-worker-test", containerId: "container-1", runId: "run_20260910190000_87654321" },
+        lastRun: {
+          runId: "run_20260910190000_87654321",
+          jobId: "job_20260910190000_abcdefgh",
+          status: "handed_off",
+          delivery: "delivered",
+          completionDelivery: "steer",
+          resultFile: "/tmp/workers/worker_20260910190000_12345678/runs/run_20260910190000_87654321/result.json",
+          stdoutLog: "/tmp/stdout.log",
+          stderrLog: "/tmp/stderr.log"
+        },
+        updatedAt: "2026-09-10T19:32:00.000Z"
+      }]
+    }
+  },
   orchestrate: {
     content: [text("Orchestrate: 0/1 tasks succeeded")],
     details: {

@@ -51,6 +51,7 @@ For each `tool_call` event:
 
 1. **Initial classification.** A set of fast deterministic command/path rules produces a baseline decision:
    - Allow routine read-only inspection, local validation commands, and file mutations inside the trusted workspace.
+   - Allow exact-ID `worker_control` status/result/cancel actions; route confirmed settled-worker discard to `review` because it permanently removes the worker container, workspace, and durable record.
    - Route credential-like paths, history-rewrite git ops, deploys, package installs, network exfiltration, privilege escalation, and similar to `review`.
    - Deny clearly malicious or self-harming patterns.
    The classification surfaces rule id, risk level, tags, and confidence, used as inputs for both the approval judge and the human review prompt.
