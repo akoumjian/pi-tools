@@ -27,26 +27,42 @@ const MAX_WORKER_TASK_READ_LIMIT = 4;
 const MAX_WORKER_TASK_RELATIONS = 4;
 const MAX_WORKER_BEADS_OUTPUT_BYTES = 512 * 1024;
 const MAX_WORKER_TASK_READ_CONTENT_BYTES = 64 * 1024;
+const CENTRAL_TASK_ID_PATTERN = "^personal-[a-zA-Z0-9]+(?:\\.[a-zA-Z0-9]+)*$";
 
 export const WorkerTaskReadParams = Type.Object({
+  taskIds: Type.Optional(Type.Array(Type.String({
+    minLength: 1,
+    maxLength: 128,
+    pattern: CENTRAL_TASK_ID_PATTERN
+  }), {
+    minItems: 1,
+    maxItems: MAX_WORKER_TASK_READ_LIMIT,
+    description: `Central personal task IDs to read, whether assigned to this worker or not. At most ${MAX_WORKER_TASK_READ_LIMIT}; do not combine with query, offset, or limit.`
+  })),
+  query: Type.Optional(Type.String({
+    minLength: 1,
+    maxLength: 256,
+    description: "Title or ID query used to discover central personal tasks, including closed tasks; do not combine with taskIds or offset."
+  })),
   offset: Type.Optional(Type.Integer({
     minimum: 0,
     maximum: MAX_WORKER_TASK_IDS - 1,
     default: 0,
-    description: "Zero-based offset into this worker's parent-assigned task IDs. Defaults to 0."
+    description: "Zero-based offset into this worker's parent-assigned task IDs; use only without taskIds or query. Defaults to 0."
   })),
   limit: Type.Optional(Type.Integer({
     minimum: 1,
     maximum: MAX_WORKER_TASK_READ_LIMIT,
     default: MAX_WORKER_TASK_READ_LIMIT,
-    description: `Maximum assigned tasks to return. Defaults to ${MAX_WORKER_TASK_READ_LIMIT}.`
+    description: `Maximum assigned or search-matching tasks to return. Defaults to ${MAX_WORKER_TASK_READ_LIMIT}; omit with taskIds.`
   }))
 }, { additionalProperties: false });
 
 export type WorkerTaskRead = Static<typeof WorkerTaskReadParams>;
 
 type WorkerTaskReadDetails = {
-  offset: number;
+  scope: "assigned" | "requested" | "search";
+  offset?: number;
   limit: number;
   totalAssigned: number;
   returned: number;
@@ -57,6 +73,7 @@ type WorkerTaskReadDetails = {
 
 type WorkerTaskRelationView = {
   id: string;
+  assigned: boolean;
   title: string;
   status: string;
   priority: number;
@@ -67,12 +84,13 @@ type WorkerTaskRelationView = {
 
 type WorkerTaskView = {
   id: string;
+  assigned: boolean;
   title: string;
   status: string;
   priority: number;
   issueType: string;
   assignee?: string;
-  parent?: string;
+  parent?: { id: string; assigned: boolean };
   description?: string;
   notes?: string;
   acceptanceCriteria?: string;
@@ -91,13 +109,13 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
   api.registerTool(defineTool({
     name: "worker_task_read",
     label: "Worker Task Read",
-    description: "Read a bounded page of tasks assigned to this managed worker, including direct Beads dependencies and dependents. The trusted host adapter verifies the exact central personal route, invokes the official bd read path in --readonly mode, and returns bounded structured JSON without exposing the database, CLI, or BEADS_DIR inside Docker.",
-    promptSnippet: "Read assigned Beads task context and direct dependency summaries through the bounded worker_task_read adapter.",
+    description: "Search central personal Beads tasks or read bounded context for assigned or explicitly requested task IDs, including direct dependencies and dependents. Every returned task and relationship says whether it is assigned to this worker. The trusted host adapter verifies the exact central route, invokes official bd read paths in --readonly mode, and returns bounded structured JSON without exposing the database, CLI, or BEADS_DIR inside Docker.",
+    promptSnippet: "Search or read any central Beads task through the bounded worker_task_read adapter; returned records identify which tasks are assigned to this worker.",
     promptGuidelines: [
-      "worker_task_read use: Read the assigned task descriptions, notes, acceptance criteria, and direct dependency/dependent summaries when more task context is needed; follow nextOffset to page additional assigned tasks.",
+      "worker_task_read use: Call with offset/limit to page this worker's assigned tasks, with taskIds to read up to four arbitrary central personal tasks by ID, or with query/limit to discover tasks by title or ID across all statuses. Returned task and relationship records mark assigned IDs explicitly.",
       inputJsonSchemaGuideline("worker_task_read", WorkerTaskReadParams),
       outputJsonSchemaGuideline("worker_task_read", workerTaskReadOutputSchema()),
-      `worker_task_read constraints: Reads only parent-assigned task roots, at most ${MAX_WORKER_TASK_READ_LIMIT} per call, through official bd --readonly JSON semantics after exact personal-route verification. Text fields, relationships, raw CLI output, and provider-visible content are bounded. The adapter cannot mutate Beads and does not expose bd, BEADS_DIR, database paths, or arbitrary queries to worker shell processes.`
+      `worker_task_read constraints: Searches or reads at most ${MAX_WORKER_TASK_READ_LIMIT} central personal task roots per call through official bd --readonly JSON semantics after exact route verification. Read access spans the central task store; worker_task_update remains restricted to parent-assigned IDs. Text fields, relationships, raw CLI output, and provider-visible content are bounded. The adapter cannot mutate Beads and does not expose bd, BEADS_DIR, database paths, or arbitrary command execution to worker shell processes.`
     ],
     parameters: WorkerTaskReadParams,
     executionMode: "sequential",
@@ -105,24 +123,44 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
       if (existsSync(workerRuntimeIdentity().resultFile)) {
         throw new Error("worker_task_read is sealed after worker_handoff acceptance.");
       }
+      validateWorkerTaskReadMode(params);
       const runtime = workerTaskRuntime();
       verifyPersonalBeadsRoute(runtime);
       const assigned = [...runtime.taskIds];
-      const offset = params.offset ?? 0;
-      const limit = params.limit ?? MAX_WORKER_TASK_READ_LIMIT;
-      if (offset >= assigned.length) {
+      const explicitTaskIds = params.taskIds;
+      const query = params.query;
+      const requestedScope = explicitTaskIds !== undefined;
+      const searchScope = query !== undefined;
+      const scope = searchScope ? "search" : requestedScope ? "requested" : "assigned";
+      const offset = scope === "assigned" ? params.offset ?? 0 : undefined;
+      const limit = explicitTaskIds === undefined
+        ? params.limit ?? MAX_WORKER_TASK_READ_LIMIT
+        : explicitTaskIds.length;
+      if (scope === "assigned" && offset! >= assigned.length) {
         throw new Error(`worker_task_read offset ${offset} exceeds ${assigned.length} assigned task IDs.`);
       }
-      const taskIds = assigned.slice(offset, offset + limit);
-      const output = readBeadsTaskPage(runtime, taskIds);
-      const tasks = workerTaskViews(output, taskIds);
+      const taskIds = query !== undefined
+        ? searchWorkerTaskIds(runtime, query, limit)
+        : explicitTaskIds !== undefined
+          ? requestedWorkerTaskIds(explicitTaskIds)
+          : assigned.slice(offset, offset! + limit);
+      const output = taskIds.length === 0 ? "[]" : readBeadsTaskPage(runtime, taskIds);
+      const tasks = workerTaskViews(output, taskIds, runtime.taskIds);
       const truncated = tasks.some((task) =>
         task.truncatedFields.length > 0 ||
         [...task.dependencies, ...task.dependents].some((relation) => relation.truncatedFields.length > 0)
       );
-      const nextOffset = offset + taskIds.length < assigned.length ? offset + taskIds.length : undefined;
+      const nextOffset = scope === "assigned" && offset! + taskIds.length < assigned.length
+        ? offset! + taskIds.length
+        : undefined;
+      const summary = scope === "search"
+        ? `Found ${tasks.length} central Beads task${tasks.length === 1 ? "" : "s"}.`
+        : scope === "requested"
+          ? `Read ${tasks.length} requested central Beads task${tasks.length === 1 ? "" : "s"}.`
+          : `Read ${tasks.length} of ${assigned.length} assigned Beads task${assigned.length === 1 ? "" : "s"}${nextOffset === undefined ? "." : `; continue with offset ${nextOffset}.`}`;
       const text = [
-        `Read ${tasks.length} of ${assigned.length} assigned Beads task${assigned.length === 1 ? "" : "s"}${nextOffset === undefined ? "." : `; continue with offset ${nextOffset}.`}`,
+        summary,
+        `Assigned to this worker: ${assigned.join(", ")}.`,
         "",
         JSON.stringify({ tasks }, null, 2)
       ].join("\n");
@@ -133,11 +171,12 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
       return {
         content: [{ type: "text", text }],
         details: {
-          offset,
+          scope,
+          ...(offset === undefined ? {} : { offset }),
           limit,
           totalAssigned: assigned.length,
           returned: tasks.length,
-          nextOffset,
+          ...(nextOffset === undefined ? {} : { nextOffset }),
           contentBytes,
           truncated
         }
@@ -256,11 +295,42 @@ function assignedTaskIds(): Set<string> {
     !Array.isArray(rawTaskIds) ||
     rawTaskIds.length === 0 ||
     rawTaskIds.length > MAX_WORKER_TASK_IDS ||
-    rawTaskIds.some((value) => typeof value !== "string" || !/^personal-[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)*$/.test(value.trim()))
+    rawTaskIds.some((value) => typeof value !== "string" || !isCentralTaskId(value.trim()))
   ) {
     throw new Error(`Worker runtime requires PI_WORKER_TASK_IDS to contain 1-${MAX_WORKER_TASK_IDS} central personal task IDs.`);
   }
   return new Set(rawTaskIds.map((value) => value.trim()));
+}
+
+function validateWorkerTaskReadMode(params: WorkerTaskRead): void {
+  const hasTaskIds = params.taskIds !== undefined;
+  const hasQuery = params.query !== undefined;
+  if (hasTaskIds && hasQuery) {
+    throw new Error("worker_task_read accepts either taskIds or query, not both.");
+  }
+  if (hasTaskIds && (params.offset !== undefined || params.limit !== undefined)) {
+    throw new Error("worker_task_read taskIds cannot be combined with offset or limit.");
+  }
+  if (hasQuery && params.offset !== undefined) {
+    throw new Error("worker_task_read query cannot be combined with offset.");
+  }
+}
+
+function requestedWorkerTaskIds(value: unknown): string[] {
+  if (
+    !Array.isArray(value) ||
+    value.length === 0 ||
+    value.length > MAX_WORKER_TASK_READ_LIMIT ||
+    value.some((taskId) => typeof taskId !== "string" || !isCentralTaskId(taskId)) ||
+    new Set(value).size !== value.length
+  ) {
+    throw new Error(`worker_task_read requires 1-${MAX_WORKER_TASK_READ_LIMIT} unique central personal task IDs.`);
+  }
+  return value as string[];
+}
+
+function isCentralTaskId(value: string): boolean {
+  return new RegExp(CENTRAL_TASK_ID_PATTERN).test(value);
 }
 
 function validateWorkerHandoff(
@@ -315,6 +385,57 @@ function workerTaskRuntime(): {
   };
 }
 
+function searchWorkerTaskIds(
+  runtime: ReturnType<typeof workerTaskRuntime>,
+  query: string,
+  limit: number
+): string[] {
+  const normalizedQuery = query.trim();
+  if (!normalizedQuery || Buffer.byteLength(normalizedQuery, "utf8") > 1_024) {
+    throw new Error("worker_task_read requires a non-empty bounded search query.");
+  }
+  let output: string;
+  try {
+    output = execFileSync(runtime.bdPath, [
+      "--readonly",
+      "search",
+      `--query=${normalizedQuery}`,
+      "--status=all",
+      `--limit=${limit}`,
+      "--sort=id",
+      "--json"
+    ], {
+      cwd: runtime.workspaceRoot,
+      env: process.env,
+      encoding: "utf8",
+      maxBuffer: MAX_WORKER_BEADS_OUTPUT_BYTES,
+      timeout: 10_000,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+  } catch {
+    throw new Error("worker_task_read could not search central Beads tasks.");
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(output) as unknown;
+  } catch {
+    throw new Error("worker_task_read received invalid JSON from Beads search.");
+  }
+  if (!Array.isArray(value) || value.length > limit) {
+    throw new Error("worker_task_read received an invalid bounded Beads search response.");
+  }
+  const taskIds = value.map((candidate) => {
+    if (!isRecord(candidate)) throw new Error("worker_task_read received an invalid Beads search record.");
+    const taskId = requiredTaskText(candidate, "id", 128);
+    if (!isCentralTaskId(taskId)) throw new Error("worker_task_read received an invalid central task ID.");
+    return taskId;
+  });
+  if (new Set(taskIds).size !== taskIds.length) {
+    throw new Error("worker_task_read received duplicate Beads search records.");
+  }
+  return taskIds;
+}
+
 function readBeadsTaskPage(runtime: ReturnType<typeof workerTaskRuntime>, taskIds: readonly string[]): string {
   try {
     return execFileSync(runtime.bdPath, [
@@ -332,7 +453,7 @@ function readBeadsTaskPage(runtime: ReturnType<typeof workerTaskRuntime>, taskId
       stdio: ["ignore", "pipe", "pipe"]
     });
   } catch {
-    throw new Error("worker_task_read could not read the assigned Beads task page.");
+    throw new Error("worker_task_read could not read the requested Beads task page.");
   }
 }
 
@@ -412,7 +533,11 @@ function writeAtomicJson(target: string, value: unknown): void {
   renameSync(temporary, target);
 }
 
-function workerTaskViews(output: string, expectedTaskIds: readonly string[]): WorkerTaskView[] {
+function workerTaskViews(
+  output: string,
+  expectedTaskIds: readonly string[],
+  assignedTaskIds: ReadonlySet<string>
+): WorkerTaskView[] {
   let value: unknown;
   try {
     value = JSON.parse(output) as unknown;
@@ -428,12 +553,12 @@ function workerTaskViews(output: string, expectedTaskIds: readonly string[]): Wo
     byId.set(taskId, candidate);
   }
   if (byId.size !== expectedTaskIds.length || expectedTaskIds.some((taskId) => !byId.has(taskId))) {
-    throw new Error("worker_task_read Beads response did not match the assigned task page.");
+    throw new Error("worker_task_read Beads response did not match the requested task IDs.");
   }
-  return expectedTaskIds.map((taskId) => workerTaskView(byId.get(taskId)!));
+  return expectedTaskIds.map((taskId) => workerTaskView(byId.get(taskId)!, assignedTaskIds));
 }
 
-function workerTaskView(value: Record<string, unknown>): WorkerTaskView {
+function workerTaskView(value: Record<string, unknown>, assignedTaskIds: ReadonlySet<string>): WorkerTaskView {
   const truncatedFields: string[] = [];
   const bounded = (field: string, maximumBytes: number): string | undefined => {
     const raw = value[field];
@@ -446,16 +571,18 @@ function workerTaskView(value: Record<string, unknown>): WorkerTaskView {
   };
   const title = bounded("title", 512);
   if (!title) throw new Error("worker_task_read expected non-empty title.");
-  const dependencies = boundedRelations(value.dependencies, "dependencies", truncatedFields);
-  const dependents = boundedRelations(value.dependents, "dependents", truncatedFields);
+  const dependencies = boundedRelations(value.dependencies, "dependencies", truncatedFields, assignedTaskIds);
+  const dependents = boundedRelations(value.dependents, "dependents", truncatedFields, assignedTaskIds);
+  const id = requiredTaskText(value, "id", 128);
   return {
-    id: requiredTaskText(value, "id", 128),
+    id,
+    assigned: assignedTaskIds.has(id),
     title,
     status: requiredTaskText(value, "status", 64),
     priority: requiredTaskInteger(value, "priority"),
     issueType: requiredTaskText(value, "issue_type", 64),
     assignee: bounded("assignee", 256),
-    parent: bounded("parent", 128),
+    parent: optionalTaskReference(value, "parent", assignedTaskIds),
     description: bounded("description", 2_048),
     notes: bounded("notes", 2_048),
     acceptanceCriteria: bounded("acceptance_criteria", 1_024),
@@ -475,7 +602,12 @@ function workerTaskView(value: Record<string, unknown>): WorkerTaskView {
   };
 }
 
-function boundedRelations(value: unknown, field: string, truncatedFields: string[]): WorkerTaskRelationView[] {
+function boundedRelations(
+  value: unknown,
+  field: string,
+  truncatedFields: string[],
+  assignedTaskIds: ReadonlySet<string>
+): WorkerTaskRelationView[] {
   if (value === undefined || value === null) return [];
   if (!Array.isArray(value)) throw new Error(`worker_task_read expected ${field} to be an array.`);
   if (value.length > MAX_WORKER_TASK_RELATIONS) truncatedFields.push(field);
@@ -487,8 +619,10 @@ function boundedRelations(value: unknown, field: string, truncatedFields: string
     const title = boundedUtf8(rawTitle, 512);
     if (!title.text) throw new Error(`worker_task_read expected non-empty ${field} title.`);
     if (title.truncated) truncatedFields.push("title");
+    const id = requiredTaskText(candidate, "id", 128);
     return {
-      id: requiredTaskText(candidate, "id", 128),
+      id,
+      assigned: assignedTaskIds.has(id),
       title: title.text,
       status: requiredTaskText(candidate, "status", 64),
       priority: requiredTaskInteger(candidate, "priority"),
@@ -499,6 +633,18 @@ function boundedRelations(value: unknown, field: string, truncatedFields: string
       truncatedFields
     };
   });
+}
+
+function optionalTaskReference(
+  value: Record<string, unknown>,
+  field: string,
+  assignedTaskIds: ReadonlySet<string>
+): { id: string; assigned: boolean } | undefined {
+  const raw = value[field];
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  const id = requiredTaskText(value, field, 128);
+  if (!isCentralTaskId(id)) throw new Error(`worker_task_read expected a central task ID in ${field}.`);
+  return { id, assigned: assignedTaskIds.has(id) };
 }
 
 function requiredTaskText(value: Record<string, unknown>, field: string, maximumBytes: number): string {
@@ -539,10 +685,11 @@ function workerTaskReadOutputSchema() {
   return Type.Object({
     content: Type.Array(textContent, { minItems: 1, maxItems: 1 }),
     details: Type.Object({
-      offset: Type.Integer({ minimum: 0 }),
+      scope: Type.Union([Type.Literal("assigned"), Type.Literal("requested"), Type.Literal("search")]),
+      offset: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_WORKER_TASK_IDS - 1 })),
       limit: Type.Integer({ minimum: 1, maximum: MAX_WORKER_TASK_READ_LIMIT }),
       totalAssigned: Type.Integer({ minimum: 1, maximum: MAX_WORKER_TASK_IDS }),
-      returned: Type.Integer({ minimum: 1, maximum: MAX_WORKER_TASK_READ_LIMIT }),
+      returned: Type.Integer({ minimum: 0, maximum: MAX_WORKER_TASK_READ_LIMIT }),
       nextOffset: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_WORKER_TASK_IDS - 1 })),
       contentBytes: Type.Integer({ minimum: 1, maximum: MAX_WORKER_TASK_READ_CONTENT_BYTES }),
       truncated: Type.Boolean()

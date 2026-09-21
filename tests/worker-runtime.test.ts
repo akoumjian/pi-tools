@@ -3,6 +3,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { validateToolArguments, type Tool, type ToolCall } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { cancelAsyncShellJobsForOwner, startManagedAsyncJob } from "../extensions/async-shell/index.js";
 import workerRuntimeExtension, { readWorkerRuntimeHandoff } from "../extensions/worker/runtime.js";
@@ -79,11 +80,12 @@ const handoff = {
   checks: [{ cwd: "repos/project", command: "npm test", outcome: "passed" }]
 } as const;
 
-test("worker_task_read uses official readonly Beads paging with bounded assigned-task output", async () => {
+test("worker_task_read uses official readonly Beads access with broad reads and assigned-only identity", async () => {
   await withTempDir(async (directory) => {
     const bdPath = path.join(directory, "fake-bd");
     const logPath = path.join(directory, "bd-read-argv.log");
     const showPath = path.join(directory, "bd-show.json");
+    const searchPath = path.join(directory, "bd-search.json");
     const beadsPath = path.join(directory, "central-beads");
     const beadsRoute = { prefix: "personal", path: beadsPath, databasePath: path.join(beadsPath, "database") } as const;
     const whereOutput = JSON.stringify({ prefix: "personal", path: beadsRoute.path, database_path: beadsRoute.databasePath });
@@ -103,13 +105,16 @@ test("worker_task_read uses official readonly Beads paging with bounded assigned
         priority: 1,
         issue_type: "feature",
         assignee: "worker-test",
-        parent: "personal-parent",
+        parent: "personal-second",
         description: "d".repeat(3_000),
         notes: "Use the bounded host adapter.",
         acceptance_criteria: "Never expose the Beads database.",
         dependency_count: 6,
         dependent_count: 5,
-        dependencies: Array.from({ length: 6 }, (_, index) => relation(index, "dependency")),
+        dependencies: Array.from({ length: 6 }, (_, index) => ({
+          ...relation(index, "dependency"),
+          ...(index === 0 ? { id: "personal-second" } : {})
+        })),
         dependents: Array.from({ length: 5 }, (_, index) => relation(index, "dependent"))
       },
       {
@@ -118,6 +123,7 @@ test("worker_task_read uses official readonly Beads paging with bounded assigned
         status: "open",
         priority: 2,
         issue_type: "task",
+        parent: "personal-parent",
         description: "Small task.",
         dependency_count: 0,
         dependent_count: 0,
@@ -126,6 +132,7 @@ test("worker_task_read uses official readonly Beads paging with bounded assigned
       }
     ];
     await writeFile(showPath, `${JSON.stringify(showOutput)}\n`);
+    await writeFile(searchPath, `${JSON.stringify(showOutput.map(({ id, title }) => ({ id, title })))}\n`);
     await writeFile(bdPath, [
       "#!/bin/sh",
       "printf '%s\\n' \"$@\" >> \"$PI_FAKE_BD_LOG\"",
@@ -133,6 +140,7 @@ test("worker_task_read uses official readonly Beads paging with bounded assigned
       "elif [ \"$1\" = --readonly ] && [ \"$2\" = show ]; then",
       "  if [ -n \"$PI_FAKE_BD_FAIL_SHOW\" ]; then printf '%s\\n' \"$0 $BEADS_DIR\" >&2; exit 9; fi",
       "  cat \"$PI_FAKE_BD_SHOW\"",
+      "elif [ \"$1\" = --readonly ] && [ \"$2\" = search ]; then cat \"$PI_FAKE_BD_SEARCH\"",
       "else exit 2",
       "fi",
       ""
@@ -143,9 +151,35 @@ test("worker_task_read uses official readonly Beads paging with bounded assigned
       workerRuntimeExtension(api);
       const tool = api.tools.find((candidate) => candidate.name === "worker_task_read");
       assert.ok(tool?.execute);
+      const parameters = tool.parameters as unknown as {
+        type?: string;
+        anyOf?: unknown;
+        properties?: Record<string, unknown>;
+        required?: string[];
+      };
+      assert.equal(parameters.type, "object");
+      assert.equal(parameters.anyOf, undefined);
+      assert.deepEqual(Object.keys(parameters.properties ?? {}).sort(), ["limit", "offset", "query", "taskIds"]);
+      const anthropicLegacySchema = {
+        type: "object",
+        properties: parameters.properties ?? {},
+        required: parameters.required ?? []
+      };
+      assert.deepEqual(Object.keys(anthropicLegacySchema.properties).sort(), ["limit", "offset", "query", "taskIds"]);
+      const validateReadArguments = (argumentsValue: unknown): unknown => validateToolArguments(
+        tool as unknown as Tool,
+        { type: "toolCall", id: "validate-read", name: "worker_task_read", arguments: argumentsValue } as ToolCall
+      );
+      for (const valid of [{}, { offset: 0, limit: 2 }, { taskIds: ["personal-other"] }, { query: "other", limit: 2 }]) {
+        assert.doesNotThrow(() => validateReadArguments(valid));
+      }
+      assert.throws(() => validateReadArguments({ taskIds: ["--db=/tmp/escape"] }), /validation failed|Invalid/i);
+      assert.throws(() => validateReadArguments({ query: "x", unknown: true }), /validation failed|Invalid/i);
+
       const result = await tool.execute("read-1", { offset: 0, limit: 2 } as never, undefined, undefined, context(directory));
       const details = result.details as {
-        offset: number;
+        scope: "assigned" | "requested";
+        offset?: number;
         limit: number;
         totalAssigned: number;
         returned: number;
@@ -154,6 +188,7 @@ test("worker_task_read uses official readonly Beads paging with bounded assigned
         truncated: boolean;
       };
       assert.deepEqual({ ...details, contentBytes: undefined }, {
+        scope: "assigned",
         offset: 0,
         limit: 2,
         totalAssigned: 3,
@@ -168,9 +203,16 @@ test("worker_task_read uses official readonly Beads paging with bounded assigned
       const text = content.type === "text" ? content.text : "";
       const payload = JSON.parse(text.slice(text.indexOf("{\n"))) as { tasks: Array<Record<string, unknown>> };
       assert.equal(payload.tasks.length, 2);
+      assert.equal(payload.tasks[0].assigned, true);
+      assert.deepEqual(payload.tasks[0].parent, { id: "personal-second", assigned: true });
+      assert.deepEqual(payload.tasks[1].parent, { id: "personal-parent", assigned: false });
       assert.equal(Buffer.byteLength(payload.tasks[0].description as string, "utf8") <= 2_048, true);
       assert.equal((payload.tasks[0].dependencies as unknown[]).length, 4);
       assert.equal((payload.tasks[0].dependents as unknown[]).length, 4);
+      assert.equal(
+        (payload.tasks[0].dependencies as Array<{ assigned: boolean }>)[0].assigned,
+        true
+      );
       assert.deepEqual((payload.tasks[0].dependencies as Array<{ truncatedFields: string[] }>)[0].truncatedFields, ["title"]);
       assert.deepEqual(payload.tasks[0].truncatedFields, ["dependencies", "dependents", "description"]);
       assert.doesNotMatch(text, /central-beads|fake-bd/);
@@ -178,6 +220,81 @@ test("worker_task_read uses official readonly Beads paging with bounded assigned
       const argv = await readFile(logPath, "utf8");
       assert.match(argv, /^where\n--json\n--readonly\nshow\n--include-dependents\n--id=personal-test\n--id=personal-second\n--json/m);
       assert.doesNotMatch(argv, /update|--db/);
+
+      await writeFile(showPath, `${JSON.stringify([
+        { ...showOutput[1], id: "personal-other", title: "Readable unassigned task" },
+        showOutput[0]
+      ])}\n`);
+      const requestedResult = await tool.execute(
+        "read-requested",
+        { taskIds: ["personal-other", "personal-test"] } as never,
+        undefined,
+        undefined,
+        context(directory)
+      );
+      assert.deepEqual({ ...(requestedResult.details as Record<string, unknown>), contentBytes: undefined }, {
+        scope: "requested",
+        limit: 2,
+        totalAssigned: 3,
+        returned: 2,
+        contentBytes: undefined,
+        truncated: true
+      });
+      const requestedContent = requestedResult.content[0];
+      assert.equal(requestedContent.type, "text");
+      const requestedText = requestedContent.type === "text" ? requestedContent.text : "";
+      const requestedPayload = JSON.parse(requestedText.slice(requestedText.indexOf("{\n"))) as {
+        tasks: Array<{ id: string; assigned: boolean }>;
+      };
+      assert.deepEqual(requestedPayload.tasks.map(({ id, assigned }) => ({ id, assigned })), [
+        { id: "personal-other", assigned: false },
+        { id: "personal-test", assigned: true }
+      ]);
+      assert.match(requestedText, /Assigned to this worker: personal-test, personal-second, personal-third/);
+      await assert.rejects(
+        tool.execute("read-invalid-id", { taskIds: ["--db=/tmp/escape"] } as never, undefined, undefined, context(directory)),
+        /requires 1-4 unique central personal task IDs/
+      );
+      await assert.rejects(
+        tool.execute("read-mixed-modes", { taskIds: ["personal-test"], query: "test" } as never, undefined, undefined, context(directory)),
+        /either taskIds or query/
+      );
+      await assert.rejects(
+        tool.execute("read-task-limit", { taskIds: ["personal-test"], limit: 1 } as never, undefined, undefined, context(directory)),
+        /taskIds cannot be combined with offset or limit/
+      );
+      await assert.rejects(
+        tool.execute("read-query-offset", { query: "test", offset: 0 } as never, undefined, undefined, context(directory)),
+        /query cannot be combined with offset/
+      );
+
+      await writeFile(searchPath, `${JSON.stringify([
+        { id: "personal-other", title: "Readable unassigned task" },
+        { id: "personal-test", title: "Assigned test task" }
+      ])}\n`);
+      const searchResult = await tool.execute(
+        "read-search",
+        { query: "Readable", limit: 2 } as never,
+        undefined,
+        undefined,
+        context(directory)
+      );
+      assert.equal((searchResult.details as { scope: string }).scope, "search");
+      const searchContent = searchResult.content[0];
+      assert.equal(searchContent.type, "text");
+      const searchText = searchContent.type === "text" ? searchContent.text : "";
+      const searchPayload = JSON.parse(searchText.slice(searchText.indexOf("{\n"))) as {
+        tasks: Array<{ id: string; assigned: boolean }>;
+      };
+      assert.deepEqual(searchPayload.tasks.map(({ id, assigned }) => ({ id, assigned })), [
+        { id: "personal-other", assigned: false },
+        { id: "personal-test", assigned: true }
+      ]);
+      assert.match(await readFile(logPath, "utf8"), /search\n--query=Readable\n--status=all\n--limit=2\n--sort=id\n--json/);
+      await assert.rejects(
+        tool.execute("read-empty-search", { query: "   " } as never, undefined, undefined, context(directory)),
+        /requires a non-empty bounded search query/
+      );
 
       await writeFile(showPath, `${JSON.stringify([{
         ...showOutput[0],
@@ -207,7 +324,7 @@ test("worker_task_read uses official readonly Beads paging with bounded assigned
       await writeFile(showPath, `${JSON.stringify([{ ...showOutput[0], id: "personal-unexpected" }])}\n`);
       await assert.rejects(
         tool.execute("read-mismatch", { offset: 0, limit: 1 } as never, undefined, undefined, context(directory)),
-        /did not match the assigned task page/
+        /did not match the requested task IDs/
       );
       await assert.rejects(
         tool.execute("read-offset", { offset: 3, limit: 1 } as never, undefined, undefined, context(directory)),
@@ -218,7 +335,7 @@ test("worker_task_read uses official readonly Beads paging with bounded assigned
         tool.execute("read-cli-failure", { offset: 0, limit: 1 } as never, undefined, undefined, context(directory)),
         (error: unknown) => {
           assert.ok(error instanceof Error);
-          assert.match(error.message, /could not read the assigned Beads task page/);
+          assert.match(error.message, /could not read the requested Beads task page/);
           assert.doesNotMatch(error.message, /central-beads|fake-bd/);
           return true;
         }
@@ -294,6 +411,7 @@ test("worker_task_read uses official readonly Beads paging with bounded assigned
       PI_WORKER_BEADS_ROUTE: JSON.stringify(beadsRoute),
       PI_FAKE_BD_LOG: logPath,
       PI_FAKE_BD_SHOW: showPath,
+      PI_FAKE_BD_SEARCH: searchPath,
       BEADS_DIR: beadsPath
     });
   });

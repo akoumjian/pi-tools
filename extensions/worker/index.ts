@@ -54,7 +54,7 @@ import {
   type WorkerRoute
 } from "./state.js";
 
-const WORKER_OPERATIONAL_GUIDANCE = "Keep all writes inside the private workspace, clone local repositories with --no-hardlinks, and do not push remotes. Use worker_task_read for bounded assigned Beads context and direct dependencies, and worker_task_update rather than shell access for assigned Beads notes. Shell commands run inside one private Docker container with all of ~/Code read-only and this workspace read-write. Process groups provide normal per-command cancellation; whole-container removal is the final run cleanup boundary. Use normal async-shell tools and finish with exactly one accepted worker_handoff after all owned jobs settle.";
+const WORKER_OPERATIONAL_GUIDANCE = "Keep all writes inside the private workspace, clone local repositories with --no-hardlinks, and do not push remotes. Use worker_task_read to search or read bounded context across central Beads; returned records mark your assigned IDs. Use worker_task_update rather than shell access for notes or status changes, and update only assigned IDs. Shell commands run inside one private Docker container with all of ~/Code read-only and this workspace read-write. Process groups provide normal per-command cancellation; whole-container removal is the final run cleanup boundary. Use normal async-shell tools and finish with exactly one accepted worker_handoff after all owned jobs settle.";
 
 const InitialRepoSchema = Type.Object({
   source: Type.String({ minLength: 1, maxLength: 2048 }),
