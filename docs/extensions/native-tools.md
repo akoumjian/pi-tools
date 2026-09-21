@@ -74,7 +74,7 @@ search_many({
 })
 ```
 
-Backed by the `rg` binary. See the deep-dive in the README and the [example section below](#search_many-examples).
+Backed by one absolute `rg` executable resolved from the trusted process `PATH`. Caller-controlled patterns, globs, and paths are passed only in explicit data positions; ambient ripgrep configuration is disabled and removed from the child environment. See the deep-dive in the README and the [example section below](#search_many-examples).
 
 ### write_many
 
@@ -135,10 +135,11 @@ The slim prompt removes Pi's default `Available tools`/`Guidelines` prose and in
 
 ### search_many
 
-- For each search item, builds an `rg` argv (always `--color never --no-messages`, plus `--glob`, `--ignore-case`, `--fixed-strings`, `--context`, etc. as requested).
-- For `kind: "files"` it appends `--files <path>` (no pattern needed).
-- For `kind: "content"` it appends `--line-number --column --no-heading <pattern> <path>`.
-- Spawns `rg` with the active cwd, captures up to 120 KB of stdout per search; on overflow `rg` is `SIGTERM`'d and the result is marked truncated. Stderr is capped at 16 KB. After completion, the per-search output is further trimmed to `maxResults` lines.
+- Resolves one executable `rg` path for the batch, then builds each argv with `--no-config --color never --no-messages`. The spawned environment also omits `RIPGREP_CONFIG_PATH`, so repository, user, or inherited config cannot add preprocessors or other options.
+- Caller globs use one `--glob=<glob>` argument. For `kind: "files"`, the path follows `--files --`; for `kind: "content"`, the pattern follows `--regexp` and the path follows a separate `--` option terminator. Leading-dash patterns and paths therefore remain data rather than ripgrep options.
+- Requested `--ignore-case`, `--fixed-strings`, and bounded `--context` behavior is unchanged. The public tool schema and output contracts are unchanged.
+- Spawns the resolved `rg` executable with the active cwd, captures up to 120 KB of stdout per search; on overflow `rg` is `SIGTERM`'d and the result is marked truncated. Stderr is capped at 16 KB. After completion, the per-search output is further trimmed to `maxResults` lines.
+- Child sessions that expose `search_many` reuse this same hardened implementation. Confined orchestrator sessions additionally reject traversal and symlink escapes before execution, so no separate child adapter is required. Managed worker RPC does not expose `search_many`; manually invoking `rg` through worker shell is outside this tool boundary.
 - Exits other than 0 (match) or 1 (no match) throw with the captured stderr.
 
 ### write_many / edit_many

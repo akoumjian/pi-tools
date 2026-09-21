@@ -1,9 +1,10 @@
 import { execFileSync } from "node:child_process";
-import { accessSync, constants, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { startManagedAsyncJob, type ManagedAsyncJobHandle } from "../async-shell/index.js";
+import { resolveExecutable } from "../_shared/executable.js";
 import type { WorkerContainerReference } from "../_shared/worker-container.js";
 import type { WorkerRecord } from "./state.js";
 
@@ -240,19 +241,7 @@ export function resolveBeadsRoute(bdPath: string, cwd: string): WorkerBeadsRoute
   };
 }
 
-export function resolveExecutable(name: string, pathValue = process.env.PATH): string {
-  for (const directory of (pathValue ?? "").split(path.delimiter)) {
-    if (!directory) continue;
-    const candidate = path.join(directory, name);
-    try {
-      if (statSync(candidate).isFile()) {
-        accessSync(candidate, constants.X_OK);
-        return realpathSync(candidate);
-      }
-    } catch {}
-  }
-  throw new Error(`Required executable is unavailable on PATH: ${name}`);
-}
+export { resolveExecutable };
 
 export function resolveWorkerHostScript(): string {
   let current = path.dirname(fileURLToPath(import.meta.url));

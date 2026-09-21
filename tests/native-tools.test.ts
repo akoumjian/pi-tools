@@ -791,6 +791,121 @@ test("search_many terminates its owned rg child on interruption", async () => {
   });
 });
 
+test("search_many passes caller-controlled patterns, globs, and paths as rg data with sanitized config", async () => {
+  await withTempDir(async (dir) => {
+    const binDir = path.join(dir, "bin");
+    await mkdir(binDir);
+    const argsLog = path.join(dir, "rg-args.log");
+    const envLog = path.join(dir, "rg-env.log");
+    const rgPath = path.join(binDir, "rg");
+    await writeFile(rgPath, [
+      "#!/bin/sh",
+      "printf '%s\\n' \"$@\" > \"$RG_ARGS_LOG\"",
+      "printf '%s' \"${RIPGREP_CONFIG_PATH-unset}\" > \"$RG_ENV_LOG\"",
+      "exit 1",
+      ""
+    ].join("\n"), "utf8");
+    await chmod(rgPath, 0o755);
+
+    const previous = {
+      path: process.env.PATH,
+      config: process.env.RIPGREP_CONFIG_PATH,
+      argsLog: process.env.RG_ARGS_LOG,
+      envLog: process.env.RG_ENV_LOG
+    };
+    process.env.PATH = `${binDir}${path.delimiter}${previous.path ?? ""}`;
+    process.env.RIPGREP_CONFIG_PATH = path.join(dir, "hostile-rg-config");
+    process.env.RG_ARGS_LOG = argsLog;
+    process.env.RG_ENV_LOG = envLog;
+    try {
+      const result = await searchMany(createContext(dir), {
+        searches: [{
+          kind: "content",
+          pattern: "--pre=/tmp/forbidden-pre",
+          path: "--scope",
+          glob: "--file=/tmp/forbidden-glob",
+          context: 2,
+          ignoreCase: true,
+          literal: true
+        }]
+      });
+      assert.equal(result.details.searches[0].exitCode, 1);
+      assert.deepEqual((await readFile(argsLog, "utf8")).trimEnd().split("\n"), [
+        "--no-config",
+        "--color",
+        "never",
+        "--no-messages",
+        "--glob=--file=/tmp/forbidden-glob",
+        "--ignore-case",
+        "--fixed-strings",
+        "--context",
+        "2",
+        "--line-number",
+        "--column",
+        "--no-heading",
+        "--regexp",
+        "--pre=/tmp/forbidden-pre",
+        "--",
+        "--scope"
+      ]);
+      assert.equal(await readFile(envLog, "utf8"), "unset");
+    } finally {
+      if (previous.path === undefined) delete process.env.PATH;
+      else process.env.PATH = previous.path;
+      if (previous.config === undefined) delete process.env.RIPGREP_CONFIG_PATH;
+      else process.env.RIPGREP_CONFIG_PATH = previous.config;
+      if (previous.argsLog === undefined) delete process.env.RG_ARGS_LOG;
+      else process.env.RG_ARGS_LOG = previous.argsLog;
+      if (previous.envLog === undefined) delete process.env.RG_ENV_LOG;
+      else process.env.RG_ENV_LOG = previous.envLog;
+    }
+  });
+});
+
+test("search_many blocks rg option and config injection without changing normal search behavior", async () => {
+  await withTempDir(async (dir) => {
+    const scope = path.join(dir, "scope");
+    const optionScope = path.join(dir, "--scope");
+    await mkdir(scope);
+    await mkdir(optionScope);
+    const marker = path.join(dir, "preprocessor-ran");
+    const preprocessor = path.join(dir, "hostile-preprocessor.sh");
+    const patternFile = path.join(dir, "outside-patterns.txt");
+    const configFile = path.join(dir, "ripgrep.conf");
+    await writeFile(preprocessor, `#!/bin/sh\nprintf executed > ${JSON.stringify(marker)}\n`, "utf8");
+    await chmod(preprocessor, 0o755);
+    await writeFile(patternFile, "needle-from-pattern-file\n", "utf8");
+    await writeFile(configFile, `--pre=${preprocessor}\n--glob=!*.txt\n`, "utf8");
+    const prePattern = `--pre=${preprocessor}`;
+    const filePattern = `--file=${patternFile}`;
+    await writeFile(path.join(scope, "target.txt"), `${prePattern}\n${filePattern}\n`, "utf8");
+    await writeFile(path.join(optionScope, "option.txt"), "needle-option-path\n", "utf8");
+
+    const previousConfig = process.env.RIPGREP_CONFIG_PATH;
+    process.env.RIPGREP_CONFIG_PATH = configFile;
+    try {
+      const result = await searchMany(createContext(dir), {
+        searches: [
+          { kind: "content", pattern: prePattern, path: "scope", glob: "*.txt", literal: true },
+          { kind: "content", pattern: filePattern, path: "scope", glob: "*.txt", literal: true },
+          { kind: "content", pattern: "needle-option-path", path: "--scope", glob: "*.txt", literal: true },
+          { kind: "files", path: "--scope", glob: "*.txt" }
+        ]
+      });
+      assert.deepEqual(result.details.searches.map((search) => search.outputLines), [1, 1, 1, 1]);
+      const text = textFromResult(result);
+      assert.match(text, new RegExp(escapeRegExp(prePattern)));
+      assert.match(text, new RegExp(escapeRegExp(filePattern)));
+      assert.match(text, /--scope\/option\.txt:1:\d+:needle-option-path/);
+      assert.match(text, /--scope\/option\.txt/);
+      await assert.rejects(readFile(marker, "utf8"), /ENOENT/);
+    } finally {
+      if (previousConfig === undefined) delete process.env.RIPGREP_CONFIG_PATH;
+      else process.env.RIPGREP_CONFIG_PATH = previousConfig;
+    }
+  });
+});
+
 test("search_many lists files and searches content with line numbers", async () => {
   await withTempDir(async (dir) => {
     await writeFile(path.join(dir, "alpha.ts"), "const alpha = 1;\nconst needle = alpha;\n", "utf8");

@@ -35,6 +35,35 @@ test("path confinement rejects traversal, absolute escapes, and symlink escapes"
   }
 });
 
+test("allowed-root extension blocks search_many symlink escapes", async () => {
+  const parent = await mkdtemp(path.join(tmpdir(), "pi-orch-confine-search-"));
+  const root = path.join(parent, "root");
+  const outside = path.join(parent, "outside");
+  let handler: ((event: ToolCallEvent) => Promise<unknown>) | undefined;
+  const api = {
+    on(event: string, callback: (event: ToolCallEvent) => Promise<unknown>): void {
+      if (event === "tool_call") handler = callback;
+    }
+  } as unknown as ExtensionAPI;
+  try {
+    await mkdir(root);
+    await mkdir(outside);
+    await symlink(outside, path.join(root, "escape"));
+    createAllowedRootExtension(root)(api);
+    assert.ok(handler);
+    const blocked = await handler!({
+      type: "tool_call",
+      toolCallId: "search-symlink",
+      toolName: "search_many",
+      input: { searches: [{ kind: "content", pattern: "needle", path: "escape" }] }
+    } as ToolCallEvent) as { block: boolean; reason: string };
+    assert.equal(blocked.block, true);
+    assert.match(blocked.reason, /symlink outside allowed root/);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
 test("allowed-root extension blocks escaping write_many calls", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "pi-orch-confine-hook-"));
   let handler: ((event: ToolCallEvent) => Promise<unknown>) | undefined;

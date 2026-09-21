@@ -16,6 +16,7 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { abortErrorFromSignal, settleAllOrThrow, terminateProcessOnAbort, throwIfAborted, withAbortableFileMutationQueue } from "../_shared/cancellation.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
+import { resolveExecutable } from "../_shared/executable.js";
 import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 
@@ -519,7 +520,7 @@ function registerBatchTools(api: ExtensionAPI): void {
       "search_many use: Prefer search_many before read_many when discovering files, symbols, definitions, references, call sites, or likely edit locations; inspect the narrowed known paths/ranges with read_many afterward.",
       inputJsonSchemaGuideline("search_many", SearchManyParams),
       outputJsonSchemaGuideline("search_many", RetainedToolOutputSchemas.search_many),
-      "search_many constraints: Use literal:true for exact text when regex semantics are unnecessary; otherwise provide a valid ripgrep regex. Narrow or raise maxResults before reading identified ranges. Use structured search_many for normal discovery instead of serial shell searches; use shell_start only when custom rg/find/git-grep inspection is actually needed. Only result content is provider-visible; details are internal, and thrown errors use the host's out-of-band error result."
+      "search_many constraints: Use literal:true for exact text when regex semantics are unnecessary; otherwise provide a valid ripgrep regex. Patterns are passed as explicit rg data, paths follow an option terminator, and ambient ripgrep config is disabled. Narrow or raise maxResults before reading identified ranges. Use structured search_many for normal discovery instead of serial shell searches; use shell_start only when custom rg/find/git-grep inspection is actually needed. Only result content is provider-visible; details are internal, and thrown errors use the host's out-of-band error result."
     ],
     parameters: SearchManyParams,
     executionMode: "parallel",
@@ -908,7 +909,8 @@ export async function readMany(
 
 export async function searchMany(context: ExtensionContext, input: SearchManyInput, signal?: AbortSignal): Promise<AgentToolResult<SearchManyDetails>> {
   throwIfAborted(signal);
-  const results = await settleAllOrThrow(input.searches.map((item) => searchOne(context, item, signal)), signal);
+  const rgPath = resolveExecutable("rg");
+  const results = await settleAllOrThrow(input.searches.map((item) => searchOne(context, item, rgPath, signal)), signal);
   const details = results.map(({ output: _output, ...detail }) => detail);
   const text = [
     `Completed ${results.length} search${results.length === 1 ? "" : "es"}.`,
@@ -922,7 +924,12 @@ export async function searchMany(context: ExtensionContext, input: SearchManyInp
   };
 }
 
-async function searchOne(context: ExtensionContext, item: SearchManyInput["searches"][number], signal?: AbortSignal): Promise<SearchResult> {
+async function searchOne(
+  context: ExtensionContext,
+  item: SearchManyInput["searches"][number],
+  rgPath: string,
+  signal?: AbortSignal
+): Promise<SearchResult> {
   throwIfAborted(signal);
   const kind = item.kind as SearchKind;
   const searchPath = item.path ?? ".";
@@ -930,7 +937,7 @@ async function searchOne(context: ExtensionContext, item: SearchManyInput["searc
   const contextLines = kind === "content" ? item.context ?? 0 : 0;
   const maxResults = item.maxResults ?? 100;
   const args = buildRgArgs(context.cwd, item, resolvedPath, contextLines);
-  const run = await runRg(context.cwd, args, signal);
+  const run = await runRg(rgPath, context.cwd, args, signal);
 
   if (!run.truncated && run.exitCode !== 0 && run.exitCode !== 1) {
     throw new Error(`rg failed for ${searchPath}: ${run.stderr || `exit code ${run.exitCode}`}`);
@@ -961,14 +968,14 @@ function buildRgArgs(
   contextLines: number
 ): string[] {
   const pathArg = searchPathArgument(cwd, resolvedPath);
-  const args = ["--color", "never", "--no-messages"];
+  const args = ["--no-config", "--color", "never", "--no-messages"];
 
   if (item.glob !== undefined) {
-    args.push("--glob", item.glob);
+    args.push(`--glob=${item.glob}`);
   }
 
   if (item.kind === "files") {
-    return [...args, "--files", pathArg];
+    return [...args, "--files", "--", pathArg];
   }
 
   if (item.pattern === undefined) {
@@ -990,7 +997,9 @@ function buildRgArgs(
     "--line-number",
     "--column",
     "--no-heading",
+    "--regexp",
     item.pattern,
+    "--",
     pathArg
   ];
 }
@@ -1006,10 +1015,14 @@ function searchPathArgument(cwd: string, resolvedPath: string): string {
   return resolvedPath;
 }
 
-function runRg(cwd: string, args: string[], signal?: AbortSignal): Promise<RgResult> {
+function runRg(rgPath: string, cwd: string, args: string[], signal?: AbortSignal): Promise<RgResult> {
   throwIfAborted(signal);
   return new Promise((resolve, reject) => {
-    const child = spawn("rg", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(rgPath, args, {
+      cwd,
+      env: ripgrepEnvironment(process.env),
+      stdio: ["ignore", "pipe", "pipe"]
+    });
     const cleanupAbort = terminateProcessOnAbort(child, signal);
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
@@ -1070,6 +1083,12 @@ function runRg(cwd: string, args: string[], signal?: AbortSignal): Promise<RgRes
       });
     });
   });
+}
+
+function ripgrepEnvironment(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const sanitized = { ...environment };
+  delete sanitized.RIPGREP_CONFIG_PATH;
+  return sanitized;
 }
 
 function limitSearchOutput(output: string, maxResults: number): { text: string; outputLines: number; truncated: boolean } {
