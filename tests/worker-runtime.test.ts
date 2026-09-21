@@ -79,6 +79,226 @@ const handoff = {
   checks: [{ cwd: "repos/project", command: "npm test", outcome: "passed" }]
 } as const;
 
+test("worker_task_read uses official readonly Beads paging with bounded assigned-task output", async () => {
+  await withTempDir(async (directory) => {
+    const bdPath = path.join(directory, "fake-bd");
+    const logPath = path.join(directory, "bd-read-argv.log");
+    const showPath = path.join(directory, "bd-show.json");
+    const beadsPath = path.join(directory, "central-beads");
+    const beadsRoute = { prefix: "personal", path: beadsPath, databasePath: path.join(beadsPath, "database") } as const;
+    const whereOutput = JSON.stringify({ prefix: "personal", path: beadsRoute.path, database_path: beadsRoute.databasePath });
+    const relation = (index: number, kind: string) => ({
+      id: `personal-${kind}${index}`,
+      title: index === 0 ? `${kind} ${"t".repeat(600)}` : `${kind} ${index}`,
+      status: "open",
+      priority: 2,
+      issue_type: "task",
+      dependency_type: "blocks"
+    });
+    const showOutput = [
+      {
+        id: "personal-test",
+        title: "Assigned test task",
+        status: "in_progress",
+        priority: 1,
+        issue_type: "feature",
+        assignee: "worker-test",
+        parent: "personal-parent",
+        description: "d".repeat(3_000),
+        notes: "Use the bounded host adapter.",
+        acceptance_criteria: "Never expose the Beads database.",
+        dependency_count: 6,
+        dependent_count: 5,
+        dependencies: Array.from({ length: 6 }, (_, index) => relation(index, "dependency")),
+        dependents: Array.from({ length: 5 }, (_, index) => relation(index, "dependent"))
+      },
+      {
+        id: "personal-second",
+        title: "Second assigned task",
+        status: "open",
+        priority: 2,
+        issue_type: "task",
+        description: "Small task.",
+        dependency_count: 0,
+        dependent_count: 0,
+        dependencies: [],
+        dependents: []
+      }
+    ];
+    await writeFile(showPath, `${JSON.stringify(showOutput)}\n`);
+    await writeFile(bdPath, [
+      "#!/bin/sh",
+      "printf '%s\\n' \"$@\" >> \"$PI_FAKE_BD_LOG\"",
+      `if [ \"$1\" = where ]; then printf '%s\\n' '${whereOutput}'`,
+      "elif [ \"$1\" = --readonly ] && [ \"$2\" = show ]; then",
+      "  if [ -n \"$PI_FAKE_BD_FAIL_SHOW\" ]; then printf '%s\\n' \"$0 $BEADS_DIR\" >&2; exit 9; fi",
+      "  cat \"$PI_FAKE_BD_SHOW\"",
+      "else exit 2",
+      "fi",
+      ""
+    ].join("\n"));
+    await chmod(bdPath, 0o700);
+    await withWorkerEnv(directory, async () => {
+      const api = fakeApi();
+      workerRuntimeExtension(api);
+      const tool = api.tools.find((candidate) => candidate.name === "worker_task_read");
+      assert.ok(tool?.execute);
+      const result = await tool.execute("read-1", { offset: 0, limit: 2 } as never, undefined, undefined, context(directory));
+      const details = result.details as {
+        offset: number;
+        limit: number;
+        totalAssigned: number;
+        returned: number;
+        nextOffset?: number;
+        contentBytes: number;
+        truncated: boolean;
+      };
+      assert.deepEqual({ ...details, contentBytes: undefined }, {
+        offset: 0,
+        limit: 2,
+        totalAssigned: 3,
+        returned: 2,
+        nextOffset: 2,
+        contentBytes: undefined,
+        truncated: true
+      });
+      assert.ok(details.contentBytes > 0 && details.contentBytes <= 64 * 1024);
+      const content = result.content[0];
+      assert.equal(content.type, "text");
+      const text = content.type === "text" ? content.text : "";
+      const payload = JSON.parse(text.slice(text.indexOf("{\n"))) as { tasks: Array<Record<string, unknown>> };
+      assert.equal(payload.tasks.length, 2);
+      assert.equal(Buffer.byteLength(payload.tasks[0].description as string, "utf8") <= 2_048, true);
+      assert.equal((payload.tasks[0].dependencies as unknown[]).length, 4);
+      assert.equal((payload.tasks[0].dependents as unknown[]).length, 4);
+      assert.deepEqual((payload.tasks[0].dependencies as Array<{ truncatedFields: string[] }>)[0].truncatedFields, ["title"]);
+      assert.deepEqual(payload.tasks[0].truncatedFields, ["dependencies", "dependents", "description"]);
+      assert.doesNotMatch(text, /central-beads|fake-bd/);
+
+      const argv = await readFile(logPath, "utf8");
+      assert.match(argv, /^where\n--json\n--readonly\nshow\n--include-dependents\n--id=personal-test\n--id=personal-second\n--json/m);
+      assert.doesNotMatch(argv, /update|--db/);
+
+      await writeFile(showPath, `${JSON.stringify([{
+        ...showOutput[0],
+        description: "Small task.",
+        dependency_count: 1,
+        dependent_count: 0,
+        dependencies: [relation(0, "dependency")],
+        dependents: []
+      }])}\n`);
+      const relationOnlyResult = await tool.execute(
+        "read-relation-truncation",
+        { offset: 0, limit: 1 } as never,
+        undefined,
+        undefined,
+        context(directory)
+      );
+      assert.equal((relationOnlyResult.details as { truncated: boolean }).truncated, true);
+      const relationOnlyContent = relationOnlyResult.content[0];
+      assert.equal(relationOnlyContent.type, "text");
+      const relationOnlyText = relationOnlyContent.type === "text" ? relationOnlyContent.text : "";
+      const relationOnlyPayload = JSON.parse(relationOnlyText.slice(relationOnlyText.indexOf("{\n"))) as {
+        tasks: Array<{ truncatedFields: string[]; dependencies: Array<{ truncatedFields: string[] }> }>;
+      };
+      assert.deepEqual(relationOnlyPayload.tasks[0].truncatedFields, []);
+      assert.deepEqual(relationOnlyPayload.tasks[0].dependencies[0].truncatedFields, ["title"]);
+
+      await writeFile(showPath, `${JSON.stringify([{ ...showOutput[0], id: "personal-unexpected" }])}\n`);
+      await assert.rejects(
+        tool.execute("read-mismatch", { offset: 0, limit: 1 } as never, undefined, undefined, context(directory)),
+        /did not match the assigned task page/
+      );
+      await assert.rejects(
+        tool.execute("read-offset", { offset: 3, limit: 1 } as never, undefined, undefined, context(directory)),
+        /offset 3 exceeds 3 assigned task IDs/
+      );
+      process.env.PI_FAKE_BD_FAIL_SHOW = "1";
+      await assert.rejects(
+        tool.execute("read-cli-failure", { offset: 0, limit: 1 } as never, undefined, undefined, context(directory)),
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.match(error.message, /could not read the assigned Beads task page/);
+          assert.doesNotMatch(error.message, /central-beads|fake-bd/);
+          return true;
+        }
+      );
+      delete process.env.PI_FAKE_BD_FAIL_SHOW;
+
+      await writeFile(showPath, "/CENTRAL_ROUTE_SECRET/not-json\n");
+      await assert.rejects(
+        tool.execute("read-malformed-json", { offset: 0, limit: 1 } as never, undefined, undefined, context(directory)),
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.match(error.message, /received invalid JSON from Beads/);
+          assert.doesNotMatch(error.message, /CENTRAL_ROUTE_SECRET/);
+          assert.ok(Buffer.byteLength(error.message, "utf8") < 1_024);
+          return true;
+        }
+      );
+
+      const oversizedId = "X".repeat(100 * 1_024);
+      const oversizedTask = { ...showOutput[0], id: oversizedId };
+      await writeFile(showPath, `${JSON.stringify([oversizedTask, oversizedTask])}\n`);
+      await assert.rejects(
+        tool.execute("read-oversized-duplicate-id", { offset: 0, limit: 1 } as never, undefined, undefined, context(directory)),
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.match(error.message, /id exceeded 128 bytes/);
+          assert.doesNotMatch(error.message, /X{32}/);
+          assert.ok(Buffer.byteLength(error.message, "utf8") < 1_024);
+          return true;
+        }
+      );
+
+      await writeFile(showPath, `${JSON.stringify([showOutput[0], showOutput[0]])}\n`);
+      await assert.rejects(
+        tool.execute("read-duplicate-id", { offset: 0, limit: 1 } as never, undefined, undefined, context(directory)),
+        /received duplicate Beads task records/
+      );
+
+      await writeFile(showPath, `${JSON.stringify([{ ...showOutput[0], status: "   " }])}\n`);
+      await assert.rejects(
+        tool.execute("read-blank-status", { offset: 0, limit: 1 } as never, undefined, undefined, context(directory)),
+        /expected non-empty status/
+      );
+
+      const taskWithoutCounts: Record<string, unknown> = {
+        ...showOutput[0],
+        description: "Small task.",
+        dependencies: Array.from({ length: 6 }, (_, index) => relation(index, "dependency")),
+        dependents: []
+      };
+      delete taskWithoutCounts.dependency_count;
+      delete taskWithoutCounts.dependent_count;
+      await writeFile(showPath, `${JSON.stringify([taskWithoutCounts])}\n`);
+      const countResult = await tool.execute(
+        "read-count-fallback",
+        { offset: 0, limit: 1 } as never,
+        undefined,
+        undefined,
+        context(directory)
+      );
+      const countContent = countResult.content[0];
+      assert.equal(countContent.type, "text");
+      const countText = countContent.type === "text" ? countContent.text : "";
+      const countPayload = JSON.parse(countText.slice(countText.indexOf("{\n"))) as {
+        tasks: Array<{ dependencyCount: number; dependentCount: number; dependencies: unknown[] }>;
+      };
+      assert.equal(countPayload.tasks[0].dependencyCount, 6);
+      assert.equal(countPayload.tasks[0].dependentCount, 0);
+      assert.equal(countPayload.tasks[0].dependencies.length, 4);
+    }, {
+      PI_WORKER_TASK_IDS: JSON.stringify(["personal-test", "personal-second", "personal-third"]),
+      PI_WORKER_BD_PATH: bdPath,
+      PI_WORKER_BEADS_ROUTE: JSON.stringify(beadsRoute),
+      PI_FAKE_BD_LOG: logPath,
+      PI_FAKE_BD_SHOW: showPath,
+      BEADS_DIR: beadsPath
+    });
+  });
+});
+
 test("worker_task_update verifies personal routing and permits only assigned tasks", async () => {
   await withTempDir(async (directory) => {
     const bdPath = path.join(directory, "fake-bd");
@@ -160,8 +380,10 @@ test("worker_handoff writes one typed accepted result when the worker is quiesce
       const api = fakeApi();
       workerRuntimeExtension(api);
       const tool = api.tools.find((candidate) => candidate.name === "worker_handoff");
+      const taskRead = api.tools.find((candidate) => candidate.name === "worker_task_read");
       const taskUpdate = api.tools.find((candidate) => candidate.name === "worker_task_update");
       assert.ok(tool?.execute);
+      assert.ok(taskRead?.execute);
       assert.ok(taskUpdate?.execute);
       const result = await tool.execute("call-1", handoff as never, undefined, undefined, context(directory));
       assert.deepEqual(result.details, {
@@ -176,6 +398,10 @@ test("worker_handoff writes one typed accepted result when the worker is quiesce
       await assert.rejects(
         tool.execute("call-2", handoff as never, undefined, undefined, context(directory)),
         /already accepted/
+      );
+      await assert.rejects(
+        taskRead.execute("read-after-handoff", {} as never, undefined, undefined, context(directory)),
+        /already accepted|sealed/i
       );
       await assert.rejects(
         taskUpdate.execute("task-after-handoff", {
@@ -271,6 +497,7 @@ test("worker RPC argv pins exact session resources and only the worker tool surf
     assert.ok(args.includes(required), required);
   }
   assert.match(args[args.indexOf("--tools") + 1], /worker_handoff/);
+  assert.match(args[args.indexOf("--tools") + 1], /worker_task_read/);
   assert.ok(resolvePiCliPath().endsWith("/dist/cli.js"));
   assert.equal(defaultWorkerExtensionPaths().length, 2);
 });

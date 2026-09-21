@@ -213,7 +213,7 @@ export function buildWorkerRpcArgs(config: WorkerHostConfig): string[] {
     "--no-themes",
     "--no-extensions",
     "--no-builtin-tools",
-    "--tools", "worker_handoff,worker_task_update,shell_start,shell_status,shell_read,shell_cancel",
+    "--tools", "worker_handoff,worker_task_read,worker_task_update,shell_start,shell_status,shell_read,shell_cancel",
     ...config.extensionPaths.flatMap((extensionPath) => ["-e", extensionPath])
   ];
 }

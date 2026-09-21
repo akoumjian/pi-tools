@@ -7,6 +7,7 @@ import { defineTool, type AgentToolResult, type ExtensionAPI } from "@earendil-w
 import { unsettledAsyncShellJobsForOwner, type AsyncShellJobOwner } from "../async-shell/index.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 import {
+  MAX_WORKER_TASK_IDS,
   WorkerHandoffParams,
   type AcceptedWorkerHandoff,
   type WorkerHandoff
@@ -22,11 +23,128 @@ export const WorkerTaskUpdateParams = Type.Object({
 
 export type WorkerTaskUpdate = Static<typeof WorkerTaskUpdateParams>;
 
+const MAX_WORKER_TASK_READ_LIMIT = 4;
+const MAX_WORKER_TASK_RELATIONS = 4;
+const MAX_WORKER_BEADS_OUTPUT_BYTES = 512 * 1024;
+const MAX_WORKER_TASK_READ_CONTENT_BYTES = 64 * 1024;
+
+export const WorkerTaskReadParams = Type.Object({
+  offset: Type.Optional(Type.Integer({
+    minimum: 0,
+    maximum: MAX_WORKER_TASK_IDS - 1,
+    default: 0,
+    description: "Zero-based offset into this worker's parent-assigned task IDs. Defaults to 0."
+  })),
+  limit: Type.Optional(Type.Integer({
+    minimum: 1,
+    maximum: MAX_WORKER_TASK_READ_LIMIT,
+    default: MAX_WORKER_TASK_READ_LIMIT,
+    description: `Maximum assigned tasks to return. Defaults to ${MAX_WORKER_TASK_READ_LIMIT}.`
+  }))
+}, { additionalProperties: false });
+
+export type WorkerTaskRead = Static<typeof WorkerTaskReadParams>;
+
+type WorkerTaskReadDetails = {
+  offset: number;
+  limit: number;
+  totalAssigned: number;
+  returned: number;
+  nextOffset?: number;
+  contentBytes: number;
+  truncated: boolean;
+};
+
+type WorkerTaskRelationView = {
+  id: string;
+  title: string;
+  status: string;
+  priority: number;
+  issueType: string;
+  dependencyType?: string;
+  truncatedFields: string[];
+};
+
+type WorkerTaskView = {
+  id: string;
+  title: string;
+  status: string;
+  priority: number;
+  issueType: string;
+  assignee?: string;
+  parent?: string;
+  description?: string;
+  notes?: string;
+  acceptanceCriteria?: string;
+  dependencyCount: number;
+  dependentCount: number;
+  dependencies: WorkerTaskRelationView[];
+  dependents: WorkerTaskRelationView[];
+  truncatedFields: string[];
+};
+
 type WorkerHandoffDetails =
   | { accepted: true; resultFile: string }
   | { accepted: false; activeJobIds: string[] };
 
 export default function workerRuntimeExtension(api: ExtensionAPI): void {
+  api.registerTool(defineTool({
+    name: "worker_task_read",
+    label: "Worker Task Read",
+    description: "Read a bounded page of tasks assigned to this managed worker, including direct Beads dependencies and dependents. The trusted host adapter verifies the exact central personal route, invokes the official bd read path in --readonly mode, and returns bounded structured JSON without exposing the database, CLI, or BEADS_DIR inside Docker.",
+    promptSnippet: "Read assigned Beads task context and direct dependency summaries through the bounded worker_task_read adapter.",
+    promptGuidelines: [
+      "worker_task_read use: Read the assigned task descriptions, notes, acceptance criteria, and direct dependency/dependent summaries when more task context is needed; follow nextOffset to page additional assigned tasks.",
+      inputJsonSchemaGuideline("worker_task_read", WorkerTaskReadParams),
+      outputJsonSchemaGuideline("worker_task_read", workerTaskReadOutputSchema()),
+      `worker_task_read constraints: Reads only parent-assigned task roots, at most ${MAX_WORKER_TASK_READ_LIMIT} per call, through official bd --readonly JSON semantics after exact personal-route verification. Text fields, relationships, raw CLI output, and provider-visible content are bounded. The adapter cannot mutate Beads and does not expose bd, BEADS_DIR, database paths, or arbitrary queries to worker shell processes.`
+    ],
+    parameters: WorkerTaskReadParams,
+    executionMode: "sequential",
+    async execute(_toolCallId, params): Promise<AgentToolResult<WorkerTaskReadDetails>> {
+      if (existsSync(workerRuntimeIdentity().resultFile)) {
+        throw new Error("worker_task_read is sealed after worker_handoff acceptance.");
+      }
+      const runtime = workerTaskRuntime();
+      verifyPersonalBeadsRoute(runtime);
+      const assigned = [...runtime.taskIds];
+      const offset = params.offset ?? 0;
+      const limit = params.limit ?? MAX_WORKER_TASK_READ_LIMIT;
+      if (offset >= assigned.length) {
+        throw new Error(`worker_task_read offset ${offset} exceeds ${assigned.length} assigned task IDs.`);
+      }
+      const taskIds = assigned.slice(offset, offset + limit);
+      const output = readBeadsTaskPage(runtime, taskIds);
+      const tasks = workerTaskViews(output, taskIds);
+      const truncated = tasks.some((task) =>
+        task.truncatedFields.length > 0 ||
+        [...task.dependencies, ...task.dependents].some((relation) => relation.truncatedFields.length > 0)
+      );
+      const nextOffset = offset + taskIds.length < assigned.length ? offset + taskIds.length : undefined;
+      const text = [
+        `Read ${tasks.length} of ${assigned.length} assigned Beads task${assigned.length === 1 ? "" : "s"}${nextOffset === undefined ? "." : `; continue with offset ${nextOffset}.`}`,
+        "",
+        JSON.stringify({ tasks }, null, 2)
+      ].join("\n");
+      const contentBytes = Buffer.byteLength(text, "utf8");
+      if (contentBytes > MAX_WORKER_TASK_READ_CONTENT_BYTES) {
+        throw new Error(`worker_task_read output exceeded ${MAX_WORKER_TASK_READ_CONTENT_BYTES} bytes after field bounds.`);
+      }
+      return {
+        content: [{ type: "text", text }],
+        details: {
+          offset,
+          limit,
+          totalAssigned: assigned.length,
+          returned: tasks.length,
+          nextOffset,
+          contentBytes,
+          truncated
+        }
+      };
+    }
+  }));
+
   api.registerTool(defineTool({
     name: "worker_task_update",
     label: "Worker Task Update",
@@ -52,12 +170,18 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
       const args = ["update", params.taskId, `--append-notes=${params.note.trim()}`];
       if (params.status) args.push("--status", params.status);
       args.push("--actor", `worker:${runtime.workerId}`, "--json");
-      execFileSync(runtime.bdPath, args, {
-        cwd: runtime.workspaceRoot,
-        env: process.env,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"]
-      });
+      try {
+        execFileSync(runtime.bdPath, args, {
+          cwd: runtime.workspaceRoot,
+          env: process.env,
+          encoding: "utf8",
+          maxBuffer: MAX_WORKER_BEADS_OUTPUT_BYTES,
+          timeout: 10_000,
+          stdio: ["ignore", "pipe", "pipe"]
+        });
+      } catch {
+        throw new Error(`worker_task_update could not record an update for ${params.taskId}.`);
+      }
       return {
         content: [{ type: "text", text: `Recorded a durable worker note on ${params.taskId}${params.status ? ` and set status ${params.status}` : ""}.` }],
         details: { taskId: params.taskId, status: params.status, recorded: true }
@@ -128,10 +252,15 @@ export function readWorkerRuntimeHandoff(resultFile: string): AcceptedWorkerHand
 
 function assignedTaskIds(): Set<string> {
   const rawTaskIds = JSON.parse(requiredEnvironment("PI_WORKER_TASK_IDS")) as unknown;
-  if (!Array.isArray(rawTaskIds) || rawTaskIds.some((value) => typeof value !== "string" || !value.trim())) {
-    throw new Error("Worker runtime requires PI_WORKER_TASK_IDS to contain a JSON string array.");
+  if (
+    !Array.isArray(rawTaskIds) ||
+    rawTaskIds.length === 0 ||
+    rawTaskIds.length > MAX_WORKER_TASK_IDS ||
+    rawTaskIds.some((value) => typeof value !== "string" || !/^personal-[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)*$/.test(value.trim()))
+  ) {
+    throw new Error(`Worker runtime requires PI_WORKER_TASK_IDS to contain 1-${MAX_WORKER_TASK_IDS} central personal task IDs.`);
   }
-  return new Set(rawTaskIds);
+  return new Set(rawTaskIds.map((value) => value.trim()));
 }
 
 function validateWorkerHandoff(
@@ -186,14 +315,42 @@ function workerTaskRuntime(): {
   };
 }
 
+function readBeadsTaskPage(runtime: ReturnType<typeof workerTaskRuntime>, taskIds: readonly string[]): string {
+  try {
+    return execFileSync(runtime.bdPath, [
+      "--readonly",
+      "show",
+      "--include-dependents",
+      ...taskIds.map((taskId) => `--id=${taskId}`),
+      "--json"
+    ], {
+      cwd: runtime.workspaceRoot,
+      env: process.env,
+      encoding: "utf8",
+      maxBuffer: MAX_WORKER_BEADS_OUTPUT_BYTES,
+      timeout: 10_000,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+  } catch {
+    throw new Error("worker_task_read could not read the assigned Beads task page.");
+  }
+}
+
 function verifyPersonalBeadsRoute(runtime: ReturnType<typeof workerTaskRuntime>): void {
-  const output = execFileSync(runtime.bdPath, ["where", "--json"], {
-    cwd: runtime.workspaceRoot,
-    env: process.env,
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"]
-  });
-  const route = JSON.parse(output) as { prefix?: unknown; path?: unknown; database_path?: unknown };
+  let route: { prefix?: unknown; path?: unknown; database_path?: unknown };
+  try {
+    const output = execFileSync(runtime.bdPath, ["where", "--json"], {
+      cwd: runtime.workspaceRoot,
+      env: process.env,
+      encoding: "utf8",
+      maxBuffer: MAX_WORKER_BEADS_OUTPUT_BYTES,
+      timeout: 10_000,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    route = JSON.parse(output) as typeof route;
+  } catch {
+    throw new Error("Worker Beads route verification failed.");
+  }
   const actual = {
     prefix: route.prefix,
     path: typeof route.path === "string" ? path.resolve(route.path) : undefined,
@@ -208,7 +365,7 @@ function verifyPersonalBeadsRoute(runtime: ReturnType<typeof workerTaskRuntime>)
   }
   const ambientPath = process.env.BEADS_DIR?.trim();
   if (!ambientPath || path.resolve(ambientPath) !== runtime.beadsRoute.path) {
-    throw new Error("Worker Beads mutation requires the unchanged ambient central BEADS_DIR route.");
+    throw new Error("Worker Beads access requires the unchanged ambient central BEADS_DIR route.");
   }
 }
 
@@ -253,6 +410,144 @@ function writeAtomicJson(target: string, value: unknown): void {
   const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
   writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
   renameSync(temporary, target);
+}
+
+function workerTaskViews(output: string, expectedTaskIds: readonly string[]): WorkerTaskView[] {
+  let value: unknown;
+  try {
+    value = JSON.parse(output) as unknown;
+  } catch {
+    throw new Error("worker_task_read received invalid JSON from Beads.");
+  }
+  if (!Array.isArray(value)) throw new Error("worker_task_read expected bd show to return a JSON array.");
+  const byId = new Map<string, Record<string, unknown>>();
+  for (const candidate of value) {
+    if (!isRecord(candidate)) throw new Error("worker_task_read received an invalid Beads task record.");
+    const taskId = requiredTaskText(candidate, "id", 128);
+    if (byId.has(taskId)) throw new Error("worker_task_read received duplicate Beads task records.");
+    byId.set(taskId, candidate);
+  }
+  if (byId.size !== expectedTaskIds.length || expectedTaskIds.some((taskId) => !byId.has(taskId))) {
+    throw new Error("worker_task_read Beads response did not match the assigned task page.");
+  }
+  return expectedTaskIds.map((taskId) => workerTaskView(byId.get(taskId)!));
+}
+
+function workerTaskView(value: Record<string, unknown>): WorkerTaskView {
+  const truncatedFields: string[] = [];
+  const bounded = (field: string, maximumBytes: number): string | undefined => {
+    const raw = value[field];
+    if (raw === undefined || raw === null || raw === "") return undefined;
+    if (typeof raw !== "string") throw new Error(`worker_task_read expected ${field} to be text.`);
+    const result = boundedUtf8(raw, maximumBytes);
+    if (!result.text) return undefined;
+    if (result.truncated) truncatedFields.push(field);
+    return result.text;
+  };
+  const title = bounded("title", 512);
+  if (!title) throw new Error("worker_task_read expected non-empty title.");
+  const dependencies = boundedRelations(value.dependencies, "dependencies", truncatedFields);
+  const dependents = boundedRelations(value.dependents, "dependents", truncatedFields);
+  return {
+    id: requiredTaskText(value, "id", 128),
+    title,
+    status: requiredTaskText(value, "status", 64),
+    priority: requiredTaskInteger(value, "priority"),
+    issueType: requiredTaskText(value, "issue_type", 64),
+    assignee: bounded("assignee", 256),
+    parent: bounded("parent", 128),
+    description: bounded("description", 2_048),
+    notes: bounded("notes", 2_048),
+    acceptanceCriteria: bounded("acceptance_criteria", 1_024),
+    dependencyCount: optionalTaskInteger(
+      value,
+      "dependency_count",
+      Array.isArray(value.dependencies) ? value.dependencies.length : dependencies.length
+    ),
+    dependentCount: optionalTaskInteger(
+      value,
+      "dependent_count",
+      Array.isArray(value.dependents) ? value.dependents.length : dependents.length
+    ),
+    dependencies,
+    dependents,
+    truncatedFields
+  };
+}
+
+function boundedRelations(value: unknown, field: string, truncatedFields: string[]): WorkerTaskRelationView[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new Error(`worker_task_read expected ${field} to be an array.`);
+  if (value.length > MAX_WORKER_TASK_RELATIONS) truncatedFields.push(field);
+  return value.slice(0, MAX_WORKER_TASK_RELATIONS).map((candidate) => {
+    if (!isRecord(candidate)) throw new Error(`worker_task_read received an invalid ${field} record.`);
+    const truncatedFields: string[] = [];
+    const rawTitle = candidate.title;
+    if (typeof rawTitle !== "string") throw new Error(`worker_task_read expected non-empty ${field} title.`);
+    const title = boundedUtf8(rawTitle, 512);
+    if (!title.text) throw new Error(`worker_task_read expected non-empty ${field} title.`);
+    if (title.truncated) truncatedFields.push("title");
+    return {
+      id: requiredTaskText(candidate, "id", 128),
+      title: title.text,
+      status: requiredTaskText(candidate, "status", 64),
+      priority: requiredTaskInteger(candidate, "priority"),
+      issueType: requiredTaskText(candidate, "issue_type", 64),
+      ...(candidate.dependency_type === undefined || candidate.dependency_type === null
+        ? {}
+        : { dependencyType: requiredTaskText(candidate, "dependency_type", 64) }),
+      truncatedFields
+    };
+  });
+}
+
+function requiredTaskText(value: Record<string, unknown>, field: string, maximumBytes: number): string {
+  const raw = value[field];
+  if (typeof raw !== "string") throw new Error(`worker_task_read expected non-empty ${field}.`);
+  const result = boundedUtf8(raw, maximumBytes);
+  if (!result.text) throw new Error(`worker_task_read expected non-empty ${field}.`);
+  if (result.truncated) throw new Error(`worker_task_read ${field} exceeded ${maximumBytes} bytes.`);
+  return result.text;
+}
+
+function requiredTaskInteger(value: Record<string, unknown>, field: string): number {
+  const raw = value[field];
+  if (!Number.isInteger(raw)) throw new Error(`worker_task_read expected integer ${field}.`);
+  return raw as number;
+}
+
+function optionalTaskInteger(value: Record<string, unknown>, field: string, fallback: number): number {
+  const raw = value[field];
+  return Number.isInteger(raw) && (raw as number) >= 0 ? raw as number : fallback;
+}
+
+function boundedUtf8(value: string, maximumBytes: number): { text: string; truncated: boolean } {
+  const buffer = Buffer.from(value.trim(), "utf8");
+  if (buffer.length <= maximumBytes) return { text: buffer.toString("utf8"), truncated: false };
+  const suffix = Buffer.from("…", "utf8");
+  let end = maximumBytes - suffix.length;
+  while (end > 0 && (buffer[end] & 0xc0) === 0x80) end -= 1;
+  return { text: `${buffer.subarray(0, end).toString("utf8")}…`, truncated: true };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function workerTaskReadOutputSchema() {
+  const textContent = Type.Object({ type: Type.Literal("text"), text: Type.String() }, { additionalProperties: false });
+  return Type.Object({
+    content: Type.Array(textContent, { minItems: 1, maxItems: 1 }),
+    details: Type.Object({
+      offset: Type.Integer({ minimum: 0 }),
+      limit: Type.Integer({ minimum: 1, maximum: MAX_WORKER_TASK_READ_LIMIT }),
+      totalAssigned: Type.Integer({ minimum: 1, maximum: MAX_WORKER_TASK_IDS }),
+      returned: Type.Integer({ minimum: 1, maximum: MAX_WORKER_TASK_READ_LIMIT }),
+      nextOffset: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_WORKER_TASK_IDS - 1 })),
+      contentBytes: Type.Integer({ minimum: 1, maximum: MAX_WORKER_TASK_READ_CONTENT_BYTES }),
+      truncated: Type.Boolean()
+    }, { additionalProperties: false })
+  }, { additionalProperties: false });
 }
 
 function workerTaskUpdateOutputSchema() {

@@ -19,6 +19,7 @@ Parent surface:
 Worker-only RPC surface:
 
 - `worker_handoff`
+- `worker_task_read`
 - `worker_task_update`
 - `shell_start`, `shell_status`, `shell_read`, `shell_cancel`
 
@@ -81,10 +82,12 @@ The Pi RPC/provider/Beads control plane remains trusted on macOS. Docker init ow
 
 Per-command process groups are cooperative convenience, not the final containment primitive. Every terminal run first settles host helpers and then stops, kills when necessary, waits for, and verifies the exact labeled container, so a descendant that calls `setsid()` or clears its environment still disappears with the container PID namespace. Successful handoff retains only that verified stopped container; all other terminal paths remove it. The run remains active and leased if either shell or container cleanup cannot be verified.
 
-The Pi RPC host remains trusted and outside the shell sandbox so it can use the configured provider route. It exposes Beads mutation only through `worker_task_update`, which:
+The Pi RPC host remains trusted and outside the shell sandbox so it can use the configured provider route and central Beads store. `worker_task_read` uses Beads 1.1's official `bd --readonly show --include-dependents --json` path after exact route verification. It pages only parent-assigned task roots, returns bounded task text plus direct dependency/dependent summaries, reports every truncation and continuation offset, and caps both raw CLI output and provider-visible content. The worker container receives no `bd` binary, database mount, route path, or `BEADS_DIR`, and the adapter exposes no arbitrary Beads query or command surface.
+
+Beads mutation remains available only through `worker_task_update`, which:
 
 - accepts only parent-assigned task IDs;
-- verifies `bd where --json` matches the exact parent-recorded central `personal` path and database, with the unchanged ambient `BEADS_DIR`, before each mutation;
+- verifies `bd where --json` matches the exact parent-recorded central `personal` path and database, with the unchanged ambient `BEADS_DIR`, before each access;
 - appends notes and may set only `in_progress` or `blocked`;
 - cannot close tasks or mutate arbitrary IDs.
 
@@ -92,7 +95,7 @@ Workspace `.pi/settings.json`, extensions, skills, prompts, themes, `SYSTEM.md`,
 
 ## Handoff and cancellation
 
-`worker_handoff` accepts `ready_for_review`, `assignment_complete`, `needs_input`, `blocked`, `checkpoint`, `failed`, or `cancelled`, with summary, task updates, optional repositories/checks, and optional question. It rejects while any owned async-shell job or pending completion notice remains unsettled and rejects duplicate handoffs. Once accepted, `shell_start` and `worker_task_update` are sealed; the host independently rechecks RPC and owned-job quiescence before settlement.
+`worker_handoff` accepts `ready_for_review`, `assignment_complete`, `needs_input`, `blocked`, `checkpoint`, `failed`, or `cancelled`, with summary, task updates, optional repositories/checks, and optional question. It rejects while any owned async-shell job or pending completion notice remains unsettled and rejects duplicate handoffs. Once accepted, `shell_start`, `worker_task_read`, and `worker_task_update` are sealed; the host independently rechecks RPC and owned-job quiescence before settlement.
 
 `/worker:view` opens the existing bounded, provider-free async-shell TUI for the worker's active or last host run. `/worker:ack` explicitly acknowledges a settled pending completion after inspection; automatic delivery acknowledgment comes only from the exact same-session custom-message receipt. Parent models use `worker_control result` instead of blind acknowledgment. `/worker:cancel` and `worker_control cancel` remove queued runs before launch; cancelling a queued resume also removes its previously parked container, retaining recovery ownership if that removal cannot be verified. Running host and command process groups receive bounded `SIGTERM` grace followed by `SIGKILL` escalation when necessary, after which the exact Docker container receives explicit `SIGTERM`/four-second stop and verified removal. Detached host cancellation still requires a matching trusted process marker and host command identity. Discard requires explicit confirmation, refuses active workers, removes the parked container when present, removes the private workspace, and removes durable state last.
 

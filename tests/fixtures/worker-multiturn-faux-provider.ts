@@ -28,7 +28,7 @@ export default function workerMultiturnFauxProviderExtension(api: ExtensionAPI):
     fauxAssistantMessage(fauxToolCall("worker_handoff", {
       state: "assignment_complete",
       summary: "Completed handoff on the asynchronous follow-up turn.",
-      taskUpdates: [{ taskId: "personal-worker-e2e", update: "Multiturn lifecycle passed." }],
+      taskUpdates: [{ taskId: "personal-workere2e", update: "Multiturn lifecycle passed." }],
       checks: [{ cwd: ".", command: "async follow-up", outcome: "passed" }]
     }), { stopReason: "toolUse" }),
     fauxAssistantMessage("The multiturn handoff is durable.")
