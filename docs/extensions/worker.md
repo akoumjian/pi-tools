@@ -10,6 +10,7 @@ Parent surface:
 
 - `worker_run({ runs: [...] })`
 - `worker_control({ action: "status" | "result" | "cancel" | "discard", ... })`
+- `/worker:list`
 - `/worker:status <worker-id>`
 - `/worker:view <worker-id> [--stream both|stdout|stderr] [--tail 1..500] [--follow]`
 - `/worker:ack <worker-id>`
@@ -22,6 +23,8 @@ Worker-only RPC surface:
 - `worker_task_read`
 - `worker_task_update`
 - `shell_start`, `shell_status`, `shell_read`, `shell_cancel`
+
+`/worker:list` is provider-free and shows the total count plus up to 100 concise identities, states, routes, assigned tasks, and active/last runs for workers owned by the exact current chat; if more exist, it reports the omitted count instead of failing. `/worker:status <worker-id>` shows the full canonical record for one listed worker.
 
 The parent owns grounding, assignment acceptance, review, integration, promotion, and task closure.
 
@@ -95,7 +98,7 @@ Workspace `.pi/settings.json`, extensions, skills, prompts, themes, `SYSTEM.md`,
 
 ## Handoff and cancellation
 
-`worker_handoff` accepts `ready_for_review`, `assignment_complete`, `needs_input`, `blocked`, `checkpoint`, `failed`, or `cancelled`, with summary, task updates, optional repositories/checks, and optional question. It rejects while any owned async-shell job or pending completion notice remains unsettled and rejects duplicate handoffs. Once accepted, `shell_start`, `worker_task_read`, and `worker_task_update` are sealed; the host independently rechecks RPC and owned-job quiescence before settlement.
+`worker_handoff` accepts `ready_for_review`, `assignment_complete`, `needs_input`, `blocked`, `checkpoint`, `failed`, or `cancelled`, with summary, task updates, optional repositories/checks, and optional question. Before calling it, the worker must inspect every owned async-shell job, choose to wait for work that should finish or cancel work that should stop, and verify terminal status. Handoff admission seals new shell starts, checks both the live registry and persisted job/process-token state, rejects every active or unverifiable job, and rejects duplicate handoffs. Once accepted, `shell_start`, `worker_task_read`, and `worker_task_update` remain sealed; the host independently rechecks RPC and actual process-group quiescence before settlement.
 
 `/worker:view` opens the existing bounded, provider-free async-shell TUI for the worker's active or last host run. `/worker:ack` explicitly acknowledges a settled pending completion after inspection; automatic delivery acknowledgment comes only from the exact same-session custom-message receipt. Parent models use `worker_control result` instead of blind acknowledgment. `/worker:cancel` and `worker_control cancel` remove queued runs before launch; cancelling a queued resume also removes its previously parked container, retaining recovery ownership if that removal cannot be verified. Running host and command process groups receive bounded `SIGTERM` grace followed by `SIGKILL` escalation when necessary, after which the exact Docker container receives explicit `SIGTERM`/four-second stop and verified removal. Detached host cancellation still requires a matching trusted process marker and host command identity. Discard requires explicit confirmation, refuses active workers, removes the parked container when present, removes the private workspace, and removes durable state last.
 

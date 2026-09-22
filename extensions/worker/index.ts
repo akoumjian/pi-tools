@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { Type, type Static } from "@earendil-works/pi-ai";
+import { Text } from "@earendil-works/pi-tui";
 import {
   defineTool,
   type AgentToolResult,
@@ -54,7 +55,7 @@ import {
   type WorkerRoute
 } from "./state.js";
 
-const WORKER_OPERATIONAL_GUIDANCE = "Keep all writes inside the private workspace, clone local repositories with --no-hardlinks, and do not push remotes. Use worker_task_read to search or read bounded context across central Beads; returned records mark your assigned IDs. Use worker_task_update rather than shell access for notes or status changes, and update only assigned IDs. Shell commands run inside one private Docker container with all of ~/Code read-only and this workspace read-write. Process groups provide normal per-command cancellation; whole-container removal is the final run cleanup boundary. Use normal async-shell tools and finish with exactly one accepted worker_handoff after all owned jobs settle.";
+const WORKER_OPERATIONAL_GUIDANCE = "Keep all writes inside the private workspace, clone local repositories with --no-hardlinks, and do not push remotes. Use worker_task_read to search or read bounded context across central Beads; returned records mark your assigned IDs. Use worker_task_update rather than shell access for notes or status changes, and update only assigned IDs. Shell commands run inside one private Docker container with all of ~/Code read-only and this workspace read-write. Process groups provide normal per-command cancellation; whole-container removal is the final run cleanup boundary. Use normal async-shell tools. Before worker_handoff, inspect every owned job: wait for work that should finish or cancel work that should stop, then verify terminal status with shell_status or shell_read. Finish with exactly one accepted worker_handoff only after every owned job is settled.";
 
 const InitialRepoSchema = Type.Object({
   source: Type.String({ minLength: 1, maxLength: 2048 }),
@@ -265,6 +266,18 @@ export function registerWorkerExtension(
     monitors.clear();
   });
 
+  api.registerCommand("worker:list", {
+    description: "List managed workers owned by the current chat with concise status, route, task, and run identity",
+    handler: async (args, context) => {
+      if (args.trim() !== "") {
+        context.ui.notify("Usage: /worker:list", "info");
+        return;
+      }
+      const records = listParentWorkerRecords(dependencies.roots, context);
+      context.ui.notify(formatWorkerList(records), "info");
+    }
+  });
+
   api.registerCommand("worker:status", {
     description: "Show one managed worker's exact session, workspace, route, tasks, and active/last run state",
     handler: async (args, context) => {
@@ -362,6 +375,12 @@ export function registerWorkerExtension(
       "worker_control constraints: Every action is restricted to the exact parent session. Result retrieval validates worker/run identity before acknowledging delivery. Cancel and discard reuse trusted lifecycle operations; cleanup uncertainty fails closed. Discard requires confirm:true and is permanent. Use shell_read with a returned job ID for logs. Only result content is provider-visible; details are internal."
     ],
     parameters: WorkerControlParams,
+    renderCall(args, theme) {
+      return renderWorkerControlCall(args as WorkerControlInput, theme);
+    },
+    renderResult(result, options, theme, context) {
+      return renderWorkerControlResult(result as AgentToolResult<WorkerControlDetails>, options, theme, context);
+    },
     executionMode: "sequential",
     async execute(_toolCallId, params, signal, _onUpdate, context): Promise<AgentToolResult<WorkerControlDetails>> {
       throwIfAborted(signal);
@@ -372,6 +391,9 @@ export function registerWorkerExtension(
         const records = params.workerId
           ? [readParentWorkerRecord(dependencies.roots, params.workerId, context)]
           : listParentWorkerRecords(dependencies.roots, context);
+        if (records.length > 100) {
+          throw new Error(`This parent session owns ${records.length} workers; worker_control status is limited to 100. Inspect one workerId at a time.`);
+        }
         const workers = records.map(workerControlSummary);
         return {
           content: [{ type: "text", text: workers.length > 0 ? records.map(formatWorkerRecord).join("\n\n") : "No managed workers belong to this parent session." }],
@@ -444,6 +466,12 @@ export function registerWorkerExtension(
       "worker_run constraints: The parent owns grounding, task acceptance, integration, and promotion. A new worker forks the completed current parent turn; a resume cannot change session/workspace/provider/model. Receipts are immediate, process exit is not semantic completion, and cancellation must settle all shell jobs owned by the worker. Only result content is provider-visible; details are internal."
     ],
     parameters: WorkerRunParams,
+    renderCall(args, theme) {
+      return renderWorkerRunCall(args as WorkerRunInput, theme);
+    },
+    renderResult(result, options, theme, context) {
+      return renderWorkerRunResult(result as AgentToolResult<WorkerRunDetails>, options, theme, context);
+    },
     executionMode: "parallel",
     async execute(_toolCallId, params, signal, onUpdate, context): Promise<AgentToolResult<WorkerRunDetails>> {
       throwIfAborted(signal);
@@ -493,9 +521,6 @@ function listParentWorkerRecords(roots: WorkerRoots, context: ExtensionContext):
     .map((paths) => readWorkerRecord(paths.recordFile))
     .filter((record) => path.resolve(record.parentSessionFile) === path.resolve(parentSessionFile))
     .sort((left, right) => left.workerId.localeCompare(right.workerId));
-  if (records.length > 100) {
-    throw new Error(`This parent session owns ${records.length} workers; worker_control status is limited to 100. Inspect one workerId at a time.`);
-  }
   return records;
 }
 
@@ -2035,6 +2060,198 @@ function buildResumeWorkerPrompt(record: WorkerRecord, message: string, parentCo
   ].join("\n\n");
 }
 
+type WorkerRenderTheme = {
+  fg(color: string, text: string): string;
+  bold(text: string): string;
+};
+
+type WorkerRenderOptions = {
+  expanded: boolean;
+  isPartial?: boolean;
+};
+
+type WorkerRenderContext = {
+  isError?: boolean;
+};
+
+function renderWorkerRunCall(args: WorkerRunInput, theme: WorkerRenderTheme): Text {
+  const runs = isRecord(args) && Array.isArray(args.runs) ? args.runs.filter(isRecord) : [];
+  const summaries = runs.map((run) => {
+    if (run.kind === "resume") return `resume ${typeof run.workerId === "string" ? shortWorkerId(run.workerId) : "worker"}`;
+    const tasks = Array.isArray(run.taskIds) ? run.taskIds.length : 0;
+    const route = typeof run.route === "string" ? ` · ${truncateOneLine(run.route, 32)}` : "";
+    return `new · ${tasks} ${tasks === 1 ? "task" : "tasks"}${route}`;
+  });
+  const summary = runs.length === 0
+    ? "no runs"
+    : runs.length === 1
+      ? summaries[0]!
+      : `${runs.length} runs · ${summaries.slice(0, 2).join(", ")}${runs.length > 2 ? `, +${runs.length - 2}` : ""}`;
+  return new Text(workerToolCall("Worker", summary, theme), 0, 0);
+}
+
+function renderWorkerRunResult(
+  result: AgentToolResult<WorkerRunDetails>,
+  options: WorkerRenderOptions,
+  theme: WorkerRenderTheme,
+  context?: WorkerRenderContext
+): Text {
+  const error = renderWorkerToolError(result, theme, context);
+  if (error !== undefined) return error;
+  if (options.isPartial) return new Text(workerToolResult("starting workers", "warning", theme), 0, 0);
+
+  const runs = result.details?.runs ?? [];
+  if (runs.length === 0) return new Text(workerToolResult("no workers", "muted", theme), 0, 0);
+  const stateCounts = countWorkerStates(runs.map((run) => run.state));
+  const summary = runs.length === 1
+    ? formatWorkerRunState(runs[0]!)
+    : `${runs.length} workers · ${formatWorkerStateCounts(stateCounts)}`;
+  const lines = [workerToolResult(summary, workerStateColor(runs.map((run) => run.state)), theme)];
+  if (options.expanded) {
+    appendBoundedWorkerRows(lines, runs.map(formatWorkerRunDetail));
+  }
+  return new Text(lines.join("\n"), 0, 0);
+}
+
+function renderWorkerControlCall(args: WorkerControlInput, theme: WorkerRenderTheme): Text {
+  const action = isRecord(args) && typeof args.action === "string" ? truncateOneLine(args.action, 24) : "status";
+  const workerId = isRecord(args) && typeof args.workerId === "string" ? args.workerId : undefined;
+  const target = workerId ? shortWorkerId(workerId) : action === "status" ? "all" : "worker";
+  return new Text(workerToolCall("Worker", `${action} · ${target}`, theme), 0, 0);
+}
+
+function renderWorkerControlResult(
+  result: AgentToolResult<WorkerControlDetails>,
+  options: WorkerRenderOptions,
+  theme: WorkerRenderTheme,
+  context?: WorkerRenderContext
+): Text {
+  const error = renderWorkerToolError(result, theme, context);
+  if (error !== undefined) return error;
+  if (options.isPartial) return new Text(workerToolResult("checking workers", "warning", theme), 0, 0);
+
+  const details = result.details;
+  if (details === undefined) return new Text(workerToolResult("worker control complete", "muted", theme), 0, 0);
+  const lines = [workerToolResult(formatWorkerControlSummary(details), workerControlColor(details), theme)];
+  if (options.expanded) appendWorkerControlDetails(lines, details);
+  return new Text(lines.join("\n"), 0, 0);
+}
+
+function renderWorkerToolError(
+  result: AgentToolResult<unknown>,
+  theme: WorkerRenderTheme,
+  context?: WorkerRenderContext
+): Text | undefined {
+  if (context?.isError !== true) return undefined;
+  const text = result.content.map((item) => item.type === "text" ? item.text : "").join("\n").trim();
+  return new Text(workerToolResult(`error: ${truncateOneLine(text || "Tool failed.", 160)}`, "error", theme), 0, 0);
+}
+
+const MAX_RENDERED_WORKER_ROWS = 8;
+
+function formatWorkerRunState(run: WorkerRunReceipt): string {
+  return `${run.state} · ${shortWorkerId(run.workerId)} · ${run.taskIds.length} ${run.taskIds.length === 1 ? "task" : "tasks"} · ${run.completionDelivery}`;
+}
+
+function formatWorkerRunDetail(run: WorkerRunReceipt): string {
+  return `${shortWorkerId(run.workerId)} · ${run.state} · ${formatWorkerRoute(run)} · ${run.completionDelivery} · ${formatWorkerTasks(run.taskIds)} · run ${shortWorkerId(run.runId)} · job ${shortWorkerId(run.jobId)}`;
+}
+
+function appendWorkerControlDetails(lines: string[], details: WorkerControlDetails): void {
+  switch (details.action) {
+    case "status":
+      appendBoundedWorkerRows(lines, details.workers.map(formatWorkerControlDetail));
+      return;
+    case "result":
+      lines.push(`  run ${shortWorkerId(details.runId)} · job ${shortWorkerId(details.jobId)} · ${details.delivery ?? "delivery unknown"} · ${details.completionDelivery} · ${formatWorkerTasks(details.taskIds)}`);
+      if (details.handoff) lines.push(`  ${details.handoff.handoff.state}: ${truncateOneLine(details.handoff.handoff.summary, 160)}`);
+      return;
+    case "cancel":
+      if (details.runId || details.jobId) lines.push(`  ${details.runId ? `run ${shortWorkerId(details.runId)}` : "run unknown"} · ${details.jobId ? `job ${shortWorkerId(details.jobId)}` : "job unknown"}`);
+      return;
+    case "discard":
+      return;
+  }
+}
+
+function formatWorkerControlDetail(worker: WorkerControlSummary): string {
+  const run = worker.activeRun
+    ? `active ${shortWorkerId(worker.activeRun.runId)} · job ${shortWorkerId(worker.activeRun.jobId)}`
+    : worker.lastRun
+      ? `last ${worker.lastRun.status} · ${shortWorkerId(worker.lastRun.runId)}`
+      : "no runs";
+  return `${shortWorkerId(worker.workerId)} · ${worker.status} · ${formatWorkerRoute(worker.route)} · ${formatWorkerTasks(worker.taskIds)} · ${run}`;
+}
+
+function appendBoundedWorkerRows(lines: string[], rows: string[]): void {
+  for (const row of rows.slice(0, MAX_RENDERED_WORKER_ROWS)) lines.push(`  ${row}`);
+  const hidden = rows.length - Math.min(rows.length, MAX_RENDERED_WORKER_ROWS);
+  if (hidden > 0) lines.push(`  +${hidden} more`);
+}
+
+function formatWorkerRoute(route: { provider: string; model: string; thinkingLevel: string }): string {
+  return `${route.provider}/${route.model}:${route.thinkingLevel}`;
+}
+
+function formatWorkerTasks(taskIds: string[]): string {
+  const visible = taskIds.slice(0, 2).join(", ");
+  const hidden = taskIds.length - Math.min(taskIds.length, 2);
+  return taskIds.length === 0 ? "no tasks" : hidden > 0 ? `${visible}, +${hidden}` : visible;
+}
+
+function formatWorkerControlSummary(details: WorkerControlDetails): string {
+  switch (details.action) {
+    case "status": {
+      if (details.workers.length === 0) return "no workers";
+      return `${details.workers.length} ${details.workers.length === 1 ? "worker" : "workers"} · ${formatWorkerStateCounts(countWorkerStates(details.workers.map((worker) => worker.status)))}`;
+    }
+    case "result":
+      return `result · ${details.status} · ${shortWorkerId(details.workerId)}${details.handoff ? ` · ${details.handoff.handoff.state}` : ""}`;
+    case "cancel":
+      return `${details.outcome === "not_active" ? "not active" : "cancelled"} · ${shortWorkerId(details.workerId)} · ${details.status}`;
+    case "discard":
+      return `discarded · ${shortWorkerId(details.workerId)}`;
+  }
+}
+
+function countWorkerStates(states: readonly string[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const state of states) counts.set(state, (counts.get(state) ?? 0) + 1);
+  return counts;
+}
+
+function formatWorkerStateCounts(counts: Map<string, number>): string {
+  return Array.from(counts.entries()).map(([state, count]) => `${count} ${state}`).join(", ");
+}
+
+function workerStateColor(states: readonly string[]): string {
+  return states.some((state) => state === "failed" || state === "cancelled") ? "warning" : states.every((state) => state === "queued") ? "warning" : "success";
+}
+
+function workerControlColor(details: WorkerControlDetails): string {
+  if (details.action === "cancel") return details.outcome === "cancelled" ? "warning" : "muted";
+  if (details.action === "result") return details.status === "failed" || details.status === "cancelled" ? "warning" : "success";
+  return "success";
+}
+
+function shortWorkerId(value: string): string {
+  const oneLine = truncateOneLine(value, 128);
+  return oneLine.length <= 20 ? oneLine : `${oneLine.slice(0, 10)}…${oneLine.slice(-7)}`;
+}
+
+function truncateOneLine(value: string, maxLength: number): string {
+  const oneLine = value.replace(/[\r\n]+/g, " ").trim();
+  return oneLine.length <= maxLength ? oneLine : `${oneLine.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+function workerToolCall(name: string, summary: string, theme: WorkerRenderTheme): string {
+  return theme.fg("toolTitle", `⏺ ${theme.bold(name)}(`) + theme.fg("accent", summary) + theme.fg("toolTitle", ")…");
+}
+
+function workerToolResult(summary: string, color: string, theme: WorkerRenderTheme): string {
+  return theme.fg("muted", "⎿ ") + theme.fg(color, summary);
+}
+
 function formatWorkerRunReceipt(value: WorkerRunReceipt): string {
   return [
     `worker_id: ${value.workerId}`,
@@ -2106,6 +2323,26 @@ function formatWorkerControlResult(record: WorkerRecord, handoff: AcceptedWorker
     lastRun.resultFile ? `result_file: ${lastRun.resultFile}` : undefined,
     lastRun.stdoutLog ? `stdout_log: ${lastRun.stdoutLog}` : undefined,
     lastRun.stderrLog ? `stderr_log: ${lastRun.stderrLog}` : undefined
+  ].filter((line): line is string => line !== undefined).join("\n");
+}
+
+function formatWorkerList(records: WorkerRecord[]): string {
+  if (records.length === 0) return "No managed workers belong to this chat.";
+  const states = formatWorkerStateCounts(countWorkerStates(records.map((record) => record.status)));
+  const visibleRecords = records.slice(0, 100);
+  const hidden = records.length - visibleRecords.length;
+  return [
+    `${records.length} managed ${records.length === 1 ? "worker" : "workers"} in this chat · ${states}`,
+    ...visibleRecords.map((record) => {
+      const run = record.activeRun
+        ? `active ${record.activeRun.status} · ${record.activeRun.runId}`
+        : record.lastRun
+          ? `last ${record.lastRun.status} · ${record.lastRun.runId}`
+          : "no runs";
+      return `- ${record.workerId} · ${record.route.provider}/${record.route.model}:${record.route.thinkingLevel} · ${formatWorkerTasks(record.taskIds)} · ${run}`;
+    }),
+    hidden > 0 ? `+${hidden} more workers; use /worker:status <worker-id> for any known worker.` : undefined,
+    "Use /worker:status <worker-id> for full details."
   ].filter((line): line is string => line !== undefined).join("\n");
 }
 

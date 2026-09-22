@@ -24,6 +24,8 @@ import { prepareWorkspaceSandboxProcess } from "../_shared/workspace-sandbox.js"
 import { prepareWorkerContainerProcess, signalWorkerContainerJob, workerContainerFromEnvironment } from "../_shared/worker-container.js";
 import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
+import { workerHandoffAdmissionPath } from "../_shared/worker-contract.js";
+import { readStrictWorkerJobMeta, workerJobIsSettled } from "../_shared/worker-job-settlement.js";
 
 export type JobStatus = "running" | "exited" | "failed" | "cancelled" | "unknown";
 export type AsyncShellJobOwner = {
@@ -681,6 +683,19 @@ export function unsettledAsyncShellJobsForOwner(owner: AsyncShellJobOwner): JobM
     .filter((job) => sameJobOwner(job.owner, owner))
     .filter((job) => !isTerminal(job.status) || (job.notifyOnExit && !job.completionNotified))
     .map(publicJob);
+}
+
+export function unsettledPersistedAsyncShellJobsForOwner(
+  asyncJobRoot: string,
+  owner: AsyncShellJobOwner
+): JobMeta[] {
+  const jobsDirectory = path.join(path.resolve(asyncJobRoot), "jobs");
+  if (!existsSync(jobsDirectory)) return [];
+  return readdirSync(jobsDirectory, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && isValidAsyncJobId(entry.name))
+    .map((entry) => readStrictWorkerJobMeta(jobsDirectory, entry.name) as JobMeta)
+    .filter((job) => sameJobOwner(job.owner, owner))
+    .filter((job) => !workerJobIsSettled(job));
 }
 
 export async function cancelAsyncShellJobsForOwner(
@@ -2138,8 +2153,9 @@ function assertWorkerRunAcceptsSideEffects(): void {
   if (!workerOwnerFromEnvironment()) return;
   const resultFile = process.env.PI_WORKER_RESULT_FILE?.trim();
   if (!resultFile) throw new Error("Managed worker shell_start requires PI_WORKER_RESULT_FILE.");
-  if (existsSync(path.resolve(resultFile))) {
-    throw new Error("Managed worker shell_start is sealed after worker_handoff acceptance.");
+  const resolvedResultFile = path.resolve(resultFile);
+  if (existsSync(resolvedResultFile) || existsSync(workerHandoffAdmissionPath(resolvedResultFile))) {
+    throw new Error("Managed worker shell_start is sealed during or after worker_handoff admission.");
   }
 }
 

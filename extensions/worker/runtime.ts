@@ -1,14 +1,15 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { Type, validateToolArguments, type Static, type Tool, type ToolCall } from "@earendil-works/pi-ai";
 import { defineTool, type AgentToolResult, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { unsettledAsyncShellJobsForOwner, type AsyncShellJobOwner } from "../async-shell/index.js";
+import { unsettledAsyncShellJobsForOwner, unsettledPersistedAsyncShellJobsForOwner, type AsyncShellJobOwner } from "../async-shell/index.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 import {
   MAX_WORKER_TASK_IDS,
   WorkerHandoffParams,
+  workerHandoffAdmissionPath,
   type AcceptedWorkerHandoff,
   type WorkerHandoff
 } from "../_shared/worker-contract.js";
@@ -231,10 +232,10 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
   api.registerTool(defineTool({
     name: "worker_handoff",
     label: "Worker Handoff",
-    description: "Submit the typed semantic handoff for the current managed worker run. The handoff is accepted only when every async-shell job owned by this worker run has settled. Use ready_for_review or assignment_complete for completed work; use needs_input, blocked, checkpoint, failed, or cancelled accurately when work should return to the parent without claiming completion.",
-    promptSnippet: "Finish a managed worker run with one typed, quiescent worker_handoff containing task updates, repository intent, checks, and any question or blocker.",
+    description: "Submit the typed semantic handoff for the current managed worker run. Before calling it, inspect every owned async-shell job and decide to wait for it or cancel it; after cancellation, verify settlement. The handoff is accepted only when every owned job is durably terminal and its process group is independently gone. Use ready_for_review or assignment_complete for completed work; use needs_input, blocked, checkpoint, failed, or cancelled accurately when work should return to the parent without claiming completion.",
+    promptSnippet: "Finish a managed worker run only after waiting for or cancelling every async-shell job and verifying quiescence, then submit one typed worker_handoff.",
     promptGuidelines: [
-      "worker_handoff use: Call worker_handoff exactly once when returning control to the parent; do not claim completion while shell jobs or other side effects remain active.",
+      "worker_handoff use: Before calling worker_handoff, inspect every shell job with shell_status or shell_read. Wait for active jobs that should finish, or call shell_cancel for jobs that should stop, then verify each job is terminal before returning control to the parent.",
       inputJsonSchemaGuideline("worker_handoff", WorkerHandoffParams),
       outputJsonSchemaGuideline("worker_handoff", workerHandoffOutputSchema()),
       "worker_handoff constraints: The runtime rejects handoff while owned async-shell jobs remain active and returns their job IDs. Wait, inspect, or cancel them, then retry. The trusted runtime writes the accepted handoff; do not write worker result files directly."
@@ -244,29 +245,37 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
     async execute(_toolCallId, params): Promise<AgentToolResult<WorkerHandoffDetails>> {
       const identity = workerRuntimeIdentity();
       validateWorkerHandoff(params, identity.workerId, identity.workspaceRoot, assignedTaskIds());
-      const activeJobs = unsettledAsyncShellJobsForOwner(identity.owner);
-      if (activeJobs.length > 0) {
-        const activeJobIds = activeJobs.map((job) => job.jobId);
-        return {
-          content: [{ type: "text", text: `Worker handoff was not accepted because ${activeJobIds.length} owned async-shell job${activeJobIds.length === 1 ? " is" : "s are"} still running: ${activeJobIds.join(", ")}. Wait for completion or cancel the jobs, then call worker_handoff again.` }],
-          details: { accepted: false, activeJobIds }
-        };
-      }
       if (existsSync(identity.resultFile)) {
         throw new Error(`Worker handoff was already accepted for ${identity.workerId}/${identity.runId}.`);
       }
-      const accepted: AcceptedWorkerHandoff = {
-        version: 1,
-        workerId: identity.workerId,
-        runId: identity.runId,
-        acceptedAt: new Date().toISOString(),
-        handoff: params
-      };
-      writeAtomicJson(identity.resultFile, accepted);
-      return {
-        content: [{ type: "text", text: `Worker handoff accepted for ${identity.workerId}/${identity.runId}. The parent will receive the typed result after this tool result is persisted.` }],
-        details: { accepted: true, resultFile: identity.resultFile }
-      };
+      const admissionFile = beginWorkerHandoffAdmission(identity);
+      try {
+        const unsettledJobs = [
+          ...unsettledAsyncShellJobsForOwner(identity.owner),
+          ...unsettledPersistedAsyncShellJobsForOwner(identity.asyncJobRoot, identity.owner)
+        ];
+        const activeJobIds = [...new Set(unsettledJobs.map((job) => job.jobId))].sort();
+        if (activeJobIds.length > 0) {
+          return {
+            content: [{ type: "text", text: `Worker handoff was not accepted because ${activeJobIds.length} owned async-shell job${activeJobIds.length === 1 ? " is not" : "s are not"} verifiably settled: ${activeJobIds.join(", ")}. Wait for completion or cancel the jobs, verify terminal status, then call worker_handoff again.` }],
+            details: { accepted: false, activeJobIds }
+          };
+        }
+        const accepted: AcceptedWorkerHandoff = {
+          version: 1,
+          workerId: identity.workerId,
+          runId: identity.runId,
+          acceptedAt: new Date().toISOString(),
+          handoff: params
+        };
+        writeAtomicJson(identity.resultFile, accepted);
+        return {
+          content: [{ type: "text", text: `Worker handoff accepted for ${identity.workerId}/${identity.runId}. The parent will receive the typed result after this tool result is persisted.` }],
+          details: { accepted: true, resultFile: identity.resultFile }
+        };
+      } finally {
+        rmSync(admissionFile, { force: true });
+      }
     }
   }));
 }
@@ -507,6 +516,7 @@ function workerRuntimeIdentity(): {
   runId: string;
   resultFile: string;
   workspaceRoot: string;
+  asyncJobRoot: string;
   owner: AsyncShellJobOwner;
 } {
   const workerId = requiredEnvironment("PI_WORKER_ID");
@@ -516,8 +526,29 @@ function workerRuntimeIdentity(): {
     runId,
     resultFile: path.resolve(requiredEnvironment("PI_WORKER_RESULT_FILE")),
     workspaceRoot: path.resolve(requiredEnvironment("PI_WORKER_WORKSPACE_ROOT")),
+    asyncJobRoot: path.resolve(requiredEnvironment("PI_WORKER_ASYNC_JOB_ROOT")),
     owner: { kind: "worker-run", workerId, runId }
   };
+}
+
+function beginWorkerHandoffAdmission(identity: ReturnType<typeof workerRuntimeIdentity>): string {
+  mkdirSync(path.dirname(identity.resultFile), { recursive: true, mode: 0o700 });
+  const admissionFile = workerHandoffAdmissionPath(identity.resultFile);
+  try {
+    writeFileSync(admissionFile, `${JSON.stringify({
+      version: 1,
+      workerId: identity.workerId,
+      runId: identity.runId,
+      pid: process.pid,
+      startedAt: new Date().toISOString()
+    })}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new Error(`Worker handoff admission is already active for ${identity.workerId}/${identity.runId}.`);
+    }
+    throw cause;
+  }
+  return admissionFile;
 }
 
 function requiredEnvironment(name: string): string {

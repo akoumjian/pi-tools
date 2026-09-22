@@ -98,6 +98,22 @@ async function withTempDir(run: (directory: string) => Promise<void>): Promise<v
   }
 }
 
+
+const workerRenderTheme = {
+  fg: (_color: string, text: string) => text,
+  bold: (text: string) => text
+};
+
+function renderWorkerToolCall(tool: ToolDefinition, args: unknown): string {
+  assert.ok(tool.renderCall, `${tool.name} should define renderCall`);
+  return tool.renderCall(args as never, workerRenderTheme as never, {} as never).render(200).join("\n");
+}
+
+function renderWorkerToolResult(tool: ToolDefinition, result: unknown, options: { expanded?: boolean; isPartial?: boolean } = {}, context: unknown = {}): string {
+  assert.ok(tool.renderResult, `${tool.name} should define renderResult`);
+  return tool.renderResult(result as never, { expanded: options.expanded ?? false, isPartial: options.isPartial ?? false }, workerRenderTheme as never, context as never).render(200).join("\n");
+}
+
 function isProcessAliveForTest(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -1547,5 +1563,172 @@ test("worker:cancel removes a queued run before it can fork or launch", async ()
     await discard.handler(`${receipt.workerId} --confirm`, context);
     assert.equal(existsSync(workerPaths(roots, receipt.workerId).workspaceRoot), false);
     assert.equal(existsSync(workerPaths(roots, receipt.workerId).stateDir), false);
+  });
+});
+
+
+test("worker:list reports only workers owned by the current chat", async () => {
+  await withTempDir(async (directory) => {
+    const parentCwd = path.join(directory, "parent");
+    const parentSessionFile = path.join(directory, "parent.jsonl");
+    const foreignSessionFile = path.join(directory, "foreign.jsonl");
+    await mkdir(parentCwd);
+    await Promise.all([
+      writeFile(parentSessionFile, "{}\n"),
+      writeFile(foreignSessionFile, "{}\n")
+    ]);
+    const roots = { stateRoot: path.join(directory, "workers"), workspaceRoot: path.join(directory, "workspaces") };
+    const records: WorkerRecord[] = [
+      {
+        version: WORKER_RECORD_VERSION,
+        workerId: "worker_20260922150000_list0001",
+        sessionId: "session-list-1",
+        parentSessionFile,
+        workspaceRoot: workerPaths(roots, "worker_20260922150000_list0001").workspaceRoot,
+        taskIds: ["personal-alpha"],
+        route: { provider: "openai-codex", model: "gpt-test", thinkingLevel: "high" },
+        status: "running",
+        activeRun: { runId: "run_20260922150000_list0001", jobId: "job_20260922150000_list0001", status: "running" },
+        updatedAt: "2026-09-22T15:00:00.000Z"
+      },
+      {
+        version: WORKER_RECORD_VERSION,
+        workerId: "worker_20260922150000_list0002",
+        sessionId: "session-list-2",
+        parentSessionFile,
+        workspaceRoot: workerPaths(roots, "worker_20260922150000_list0002").workspaceRoot,
+        taskIds: ["personal-beta", "personal-gamma"],
+        route: { provider: "anthropic", model: "claude-test", thinkingLevel: "xhigh" },
+        status: "handed_off",
+        lastRun: { runId: "run_20260922150000_list0002", jobId: "job_20260922150000_list0002", status: "handed_off", completionDelivery: "steer" },
+        updatedAt: "2026-09-22T15:01:00.000Z"
+      },
+      {
+        version: WORKER_RECORD_VERSION,
+        workerId: "worker_20260922150000_foreign1",
+        sessionId: "session-foreign",
+        parentSessionFile: foreignSessionFile,
+        workspaceRoot: workerPaths(roots, "worker_20260922150000_foreign1").workspaceRoot,
+        taskIds: ["personal-foreign"],
+        route: { provider: "openai-codex", model: "gpt-test", thinkingLevel: "low" },
+        status: "queued",
+        updatedAt: "2026-09-22T15:02:00.000Z"
+      }
+    ];
+    for (const record of records) {
+      const paths = workerPaths(roots, record.workerId);
+      provisionWorkerPaths(paths);
+      writeWorkerRecord(paths.recordFile, record);
+    }
+
+    const notifications: string[] = [];
+    const context = parentContext(parentCwd, parentSessionFile);
+    context.ui.notify = (message: string) => { notifications.push(message); };
+    const api = fakeApi();
+    registerWorkerExtension(api, { roots });
+    const list = api.commands.get("worker:list");
+    assert.ok(list);
+
+    await list.handler("", context);
+    assert.match(notifications.at(-1) ?? "", /2 managed workers in this chat · 1 running, 1 handed_off/);
+    assert.match(notifications.at(-1) ?? "", /worker_20260922150000_list0001/);
+    assert.match(notifications.at(-1) ?? "", /personal-beta, personal-gamma/);
+    assert.doesNotMatch(notifications.at(-1) ?? "", /foreign1|personal-foreign/);
+    assert.match(notifications.at(-1) ?? "", /\/worker:status <worker-id>/);
+
+    await list.handler("unexpected", context);
+    assert.equal(notifications.at(-1), "Usage: /worker:list");
+
+    const extraRecords = Array.from({ length: 99 }, (_, index): WorkerRecord => {
+      const workerId = `worker_20260922150001_${String(index).padStart(8, "0")}`;
+      return {
+        version: WORKER_RECORD_VERSION,
+        workerId,
+        sessionId: `session-extra-${index}`,
+        parentSessionFile,
+        workspaceRoot: workerPaths(roots, workerId).workspaceRoot,
+        taskIds: [`personal-extra${index}`],
+        route: { provider: "openai-codex", model: "gpt-test", thinkingLevel: "low" },
+        status: "queued",
+        updatedAt: "2026-09-22T15:03:00.000Z"
+      };
+    });
+    for (const record of extraRecords) {
+      const paths = workerPaths(roots, record.workerId);
+      provisionWorkerPaths(paths);
+      writeWorkerRecord(paths.recordFile, record);
+    }
+    await list.handler("", context);
+    assert.match(notifications.at(-1) ?? "", /101 managed workers in this chat/);
+    assert.match(notifications.at(-1) ?? "", /\+1 more workers/);
+
+    await Promise.all([...records.slice(0, 2), ...extraRecords].map((record) => rm(workerPaths(roots, record.workerId).stateDir, { recursive: true, force: true })));
+    await list.handler("", context);
+    assert.equal(notifications.at(-1), "No managed workers belong to this chat.");
+  });
+});
+
+test("worker_run and worker_control render compact lifecycle snippets", async () => {
+  await withTempDir(async (directory) => {
+    const api = fakeApi();
+    registerWorkerExtension(api, { roots: { stateRoot: path.join(directory, "workers"), workspaceRoot: path.join(directory, "workspaces") } });
+    const workerRun = api.tools.find((tool) => tool.name === "worker_run");
+    const workerControl = api.tools.find((tool) => tool.name === "worker_control");
+    assert.ok(workerRun);
+    assert.ok(workerControl);
+    const workerId = "worker_20260922141407_841146f1";
+    const workerId2 = "worker_20260922141500_22222222";
+
+    assert.match(renderWorkerToolCall(workerRun, {}), /⏺ Worker\(no runs\)…/);
+    assert.match(renderWorkerToolCall(workerRun, { runs: [{}] }), /⏺ Worker\(new · 0 tasks\)…/);
+    assert.match(renderWorkerToolCall(workerRun, { runs: [{ kind: "new", taskIds: ["personal-a"], route: "openai-codex/gpt-5.6-luna:low" }] }), /⏺ Worker\(new · 1 task · openai-codex\/gpt-5\.6-luna:low\)…/);
+    assert.match(renderWorkerToolCall(workerRun, { runs: [{ kind: "resume", workerId, message: "continue" }] }), /⏺ Worker\(resume worker_202…41146f1\)…/);
+    assert.match(renderWorkerToolCall(workerRun, { runs: [
+      { kind: "new", taskIds: ["personal-a"] },
+      { kind: "new", taskIds: ["personal-b", "personal-c"] },
+      { kind: "resume", workerId: workerId2, message: "continue" }
+    ] }), /⏺ Worker\(3 runs · new · 1 task, new · 2 tasks, \+1\)…/);
+
+    const runResult = { content: [{ type: "text", text: "provider-visible receipt" }], details: { runs: [
+      { workerId, runId: "run_a", jobId: "job_a", sessionId: "session_a", workspaceRoot: "/tmp/a", taskIds: ["personal-a"], provider: "openai-codex", model: "gpt-5.6-luna", thinkingLevel: "low", completionDelivery: "steer", state: "queued" },
+      { workerId: workerId2, runId: "run_b", jobId: "job_b", sessionId: "session_b", workspaceRoot: "/tmp/b", taskIds: ["personal-b", "personal-c"], provider: "openai-codex", model: "gpt-5.6-luna", thinkingLevel: "low", completionDelivery: "followUp", state: "running" }
+    ] }
+    };
+    assert.match(renderWorkerToolResult(workerRun, runResult), /⎿ 2 workers · 1 queued, 1 running/);
+    const expandedRuns = renderWorkerToolResult(workerRun, runResult, { expanded: true });
+    assert.match(expandedRuns, /worker_202…41146f1/);
+    assert.match(expandedRuns, /openai-codex\/gpt-5\.6-luna:low/);
+    assert.match(expandedRuns, /personal-a/);
+    assert.match(renderWorkerToolResult(workerRun, runResult, { isPartial: true }), /⎿ starting workers/);
+    assert.match(renderWorkerToolResult(workerRun, { content: [{ type: "text", text: "sensitive internal failure" }], details: undefined }, {}, { isError: true }), /⎿ error: sensitive internal failure/);
+
+    assert.match(renderWorkerToolCall(workerControl, {}), /⏺ Worker\(status · all\)…/);
+    const malformedControlCall = renderWorkerToolCall(workerControl, { action: `bad\n${"x".repeat(100)}` });
+    assert.equal(malformedControlCall.split("\n").length, 1);
+    assert.doesNotMatch(malformedControlCall, /x{24}/);
+    assert.match(renderWorkerToolCall(workerControl, { action: "status" }), /⏺ Worker\(status · all\)…/);
+    assert.match(renderWorkerToolCall(workerControl, { action: "result", workerId }), /⏺ Worker\(result · worker_202…41146f1\)…/);
+    assert.match(renderWorkerToolCall(workerControl, { action: "cancel", workerId }), /⏺ Worker\(cancel · worker_202…41146f1\)…/);
+    assert.match(renderWorkerToolCall(workerControl, { action: "discard", workerId, confirm: true }), /⏺ Worker\(discard · worker_202…41146f1\)…/);
+
+    const baseWorker = { workerId, status: "running", sessionId: "session_a", workspaceRoot: "/tmp/a", taskIds: ["personal-a"], route: { provider: "openai-codex", model: "gpt-5.6-luna", thinkingLevel: "low" }, updatedAt: "2026-09-22T14:00:00.000Z" };
+    assert.match(renderWorkerToolResult(workerControl, { content: [], details: { action: "status", workers: [baseWorker, { ...baseWorker, workerId: workerId2, status: "handed_off", taskIds: ["personal-b", "personal-c"] }] } }), /⎿ 2 workers · 1 running, 1 handed_off/);
+    assert.match(renderWorkerToolResult(workerControl, { content: [], details: { action: "status", workers: [baseWorker, { ...baseWorker, workerId: workerId2, status: "handed_off", taskIds: ["personal-b", "personal-c"] }] } }, { expanded: true }), /worker_202…41146f1/);
+    const manyWorkers = Array.from({ length: 10 }, (_, index) => ({
+      ...baseWorker,
+      workerId: `worker_20260922141500_${String(index).padStart(8, "0")}`
+    }));
+    const boundedStatus = renderWorkerToolResult(workerControl, { content: [], details: { action: "status", workers: manyWorkers } }, { expanded: true });
+    assert.match(boundedStatus, /\+2 more/);
+    assert.doesNotMatch(boundedStatus, /00000008/);
+    const controlResult = { content: [], details: { action: "result", workerId, runId: "run_a", jobId: "job_a", status: "handed_off", delivery: "delivered", completionDelivery: "steer", sessionId: "session_a", workspaceRoot: "/tmp/a", taskIds: ["personal-a"], route: baseWorker.route, acknowledgedDelivery: true, handoff: { version: 1, workerId, runId: "run_a", acceptedAt: "2026-09-22T14:00:00.000Z", handoff: { state: "assignment_complete", summary: "done", taskUpdates: [] } } } };
+    assert.match(renderWorkerToolResult(workerControl, controlResult), /⎿ result · handed_off · worker_202…41146f1 · assignment_complete/);
+    const expandedControlResult = renderWorkerToolResult(workerControl, controlResult, { expanded: true });
+    assert.match(expandedControlResult, /run run_a · job job_a · delivered · steer · personal-a/);
+    assert.match(expandedControlResult, /assignment_complete: done/);
+    assert.match(renderWorkerToolResult(workerControl, { content: [], details: { action: "cancel", workerId, outcome: "cancelled", status: "cancelled", runId: "run_a", jobId: "job_a" } }), /⎿ cancelled · worker_202…41146f1 · cancelled/);
+    assert.match(renderWorkerToolResult(workerControl, { content: [], details: { action: "discard", workerId, discarded: true } }), /⎿ discarded · worker_202…41146f1/);
+    assert.match(renderWorkerToolResult(workerControl, { content: [], details: { action: "status", workers: [] } }, { isPartial: true }), /⎿ checking workers/);
+    assert.match(renderWorkerToolResult(workerControl, { content: [{ type: "text", text: "control failure" }], details: undefined }, {}, { isError: true }), /⎿ error: control failure/);
   });
 });

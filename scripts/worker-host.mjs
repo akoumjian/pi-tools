@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFile
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { RpcClient } from "@earendil-works/pi-coding-agent";
-import { isAsyncJobExecutionAlive } from "../extensions/_shared/async-job-process.js";
+import { readStrictWorkerJobMeta, workerJobIsSettled } from "../extensions/_shared/worker-job-settlement.js";
 
 const configFile = process.argv[2];
 if (!configFile) throw new Error("Usage: worker-host.mjs <host-config.json>");
@@ -117,12 +117,9 @@ function assertOwnedShellQuiescence() {
   if (!existsSync(jobsDirectory)) return;
   for (const entry of readdirSync(jobsDirectory, { withFileTypes: true })) {
     if (!entry.isDirectory() || !/^job_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(entry.name)) continue;
-    const metaFile = path.join(jobsDirectory, entry.name, "meta.json");
-    if (!existsSync(metaFile)) continue;
-    const meta = JSON.parse(readFileSync(metaFile, "utf8"));
-    if (meta.owner?.kind !== "worker-run" || meta.owner.workerId !== config.workerId || meta.owner.runId !== config.runId) continue;
-    const terminal = ["exited", "failed", "cancelled", "unknown"].includes(meta.status);
-    if (!terminal && (!meta.processToken || isAsyncJobExecutionAlive(meta.pid, meta.processToken))) {
+    const meta = readStrictWorkerJobMeta(jobsDirectory, entry.name);
+    if (meta.owner.workerId !== config.workerId || meta.owner.runId !== config.runId) continue;
+    if (!workerJobIsSettled(meta)) {
       throw new Error(`Worker handoff settlement found active or unverifiable owned async-shell job ${entry.name}.`);
     }
   }

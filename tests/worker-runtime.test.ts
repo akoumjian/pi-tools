@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { validateToolArguments, type Tool, type ToolCall } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { cancelAsyncShellJobsForOwner, startManagedAsyncJob } from "../extensions/async-shell/index.js";
+import asyncShellExtension, { cancelAsyncShellJobsForOwner, startManagedAsyncJob } from "../extensions/async-shell/index.js";
+import { workerHandoffAdmissionPath } from "../extensions/_shared/worker-contract.js";
 import workerRuntimeExtension, { readWorkerRuntimeHandoff } from "../extensions/worker/runtime.js";
 import { buildWorkerRpcArgs, defaultWorkerExtensionPaths, resolvePiCliPath, type WorkerHostConfig } from "../extensions/worker/runner.js";
 
@@ -16,6 +19,9 @@ function fakeApi(): FakeApi {
   return {
     tools,
     registerTool(tool: ToolDefinition): void { tools.push(tool); },
+    registerCommand(): void {},
+    registerMessageRenderer(): void {},
+    on(): void {},
     sendMessage(): void {}
   } as unknown as FakeApi;
 }
@@ -569,6 +575,152 @@ test("worker_handoff refuses active owned shell jobs and succeeds after cascade 
       await cancelAsyncShellJobsForOwner(owner, "SIGTERM", 1_000);
       const accepted = await tool.execute("call-2", handoff as never, undefined, undefined, context(directory));
       assert.equal((accepted.details as { accepted: boolean }).accepted, true);
+    });
+  });
+});
+
+test("worker_handoff rejects persisted jobs that are absent from its in-memory registry", async () => {
+  await withTempDir(async (directory) => {
+    await withWorkerEnv(directory, async () => {
+      const api = fakeApi();
+      workerRuntimeExtension(api);
+      const tool = api.tools.find((candidate) => candidate.name === "worker_handoff");
+      assert.ok(tool?.execute);
+      assert.match((tool.promptGuidelines ?? []).join("\n"), /wait.*cancel|cancel.*wait/i);
+      assert.match((tool.promptGuidelines ?? []).join("\n"), /verify.*terminal/i);
+
+      const jobId = "job_persisted_only";
+      const logDir = path.join(directory, "worker-state", "async-shell", "jobs", jobId);
+      await mkdir(logDir, { recursive: true });
+      await Promise.all([
+        writeFile(path.join(logDir, "stdout.log"), ""),
+        writeFile(path.join(logDir, "stderr.log"), "")
+      ]);
+      const meta = {
+        jobId,
+        command: "persisted-only job",
+        cwd: directory,
+        shell: process.execPath,
+        status: "running",
+        pid: process.pid,
+        startedAt: "2026-09-22T14:22:25.000Z",
+        notifyOnExit: false,
+        completionNotified: false,
+        owner: { kind: "worker-run", workerId: "worker-test", runId: "run-test" },
+        processToken: "11111111-1111-4111-8111-111111111111",
+        logDir,
+        stdoutLog: path.join(logDir, "stdout.log"),
+        stderrLog: path.join(logDir, "stderr.log"),
+        outputBytes: { stdout: 0, stderr: 0 }
+      };
+      await writeFile(path.join(logDir, "meta.json"), `${JSON.stringify(meta, null, 2)}\n`);
+
+      const blocked = await tool.execute("persisted-blocked", handoff as never, undefined, undefined, context(directory));
+      assert.deepEqual(blocked.details, { accepted: false, activeJobIds: [jobId] });
+      assert.match(JSON.stringify(blocked.content), /not verifiably settled/);
+      assert.equal(existsSync(path.join(directory, "run", "result.json")), false);
+      assert.equal(existsSync(workerHandoffAdmissionPath(path.join(directory, "run", "result.json"))), false);
+
+      const metaFile = path.join(logDir, "meta.json");
+      await writeFile(metaFile, `${JSON.stringify({ ...meta, command: undefined }, null, 2)}\n`);
+      await assert.rejects(
+        tool.execute("persisted-malformed", handoff as never, undefined, undefined, context(directory)),
+        /invalid metadata.*cannot verify quiescence/
+      );
+      assert.equal(existsSync(workerHandoffAdmissionPath(path.join(directory, "run", "result.json"))), false);
+
+      await writeFile(metaFile, `${JSON.stringify({
+        ...meta,
+        owner: { kind: "worker-run", workerId: "worker-test", runId: " " }
+      }, null, 2)}\n`);
+      await assert.rejects(
+        tool.execute("persisted-invalid-owner", handoff as never, undefined, undefined, context(directory)),
+        /unverifiable ownership metadata.*cannot verify quiescence/
+      );
+
+      await writeFile(metaFile, `${JSON.stringify({
+        ...meta,
+        status: "unknown",
+        processToken: "22222222-2222-4222-8222-222222222222"
+      }, null, 2)}\n`);
+      const unknown = await tool.execute("persisted-unknown", handoff as never, undefined, undefined, context(directory));
+      assert.deepEqual(unknown.details, { accepted: false, activeJobIds: [jobId] });
+
+      await writeFile(metaFile, `${JSON.stringify({
+        ...meta,
+        status: "cancelled",
+        endedAt: "2026-09-22T14:22:26.000Z",
+        processToken: undefined
+      }, null, 2)}\n`);
+      await assert.rejects(
+        tool.execute("persisted-tokenless", handoff as never, undefined, undefined, context(directory)),
+        /invalid metadata.*cannot verify quiescence/
+      );
+
+      if (process.platform === "darwin") {
+        const liveToken = "33333333-3333-4333-8333-333333333333";
+        const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+          env: { ...process.env, PI_WORKER_JOB_TOKEN: liveToken },
+          stdio: "ignore"
+        });
+        assert.ok(child.pid);
+        try {
+          await writeFile(metaFile, `${JSON.stringify({
+            ...meta,
+            status: "cancelled",
+            endedAt: "2026-09-22T14:22:26.000Z",
+            pid: child.pid,
+            processToken: liveToken
+          }, null, 2)}\n`);
+          const terminalButLive = await tool.execute("persisted-terminal-live", handoff as never, undefined, undefined, context(directory));
+          assert.deepEqual(terminalButLive.details, { accepted: false, activeJobIds: [jobId] });
+        } finally {
+          child.kill("SIGKILL");
+          await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+        }
+      }
+
+      await writeFile(metaFile, `${JSON.stringify({
+        ...meta,
+        status: "cancelled",
+        endedAt: "2026-09-22T14:22:26.000Z",
+        processToken: "22222222-2222-4222-8222-222222222222",
+        notifyOnExit: true,
+        completionNotified: false
+      }, null, 2)}\n`);
+      const pendingNotice = await tool.execute("persisted-pending-notice", handoff as never, undefined, undefined, context(directory));
+      assert.deepEqual(pendingNotice.details, { accepted: false, activeJobIds: [jobId] });
+
+      await writeFile(metaFile, `${JSON.stringify({
+        ...meta,
+        status: "cancelled",
+        endedAt: "2026-09-22T14:22:26.000Z",
+        processToken: "22222222-2222-4222-8222-222222222222",
+        notifyOnExit: true,
+        completionNotified: true
+      }, null, 2)}\n`);
+      const accepted = await tool.execute("persisted-settled", handoff as never, undefined, undefined, context(directory));
+      assert.equal((accepted.details as { accepted: boolean }).accepted, true);
+    });
+  });
+});
+
+test("managed worker shell starts are sealed while handoff admission is active", async () => {
+  await withTempDir(async (directory) => {
+    await withWorkerEnv(directory, async () => {
+      const resultFile = path.join(directory, "run", "result.json");
+      await mkdir(path.dirname(resultFile), { recursive: true });
+      await writeFile(workerHandoffAdmissionPath(resultFile), "admitting\n");
+      const api = fakeApi();
+      asyncShellExtension(api);
+      const shellStart = api.tools.find((candidate) => candidate.name === "shell_start");
+      assert.ok(shellStart?.execute);
+      await assert.rejects(
+        shellStart.execute("sealed-start", {
+          commands: [{ command: "printf must-not-start", cwd: directory }]
+        } as never, undefined, undefined, context(directory)),
+        /sealed during or after worker_handoff admission/
+      );
     });
   });
 });

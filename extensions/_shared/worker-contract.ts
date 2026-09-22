@@ -2,6 +2,10 @@ import { Type, type Static } from "@earendil-works/pi-ai";
 
 export const MAX_WORKER_TASK_IDS = 32;
 
+export function workerHandoffAdmissionPath(resultFile: string): string {
+  return `${resultFile}.admitting`;
+}
+
 export const WorkerHandoffStateSchema = Type.Union([
   Type.Literal("ready_for_review"),
   Type.Literal("assignment_complete"),
