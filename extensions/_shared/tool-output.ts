@@ -583,6 +583,72 @@ const WorkerRouteSchema = Type.Object({
   thinkingLevel: Type.String({ minLength: 1 })
 }, { additionalProperties: false });
 
+const RepositoryPolicyIssuesSchema = Type.Array(Type.String({ maxLength: 160 }), { maxItems: 64 });
+
+const RepositoryCandidateSummarySchema = Type.Object({
+  candidateId: Type.String({ pattern: "^candidate_[0-9a-f]{24}$" }),
+  workspaceRepo: Type.String({ minLength: 1, maxLength: 1024 }),
+  reported: Type.Boolean(),
+  dirty: Type.Boolean(),
+  changed: Type.Boolean(),
+  foldable: Type.Boolean(),
+  policyIssues: RepositoryPolicyIssuesSchema
+}, { additionalProperties: false });
+
+const RepositoryDiscrepancySchema = Type.Object({
+  kind: Type.Union([
+    Type.Literal("unreported_changed"),
+    Type.Literal("reported_missing"),
+    Type.Literal("reported_not_repository"),
+    Type.Literal("symlink_skipped"),
+    Type.Literal("scan_limit")
+  ]),
+  workspaceRepo: Type.String({ minLength: 1, maxLength: 1024 }),
+  detail: Type.String({ minLength: 1, maxLength: 512 })
+}, { additionalProperties: false });
+
+const RepositoryInventorySummarySchema = Type.Object({
+  inventoryFile: Type.String({ minLength: 1 }),
+  inventorySha256: Type.String({ pattern: "^[0-9a-f]{64}$" }),
+  candidateCount: Type.Integer({ minimum: 0, maximum: 32 }),
+  foldableCount: Type.Integer({ minimum: 0, maximum: 32 }),
+  discrepancyCount: Type.Integer({ minimum: 0, maximum: 128 }),
+  candidates: Type.Array(RepositoryCandidateSummarySchema, { maxItems: 32 }),
+  discrepancies: Type.Array(RepositoryDiscrepancySchema, { maxItems: 128 })
+}, { additionalProperties: false });
+
+const RepositoryCandidateSchema = Type.Object({
+  candidateId: Type.String({ pattern: "^candidate_[0-9a-f]{24}$" }),
+  workerId: Type.String({ minLength: 1 }),
+  runId: Type.String({ minLength: 1 }),
+  workspaceRepo: Type.String({ minLength: 1, maxLength: 1024 }),
+  reported: Type.Boolean(),
+  purpose: Type.Optional(Type.String({ minLength: 1, maxLength: 2000 })),
+  dependsOn: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 16 }),
+  source: Type.Optional(Type.String({ minLength: 1, maxLength: 2048 })),
+  baseCommit: Type.Optional(Type.String({ pattern: "^[0-9a-f]{40,64}$" })),
+  baseTree: Type.Optional(Type.String({ pattern: "^[0-9a-f]{40,64}$" })),
+  headCommit: Type.Optional(Type.String({ pattern: "^[0-9a-f]{40,64}$" })),
+  headTree: Type.Optional(Type.String({ pattern: "^[0-9a-f]{40,64}$" })),
+  dirty: Type.Boolean(),
+  changed: Type.Boolean(),
+  foldable: Type.Boolean(),
+  changedPaths: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 128 }),
+  changedPathCount: Type.Integer({ minimum: 0 }),
+  changedPathsTruncated: Type.Boolean(),
+  policyIssues: RepositoryPolicyIssuesSchema
+}, { additionalProperties: false });
+
+const RepositoryInventorySchema = Type.Object({
+  version: Type.Literal(1),
+  workerId: Type.String({ minLength: 1 }),
+  runId: Type.String({ minLength: 1 }),
+  workspaceRoot: Type.String({ minLength: 1 }),
+  generatedAt: Type.String({ minLength: 1 }),
+  candidates: Type.Array(RepositoryCandidateSchema, { maxItems: 32 }),
+  discrepancies: Type.Array(RepositoryDiscrepancySchema, { maxItems: 128 })
+}, { additionalProperties: false });
+
 const WorkerControlSummarySchema = Type.Object({
   workerId: Type.String({ minLength: 1 }),
   status: WorkerStatusSchema,
@@ -614,7 +680,9 @@ const WorkerControlSummarySchema = Type.Object({
     resultFile: Type.Optional(Type.String({ minLength: 1 })),
     stdoutLog: Type.Optional(Type.String({ minLength: 1 })),
     stderrLog: Type.Optional(Type.String({ minLength: 1 })),
-    error: Type.Optional(Type.String())
+    error: Type.Optional(Type.String()),
+    repositoryInventory: Type.Optional(RepositoryInventorySummarySchema),
+    repositoryError: Type.Optional(Type.String({ maxLength: 512 }))
   }, { additionalProperties: false })),
   updatedAt: Type.String({ minLength: 1 })
 }, { additionalProperties: false });
@@ -641,6 +709,8 @@ const WorkerControlDetailsSchema = Type.Union([
     stderrLog: Type.Optional(Type.String({ minLength: 1 })),
     error: Type.Optional(Type.String()),
     handoff: Type.Optional(AcceptedWorkerHandoffSchema),
+    repositories: Type.Optional(RepositoryInventorySchema),
+    repositoryError: Type.Optional(Type.String({ maxLength: 512 })),
     acknowledgedDelivery: Type.Boolean()
   }, { additionalProperties: false }),
   Type.Object({

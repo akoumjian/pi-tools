@@ -6,6 +6,7 @@ import { isAsyncJobProcessAlive } from "../_shared/async-job.js";
 import { isWorkerId } from "../_shared/worker-id.js";
 import type { CompletionDelivery } from "../_shared/completion-delivery.js";
 import type { WorkerContainerReference } from "../_shared/worker-container.js";
+import type { InitialRepositoryPin, RepositoryInventorySummary } from "./repositories.js";
 
 export const WORKER_RECORD_VERSION = 1;
 
@@ -32,6 +33,7 @@ export type WorkerRecord = {
   workspaceRoot: string;
   taskIds: string[];
   route: WorkerRoute;
+  initialRepositories?: InitialRepositoryPin[];
   status: "queued" | "running" | "handed_off" | "failed" | "cancelled";
   container?: WorkerContainerReference;
   activeRun?: {
@@ -67,6 +69,8 @@ export type WorkerRecord = {
     stdoutLog?: string;
     stderrLog?: string;
     error?: string;
+    repositoryInventory?: RepositoryInventorySummary;
+    repositoryError?: string;
   };
   updatedAt: string;
 };
@@ -276,11 +280,59 @@ export function readWorkerRecord(recordFile: string): WorkerRecord {
     typeof value.parentSessionFile !== "string" ||
     typeof value.workspaceRoot !== "string" ||
     !Array.isArray(value.taskIds) ||
-    !value.route
+    !value.route ||
+    !validInitialRepositories(value.initialRepositories) ||
+    !validRepositoryInventorySummary(value.lastRun?.repositoryInventory, target, value.lastRun?.runId) ||
+    (value.lastRun?.repositoryError !== undefined && (typeof value.lastRun.repositoryError !== "string" || value.lastRun.repositoryError.length > 512))
   ) {
     throw new Error(`Invalid worker record: ${target}`);
   }
   return value as WorkerRecord;
+}
+
+function validInitialRepositories(value: unknown): boolean {
+  if (value === undefined) return true;
+  return Array.isArray(value) && value.length <= 16 && value.every((item) => {
+    if (!isRecord(item) || typeof item.source !== "string" || item.source.length > 2048 || !["pinned", "unresolved", "unsupported"].includes(String(item.status))) return false;
+    if (item.revision !== undefined && (typeof item.revision !== "string" || item.revision.length > 256)) return false;
+    if (item.canonicalSource !== undefined && (typeof item.canonicalSource !== "string" || item.canonicalSource.length > 2048)) return false;
+    if (item.issue !== undefined && (typeof item.issue !== "string" || item.issue.length > 160)) return false;
+    for (const key of ["baseCommit", "baseTree"] as const) {
+      if (item[key] !== undefined && (typeof item[key] !== "string" || !/^[0-9a-f]{40,64}$/.test(item[key]))) return false;
+    }
+    if (item.status === "pinned" && (typeof item.baseCommit !== "string" || typeof item.baseTree !== "string" || typeof item.canonicalSource !== "string")) return false;
+    if ((item.baseCommit === undefined) !== (item.baseTree === undefined)) return false;
+    return true;
+  });
+}
+
+function validRepositoryInventorySummary(value: unknown, recordFile: string, runId: unknown): boolean {
+  if (value === undefined) return true;
+  if (!isRecord(value) || typeof runId !== "string") return false;
+  const expected = path.join(path.dirname(recordFile), "runs", runId, "repository-candidates.json");
+  if (typeof value.inventoryFile !== "string" || path.resolve(value.inventoryFile) !== expected) return false;
+  if (typeof value.inventorySha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.inventorySha256)) return false;
+  if (!Array.isArray(value.candidates) || value.candidates.length > 32 || !Array.isArray(value.discrepancies) || value.discrepancies.length > 128) return false;
+  if (value.candidateCount !== value.candidates.length || value.discrepancyCount !== value.discrepancies.length) return false;
+  const foldableCount = value.candidates.filter((candidate) => isRecord(candidate) && candidate.foldable === true).length;
+  if (value.foldableCount !== foldableCount) return false;
+  if (!value.candidates.every((candidate) =>
+    isRecord(candidate) &&
+    typeof candidate.candidateId === "string" && /^candidate_[0-9a-f]{24}$/.test(candidate.candidateId) &&
+    typeof candidate.workspaceRepo === "string" && candidate.workspaceRepo.length > 0 && candidate.workspaceRepo.length <= 1024 &&
+    typeof candidate.reported === "boolean" && typeof candidate.dirty === "boolean" && typeof candidate.changed === "boolean" && typeof candidate.foldable === "boolean" &&
+    Array.isArray(candidate.policyIssues) && candidate.policyIssues.length <= 64 && candidate.policyIssues.every((issue) => typeof issue === "string" && issue.length <= 160)
+  )) return false;
+  return value.discrepancies.every((item) =>
+    isRecord(item) &&
+    ["unreported_changed", "reported_missing", "reported_not_repository", "symlink_skipped", "scan_limit"].includes(String(item.kind)) &&
+    typeof item.workspaceRepo === "string" && item.workspaceRepo.length > 0 && item.workspaceRepo.length <= 1024 &&
+    typeof item.detail === "string" && item.detail.length > 0 && item.detail.length <= 512
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isErrorCode(error: unknown, code: string): boolean {

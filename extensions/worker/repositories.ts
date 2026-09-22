@@ -1,0 +1,813 @@
+import { createHash, randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  statSync,
+  writeFileSync
+} from "node:fs";
+import path from "node:path";
+import { resolveExecutable } from "../_shared/executable.js";
+import type { AcceptedWorkerHandoff } from "../_shared/worker-contract.js";
+
+const REPOSITORY_INVENTORY_VERSION = 1;
+const MAX_REPOSITORIES = 32;
+const MAX_SCAN_ENTRIES = 20_000;
+const MAX_SCAN_DEPTH = 12;
+const MAX_CHANGED_PATHS = 128;
+const MAX_DISCREPANCIES = 128;
+const MAX_GIT_OUTPUT_BYTES = 1024 * 1024;
+const MAX_PATH_BYTES = 1024;
+const OID_PATTERN = /^[0-9a-f]{40,64}$/;
+
+export type InitialRepositoryPin = {
+  source: string;
+  revision?: string;
+  canonicalSource?: string;
+  baseCommit?: string;
+  baseTree?: string;
+  status: "pinned" | "unresolved" | "unsupported";
+  issue?: string;
+};
+
+export type RepositoryCandidate = {
+  candidateId: string;
+  workerId: string;
+  runId: string;
+  workspaceRepo: string;
+  reported: boolean;
+  purpose?: string;
+  dependsOn: string[];
+  source?: string;
+  baseCommit?: string;
+  baseTree?: string;
+  headCommit?: string;
+  headTree?: string;
+  dirty: boolean;
+  changed: boolean;
+  foldable: boolean;
+  changedPaths: string[];
+  changedPathCount: number;
+  changedPathsTruncated: boolean;
+  policyIssues: string[];
+};
+
+export type RepositoryDiscrepancy = {
+  kind: "unreported_changed" | "reported_missing" | "reported_not_repository" | "symlink_skipped" | "scan_limit";
+  workspaceRepo: string;
+  detail: string;
+};
+
+export type RepositoryInventory = {
+  version: typeof REPOSITORY_INVENTORY_VERSION;
+  workerId: string;
+  runId: string;
+  workspaceRoot: string;
+  generatedAt: string;
+  candidates: RepositoryCandidate[];
+  discrepancies: RepositoryDiscrepancy[];
+};
+
+export type RepositoryCandidateSummary = {
+  candidateId: string;
+  workspaceRepo: string;
+  reported: boolean;
+  dirty: boolean;
+  changed: boolean;
+  foldable: boolean;
+  policyIssues: string[];
+};
+
+export type RepositoryInventorySummary = {
+  inventoryFile: string;
+  inventorySha256: string;
+  candidateCount: number;
+  foldableCount: number;
+  discrepancyCount: number;
+  candidates: RepositoryCandidateSummary[];
+  discrepancies: RepositoryDiscrepancy[];
+};
+
+type GitRunner = {
+  gitPath: string;
+  env: NodeJS.ProcessEnv;
+};
+
+type RepositoryInspection = {
+  source?: string;
+  baseCommit?: string;
+  baseTree?: string;
+  headCommit?: string;
+  headTree?: string;
+  dirty: boolean;
+  changed: boolean;
+  foldable: boolean;
+  changedPaths: string[];
+  changedPathCount: number;
+  changedPathsTruncated: boolean;
+  policyIssues: string[];
+};
+
+export function pinInitialRepositories(
+  requested: readonly { source: string; revision?: string }[],
+  trustedStateRoot: string,
+  gitPath = resolveExecutable("git")
+): InitialRepositoryPin[] {
+  const runner = createGitRunner(gitPath, trustedStateRoot);
+  return requested.map((entry) => pinInitialRepository(entry, runner));
+}
+
+export function deriveRepositoryInventory(input: {
+  workerId: string;
+  runId: string;
+  workspaceRoot: string;
+  reposRoot: string;
+  handoff: AcceptedWorkerHandoff;
+  initialRepositories?: readonly InitialRepositoryPin[];
+  generatedAt: string;
+  trustedStateRoot: string;
+  gitPath?: string;
+}): RepositoryInventory {
+  const workspaceRoot = requireCanonicalDirectory(input.workspaceRoot, "worker workspace");
+  const reposRoot = requireCanonicalDirectory(input.reposRoot, "worker repositories");
+  if (!isWithin(workspaceRoot, reposRoot)) {
+    throw new Error("Worker repository root escapes the canonical workspace.");
+  }
+  const reported = reportedRepositories(input.handoff, workspaceRoot);
+  const scan = discoverRepositories(reposRoot, workspaceRoot);
+  const runner = createGitRunner(input.gitPath ?? resolveExecutable("git"), input.trustedStateRoot);
+  const candidates: RepositoryCandidate[] = [];
+  const discrepancies = [...scan.discrepancies];
+
+  for (const repoPath of scan.repositories) {
+    const workspaceRepo = relativeWorkspacePath(workspaceRoot, repoPath);
+    const report = reported.get(workspaceRepo);
+    const inspection = inspectRepositorySafely(repoPath, input.initialRepositories ?? [], runner);
+    const candidateId = stableCandidateId({
+      workerId: input.workerId,
+      runId: input.runId,
+      workspaceRepo,
+      baseCommit: inspection.baseCommit,
+      headCommit: inspection.headCommit,
+      headTree: inspection.headTree
+    });
+    candidates.push({
+      candidateId,
+      workerId: input.workerId,
+      runId: input.runId,
+      workspaceRepo,
+      reported: report !== undefined,
+      purpose: report?.purpose,
+      dependsOn: [...(report?.dependsOn ?? [])],
+      ...inspection
+    });
+    if (!report && inspection.changed) {
+      pushDiscrepancy(discrepancies, {
+        kind: "unreported_changed",
+        workspaceRepo,
+        detail: "Changed repository was not listed in the worker handoff."
+      });
+    }
+    reported.delete(workspaceRepo);
+  }
+
+  for (const [workspaceRepo] of reported) {
+    const absolute = path.resolve(workspaceRoot, workspaceRepo);
+    pushDiscrepancy(discrepancies, {
+      kind: existsSync(absolute) ? "reported_not_repository" : "reported_missing",
+      workspaceRepo,
+      detail: existsSync(absolute)
+        ? "Worker-reported path is not an independently discovered Git repository."
+        : "Worker-reported repository path does not exist."
+    });
+  }
+
+  candidates.sort((left, right) => left.workspaceRepo.localeCompare(right.workspaceRepo));
+  discrepancies.sort((left, right) => left.workspaceRepo.localeCompare(right.workspaceRepo) || left.kind.localeCompare(right.kind));
+  return {
+    version: REPOSITORY_INVENTORY_VERSION,
+    workerId: input.workerId,
+    runId: input.runId,
+    workspaceRoot,
+    generatedAt: input.generatedAt,
+    candidates,
+    discrepancies
+  };
+}
+
+export function persistRepositoryInventory(
+  inventoryFile: string,
+  inventory: RepositoryInventory
+): RepositoryInventorySummary {
+  const target = path.resolve(inventoryFile);
+  mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+  const serialized = `${JSON.stringify(inventory, null, 2)}\n`;
+  const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(temporary, serialized, { mode: 0o600 });
+  renameSync(temporary, target);
+  return summarizeRepositoryInventory(target, serialized, inventory);
+}
+
+export function readRepositoryInventory(
+  inventoryFile: string,
+  expected: { workerId: string; runId: string; workspaceRoot: string; sha256?: string }
+): RepositoryInventory {
+  const target = path.resolve(inventoryFile);
+  const metadata = lstatSync(target);
+  if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error("Worker repository inventory is not a regular file.");
+  if (expected.sha256 !== undefined && !/^[0-9a-f]{64}$/.test(expected.sha256)) {
+    throw new Error("Worker repository inventory has an invalid expected hash.");
+  }
+  const raw = readFileSync(target, "utf8");
+  if (expected.sha256 && sha256(raw) !== expected.sha256) {
+    throw new Error("Worker repository inventory hash mismatch.");
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(raw) as unknown;
+  } catch {
+    throw new Error("Worker repository inventory is not valid JSON.");
+  }
+  if (!isRepositoryInventory(value)) {
+    throw new Error("Worker repository inventory failed strict validation.");
+  }
+  if (
+    value.workerId !== expected.workerId ||
+    value.runId !== expected.runId ||
+    path.resolve(value.workspaceRoot) !== path.resolve(expected.workspaceRoot)
+  ) {
+    throw new Error("Worker repository inventory identity mismatch.");
+  }
+  return value;
+}
+
+function pinInitialRepository(
+  entry: { source: string; revision?: string },
+  runner: GitRunner
+): InitialRepositoryPin {
+  const source = entry.source.trim();
+  const revision = entry.revision?.trim();
+  if (!source) return { source, revision, status: "unsupported", issue: "blank_source" };
+  if (containsCredentialUrl(source)) {
+    return { source: redactSource(source), revision, status: "unsupported", issue: "credential_bearing_source" };
+  }
+  const local = localSourcePath(source);
+  if (!local) return { source, revision, canonicalSource: normalizeSource(source), status: "unresolved", issue: "nonlocal_source" };
+  try {
+    const canonicalSource = requireCanonicalDirectory(local, "initial repository source");
+    if (!isGitMarker(path.join(canonicalSource, ".git"))) {
+      return { source, revision, canonicalSource, status: "unresolved", issue: "not_repository" };
+    }
+    const configIssues = repositoryPolicyIssues(canonicalSource, runner);
+    if (configIssues.length > 0) {
+      return { source, revision, canonicalSource, status: "unsupported", issue: configIssues[0] };
+    }
+    const baseCommit = gitText(runner, canonicalSource, ["rev-parse", "--verify", "--end-of-options", `${revision || "HEAD"}^{commit}`]).trim();
+    const baseTree = gitText(runner, canonicalSource, ["rev-parse", "--verify", `${baseCommit}^{tree}`]).trim();
+    if (!OID_PATTERN.test(baseCommit) || !OID_PATTERN.test(baseTree)) {
+      return { source, revision, canonicalSource, status: "unresolved", issue: "invalid_base_identity" };
+    }
+    return { source, revision, canonicalSource, baseCommit, baseTree, status: "pinned" };
+  } catch (error) {
+    return { source, revision, status: "unresolved", issue: safeIssue(error) };
+  }
+}
+
+function inspectRepositorySafely(
+  repoPath: string,
+  initialRepositories: readonly InitialRepositoryPin[],
+  runner: GitRunner
+): RepositoryInspection {
+  try {
+    return inspectRepository(repoPath, initialRepositories, runner);
+  } catch (error) {
+    return {
+      dirty: true,
+      changed: true,
+      foldable: false,
+      changedPaths: [],
+      changedPathCount: 0,
+      changedPathsTruncated: false,
+      policyIssues: [safeIssue(error)]
+    };
+  }
+}
+
+function inspectRepository(
+  repoPath: string,
+  initialRepositories: readonly InitialRepositoryPin[],
+  runner: GitRunner
+): RepositoryInspection {
+  const policyIssues = repositoryPolicyIssues(repoPath, runner);
+  if (policyIssues.some((issue) => issue.startsWith("git_metadata_") || issue === "linked_or_indirect_gitdir")) {
+    return {
+      dirty: true,
+      changed: true,
+      foldable: false,
+      changedPaths: [],
+      changedPathCount: 0,
+      changedPathsTruncated: false,
+      policyIssues: [...new Set([...policyIssues, "missing_base"])].sort()
+    };
+  }
+  let source: string | undefined;
+  let headCommit: string | undefined;
+  let headTree: string | undefined;
+  let dirty = true;
+  let changedPaths: string[] = [];
+  let changedPathCount = 0;
+  let changedPathsTruncated = false;
+
+  const localConfig = readLocalConfig(repoPath, runner);
+  const origin = localConfig.get("remote.origin.url")?.at(-1);
+  if (origin && !containsCredentialUrl(origin) && origin.length <= 2048) source = normalizeSource(origin);
+  else if (origin && containsCredentialUrl(origin)) policyIssues.push("credential_bearing_remote");
+  else if (origin) policyIssues.push("remote_url_limit");
+
+  const pin = matchInitialRepository(source, initialRepositories);
+  try {
+    headCommit = gitText(runner, repoPath, ["rev-parse", "--verify", "HEAD^{commit}"]).trim();
+    headTree = gitText(runner, repoPath, ["rev-parse", "--verify", `${headCommit}^{tree}`]).trim();
+    if (!OID_PATTERN.test(headCommit) || !OID_PATTERN.test(headTree)) throw new Error("invalid_head_identity");
+  } catch (error) {
+    policyIssues.push(safeIssue(error));
+  }
+
+  const baseCommit = pin?.status === "pinned" ? pin.baseCommit : undefined;
+  const baseTree = pin?.status === "pinned" ? pin.baseTree : undefined;
+  if (pin && pin.status !== "pinned") policyIssues.push(`initial_base_${pin.status}:${pin.issue ?? "unresolved"}`);
+  if (!baseCommit) policyIssues.push("missing_base");
+  if (baseCommit && !baseTree) policyIssues.push("missing_base_tree");
+  if (headCommit && !headTree) policyIssues.push("missing_head_tree");
+  if (headCommit && baseCommit && !objectExists(repoPath, baseCommit, runner)) policyIssues.push("base_object_missing");
+
+  try {
+    const statusPaths = parsePorcelainPaths(gitBuffer(runner, repoPath, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"]));
+    dirty = statusPaths.length > 0;
+    let commitPaths: string[] = [];
+    if (headCommit && baseCommit && objectExists(repoPath, baseCommit, runner)) {
+      commitPaths = parseNulPaths(gitBuffer(runner, repoPath, ["diff", "--name-only", "-z", "--no-ext-diff", "--no-textconv", `${baseCommit}..${headCommit}`, "--"]));
+    } else if (headCommit) {
+      commitPaths = parseNulPaths(gitBuffer(runner, repoPath, ["ls-tree", "-r", "--name-only", "-z", headCommit]));
+    }
+    const allPaths = uniqueBoundedPaths([...commitPaths, ...statusPaths]);
+    changedPaths = allPaths.paths;
+    changedPathCount = allPaths.total;
+    changedPathsTruncated = allPaths.truncated;
+  } catch (error) {
+    policyIssues.push(safeIssue(error));
+  }
+
+  const changed = dirty || (headCommit !== undefined && baseCommit !== undefined && headCommit !== baseCommit) || (headCommit !== undefined && !baseCommit);
+  if (!changed) policyIssues.push("no_changes");
+  const allIssues = [...new Set(policyIssues)].sort();
+  const issues = allIssues.length <= 64 ? allIssues : [...allIssues.slice(0, 63), "policy_issues_truncated"];
+  return {
+    source,
+    baseCommit,
+    baseTree,
+    headCommit,
+    headTree,
+    dirty,
+    changed,
+    foldable: changed && !dirty && Boolean(headCommit && baseCommit && headTree && baseTree) && issues.length === 0,
+    changedPaths,
+    changedPathCount,
+    changedPathsTruncated,
+    policyIssues: issues
+  };
+}
+
+function repositoryPolicyIssues(repoPath: string, runner: GitRunner): string[] {
+  const issues: string[] = [];
+  const gitMarker = path.join(repoPath, ".git");
+  const marker = lstatSync(gitMarker);
+  if (marker.isSymbolicLink()) issues.push("git_metadata_symlink");
+  if (!marker.isDirectory()) issues.push("linked_or_indirect_gitdir");
+  if (marker.isDirectory()) issues.push(...gitMetadataIssues(gitMarker));
+  if (issues.length > 0) return [...new Set(issues)].sort();
+  const config = readLocalConfig(repoPath, runner);
+  for (const key of config.keys()) {
+    const lower = key.toLowerCase();
+    if (
+      lower === "core.hookspath" ||
+      lower === "core.fsmonitor" ||
+      lower === "core.sparsecheckout" ||
+      lower === "core.sparsecheckoutcone" ||
+      lower === "core.worktree" ||
+      lower.startsWith("filter.") ||
+      (lower.startsWith("diff.") && (lower.endsWith(".textconv") || lower.endsWith(".command"))) ||
+      (lower.startsWith("merge.") && lower.endsWith(".driver")) ||
+      lower.startsWith("include.") ||
+      lower.startsWith("includeif.") ||
+      lower.startsWith("extensions.") ||
+      (lower.startsWith("remote.") && lower.endsWith(".promisor"))
+    ) issues.push(`unsupported_config:${boundText(lower, 120)}`);
+  }
+  const repositoryFormat = config.get("core.repositoryformatversion")?.at(-1);
+  if (repositoryFormat !== undefined && repositoryFormat !== "0") issues.push("unsupported_repository_format");
+  const gitDir = marker.isDirectory() ? gitMarker : undefined;
+  if (gitDir) {
+    if (existsSync(path.join(gitDir, "objects", "info", "alternates"))) issues.push("object_alternates");
+    if (existsSync(path.join(gitDir, "info", "sparse-checkout"))) issues.push("sparse_checkout");
+    const hooks = path.join(gitDir, "hooks");
+    if (existsSync(hooks) && readdirSync(hooks).some((entry) => !entry.endsWith(".sample"))) issues.push("repository_hooks");
+    if (existsSync(path.join(gitDir, "info", "attributes"))) issues.push("repository_attributes");
+    if (existsSync(path.join(gitDir, "shallow"))) issues.push("shallow_repository");
+  }
+  try {
+    const attributes = parseNulPaths(gitBuffer(runner, repoPath, ["ls-files", "-z", "--", ".gitattributes", "**/.gitattributes"]));
+    if (attributes.length > 0) issues.push("tracked_attributes");
+    const gitlinks = gitText(runner, repoPath, ["ls-tree", "-r", "HEAD"]);
+    if (gitlinks.split("\n").some((line) => line.startsWith("160000 "))) issues.push("gitlinks_or_submodules");
+    const replacements = gitText(runner, repoPath, ["for-each-ref", "--format=%(refname)", "refs/replace"]);
+    if (replacements.trim()) issues.push("replace_refs");
+  } catch (error) {
+    issues.push(safeIssue(error));
+  }
+  const unique = [...new Set(issues)].sort();
+  return unique.length <= 64 ? unique : [...unique.slice(0, 63), "policy_issues_truncated"];
+}
+
+function gitMetadataIssues(gitDirectory: string): string[] {
+  const root = path.resolve(gitDirectory);
+  if (realpathSync(root) !== root) return ["git_metadata_alias"];
+  const queue = [root];
+  let scanned = 0;
+  while (queue.length > 0) {
+    const directory = queue.shift()!;
+    let entries;
+    try {
+      entries = readdirSync(directory, { withFileTypes: true });
+    } catch {
+      return ["git_metadata_unreadable"];
+    }
+    for (const entry of entries) {
+      if (++scanned > MAX_SCAN_ENTRIES) return ["git_metadata_scan_limit"];
+      const child = path.join(directory, entry.name);
+      if (entry.isSymbolicLink()) return ["git_metadata_symlink"];
+      if (entry.isDirectory()) queue.push(child);
+      else if (!entry.isFile()) return ["git_metadata_special_file"];
+    }
+  }
+  return [];
+}
+
+function discoverRepositories(
+  reposRoot: string,
+  workspaceRoot: string
+): { repositories: string[]; discrepancies: RepositoryDiscrepancy[] } {
+  const repositories: string[] = [];
+  const discrepancies: RepositoryDiscrepancy[] = [];
+  const queue: Array<{ directory: string; depth: number }> = [{ directory: reposRoot, depth: 0 }];
+  let scanned = 0;
+  while (queue.length > 0) {
+    const next = queue.shift()!;
+    if (++scanned > MAX_SCAN_ENTRIES) {
+      pushDiscrepancy(discrepancies, { kind: "scan_limit", workspaceRepo: "repos", detail: "Repository scan entry limit reached." });
+      break;
+    }
+    const marker = path.join(next.directory, ".git");
+    if (existsSync(marker)) {
+      repositories.push(next.directory);
+      if (repositories.length >= MAX_REPOSITORIES) {
+        pushDiscrepancy(discrepancies, { kind: "scan_limit", workspaceRepo: relativeWorkspacePath(workspaceRoot, next.directory), detail: "Repository count limit reached." });
+        break;
+      }
+    }
+    if (next.depth >= MAX_SCAN_DEPTH) continue;
+    let entries;
+    try {
+      entries = readdirSync(next.directory, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name));
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.name === ".git") continue;
+      const child = path.join(next.directory, entry.name);
+      if (entry.isSymbolicLink()) {
+        pushDiscrepancy(discrepancies, {
+          kind: "symlink_skipped",
+          workspaceRepo: relativeWorkspacePath(workspaceRoot, child),
+          detail: "Repository scan does not follow symlinks."
+        });
+        continue;
+      }
+      if (entry.isDirectory()) queue.push({ directory: child, depth: next.depth + 1 });
+    }
+  }
+  return { repositories: [...new Set(repositories)].sort(), discrepancies };
+}
+
+function reportedRepositories(
+  handoff: AcceptedWorkerHandoff,
+  workspaceRoot: string
+): Map<string, { purpose: string; dependsOn: string[] }> {
+  const reports = new Map<string, { purpose: string; dependsOn: string[] }>();
+  for (const report of handoff.handoff.repositories ?? []) {
+    const absolute = path.resolve(workspaceRoot, report.workspaceRepo);
+    if (!isWithin(workspaceRoot, absolute)) continue;
+    const relative = relativeWorkspacePath(workspaceRoot, absolute);
+    reports.set(relative, { purpose: report.purpose, dependsOn: [...(report.dependsOn ?? [])] });
+  }
+  return reports;
+}
+
+function createGitRunner(gitPath: string, trustedStateRoot: string): GitRunner {
+  const executable = realpathSync(gitPath);
+  const home = path.join(path.resolve(trustedStateRoot), "git-home");
+  mkdirSync(home, { recursive: true, mode: 0o700 });
+  return {
+    gitPath: executable,
+    env: {
+      HOME: home,
+      XDG_CONFIG_HOME: home,
+      LANG: "C",
+      LC_ALL: "C",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_SYSTEM: "/dev/null",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_ASKPASS: "/usr/bin/false",
+      SSH_ASKPASS: "/usr/bin/false",
+      GIT_OPTIONAL_LOCKS: "0",
+      GIT_NO_REPLACE_OBJECTS: "1",
+      GIT_NO_LAZY_FETCH: "1",
+      GIT_ATTR_NOSYSTEM: "1",
+      GIT_PAGER: "cat",
+      PAGER: "cat",
+      GIT_EDITOR: "false",
+      GIT_SEQUENCE_EDITOR: "false",
+      GIT_SSH_COMMAND: "false"
+    }
+  };
+}
+
+function gitBuffer(runner: GitRunner, cwd: string, args: string[]): Buffer {
+  const common = [
+    "--no-optional-locks",
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "core.fsmonitor=false",
+    "-c", "credential.helper=",
+    "-c", "commit.gpgSign=false",
+    "-c", "tag.gpgSign=false",
+    "-c", "diff.external=",
+    "-c", "core.attributesFile=/dev/null",
+    "-c", "core.excludesFile=/dev/null"
+  ];
+  const result = spawnSync(runner.gitPath, [...common, "-C", cwd, ...args], {
+    cwd,
+    env: runner.env,
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 5_000,
+    killSignal: "SIGKILL",
+    maxBuffer: MAX_GIT_OUTPUT_BYTES
+  });
+  if (result.error) throw new Error(`git_spawn_failed:${boundText(result.error.message, 120)}`);
+  if (result.status !== 0) throw new Error(`git_failed:${args[0] ?? "command"}`);
+  const output = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout ?? "");
+  if (output.byteLength > MAX_GIT_OUTPUT_BYTES) throw new Error("git_output_limit");
+  return output;
+}
+
+function gitText(runner: GitRunner, cwd: string, args: string[]): string {
+  const output = gitBuffer(runner, cwd, args).toString("utf8");
+  if (output.includes("\uFFFD")) throw new Error("git_output_not_utf8");
+  return output;
+}
+
+function readLocalConfig(repoPath: string, runner: GitRunner): Map<string, string[]> {
+  const output = gitText(runner, repoPath, ["config", "--local", "--no-includes", "--null", "--list"]);
+  const config = new Map<string, string[]>();
+  for (const item of output.split("\0")) {
+    if (!item) continue;
+    const newline = item.indexOf("\n");
+    if (newline <= 0) throw new Error("invalid_local_config_output");
+    const key = item.slice(0, newline).toLowerCase();
+    const value = item.slice(newline + 1);
+    const values = config.get(key) ?? [];
+    values.push(value);
+    config.set(key, values);
+  }
+  return config;
+}
+
+function objectExists(repoPath: string, oid: string, runner: GitRunner): boolean {
+  if (!OID_PATTERN.test(oid)) return false;
+  try {
+    gitBuffer(runner, repoPath, ["cat-file", "-e", `${oid}^{commit}`]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function parsePorcelainPaths(output: Buffer): string[] {
+  const entries = output.toString("utf8").split("\0");
+  const paths: string[] = [];
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index];
+    if (!entry) continue;
+    if (entry.length < 4 || entry[2] !== " ") throw new Error("invalid_git_status_output");
+    paths.push(entry.slice(3));
+    if (entry[0] === "R" || entry[0] === "C" || entry[1] === "R" || entry[1] === "C") {
+      const previous = entries[++index];
+      if (!previous) throw new Error("invalid_git_status_rename");
+      paths.push(previous);
+    }
+  }
+  return paths;
+}
+
+function parseNulPaths(output: Buffer): string[] {
+  const text = output.toString("utf8");
+  if (text.includes("\uFFFD")) throw new Error("git_path_not_utf8");
+  return text.split("\0").filter(Boolean);
+}
+
+function uniqueBoundedPaths(paths: string[]): { paths: string[]; total: number; truncated: boolean } {
+  const values = [...new Set(paths.map(normalizeRepositoryPath))].sort();
+  return { paths: values.slice(0, MAX_CHANGED_PATHS), total: values.length, truncated: values.length > MAX_CHANGED_PATHS };
+}
+
+function normalizeRepositoryPath(value: string): string {
+  if (!value || value.includes("\0") || Buffer.byteLength(value, "utf8") > MAX_PATH_BYTES) throw new Error("invalid_git_path");
+  const normalized = value.replaceAll("\\", "/").replace(/^\.\//, "");
+  if (normalized.startsWith("/") || normalized === ".." || normalized.startsWith("../") || normalized.includes("/../")) throw new Error("invalid_git_path");
+  return normalized;
+}
+
+function matchInitialRepository(source: string | undefined, pins: readonly InitialRepositoryPin[]): InitialRepositoryPin | undefined {
+  if (!source) return undefined;
+  const normalized = normalizeSource(source);
+  return pins.find((pin) => pin.canonicalSource === normalized || normalizeSource(pin.source) === normalized);
+}
+
+function localSourcePath(source: string): string | undefined {
+  if (path.isAbsolute(source)) return path.resolve(source);
+  if (source.startsWith("file://")) {
+    try {
+      const url = new URL(source);
+      return path.resolve(decodeURIComponent(url.pathname));
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+function normalizeSource(source: string): string {
+  const local = localSourcePath(source);
+  if (local && existsSync(local)) {
+    try { return realpathSync(local); } catch { return local; }
+  }
+  return source.trim().replace(/\/+$/, "").replace(/\.git$/, "");
+}
+
+function containsCredentialUrl(source: string): boolean {
+  try {
+    const url = new URL(source);
+    return Boolean(url.username || url.password);
+  } catch {
+    return false;
+  }
+}
+
+function redactSource(source: string): string {
+  try {
+    const url = new URL(source);
+    url.username = "";
+    url.password = "";
+    return url.toString();
+  } catch {
+    return "redacted-source";
+  }
+}
+
+function requireCanonicalDirectory(directory: string, label: string): string {
+  const target = path.resolve(directory);
+  const stat = lstatSync(target);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`${label} is not a canonical directory.`);
+  const canonical = realpathSync(target);
+  if (canonical !== target) throw new Error(`${label} contains a path alias.`);
+  return canonical;
+}
+
+function isGitMarker(marker: string): boolean {
+  try {
+    const stat = lstatSync(marker);
+    return stat.isDirectory() && !stat.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+function isWithin(root: string, candidate: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function relativeWorkspacePath(workspaceRoot: string, absolute: string): string {
+  const relative = path.relative(workspaceRoot, absolute).replaceAll(path.sep, "/");
+  if (!relative || relative === "." || relative.startsWith("../")) throw new Error("Repository path escapes the worker workspace.");
+  if (Buffer.byteLength(relative, "utf8") > MAX_PATH_BYTES) throw new Error("Repository path exceeds the bounded identity limit.");
+  return relative;
+}
+
+function stableCandidateId(input: {
+  workerId: string;
+  runId: string;
+  workspaceRepo: string;
+  baseCommit?: string;
+  headCommit?: string;
+  headTree?: string;
+}): string {
+  const digest = createHash("sha256").update(JSON.stringify({ version: 1, ...input })).digest("hex");
+  return `candidate_${digest.slice(0, 24)}`;
+}
+
+function summarizeRepositoryInventory(
+  inventoryFile: string,
+  serialized: string,
+  inventory: RepositoryInventory
+): RepositoryInventorySummary {
+  return {
+    inventoryFile,
+    inventorySha256: sha256(serialized),
+    candidateCount: inventory.candidates.length,
+    foldableCount: inventory.candidates.filter((candidate) => candidate.foldable).length,
+    discrepancyCount: inventory.discrepancies.length,
+    candidates: inventory.candidates.map((candidate) => ({
+      candidateId: candidate.candidateId,
+      workspaceRepo: candidate.workspaceRepo,
+      reported: candidate.reported,
+      dirty: candidate.dirty,
+      changed: candidate.changed,
+      foldable: candidate.foldable,
+      policyIssues: [...candidate.policyIssues]
+    })),
+    discrepancies: inventory.discrepancies.map((item) => ({ ...item }))
+  };
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function pushDiscrepancy(discrepancies: RepositoryDiscrepancy[], discrepancy: RepositoryDiscrepancy): void {
+  if (discrepancies.length < MAX_DISCREPANCIES) discrepancies.push(discrepancy);
+}
+
+function safeIssue(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return boundText(message.replace(/[^a-zA-Z0-9_.:-]+/g, "_"), 160) || "repository_inspection_failed";
+}
+
+function boundText(value: string, maxLength: number): string {
+  return value.length <= maxLength ? value : `${value.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+function isRepositoryInventory(value: unknown): value is RepositoryInventory {
+  if (!isRecord(value) || value.version !== 1 || typeof value.workerId !== "string" || typeof value.runId !== "string" || typeof value.workspaceRoot !== "string" || typeof value.generatedAt !== "string" || !Array.isArray(value.candidates) || !Array.isArray(value.discrepancies)) return false;
+  if (value.candidates.length > MAX_REPOSITORIES || value.discrepancies.length > MAX_DISCREPANCIES) return false;
+  return value.candidates.every((candidate) =>
+    isRepositoryCandidate(candidate) && candidate.workerId === value.workerId && candidate.runId === value.runId
+  ) && value.discrepancies.every((item) =>
+    isRecord(item) &&
+    ["unreported_changed", "reported_missing", "reported_not_repository", "symlink_skipped", "scan_limit"].includes(String(item.kind)) &&
+    typeof item.workspaceRepo === "string" && item.workspaceRepo.length > 0 && Buffer.byteLength(item.workspaceRepo, "utf8") <= MAX_PATH_BYTES &&
+    typeof item.detail === "string" && item.detail.length > 0 && item.detail.length <= 512
+  );
+}
+
+function isRepositoryCandidate(value: unknown): value is RepositoryCandidate {
+  return isRecord(value) &&
+    typeof value.candidateId === "string" && /^candidate_[0-9a-f]{24}$/.test(value.candidateId) &&
+    typeof value.workerId === "string" && typeof value.runId === "string" && typeof value.workspaceRepo === "string" &&
+    typeof value.reported === "boolean" && Array.isArray(value.dependsOn) && value.dependsOn.length <= 16 && value.dependsOn.every((item) => typeof item === "string" && item.length > 0 && item.length <= 1024) &&
+    typeof value.dirty === "boolean" && typeof value.changed === "boolean" && typeof value.foldable === "boolean" &&
+    Array.isArray(value.changedPaths) && value.changedPaths.length <= MAX_CHANGED_PATHS && value.changedPaths.every((item) => typeof item === "string" && item.length > 0 && Buffer.byteLength(item, "utf8") <= MAX_PATH_BYTES) &&
+    typeof value.changedPathCount === "number" && Number.isInteger(value.changedPathCount) && value.changedPathCount >= value.changedPaths.length && typeof value.changedPathsTruncated === "boolean" &&
+    (value.changedPathsTruncated || value.changedPathCount === value.changedPaths.length) &&
+    Array.isArray(value.policyIssues) && value.policyIssues.length <= 64 && value.policyIssues.every((item) => typeof item === "string" && item.length <= 160) &&
+    optionalString(value.purpose) && optionalString(value.source) && optionalOid(value.baseCommit) && optionalOid(value.baseTree) && optionalOid(value.headCommit) && optionalOid(value.headTree) &&
+    ((value.baseCommit === undefined) === (value.baseTree === undefined)) && ((value.headCommit === undefined) === (value.headTree === undefined));
+}
+
+function optionalString(value: unknown): boolean {
+  return value === undefined || typeof value === "string";
+}
+
+function optionalOid(value: unknown): boolean {
+  return value === undefined || (typeof value === "string" && OID_PATTERN.test(value));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}

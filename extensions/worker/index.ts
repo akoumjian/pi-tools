@@ -33,6 +33,14 @@ import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/
 import { cancelPersistedAsyncShellJobsForOwner, handleAsyncShellViewerCommand, type JobMeta, type ManagedAsyncJobHandle } from "../async-shell/index.js";
 import { launchWorkerHost, readWorkerHostProcess, readWorkerHostSettlement } from "./runner.js";
 import { readWorkerRuntimeHandoff, type AcceptedWorkerHandoff } from "./runtime.js";
+import {
+  deriveRepositoryInventory,
+  persistRepositoryInventory,
+  pinInitialRepositories,
+  readRepositoryInventory,
+  type RepositoryInventory,
+  type RepositoryInventorySummary
+} from "./repositories.js";
 import { forkWorkerSession, verifyWorkerSession } from "./session.js";
 import {
   WORKER_RECORD_VERSION,
@@ -150,6 +158,8 @@ type WorkerControlSummary = {
     stdoutLog?: string;
     stderrLog?: string;
     error?: string;
+    repositoryInventory?: RepositoryInventorySummary;
+    repositoryError?: string;
   };
   updatedAt: string;
 };
@@ -173,6 +183,8 @@ type WorkerControlDetails =
       stderrLog?: string;
       error?: string;
       handoff?: AcceptedWorkerHandoff;
+      repositories?: RepositoryInventory;
+      repositoryError?: string;
       acknowledgedDelivery: boolean;
     }
   | {
@@ -366,13 +378,13 @@ export function registerWorkerExtension(
   api.registerTool(defineTool({
     name: "worker_control",
     label: "Worker Control",
-    description: "Inspect and manage durable workers owned by this exact parent session. Status can list session workers or inspect one worker. Result returns the validated typed last handoff and acknowledges any pending completion delivery. Cancel performs authoritative run cleanup. Discard permanently removes one settled worker after explicit confirmation.",
+    description: "Inspect and manage durable workers owned by this exact parent session. Status can list session workers or inspect one worker. Result returns the validated typed last handoff plus any hash-bound repository candidate inventory and acknowledges pending completion delivery only after both validate. Cancel performs authoritative run cleanup. Discard permanently removes one settled worker after explicit confirmation.",
     promptSnippet: "Inspect exact-session workers, read and acknowledge typed results, cancel active runs, or discard settled workers with one worker_control action.",
     promptGuidelines: [
-      "worker_control use: Use status to list or inspect exact-session workers; result to retrieve a settled typed handoff and acknowledge pending delivery; cancel for authoritative active-run cleanup; discard only for an intentionally retired settled worker.",
+      "worker_control use: Use status to list or inspect exact-session workers and repository candidate summaries; result to retrieve a settled typed handoff plus exact candidate inventory and acknowledge pending delivery; cancel for authoritative active-run cleanup; discard only for an intentionally retired settled worker.",
       inputJsonSchemaGuideline("worker_control", WorkerControlParams),
       outputJsonSchemaGuideline("worker_control", RetainedToolOutputSchemas.worker_control),
-      "worker_control constraints: Every action is restricted to the exact parent session. Result retrieval validates worker/run identity before acknowledging delivery. Cancel and discard reuse trusted lifecycle operations; cleanup uncertainty fails closed. Discard requires confirm:true and is permanent. Use shell_read with a returned job ID for logs. Only result content is provider-visible; details are internal."
+      "worker_control constraints: Every action is restricted to the exact parent session. Result retrieval validates worker/run identity and any durable repository inventory before acknowledging delivery. Cancel and discard reuse trusted lifecycle operations; cleanup uncertainty fails closed. Discard requires confirm:true and is permanent. Use shell_read with a returned job ID for logs. Only result content is provider-visible; details are internal."
     ],
     parameters: WorkerControlParams,
     renderCall(args, theme) {
@@ -425,6 +437,8 @@ export function registerWorkerExtension(
             stderrLog: lastRun.stderrLog,
             error: lastRun.error,
             handoff: result.handoff,
+            repositories: result.repositories,
+            repositoryError: lastRun.repositoryError,
             acknowledgedDelivery: result.acknowledgedDelivery
           }
         };
@@ -528,7 +542,7 @@ function readParentWorkerResult(
   workerId: string,
   context: ExtensionContext,
   dependencies: WorkerExtensionDependencies
-): { record: WorkerRecord; handoff?: AcceptedWorkerHandoff; acknowledgedDelivery: boolean } {
+): { record: WorkerRecord; handoff?: AcceptedWorkerHandoff; repositories?: RepositoryInventory; acknowledgedDelivery: boolean } {
   const paths = workerPaths(dependencies.roots, workerId);
   const record = readWorkerRecord(paths.recordFile);
   assertWorkerParentSession(record, context);
@@ -541,6 +555,14 @@ function readParentWorkerResult(
   } else if (lastRun.status === "handed_off") {
     throw new Error(`Worker ${workerId}/${lastRun.runId} is marked handed_off without a result file.`);
   }
+  const repositories = lastRun.repositoryInventory
+    ? readRepositoryInventory(lastRun.repositoryInventory.inventoryFile, {
+        workerId,
+        runId: lastRun.runId,
+        workspaceRoot: record.workspaceRoot,
+        sha256: lastRun.repositoryInventory.inventorySha256
+      })
+    : undefined;
 
   const observed = withWorkerOperationLock(paths, () => {
     const current = readWorkerRecord(paths.recordFile);
@@ -557,7 +579,7 @@ function readParentWorkerResult(
     writeWorkerRecord(paths.recordFile, next);
     return { record: next, acknowledgedDelivery: true };
   });
-  return { record: observed.record, handoff, acknowledgedDelivery: observed.acknowledgedDelivery };
+  return { record: observed.record, handoff, repositories, acknowledgedDelivery: observed.acknowledgedDelivery };
 }
 
 function discardParentWorker(
@@ -803,6 +825,9 @@ function prepareNewWorker(
     workspaceRoot: paths.workspaceRoot,
     taskIds: plan.taskIds,
     route: plan.route,
+    initialRepositories: plan.input.initialRepos?.length
+      ? pinInitialRepositories(plan.input.initialRepos, path.join(paths.stateDir, "repository-inspection"))
+      : undefined,
     status: "queued",
     activeRun: {
       runId,
@@ -1151,6 +1176,28 @@ function finalizeWorkerRunRecord(input: {
       lease.runId !== input.runId ||
       lease.parentPid !== process.pid
     ) return undefined;
+    let repositoryInventory: RepositoryInventorySummary | undefined;
+    let repositoryError: string | undefined;
+    if (input.status === "handed_off" && input.handoff) {
+      try {
+        const inventory = deriveRepositoryInventory({
+          workerId: current.workerId,
+          runId: input.runId,
+          workspaceRoot: current.workspaceRoot,
+          reposRoot: input.paths.reposDir,
+          handoff: input.handoff,
+          initialRepositories: current.initialRepositories,
+          generatedAt: input.dependencies.now().toISOString(),
+          trustedStateRoot: path.join(path.dirname(input.resultFile), "repository-inspection")
+        });
+        repositoryInventory = persistRepositoryInventory(
+          path.join(path.dirname(input.resultFile), "repository-candidates.json"),
+          inventory
+        );
+      } catch (cause) {
+        repositoryError = truncateOneLine(cause instanceof Error ? cause.message : "Repository candidate inspection failed.", 512);
+      }
+    }
     const next: WorkerRecord = {
       ...current,
       status: input.status,
@@ -1169,7 +1216,9 @@ function finalizeWorkerRunRecord(input: {
         logDir: input.job.logDir,
         stdoutLog: input.job.stdoutLog,
         stderrLog: input.job.stderrLog,
-        error: input.error
+        error: input.error,
+        repositoryInventory,
+        repositoryError
       },
       updatedAt: input.dependencies.now().toISOString()
     };
@@ -1314,6 +1363,9 @@ function sendWorkerCompletion(
     `worker result: ${record.workerId}/${runId}`,
     `process: ${job.status}${job.exitCode === undefined ? "" : ` exit=${job.exitCode}`}`,
     `semantic: ${record.status}`,
+    `route: ${record.route.provider}/${record.route.model}:${record.route.thinkingLevel}`,
+    ...formatRepositoryInventorySummary(record.lastRun?.repositoryInventory),
+    record.lastRun?.repositoryError ? `repository_error: ${record.lastRun.repositoryError}` : undefined,
     handoff ? `handoff: ${handoff.handoff.state} — ${handoff.handoff.summary}` : undefined,
     handoff ? `handoff_json: ${JSON.stringify(handoff.handoff)}` : undefined,
     error ? `error: ${error}` : undefined,
@@ -2165,6 +2217,13 @@ function appendWorkerControlDetails(lines: string[], details: WorkerControlDetai
     case "result":
       lines.push(`  run ${shortWorkerId(details.runId)} · job ${shortWorkerId(details.jobId)} · ${details.delivery ?? "delivery unknown"} · ${details.completionDelivery} · ${formatWorkerTasks(details.taskIds)}`);
       if (details.handoff) lines.push(`  ${details.handoff.handoff.state}: ${truncateOneLine(details.handoff.handoff.summary, 160)}`);
+      if (details.repositories) {
+        appendBoundedWorkerRows(lines, details.repositories.candidates.map((candidate) =>
+          `${shortWorkerId(candidate.candidateId)} · ${truncateOneLine(candidate.workspaceRepo, 100)} · ${candidate.foldable ? "foldable" : candidate.dirty ? "dirty" : "not foldable"}${candidate.reported ? "" : " · unreported"}`
+        ));
+        if (details.repositories.discrepancies.length > 0) lines.push(`  ${details.repositories.discrepancies.length} repository ${details.repositories.discrepancies.length === 1 ? "discrepancy" : "discrepancies"}`);
+      }
+      if (details.repositoryError) lines.push(`  repository error: ${truncateOneLine(details.repositoryError, 160)}`);
       return;
     case "cancel":
       if (details.runId || details.jobId) lines.push(`  ${details.runId ? `run ${shortWorkerId(details.runId)}` : "run unknown"} · ${details.jobId ? `job ${shortWorkerId(details.jobId)}` : "job unknown"}`);
@@ -2180,7 +2239,10 @@ function formatWorkerControlDetail(worker: WorkerControlSummary): string {
     : worker.lastRun
       ? `last ${worker.lastRun.status} · ${shortWorkerId(worker.lastRun.runId)}`
       : "no runs";
-  return `${shortWorkerId(worker.workerId)} · ${worker.status} · ${formatWorkerRoute(worker.route)} · ${formatWorkerTasks(worker.taskIds)} · ${run}`;
+  const repositories = worker.lastRun?.repositoryInventory
+    ? ` · ${worker.lastRun.repositoryInventory.candidateCount} ${worker.lastRun.repositoryInventory.candidateCount === 1 ? "candidate" : "candidates"}`
+    : "";
+  return `${shortWorkerId(worker.workerId)} · ${worker.status} · ${formatWorkerRoute(worker.route)} · ${formatWorkerTasks(worker.taskIds)} · ${run}${repositories}`;
 }
 
 function appendBoundedWorkerRows(lines: string[], rows: string[]): void {
@@ -2206,7 +2268,7 @@ function formatWorkerControlSummary(details: WorkerControlDetails): string {
       return `${details.workers.length} ${details.workers.length === 1 ? "worker" : "workers"} · ${formatWorkerStateCounts(countWorkerStates(details.workers.map((worker) => worker.status)))}`;
     }
     case "result":
-      return `result · ${details.status} · ${shortWorkerId(details.workerId)}${details.handoff ? ` · ${details.handoff.handoff.state}` : ""}`;
+      return `result · ${details.status} · ${shortWorkerId(details.workerId)}${details.handoff ? ` · ${details.handoff.handoff.state}` : ""}${details.repositories ? ` · ${details.repositories.candidates.length} ${details.repositories.candidates.length === 1 ? "candidate" : "candidates"}` : ""}`;
     case "cancel":
       return `${details.outcome === "not_active" ? "not active" : "cancelled"} · ${shortWorkerId(details.workerId)} · ${details.status}`;
     case "discard":
@@ -2299,7 +2361,13 @@ function workerControlSummary(record: WorkerRecord): WorkerControlSummary {
       resultFile: record.lastRun.resultFile,
       stdoutLog: record.lastRun.stdoutLog,
       stderrLog: record.lastRun.stderrLog,
-      error: record.lastRun.error
+      error: record.lastRun.error,
+      repositoryInventory: record.lastRun.repositoryInventory ? {
+        ...record.lastRun.repositoryInventory,
+        candidates: record.lastRun.repositoryInventory.candidates.map((candidate) => ({ ...candidate, policyIssues: [...candidate.policyIssues] })),
+        discrepancies: record.lastRun.repositoryInventory.discrepancies.map((item) => ({ ...item }))
+      } : undefined,
+      repositoryError: record.lastRun.repositoryError
     } : undefined,
     updatedAt: record.updatedAt
   };
@@ -2317,6 +2385,8 @@ function formatWorkerControlResult(record: WorkerRecord, handoff: AcceptedWorker
     `route: ${record.route.provider}/${record.route.model}:${record.route.thinkingLevel}`,
     handoff ? `handoff: ${handoff.handoff.state} — ${handoff.handoff.summary}` : undefined,
     handoff ? `handoff_json: ${JSON.stringify(handoff.handoff)}` : undefined,
+    ...formatRepositoryInventorySummary(lastRun.repositoryInventory),
+    lastRun.repositoryError ? `repository_error: ${lastRun.repositoryError}` : undefined,
     lastRun.error ? `error: ${lastRun.error}` : undefined,
     `workspace: ${record.workspaceRoot}`,
     `session: ${record.sessionId}`,
@@ -2324,6 +2394,24 @@ function formatWorkerControlResult(record: WorkerRecord, handoff: AcceptedWorker
     lastRun.stdoutLog ? `stdout_log: ${lastRun.stdoutLog}` : undefined,
     lastRun.stderrLog ? `stderr_log: ${lastRun.stderrLog}` : undefined
   ].filter((line): line is string => line !== undefined).join("\n");
+}
+
+function formatRepositoryInventorySummary(summary: RepositoryInventorySummary | undefined): string[] {
+  if (!summary) return [];
+  const candidates = summary.candidates.slice(0, 8).map((candidate) =>
+    `candidate: ${candidate.candidateId} · ${candidate.workspaceRepo} · ${candidate.foldable ? "foldable" : candidate.dirty ? "dirty" : "not foldable"}${candidate.reported ? " · reported" : " · unreported"}${candidate.policyIssues.length > 0 ? ` · ${candidate.policyIssues.slice(0, 3).join(",")}` : ""}`
+  );
+  const discrepancies = summary.discrepancies.slice(0, 8).map((item) =>
+    `repository_discrepancy: ${item.kind} · ${item.workspaceRepo}`
+  );
+  return [
+    `repositories: ${summary.candidateCount} candidates · ${summary.foldableCount} foldable · ${summary.discrepancyCount} discrepancies`,
+    ...candidates,
+    summary.candidates.length > candidates.length ? `repository_candidates_omitted: ${summary.candidates.length - candidates.length}` : undefined,
+    ...discrepancies,
+    summary.discrepancies.length > discrepancies.length ? `repository_discrepancies_omitted: ${summary.discrepancies.length - discrepancies.length}` : undefined,
+    `repository_inventory: ${summary.inventoryFile}`
+  ].filter((line): line is string => line !== undefined);
 }
 
 function formatWorkerList(records: WorkerRecord[]): string {
@@ -2356,7 +2444,9 @@ function formatWorkerRecord(record: WorkerRecord): string {
     record.container ? `Container: ${record.container.name} · ${record.container.containerId?.slice(0, 12) ?? "planned"} · created for ${record.container.runId}` : "Container: not created",
     record.activeRun ? `Active run: ${record.activeRun.runId} · ${record.activeRun.jobId} · ${record.activeRun.status}` : undefined,
     record.activeRun?.recoveryError ? `Recovery required: ${record.activeRun.recoveryError}` : undefined,
-    record.lastRun ? `Last run: ${record.lastRun.runId} · ${record.lastRun.status} · delivery ${record.lastRun.delivery ?? "not required"} · ${resolveCompletionDelivery(record.lastRun.completionDelivery)}` : undefined
+    record.lastRun ? `Last run: ${record.lastRun.runId} · ${record.lastRun.status} · delivery ${record.lastRun.delivery ?? "not required"} · ${resolveCompletionDelivery(record.lastRun.completionDelivery)}` : undefined,
+    ...formatRepositoryInventorySummary(record.lastRun?.repositoryInventory),
+    record.lastRun?.repositoryError ? `Repository inspection: ${record.lastRun.repositoryError}` : undefined
   ].filter((line): line is string => line !== undefined).join("\n");
 }
 

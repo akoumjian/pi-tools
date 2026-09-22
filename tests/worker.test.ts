@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { appendFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -13,6 +13,7 @@ import { MAX_WORKER_TASK_IDS } from "../extensions/_shared/worker-contract.js";
 import { startManagedAsyncJob, type JobMeta } from "../extensions/async-shell/index.js";
 import type { WorkerContainerReference } from "../extensions/_shared/worker-container.js";
 import { registerWorkerExtension } from "../extensions/worker/index.js";
+import { persistRepositoryInventory } from "../extensions/worker/repositories.js";
 import { forkWorkerSession } from "../extensions/worker/session.js";
 import {
   WORKER_RECORD_VERSION,
@@ -140,6 +141,24 @@ async function writeHostSettlement(resultFile: string, workerId: string, runId: 
   })}\n`);
 }
 
+function gitFixture(cwd: string, ...args: string[]): string {
+  return execFileSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_SYSTEM: "/dev/null",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_AUTHOR_NAME: "Worker Test",
+      GIT_AUTHOR_EMAIL: "worker@example.invalid",
+      GIT_COMMITTER_NAME: "Worker Test",
+      GIT_COMMITTER_EMAIL: "worker@example.invalid"
+    }
+  }).trim();
+}
+
 function completedJob(jobId: string, cwd: string): JobMeta {
   const logDir = path.join(cwd, ".pi", "async-shell", "jobs", jobId);
   return {
@@ -176,6 +195,12 @@ test("worker_run queues immediately, then forks the completed parent turn before
     const context = parentContext(parentCwd, parentSessionFile);
     const api = fakeApi();
     const roots = { stateRoot: path.join(directory, "workers"), workspaceRoot: path.join(directory, "workspaces") };
+    const sourceRepo = path.join(directory, "source-repo");
+    await mkdir(sourceRepo);
+    gitFixture(sourceRepo, "init", "-q", "-b", "main");
+    await writeFile(path.join(sourceRepo, "README.md"), "base\n");
+    gitFixture(sourceRepo, "add", "README.md");
+    gitFixture(sourceRepo, "commit", "-qm", "base");
     const randomValues = [
       "11111111-1111-4111-8111-111111111111",
       "22222222-2222-4222-8222-222222222222",
@@ -224,7 +249,8 @@ test("worker_run queues immediately, then forks the completed parent turn before
         kind: "new",
         taskIds: ["personal-test"],
         guidance: "Implement the focused slice.",
-        completionDelivery: "followUp"
+        completionDelivery: "followUp",
+        initialRepos: [{ source: sourceRepo, revision: gitFixture(sourceRepo, "rev-parse", "HEAD") }]
       }]
     } as never, undefined, undefined, context);
     const receipt = (result.details as { runs: Array<{ workerId: string; runId: string; jobId: string; sessionId: string; sessionFile?: string; completionDelivery: string; state: string }> }).runs[0];
@@ -236,6 +262,11 @@ test("worker_run queues immediately, then forks the completed parent turn before
     assert.equal(receipt.completionDelivery, "followUp");
     assert.equal(receipt.state, "queued");
     assert.equal(launches.length, 0, "launch waits for the parent turn to be durable");
+    const candidateRepo = path.join(workerPaths(roots, receipt.workerId).reposDir, "project");
+    execFileSync("git", ["clone", "-q", "--no-hardlinks", sourceRepo, candidateRepo]);
+    await writeFile(path.join(candidateRepo, "feature.txt"), "feature\n");
+    gitFixture(candidateRepo, "add", "feature.txt");
+    gitFixture(candidateRepo, "commit", "-qm", "feature");
 
     await appendFile(parentSessionFile, `${JSON.stringify({ type: "custom", id: "after", parentId: "before", timestamp: "2026-09-10T19:30:00.500Z", customType: "worker-run-result", data: { jobId: receipt.jobId } })}\n`);
     await api.emit("turn_end", {}, context);
@@ -251,7 +282,12 @@ test("worker_run queues immediately, then forks the completed parent turn before
       workerId: receipt.workerId,
       runId: receipt.runId,
       acceptedAt: "2026-09-10T19:30:01.000Z",
-      handoff: { state: "assignment_complete", summary: "done", taskUpdates: [] }
+      handoff: {
+        state: "assignment_complete",
+        summary: "done",
+        taskUpdates: [],
+        repositories: [{ workspaceRepo: "repos/project", purpose: "candidate integration test" }]
+      }
     })}\n`);
     await writeHostSettlement(launches[0].resultFile, receipt.workerId, receipt.runId, receipt.sessionId);
     launchCompletion.resolve(completedJob(receipt.jobId, parentCwd));
@@ -265,8 +301,13 @@ test("worker_run queues immediately, then forks the completed parent turn before
     assert.deepEqual(parkedContainer, plannedContainer, "successful handoff parks the exact worker container");
     assert.equal(api.messages.length, 1);
     assert.match(JSON.stringify(api.messages[0].message), /assignment_complete/);
+    assert.match(JSON.stringify(api.messages[0].message), /openai-codex\/gpt-test:xhigh/);
     assert.deepEqual(api.messages[0].options, { triggerTurn: true, deliverAs: "followUp" });
     assert.equal(record.lastRun?.delivery, "pending");
+    assert.equal(record.lastRun?.repositoryInventory?.candidateCount, 1);
+    assert.equal(record.lastRun?.repositoryInventory?.foldableCount, 1);
+    assert.equal(record.lastRun?.repositoryInventory?.candidates[0]?.workspaceRepo, "repos/project");
+    assert.match(JSON.stringify(api.messages[0].message), /candidate_[0-9a-f]{24}/);
 
     await api.emit(
       "message_end",
@@ -1343,6 +1384,34 @@ test("worker_control lists exact-session workers and validates a typed result be
     provisionWorkerPaths(paths);
     const resultFile = path.join(paths.stateDir, "runs", runId, "result.json");
     await mkdir(path.dirname(resultFile), { recursive: true });
+    const repositoryInventory = persistRepositoryInventory(path.join(path.dirname(resultFile), "repository-candidates.json"), {
+      version: 1,
+      workerId,
+      runId,
+      workspaceRoot: paths.workspaceRoot,
+      generatedAt: "2026-09-10T19:31:00.500Z",
+      candidates: [{
+        candidateId: "candidate_aaaaaaaaaaaaaaaaaaaaaaaa",
+        workerId,
+        runId,
+        workspaceRepo: "repos/project",
+        reported: true,
+        purpose: "control candidate",
+        dependsOn: [],
+        baseCommit: "a".repeat(40),
+        baseTree: "b".repeat(40),
+        headCommit: "c".repeat(40),
+        headTree: "d".repeat(40),
+        dirty: false,
+        changed: true,
+        foldable: true,
+        changedPaths: ["feature.ts"],
+        changedPathCount: 1,
+        changedPathsTruncated: false,
+        policyIssues: []
+      }],
+      discrepancies: []
+    });
     await writeFile(resultFile, `${JSON.stringify({
       version: 1,
       workerId,
@@ -1373,7 +1442,8 @@ test("worker_control lists exact-session workers and validates a typed result be
         delivery: "pending",
         completionDelivery: "followUp",
         stdoutLog: path.join(path.dirname(resultFile), "stdout.log"),
-        stderrLog: path.join(path.dirname(resultFile), "stderr.log")
+        stderrLog: path.join(path.dirname(resultFile), "stderr.log"),
+        repositoryInventory
       },
       updatedAt: "2026-09-10T19:31:01.000Z"
     });
@@ -1399,19 +1469,31 @@ test("worker_control lists exact-session workers and validates a typed result be
     assert.ok(control?.execute);
 
     const status = await control.execute("control-status", { action: "status" } as never, undefined, undefined, context);
-    const statusDetails = status.details as { action: string; workers: Array<{ workerId: string }> };
+    const statusDetails = status.details as { action: string; workers: Array<{ workerId: string; lastRun?: { repositoryInventory?: { candidateCount: number } } }> };
     assert.equal(Check(RetainedToolOutputSchemas.worker_control, status), true);
     assert.equal(statusDetails.action, "status");
     assert.deepEqual(statusDetails.workers.map((worker) => worker.workerId), [workerId]);
+    assert.equal(statusDetails.workers[0]?.lastRun?.repositoryInventory?.candidateCount, 1);
+
+    const inventoryText = await readFile(repositoryInventory.inventoryFile, "utf8");
+    await writeFile(repositoryInventory.inventoryFile, `${inventoryText} `);
+    await assert.rejects(
+      async () => control.execute("control-poisoned-inventory", { action: "result", workerId } as never, undefined, undefined, context),
+      /inventory hash mismatch/
+    );
+    assert.equal(readWorkerRecord(paths.recordFile).lastRun?.delivery, "pending");
+    await writeFile(repositoryInventory.inventoryFile, inventoryText);
 
     const result = await control.execute("control-result", { action: "result", workerId } as never, undefined, undefined, context);
-    const resultDetails = result.details as { action: string; acknowledgedDelivery: boolean; delivery?: string; handoff?: { handoff: { summary: string } } };
+    const resultDetails = result.details as { action: string; acknowledgedDelivery: boolean; delivery?: string; handoff?: { handoff: { summary: string } }; repositories?: { candidates: Array<{ workspaceRepo: string; foldable: boolean }> } };
     assert.equal(Check(RetainedToolOutputSchemas.worker_control, result), true);
     assert.equal(resultDetails.action, "result");
     assert.equal(resultDetails.acknowledgedDelivery, true);
     assert.equal(resultDetails.handoff?.handoff.summary, "control result");
     assert.equal(resultDetails.delivery, "delivered");
+    assert.deepEqual(resultDetails.repositories?.candidates.map((candidate) => [candidate.workspaceRepo, candidate.foldable]), [["repos/project", true]]);
     assert.match(JSON.stringify(result.content), /control result/);
+    assert.match(JSON.stringify(result.content), /candidate_aaaaaaaaaaaaaaaaaaaaaaaa/);
     assert.equal(readWorkerRecord(paths.recordFile).lastRun?.delivery, "delivered");
     const observedAgain = await control.execute("control-result-again", { action: "result", workerId } as never, undefined, undefined, context);
     assert.equal((observedAgain.details as { acknowledgedDelivery: boolean }).acknowledgedDelivery, false);
@@ -1721,11 +1803,12 @@ test("worker_run and worker_control render compact lifecycle snippets", async ()
     const boundedStatus = renderWorkerToolResult(workerControl, { content: [], details: { action: "status", workers: manyWorkers } }, { expanded: true });
     assert.match(boundedStatus, /\+2 more/);
     assert.doesNotMatch(boundedStatus, /00000008/);
-    const controlResult = { content: [], details: { action: "result", workerId, runId: "run_a", jobId: "job_a", status: "handed_off", delivery: "delivered", completionDelivery: "steer", sessionId: "session_a", workspaceRoot: "/tmp/a", taskIds: ["personal-a"], route: baseWorker.route, acknowledgedDelivery: true, handoff: { version: 1, workerId, runId: "run_a", acceptedAt: "2026-09-22T14:00:00.000Z", handoff: { state: "assignment_complete", summary: "done", taskUpdates: [] } } } };
-    assert.match(renderWorkerToolResult(workerControl, controlResult), /⎿ result · handed_off · worker_202…41146f1 · assignment_complete/);
+    const controlResult = { content: [], details: { action: "result", workerId, runId: "run_a", jobId: "job_a", status: "handed_off", delivery: "delivered", completionDelivery: "steer", sessionId: "session_a", workspaceRoot: "/tmp/a", taskIds: ["personal-a"], route: baseWorker.route, acknowledgedDelivery: true, handoff: { version: 1, workerId, runId: "run_a", acceptedAt: "2026-09-22T14:00:00.000Z", handoff: { state: "assignment_complete", summary: "done", taskUpdates: [] } }, repositories: { version: 1, workerId, runId: "run_a", workspaceRoot: "/tmp/a", generatedAt: "2026-09-22T14:00:01.000Z", candidates: [{ candidateId: "candidate_aaaaaaaaaaaaaaaaaaaaaaaa", workerId, runId: "run_a", workspaceRepo: "repos/project", reported: true, purpose: "render", dependsOn: [], baseCommit: "a".repeat(40), baseTree: "b".repeat(40), headCommit: "c".repeat(40), headTree: "d".repeat(40), dirty: false, changed: true, foldable: true, changedPaths: ["feature.ts"], changedPathCount: 1, changedPathsTruncated: false, policyIssues: [] }], discrepancies: [] } } };
+    assert.match(renderWorkerToolResult(workerControl, controlResult), /⎿ result · handed_off · worker_202…41146f1 · assignment_complete · 1 candidate/);
     const expandedControlResult = renderWorkerToolResult(workerControl, controlResult, { expanded: true });
     assert.match(expandedControlResult, /run run_a · job job_a · delivered · steer · personal-a/);
     assert.match(expandedControlResult, /assignment_complete: done/);
+    assert.match(expandedControlResult, /candidate_…aaaaaaa · repos\/project · foldable/);
     assert.match(renderWorkerToolResult(workerControl, { content: [], details: { action: "cancel", workerId, outcome: "cancelled", status: "cancelled", runId: "run_a", jobId: "job_a" } }), /⎿ cancelled · worker_202…41146f1 · cancelled/);
     assert.match(renderWorkerToolResult(workerControl, { content: [], details: { action: "discard", workerId, discarded: true } }), /⎿ discarded · worker_202…41146f1/);
     assert.match(renderWorkerToolResult(workerControl, { content: [], details: { action: "status", workers: [] } }, { isPartial: true }), /⎿ checking workers/);
