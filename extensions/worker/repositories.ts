@@ -96,7 +96,7 @@ export type RepositoryInventorySummary = {
   scanCoverage: RepositoryScanCoverage;
 };
 
-type GitRunner = {
+export type GitRunner = {
   gitPath: string;
   env: NodeJS.ProcessEnv;
 };
@@ -365,7 +365,7 @@ function inspectRepository(
   };
 }
 
-function repositoryPolicyIssues(repoPath: string, runner: GitRunner): string[] {
+export function repositoryPolicyIssues(repoPath: string, runner: GitRunner): string[] {
   const issues: string[] = [];
   const gitMarker = path.join(repoPath, ".git");
   const marker = lstatSync(gitMarker);
@@ -534,7 +534,7 @@ function reportedRepositories(
   return { reports, issues, repositoryPaths };
 }
 
-function createGitRunner(gitPath: string, trustedStateRoot: string): GitRunner {
+export function createGitRunner(gitPath: string, trustedStateRoot: string): GitRunner {
   const executable = realpathSync(gitPath);
   const home = path.join(path.resolve(trustedStateRoot), "git-home");
   mkdirSync(home, { recursive: true, mode: 0o700 });
@@ -564,7 +564,17 @@ function createGitRunner(gitPath: string, trustedStateRoot: string): GitRunner {
   };
 }
 
-function gitBuffer(runner: GitRunner, cwd: string, args: string[]): Buffer {
+export type GitRunOptions = {
+  allowedStatuses?: readonly number[];
+  deterministicCommitIdentity?: boolean;
+};
+
+export function runGit(
+  runner: GitRunner,
+  cwd: string,
+  args: string[],
+  options: GitRunOptions = {}
+): { stdout: Buffer; status: number } {
   const common = [
     "--no-optional-locks",
     "-c", "core.hooksPath=/dev/null",
@@ -582,7 +592,47 @@ function gitBuffer(runner: GitRunner, cwd: string, args: string[]): Buffer {
     "-c", "core.excludesFile=/dev/null"
   ];
   const gitDirectory = path.join(cwd, ".git");
+  const commitEnvironment = options.deterministicCommitIdentity ? {
+    GIT_AUTHOR_NAME: "Pi Worker Fold",
+    GIT_AUTHOR_EMAIL: "worker-fold@localhost",
+    GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z",
+    GIT_COMMITTER_NAME: "Pi Worker Fold",
+    GIT_COMMITTER_EMAIL: "worker-fold@localhost",
+    GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z"
+  } : {};
   const result = spawnSync(runner.gitPath, [...common, `--git-dir=${gitDirectory}`, `--work-tree=${cwd}`, ...args], {
+    cwd,
+    env: { ...runner.env, ...commitEnvironment, GIT_CEILING_DIRECTORIES: cwd },
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 5_000,
+    killSignal: "SIGKILL",
+    maxBuffer: MAX_GIT_OUTPUT_BYTES
+  });
+  if (result.error) throw new Error(`git_spawn_failed:${boundText(result.error.message, 120)}`);
+  const status = result.status ?? -1;
+  if (!(options.allowedStatuses ?? [0]).includes(status)) throw new Error(`git_failed:${args[0] ?? "command"}`);
+  const output = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout ?? "");
+  if (output.byteLength > MAX_GIT_OUTPUT_BYTES) throw new Error("git_output_limit");
+  return { stdout: output, status };
+}
+
+export function runStandaloneGit(runner: GitRunner, cwd: string, args: string[]): Buffer {
+  const common = [
+    "--no-optional-locks",
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "core.fsmonitor=false",
+    "-c", "core.ignoreStat=false",
+    "-c", "core.fileMode=true",
+    "-c", "core.autocrlf=false",
+    "-c", "credential.helper=",
+    "-c", "commit.gpgSign=false",
+    "-c", "tag.gpgSign=false",
+    "-c", "diff.external=",
+    "-c", "core.attributesFile=/dev/null",
+    "-c", "core.excludesFile=/dev/null"
+  ];
+  const result = spawnSync(runner.gitPath, [...common, ...args], {
     cwd,
     env: { ...runner.env, GIT_CEILING_DIRECTORIES: cwd },
     shell: false,
@@ -598,8 +648,12 @@ function gitBuffer(runner: GitRunner, cwd: string, args: string[]): Buffer {
   return output;
 }
 
-function gitText(runner: GitRunner, cwd: string, args: string[]): string {
-  const output = gitBuffer(runner, cwd, args).toString("utf8");
+export function gitBuffer(runner: GitRunner, cwd: string, args: string[], options?: GitRunOptions): Buffer {
+  return runGit(runner, cwd, args, options).stdout;
+}
+
+export function gitText(runner: GitRunner, cwd: string, args: string[], options?: GitRunOptions): string {
+  const output = gitBuffer(runner, cwd, args, options).toString("utf8");
   if (output.includes("\uFFFD")) throw new Error("git_output_not_utf8");
   return output;
 }

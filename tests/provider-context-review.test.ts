@@ -21,6 +21,7 @@ const retainedToolNames = [
   "document_parse",
   "worker_run",
   "worker_control",
+  "worker_fold_prepare",
   "orchestrate",
   "reconcile"
 ] as const;
@@ -105,13 +106,14 @@ test("provider context review command renders sanitized prompt, tool declaration
     assert.match(artifact.systemPrompt, /read_many use:/);
     assert.match(artifact.systemPrompt, /worker_run constraints:/);
     assert.match(artifact.systemPrompt, /worker_control constraints:/);
+    assert.match(artifact.systemPrompt, /worker_fold_prepare constraints:/);
     assert.match(artifact.systemPrompt, /orchestrate constraints:/);
     assert.doesNotMatch(artifact.systemPrompt, /Batch-native tool usage:/);
     assert.doesNotMatch(artifact.systemPrompt, /hunk_session/);
 
     const names = artifact.activeTools.map((tool) => tool.name);
     const sortedRetainedToolNames = [...retainedToolNames].sort();
-    assert.deepEqual([...names].sort(), sortedRetainedToolNames, "review covers exactly the 16 retained custom tools");
+    assert.deepEqual([...names].sort(), sortedRetainedToolNames, "review covers exactly the 17 retained custom tools");
     assert.deepEqual(Object.keys(RetainedToolOutputSchemas).sort(), sortedRetainedToolNames, "authoritative output schemas cover every retained tool");
     assert.equal(names.includes("hunk_session"), false);
     assert.equal(names.includes("bash"), false);

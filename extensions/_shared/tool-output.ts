@@ -733,6 +733,28 @@ const WorkerControlDetailsSchema = Type.Union([
   }, { additionalProperties: false })
 ]);
 
+const WorkerFoldPreparedRepositorySchema = Type.Object({
+  candidateId: Type.String({ minLength: 34, maxLength: 34, pattern: "^candidate_[0-9a-f]{24}$" }),
+  targetRepo: Type.String({ minLength: 1, maxLength: 1024 }),
+  targetRef: Type.String({ minLength: 12, maxLength: 251, pattern: "^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,239}$" }),
+  method: Type.Union([Type.Literal("merge"), Type.Literal("squash")]),
+  status: Type.Union([Type.Literal("ready"), Type.Literal("resolution_required")]),
+  expectedCommit: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
+  desiredCommit: Type.Optional(Type.String({ pattern: "^[0-9a-f]{40,64}$" })),
+  viewPath: Type.String({ minLength: 1, maxLength: 2048 })
+}, { additionalProperties: false });
+
+const WorkerFoldPrepareDetailsSchema = Type.Object({
+  preparedId: Type.String({ minLength: 33, maxLength: 33, pattern: "^prepared_[0-9a-f]{24}$" }),
+  manifestFile: Type.String({ minLength: 1, maxLength: 2048 }),
+  manifestSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }),
+  status: Type.Union([Type.Literal("ready"), Type.Literal("resolution_required")]),
+  repositoryCount: Type.Integer({ minimum: 1, maximum: 16 }),
+  resolutionCaseCount: Type.Integer({ minimum: 0, maximum: 16 }),
+  overlapCount: Type.Integer({ minimum: 0, maximum: 16 }),
+  repositories: Type.Array(WorkerFoldPreparedRepositorySchema, { minItems: 1, maxItems: 16 })
+}, { additionalProperties: false });
+
 const ReconcileDetailsSchema = Type.Union([
   Type.Object({
     status: Type.Literal("merged"),
@@ -768,6 +790,7 @@ export const RetainedToolOutputSchemas = {
   document_parse: finalResultSchema(DocumentParseDetailsSchema),
   worker_run: finalResultSchema(WorkerRunDetailsSchema),
   worker_control: finalResultSchema(WorkerControlDetailsSchema),
+  worker_fold_prepare: finalResultSchema(WorkerFoldPrepareDetailsSchema),
   orchestrate: finalResultSchema(OrchestrateDetailsSchema),
   reconcile: finalResultSchema(ReconcileDetailsSchema)
 } satisfies Record<string, TSchema>;

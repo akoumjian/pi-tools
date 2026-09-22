@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { chmodSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { homedir } from "node:os";
 import path from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { Type, type Static } from "@earendil-works/pi-ai";
@@ -31,6 +32,12 @@ import { isWorkerId, WORKER_ID_PATTERN } from "../_shared/worker-id.js";
 import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 import { cancelPersistedAsyncShellJobsForOwner, handleAsyncShellViewerCommand, type JobMeta, type ManagedAsyncJobHandle } from "../async-shell/index.js";
+import {
+  defaultWorkerFoldsRoot,
+  prepareRepositoryChangeSet,
+  type PreparedWorkerFoldSummary,
+  type RepositoryChangeSet
+} from "./folds.js";
 import { launchWorkerHost, readWorkerHostProcess, readWorkerHostSettlement } from "./runner.js";
 import { readWorkerRuntimeHandoff, type AcceptedWorkerHandoff } from "./runtime.js";
 import {
@@ -117,8 +124,22 @@ export const WorkerControlParams = Type.Object({
   confirm: Type.Optional(Type.Literal(true))
 }, { additionalProperties: false });
 
+const RepositoryChangeSetEntrySchema = Type.Object({
+  candidateId: Type.String({ minLength: 34, maxLength: 34, pattern: "^candidate_[0-9a-f]{24}$" }),
+  targetRepo: Type.String({ minLength: 1, maxLength: 1024, description: "Absolute existing local target repository below the accepted local target root (~/Code by default)." }),
+  targetRef: Type.String({ minLength: 12, maxLength: 251, pattern: "^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,239}$" }),
+  purpose: Type.String({ minLength: 1, maxLength: 2000 }),
+  method: Type.Union([Type.Literal("merge"), Type.Literal("squash")]),
+  dependsOn: Type.Optional(Type.Array(Type.String({ minLength: 34, maxLength: 34, pattern: "^candidate_[0-9a-f]{24}$" }), { maxItems: 16 }))
+}, { additionalProperties: false });
+
+export const WorkerFoldPrepareParams = Type.Object({
+  repositories: Type.Array(RepositoryChangeSetEntrySchema, { minItems: 1, maxItems: 16 })
+}, { additionalProperties: false });
+
 export type WorkerRunInput = Static<typeof WorkerRunParams>;
 export type WorkerControlInput = Static<typeof WorkerControlParams>;
+export type WorkerFoldPrepareInput = Static<typeof WorkerFoldPrepareParams>;
 export type WorkerRunReceipt = {
   workerId: string;
   runId: string;
@@ -241,6 +262,9 @@ type WorkerExtensionDependencies = {
   now(): Date;
   random(): string;
   pinRepositories(requested: readonly { source: string; revision?: string }[], trustedStateRoot: string): InitialRepositoryPin[];
+  foldsRoot: string;
+  targetRoot: string;
+  prepareFold: typeof prepareRepositoryChangeSet;
   planContainer?(record: WorkerRecord, runId: string, nonce: string): WorkerContainerReference;
   parkContainer?(container: WorkerContainerReference): void;
   removeContainer(container: WorkerContainerReference): void;
@@ -272,6 +296,7 @@ export function registerWorkerExtension(
 ): void {
   const defaults = defaultDependencies();
   const dependencies: WorkerExtensionDependencies = { ...defaults, ...overrides };
+  if (overrides.roots && !overrides.foldsRoot) dependencies.foldsRoot = defaultWorkerFoldsRoot(overrides.roots.stateRoot);
   if (overrides.launch && !overrides.planContainer) dependencies.planContainer = undefined;
   const pending = new Map<string, PendingWorkerRun>();
   const active = new Map<string, { runId: string; handle: ManagedWorkerHandle }>();
@@ -485,6 +510,57 @@ export function registerWorkerExtension(
     }
   }));
 
+
+  api.registerTool(defineTool({
+    name: "worker_fold_prepare",
+    label: "Worker Fold Prepare",
+    description: "Prepare an exact multi-repository worker changeset outside authoritative repositories. Select durable repository candidate IDs and map each to one explicit existing local target repository/ref, purpose, merge or squash method, and candidate dependencies. The trusted host revalidates exact candidate and target identities, computes deterministic desired commits or bounded resolution cases, materializes owner-private disposable views, and persists one immutable hash-bound manifest without updating authoritative refs, indexes, worktrees, or files.",
+    promptSnippet: "Prepare selected durable worker repository candidates as an exact external multi-repository changeset without modifying authoritative targets.",
+    promptGuidelines: [
+      "worker_fold_prepare use: Call only after inspecting worker_control result/status evidence and deciding the semantic candidate-to-target mapping, method, purpose, and dependency DAG. Use fully qualified existing refs/heads/... targets.",
+      inputJsonSchemaGuideline("worker_fold_prepare", WorkerFoldPrepareParams),
+      outputJsonSchemaGuideline("worker_fold_prepare", RetainedToolOutputSchemas.worker_fold_prepare),
+      "worker_fold_prepare constraints: Preparation is deterministic and model-free. It revalidates hash-bound candidate inventories, exact OIDs, target cleanliness and policy, and dependency order; creates only external owner-private bundles/views/manifests; never updates target refs, indexes, worktrees, remotes, or files. Conflicts become resolution_required cases. Promotion, review, validation, pushing, release, and conflict resolution are separate parent-owned operations. Only result content is provider-visible; details are internal."
+    ],
+    parameters: WorkerFoldPrepareParams,
+    renderCall(args, theme) {
+      return renderWorkerFoldPrepareCall(args as WorkerFoldPrepareInput, theme);
+    },
+    renderResult(result, options, theme, context) {
+      return renderWorkerFoldPrepareResult(result as AgentToolResult<PreparedWorkerFoldSummary>, options, theme, context);
+    },
+    executionMode: "sequential",
+    async execute(_toolCallId, params, signal, _onUpdate, context): Promise<AgentToolResult<PreparedWorkerFoldSummary>> {
+      throwIfAborted(signal);
+      const parentSessionFile = context.sessionManager.getSessionFile();
+      if (!parentSessionFile) throw new Error("worker_fold_prepare requires a persisted parent session.");
+      const changeSet: RepositoryChangeSet = {
+        repositories: params.repositories.map((item) => ({
+          candidateId: item.candidateId,
+          targetRepo: item.targetRepo,
+          targetRef: item.targetRef,
+          purpose: item.purpose,
+          method: item.method,
+          dependsOn: [...(item.dependsOn ?? [])]
+        }))
+      };
+      const candidates = resolveParentFoldCandidates(changeSet, context, dependencies);
+      const { summary } = dependencies.prepareFold({
+        changeSet,
+        candidates,
+        parentSessionFile,
+        foldsRoot: dependencies.foldsRoot,
+        targetRoot: dependencies.targetRoot,
+        createdAt: dependencies.now().toISOString(),
+        isCancelled: () => signal?.aborted === true
+      });
+      return {
+        content: [{ type: "text", text: formatWorkerFoldPrepareSummary(summary) }],
+        details: summary
+      };
+    }
+  }));
+
   api.registerTool(defineTool({
     name: "worker_run",
     label: "Worker Run",
@@ -553,6 +629,36 @@ function listParentWorkerRecords(roots: WorkerRoots, context: ExtensionContext):
     .filter((record) => path.resolve(record.parentSessionFile) === path.resolve(parentSessionFile))
     .sort((left, right) => left.workerId.localeCompare(right.workerId));
   return records;
+}
+
+function resolveParentFoldCandidates(
+  changeSet: RepositoryChangeSet,
+  context: ExtensionContext,
+  dependencies: WorkerExtensionDependencies
+): Array<{ candidate: RepositoryInventory["candidates"][number]; workspaceRoot: string }> {
+  const requested = new Set(changeSet.repositories.map((item) => item.candidateId));
+  const resolved = new Map<string, { candidate: RepositoryInventory["candidates"][number]; workspaceRoot: string }>();
+  for (const record of listParentWorkerRecords(dependencies.roots, context)) {
+    const run = record.lastRun;
+    const summary = run?.repositoryInventory;
+    if (!run || run.status !== "handed_off" || !summary || !summary.candidates.some((item) => requested.has(item.candidateId))) continue;
+    const inventory = readRepositoryInventory(summary.inventoryFile, {
+      workerId: record.workerId,
+      runId: run.runId,
+      workspaceRoot: record.workspaceRoot,
+      sha256: summary.inventorySha256
+    });
+    for (const candidate of inventory.candidates) {
+      if (!requested.has(candidate.candidateId)) continue;
+      if (resolved.has(candidate.candidateId)) throw new Error(`Worker repository candidate identity is ambiguous: ${candidate.candidateId}`);
+      resolved.set(candidate.candidateId, { candidate, workspaceRoot: record.workspaceRoot });
+    }
+  }
+  return changeSet.repositories.map((item) => {
+    const candidate = resolved.get(item.candidateId);
+    if (!candidate) throw new Error(`Worker repository candidate is not available to this parent session: ${item.candidateId}`);
+    return candidate;
+  });
 }
 
 function readParentWorkerResult(
@@ -2187,6 +2293,28 @@ function renderWorkerRunResult(
   return new Text(lines.join("\n"), 0, 0);
 }
 
+function renderWorkerFoldPrepareCall(args: WorkerFoldPrepareInput, theme: WorkerRenderTheme): Text {
+  const count = isRecord(args) && Array.isArray(args.repositories) ? args.repositories.length : 0;
+  return new Text(workerToolCall("Worker Fold", `${count} ${count === 1 ? "repository" : "repositories"}`, theme), 0, 0);
+}
+
+function renderWorkerFoldPrepareResult(
+  result: AgentToolResult<PreparedWorkerFoldSummary>,
+  options: WorkerRenderOptions,
+  theme: WorkerRenderTheme,
+  context?: WorkerRenderContext
+): Text {
+  const error = renderWorkerToolError(result, theme, context);
+  if (error !== undefined) return error;
+  if (options.isPartial) return new Text(workerToolResult("preparing repositories", "warning", theme), 0, 0);
+  const details = result.details;
+  if (!details) return new Text(workerToolResult("fold preparation complete", "muted", theme), 0, 0);
+  const summary = `${details.status} · ${shortWorkerId(details.preparedId)} · ${details.repositoryCount} ${details.repositoryCount === 1 ? "repository" : "repositories"}${details.resolutionCaseCount > 0 ? ` · ${details.resolutionCaseCount} resolution ${details.resolutionCaseCount === 1 ? "case" : "cases"}` : ""}${details.overlapCount > 0 ? ` · ${details.overlapCount} ${details.overlapCount === 1 ? "overlap" : "overlaps"}` : ""}`;
+  const lines = [workerToolResult(summary, details.status === "ready" ? "success" : "warning", theme)];
+  if (options.expanded) appendBoundedWorkerRows(lines, details.repositories.map((item) => `${shortWorkerId(item.candidateId)} · ${item.method} · ${item.status} · ${truncateOneLine(item.targetRef, 80)}`));
+  return new Text(lines.join("\n"), 0, 0);
+}
+
 function renderWorkerControlCall(args: WorkerControlInput, theme: WorkerRenderTheme): Text {
   const action = isRecord(args) && typeof args.action === "string" ? truncateOneLine(args.action, 24) : "status";
   const workerId = isRecord(args) && typeof args.workerId === "string" ? args.workerId : undefined;
@@ -2423,6 +2551,19 @@ function formatWorkerControlResult(record: WorkerRecord, handoff: AcceptedWorker
   ].filter((line): line is string => line !== undefined).join("\n");
 }
 
+function formatWorkerFoldPrepareSummary(summary: PreparedWorkerFoldSummary): string {
+  return [
+    `prepared_fold: ${summary.preparedId}`,
+    `status: ${summary.status}`,
+    `repositories: ${summary.repositoryCount}`,
+    `resolution_cases: ${summary.resolutionCaseCount}`,
+    `overlaps: ${summary.overlapCount}`,
+    ...summary.repositories.map((item) => `repository: ${item.candidateId} · ${item.method} · ${item.status} · ${item.targetRepo}#${item.targetRef} · expected ${item.expectedCommit}${item.desiredCommit ? ` · desired ${item.desiredCommit}` : ""} · view ${item.viewPath}`),
+    `manifest: ${summary.manifestFile}`,
+    `manifest_sha256: ${summary.manifestSha256}`
+  ].join("\n");
+}
+
 function formatRepositoryInventorySummary(summary: RepositoryInventorySummary | undefined): string[] {
   if (!summary) return [];
   const candidates = summary.candidates.slice(0, 8).map((candidate) =>
@@ -2507,11 +2648,15 @@ function validatePersonalTaskIds(taskIds: readonly string[]): void {
 }
 
 function defaultDependencies(): WorkerExtensionDependencies {
+  const roots = defaultWorkerRoots();
   return {
-    roots: defaultWorkerRoots(),
+    roots,
     now: () => new Date(),
     random: () => randomUUID(),
     pinRepositories: (requested, trustedStateRoot) => pinInitialRepositories(requested, trustedStateRoot),
+    foldsRoot: defaultWorkerFoldsRoot(roots.stateRoot),
+    targetRoot: path.join(homedir(), "Code"),
+    prepareFold: prepareRepositoryChangeSet,
     planContainer: (record, runId, nonce) => planWorkerContainer({
       workerId: record.workerId,
       runId,

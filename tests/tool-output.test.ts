@@ -206,6 +206,28 @@ const samples: Record<RetainedToolName, unknown> = {
       }]
     }
   },
+  worker_fold_prepare: {
+    content: [text("prepared fold")],
+    details: {
+      preparedId: "prepared_aaaaaaaaaaaaaaaaaaaaaaaa",
+      manifestFile: "/tmp/worker-folds/prepared_aaaaaaaaaaaaaaaaaaaaaaaa/manifest.json",
+      manifestSha256: "a".repeat(64),
+      status: "ready",
+      repositoryCount: 1,
+      resolutionCaseCount: 0,
+      overlapCount: 0,
+      repositories: [{
+        candidateId: "candidate_bbbbbbbbbbbbbbbbbbbbbbbb",
+        targetRepo: "/tmp/targets/project",
+        targetRef: "refs/heads/main",
+        method: "merge",
+        status: "ready",
+        expectedCommit: "c".repeat(40),
+        desiredCommit: "d".repeat(40),
+        viewPath: "/tmp/worker-folds/prepared_aaaaaaaaaaaaaaaaaaaaaaaa/repositories/01/view"
+      }]
+    }
+  },
   worker_control: {
     content: [text("Worker status")],
     details: {

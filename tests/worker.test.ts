@@ -1886,3 +1886,113 @@ test("worker_run and worker_control render compact lifecycle snippets", async ()
     assert.match(renderWorkerToolResult(workerControl, { content: [{ type: "text", text: "control failure" }], details: undefined }, {}, { isError: true }), /⎿ error: control failure/);
   });
 });
+
+test("worker_fold_prepare resolves exact-session candidates and returns a strict durable summary", async () => {
+  await withTempDir(async (directory) => {
+    const roots = {
+      stateRoot: path.join(directory, "workers"),
+      workspaceRoot: path.join(directory, "workspaces")
+    };
+    const workerId = "worker_20260922220000_12345678";
+    const runId = "run_20260922220000_87654321";
+    const candidateId = "candidate_aaaaaaaaaaaaaaaaaaaaaaaa";
+    const paths = workerPaths(roots, workerId);
+    provisionWorkerPaths(paths);
+    const inventory = {
+      version: 2 as const,
+      workerId,
+      runId,
+      workspaceRoot: paths.workspaceRoot,
+      generatedAt: "2026-09-22T22:00:00.000Z",
+      candidates: [{
+        candidateId,
+        workerId,
+        runId,
+        workspaceRepo: "repos/project",
+        reported: true,
+        purpose: "project",
+        dependsOn: [],
+        source: "/tmp/source",
+        baseCommit: "a".repeat(40),
+        baseTree: "b".repeat(40),
+        headCommit: "c".repeat(40),
+        headTree: "d".repeat(40),
+        dirty: false,
+        committedChanged: true,
+        foldable: true,
+        policyIssues: []
+      }],
+      reportedIssues: [],
+      scanCoverage: { complete: true, limitations: [] }
+    };
+    const repositoryInventory = persistRepositoryInventory(path.join(paths.stateDir, "runs", runId, "repository-candidates.json"), inventory);
+    const parentSessionFile = path.join(directory, "parent.jsonl");
+    writeWorkerRecord(paths.recordFile, {
+      version: WORKER_RECORD_VERSION,
+      workerId,
+      sessionId: "019c0000-0000-7000-8000-000000000001",
+      parentSessionFile,
+      workspaceRoot: paths.workspaceRoot,
+      taskIds: ["personal-test"],
+      route: { provider: "openai-codex", model: "gpt-test", thinkingLevel: "xhigh" },
+      status: "handed_off",
+      lastRun: {
+        runId,
+        jobId: "job_20260922220000_abcdefgh",
+        status: "handed_off",
+        completionDelivery: "steer",
+        repositoryInventory
+      },
+      updatedAt: "2026-09-22T22:00:00.000Z"
+    });
+
+    let resolvedCandidate = "";
+    const summary = {
+      preparedId: "prepared_bbbbbbbbbbbbbbbbbbbbbbbb",
+      manifestFile: path.join(directory, "folds", "prepared_bbbbbbbbbbbbbbbbbbbbbbbb", "manifest.json"),
+      manifestSha256: "b".repeat(64),
+      status: "ready" as const,
+      repositoryCount: 1,
+      resolutionCaseCount: 0,
+      overlapCount: 0,
+      repositories: [{
+        candidateId,
+        targetRepo: path.join(directory, "targets", "project"),
+        targetRef: "refs/heads/main",
+        method: "merge" as const,
+        status: "ready" as const,
+        expectedCommit: "e".repeat(40),
+        desiredCommit: "f".repeat(40),
+        viewPath: path.join(directory, "folds", "prepared_bbbbbbbbbbbbbbbbbbbbbbbb", "repositories", "01", "view")
+      }]
+    };
+    const api = fakeApi();
+    registerWorkerExtension(api, {
+      roots,
+      foldsRoot: path.join(directory, "folds"),
+      targetRoot: path.join(directory, "targets"),
+      now: () => new Date("2026-09-22T22:00:00.000Z"),
+      prepareFold: ((input: { candidates: Array<{ candidate: { candidateId: string } }> }) => {
+        resolvedCandidate = input.candidates[0]?.candidate.candidateId ?? "";
+        return { manifest: {} as never, summary };
+      }) as never
+    });
+    const tool = api.tools.find((candidate) => candidate.name === "worker_fold_prepare");
+    assert.ok(tool?.execute);
+    const params = {
+      repositories: [{
+        candidateId,
+        targetRepo: path.join(directory, "targets", "project"),
+        targetRef: "refs/heads/main",
+        purpose: "prepare project",
+        method: "merge"
+      }]
+    };
+    const result = await tool.execute("fold-1", params as never, undefined, undefined, parentContext(directory, parentSessionFile));
+    assert.equal(resolvedCandidate, candidateId);
+    assert.equal(Check(RetainedToolOutputSchemas.worker_fold_prepare, result), true);
+    assert.match(JSON.stringify(result.content), /prepared_bbbbb/);
+    assert.match(renderWorkerToolCall(tool, params), /Worker Fold\(1 repository\)/);
+    assert.match(renderWorkerToolResult(tool, result), /ready · prepared_b/);
+  });
+});
