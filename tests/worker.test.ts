@@ -19,8 +19,10 @@ import { normalizeWorkerSettings } from "../extensions/worker/settings.js";
 import {
   WORKER_RECORD_VERSION,
   acquireWorkerLease,
+  acquireWorkerOperationLock,
   provisionWorkerPaths,
   readWorkerRecord,
+  releaseWorkerLease,
   workerPaths,
   writeWorkerRecord,
   type WorkerRecord
@@ -1963,6 +1965,7 @@ test("worker_fold_prepare resolves exact-session candidates and returns a strict
         status: "ready" as const,
         expectedCommit: "e".repeat(40),
         desiredCommit: "f".repeat(40),
+        artifactFile: path.join(directory, "folds", "prepared_bbbbbbbbbbbbbbbbbbbbbbbb", "repositories", "01", "prepared-objects.bundle"),
         viewPath: path.join(directory, "folds", "prepared_bbbbbbbbbbbbbbbbbbbbbbbb", "repositories", "01", "view")
       }]
     };
@@ -1972,8 +1975,10 @@ test("worker_fold_prepare resolves exact-session candidates and returns a strict
       foldsRoot: path.join(directory, "folds"),
       targetRoot: path.join(directory, "targets"),
       now: () => new Date("2026-09-22T22:00:00.000Z"),
-      prepareFold: ((input: { candidates: Array<{ candidate: { candidateId: string } }> }) => {
+      prepareFold: ((input: { candidates: Array<{ candidate: { candidateId: string }; inventory: { inventorySha256: string } }> }) => {
         resolvedCandidate = input.candidates[0]?.candidate.candidateId ?? "";
+        assert.equal(input.candidates[0]?.inventory.inventorySha256, repositoryInventory.inventorySha256);
+        assert.throws(() => acquireWorkerOperationLock(paths.operationLockFile), /already active/);
         return { manifest: {} as never, summary };
       }) as never
     });
@@ -1994,5 +1999,30 @@ test("worker_fold_prepare resolves exact-session candidates and returns a strict
     assert.match(JSON.stringify(result.content), /prepared_bbbbb/);
     assert.match(renderWorkerToolCall(tool, params), /Worker Fold\(1 repository\)/);
     assert.match(renderWorkerToolResult(tool, result), /ready · prepared_b/);
+
+    const settled = readWorkerRecord(paths.recordFile);
+    writeWorkerRecord(paths.recordFile, {
+      ...settled,
+      status: "running",
+      activeRun: { runId: "run_20260922220100_active00", jobId: "job_20260922220100_active00", status: "running" }
+    });
+    await assert.rejects(
+      tool.execute("fold-active", params as never, undefined, undefined, parentContext(directory, parentSessionFile)),
+      /active run or lease/
+    );
+
+    writeWorkerRecord(paths.recordFile, { ...settled, status: "handed_off", activeRun: undefined });
+    acquireWorkerLease(paths.leaseFile, {
+      version: 1,
+      workerId,
+      runId: "run_20260922220200_resume00",
+      parentPid: process.pid,
+      acquiredAt: "2026-09-22T22:02:00.000Z"
+    });
+    await assert.rejects(
+      tool.execute("fold-resume", params as never, undefined, undefined, parentContext(directory, parentSessionFile)),
+      /active run or lease/
+    );
+    releaseWorkerLease(paths.leaseFile, workerId, "run_20260922220200_resume00");
   });
 });

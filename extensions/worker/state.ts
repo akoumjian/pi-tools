@@ -158,6 +158,9 @@ export function acquireWorkerOperationLock(
 ): WorkerOperationLock {
   const target = path.resolve(lockFile);
   mkdirSync(target, { recursive: true, mode: 0o700 });
+  if (liveWorkerOperationClaims(target).length > 0) {
+    throw new Error(`Worker lifecycle operation is already active for ${target}.`);
+  }
   const token = `${process.pid}:${nonce}`;
   const claimFile = path.join(target, `claim-${process.pid}-${randomUUID()}`);
   writeFileSync(claimFile, token, { flag: "wx", mode: 0o600 });

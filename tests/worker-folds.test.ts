@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { chmodSync, readFileSync, statSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmodSync, readFileSync, renameSync, statSync } from "node:fs";
+import { link, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -11,6 +12,7 @@ import {
   type RepositoryChangeSetEntry,
   type ResolvedRepositoryCandidate
 } from "../extensions/worker/folds.js";
+import { repositoryCandidateId } from "../extensions/worker/repositories.js";
 
 async function withTempDir(run: (directory: string) => Promise<void>): Promise<void> {
   const raw = await mkdtemp(path.join(tmpdir(), "pi-worker-folds-"));
@@ -70,29 +72,51 @@ async function fixture(
   }
   commit(target, `target ${suffix}`);
 
-  const candidateId = `candidate_${suffix.repeat(24).slice(0, 24)}`;
+  const workerId = `worker_20260922220000_${suffix.repeat(8).slice(0, 8)}`;
+  const runId = `run_20260922220000_${suffix.repeat(8).slice(0, 8)}`;
+  const workspaceRepo = `repos/candidate-${suffix}`;
+  const candidateId = repositoryCandidateId({ workerId, runId, workspaceRepo, baseCommit, headCommit, headTree });
+  const candidate = {
+    candidateId,
+    workerId,
+    runId,
+    workspaceRepo,
+    reported: true,
+    purpose: `candidate ${suffix}`,
+    dependsOn: [],
+    source: target,
+    baseCommit,
+    baseTree,
+    headCommit,
+    headTree,
+    dirty: false,
+    committedChanged: true,
+    foldable: true,
+    policyIssues: []
+  };
+  const inventoryFile = path.join(root, `inventory-${suffix}.json`);
+  const inventoryContent = Buffer.from(`${JSON.stringify({
+    version: 2,
+    workerId,
+    runId,
+    workspaceRoot: workspace,
+    generatedAt: "2026-09-22T22:00:00.000Z",
+    candidates: [candidate],
+    reportedIssues: [],
+    scanCoverage: { complete: true, limitations: [] }
+  }, null, 2)}\n`);
+  await writeFile(inventoryFile, inventoryContent, { mode: 0o400 });
   return {
     target,
     resolved: {
       workspaceRoot: workspace,
-      candidate: {
-        candidateId,
-        workerId: `worker_20260922220000_${suffix.repeat(8).slice(0, 8)}`,
-        runId: `run_20260922220000_${suffix.repeat(8).slice(0, 8)}`,
-        workspaceRepo: `repos/candidate-${suffix}`,
-        reported: true,
-        purpose: `candidate ${suffix}`,
-        dependsOn: [],
-        source: target,
-        baseCommit,
-        baseTree,
-        headCommit,
-        headTree,
-        dirty: false,
-        committedChanged: true,
-        foldable: true,
-        policyIssues: []
-      }
+      inventory: {
+        inventoryFile,
+        inventorySha256: createHash("sha256").update(inventoryContent).digest("hex"),
+        reportedIssues: [],
+        scanCoverage: { complete: true, limitations: [] }
+      },
+      candidate
     },
     selection: {
       candidateId,
@@ -103,6 +127,23 @@ async function fixture(
       dependsOn: []
     }
   };
+}
+
+async function refreshInventory(resolved: ResolvedRepositoryCandidate): Promise<void> {
+  const content = Buffer.from(`${JSON.stringify({
+    version: 2,
+    workerId: resolved.candidate.workerId,
+    runId: resolved.candidate.runId,
+    workspaceRoot: resolved.workspaceRoot,
+    generatedAt: "2026-09-22T22:00:00.000Z",
+    candidates: [resolved.candidate],
+    reportedIssues: resolved.inventory.reportedIssues,
+    scanCoverage: resolved.inventory.scanCoverage
+  }, null, 2)}\n`);
+  chmodSync(resolved.inventory.inventoryFile, 0o600);
+  await writeFile(resolved.inventory.inventoryFile, content);
+  chmodSync(resolved.inventory.inventoryFile, 0o400);
+  resolved.inventory.inventorySha256 = createHash("sha256").update(content).digest("hex");
 }
 
 function prepare(root: string, resolved: ResolvedRepositoryCandidate[], repositories: RepositoryChangeSetEntry[]) {
@@ -123,6 +164,7 @@ test("prepares exact merge and squash commits without changing authoritative tar
     const squash = await fixture(root, "b", { squash: true });
     await writeFile(path.join(merge.resolved.workspaceRoot, merge.resolved.candidate.workspaceRepo, "uncommitted.txt"), "inspection signal\n");
     merge.resolved.candidate.dirty = true;
+    await refreshInventory(merge.resolved);
     await writeFile(path.join(squash.target, ".gitignore"), "node_modules/\n");
     git(squash.target, "add", ".gitignore");
     commit(squash.target, "ignore build dependencies");
@@ -142,7 +184,7 @@ test("prepares exact merge and squash commits without changing authoritative tar
     assert.equal(statSync(result.summary.manifestFile).mode & 0o222, 0);
     const mergeRecord = result.manifest.repositories.find((item) => item.candidateId === merge.selection.candidateId)!;
     const squashRecord = result.manifest.repositories.find((item) => item.candidateId === squash.selection.candidateId)!;
-    assert.equal(statSync(path.join(path.dirname(result.summary.manifestFile), mergeRecord.bundleFile)).mode & 0o222, 0);
+    assert.equal(statSync(path.join(path.dirname(result.summary.manifestFile), mergeRecord.artifact.file)).mode & 0o222, 0);
     assert.equal(git(path.join(path.dirname(result.summary.manifestFile), mergeRecord.viewPath), "rev-list", "--parents", "-n", "1", mergeRecord.desiredCommit!).split(/\s+/).length, 3);
     assert.equal(git(path.join(path.dirname(result.summary.manifestFile), squashRecord.viewPath), "rev-list", "--parents", "-n", "1", squashRecord.desiredCommit!).split(/\s+/).length, 2);
     assert.equal(await readFile(path.join(path.dirname(result.summary.manifestFile), mergeRecord.viewPath, "candidate-a.txt"), "utf8"), "candidate a\n");
@@ -202,20 +244,165 @@ test("fails closed for stale candidates, dirty targets, unsupported policy, and 
   });
 });
 
-test("detects manifest and candidate bundle tampering after restart", async () => {
+test("detects immutable artifact tampering while disposable view changes do not invalidate the manifest", async () => {
   await withTempDir(async (root) => {
     const item = await fixture(root, "9");
     const result = prepare(root, [item.resolved], [item.selection]);
     const preparedRoot = path.dirname(result.summary.manifestFile);
     const record = result.manifest.repositories[0]!;
-    const bundle = path.join(preparedRoot, record.bundleFile);
-    const bundleContent = await readFile(bundle);
-    chmodSync(bundle, 0o600);
-    await writeFile(bundle, "poisoned");
-    assert.throws(() => readPreparedWorkerFold(path.join(root, "folds"), result.manifest.preparedId), /bundle hash mismatch/);
-    await writeFile(bundle, bundleContent);
-    chmodSync(bundle, 0o400);
+    const artifact = path.join(preparedRoot, record.artifact.file);
+    const content = await readFile(artifact);
+    chmodSync(artifact, 0o600);
+    await writeFile(artifact, "poisoned");
+    assert.throws(() => readPreparedWorkerFold(path.join(root, "folds"), result.manifest.preparedId), /artifact failed immutable file or hash validation/);
+    await writeFile(artifact, content);
+    chmodSync(artifact, 0o400);
+    const hardlink = `${artifact}.hardlink`;
+    await link(artifact, hardlink);
+    assert.throws(() => readPreparedWorkerFold(path.join(root, "folds"), result.manifest.preparedId), /artifact failed immutable file or hash validation/);
+    await rm(hardlink);
+    const preparedInventory = path.join(preparedRoot, record.candidateInventory.inventoryFile);
+    assert.equal(statSync(preparedInventory).mode & 0o222, 0);
+    chmodSync(item.resolved.inventory.inventoryFile, 0o600);
+    await writeFile(item.resolved.inventory.inventoryFile, "source inventory changed after preparation");
+    assert.deepEqual(readPreparedWorkerFold(path.join(root, "folds"), result.manifest.preparedId), result.manifest);
+
     await writeFile(path.join(preparedRoot, record.viewPath, "shared.txt"), "tampered\n");
-    assert.throws(() => readPreparedWorkerFold(path.join(root, "folds"), result.manifest.preparedId), /view identity mismatch/);
+    assert.deepEqual(readPreparedWorkerFold(path.join(root, "folds"), result.manifest.preparedId), result.manifest);
+    await rm(path.join(preparedRoot, record.viewPath), { recursive: true, force: true });
+    assert.deepEqual(readPreparedWorkerFold(path.join(root, "folds"), result.manifest.preparedId), result.manifest);
+  });
+});
+
+test("pins an A-B-A candidate race to the inventory head instead of mutable HEAD", async () => {
+  await withTempDir(async (root) => {
+    const item = await fixture(root, "8");
+    const candidateRepo = path.join(item.resolved.workspaceRoot, item.resolved.candidate.workspaceRepo);
+    const originalHead = item.resolved.candidate.headCommit!;
+    const result = prepareRepositoryChangeSet({
+      changeSet: { repositories: [item.selection] },
+      candidates: [item.resolved],
+      parentSessionFile: path.join(root, "parent.jsonl"),
+      foldsRoot: path.join(root, "folds"),
+      targetRoot: path.join(root, "targets"),
+      createdAt: "2026-09-22T22:00:00.000Z",
+      gitPath: execFileSync("which", ["git"], { encoding: "utf8" }).trim(),
+      testHooks: {
+        beforeCandidateSourceBundle(repo) {
+          git(repo, "checkout", "--orphan", "race-head");
+          git(repo, "rm", "-rf", ".");
+          execFileSync("sh", ["-c", "printf race > race.txt"], { cwd: repo });
+          git(repo, "add", "race.txt");
+          commit(repo, "racing head");
+        },
+        afterCandidateSourceBundle(repo) { git(repo, "checkout", "main"); }
+      }
+    });
+    const record = result.manifest.repositories[0]!;
+    assert.equal(record.candidateHeadCommit, originalHead);
+    assert.equal(record.artifact.heads.candidate.oid, originalHead);
+    assert.notEqual(git(candidateRepo, "rev-parse", "race-head"), originalHead);
+    assert.deepEqual(readPreparedWorkerFold(path.join(root, "folds"), result.manifest.preparedId), result.manifest);
+  });
+});
+
+test("checks policy on exact target and dirty candidate commit trees", async () => {
+  await withTempDir(async (root) => {
+    const targetPolicy = await fixture(root, "7");
+    const cleanHead = git(targetPolicy.target, "rev-parse", "HEAD");
+    git(targetPolicy.target, "checkout", "-b", "policy");
+    await writeFile(path.join(targetPolicy.target, ".gitattributes"), "* text\n");
+    git(targetPolicy.target, "add", ".gitattributes");
+    commit(targetPolicy.target, "policy tree");
+    git(targetPolicy.target, "checkout", "main");
+    assert.equal(git(targetPolicy.target, "rev-parse", "HEAD"), cleanHead);
+    targetPolicy.selection.targetRef = "refs/heads/policy";
+    await assert.rejects(async () => prepare(root, [targetPolicy.resolved], [targetPolicy.selection]), /exact-tree policy/);
+
+    const candidatePolicy = await fixture(root, "6");
+    const repo = path.join(candidatePolicy.resolved.workspaceRoot, candidatePolicy.resolved.candidate.workspaceRepo);
+    await writeFile(path.join(repo, ".gitattributes"), "* text\n");
+    git(repo, "add", ".gitattributes");
+    const headCommit = commit(repo, "candidate policy");
+    const headTree = git(repo, "rev-parse", "HEAD^{tree}");
+    await rm(path.join(repo, ".gitattributes"));
+    const c = candidatePolicy.resolved.candidate;
+    c.headCommit = headCommit;
+    c.headTree = headTree;
+    c.dirty = true;
+    c.candidateId = repositoryCandidateId({ workerId: c.workerId, runId: c.runId, workspaceRepo: c.workspaceRepo, baseCommit: c.baseCommit!, headCommit, headTree });
+    candidatePolicy.selection.candidateId = c.candidateId;
+    await assert.rejects(async () => prepare(root, [candidatePolicy.resolved], [candidatePolicy.selection]), /candidate policy changed/);
+  });
+});
+
+
+test("fails closed when the prepared view cannot supply exact policy evidence", async () => {
+  await withTempDir(async (root) => {
+    const item = await fixture(root, "5");
+    await assert.rejects(async () => prepareRepositoryChangeSet({
+      changeSet: { repositories: [item.selection] },
+      candidates: [item.resolved],
+      parentSessionFile: path.join(root, "parent.jsonl"),
+      foldsRoot: path.join(root, "folds"),
+      targetRoot: path.join(root, "targets"),
+      createdAt: "2026-09-22T22:00:00.000Z",
+      gitPath: execFileSync("which", ["git"], { encoding: "utf8" }).trim(),
+      testHooks: {
+        afterTargetReset(view) { renameSync(path.join(view, ".git", "objects"), path.join(view, ".git", "objects-unreadable")); }
+      }
+    }), /Prepared target .* view failed policy/);
+  });
+});
+
+test("restart verification rejects a hash-updated artifact with mismatched advertised heads", async () => {
+  await withTempDir(async (root) => {
+    const item = await fixture(root, "4");
+    const result = prepare(root, [item.resolved], [item.selection]);
+    const oldRoot = path.dirname(result.summary.manifestFile);
+    const record = result.manifest.repositories[0]!;
+    const view = path.join(oldRoot, record.viewPath);
+    git(view, "update-ref", "refs/worker-fold/candidate", record.targetExpectedCommit);
+    const replacement = path.join(oldRoot, `${record.artifact.file}.replacement`);
+    git(view, "bundle", "create", replacement, "refs/worker-fold/target", "refs/worker-fold/candidate", "refs/worker-fold/desired");
+    const artifact = path.join(oldRoot, record.artifact.file);
+    chmodSync(artifact, 0o600);
+    renameSync(replacement, artifact);
+    chmodSync(artifact, 0o400);
+
+    const manifest = JSON.parse(await readFile(result.summary.manifestFile, "utf8")) as Record<string, any>;
+    manifest.repositories[0].artifact.sha256 = createHash("sha256").update(await readFile(artifact)).digest("hex");
+    delete manifest.preparedId;
+    delete manifest.manifestSha256;
+    const manifestSha256 = createHash("sha256").update(Buffer.from(JSON.stringify(manifest))).digest("hex");
+    const preparedId = `prepared_${manifestSha256.slice(0, 24)}`;
+    manifest.preparedId = preparedId;
+    manifest.manifestSha256 = manifestSha256;
+    chmodSync(result.summary.manifestFile, 0o600);
+    await writeFile(result.summary.manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
+    chmodSync(result.summary.manifestFile, 0o400);
+    const newRoot = path.join(path.dirname(oldRoot), preparedId);
+    renameSync(oldRoot, newRoot);
+    assert.throws(() => readPreparedWorkerFold(path.join(root, "folds"), preparedId), /advertised heads do not match/);
+  });
+});
+
+
+test("rejects two candidate mappings to one physical target identity", async () => {
+  await withTempDir(async (root) => {
+    const first = await fixture(root, "3");
+    const secondWorker = "worker_20260922220000_duplicate";
+    const secondRun = "run_20260922220000_duplicate";
+    const c = first.resolved.candidate;
+    const secondId = repositoryCandidateId({ workerId: secondWorker, runId: secondRun, workspaceRepo: c.workspaceRepo, baseCommit: c.baseCommit!, headCommit: c.headCommit!, headTree: c.headTree! });
+    const second: ResolvedRepositoryCandidate = {
+      workspaceRoot: first.resolved.workspaceRoot,
+      inventory: first.resolved.inventory,
+      candidate: { ...c, candidateId: secondId, workerId: secondWorker, runId: secondRun }
+    };
+    await assert.rejects(async () => prepare(root, [first.resolved, second], [
+      first.selection,
+      { ...first.selection, candidateId: secondId, purpose: "duplicate physical target" }
+    ]), /one candidate per physical target/);
   });
 });

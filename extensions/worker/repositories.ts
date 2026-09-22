@@ -99,6 +99,7 @@ export type RepositoryInventorySummary = {
 export type GitRunner = {
   gitPath: string;
   env: NodeJS.ProcessEnv;
+  templateDir: string;
 };
 
 type ReportedRepository = { purpose: string; dependsOn: string[] };
@@ -156,7 +157,7 @@ export function deriveRepositoryInventory(input: {
     const workspaceRepo = relativeWorkspacePath(workspaceRoot, repoPath);
     const report = reported.reports.get(workspaceRepo);
     const inspection = inspectRepositorySafely(repoPath, input.initialRepositories ?? [], runner);
-    const candidateId = stableCandidateId({
+    const candidateId = repositoryCandidateId({
       workerId: input.workerId,
       runId: input.runId,
       workspaceRepo,
@@ -420,6 +421,23 @@ export function repositoryPolicyIssues(repoPath: string, runner: GitRunner): str
   return boundedPolicyIssues(issues);
 }
 
+export function repositoryDirty(repoPath: string, runner: GitRunner): boolean {
+  return gitBuffer(runner, repoPath, ["status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching", "-z"]).byteLength > 0;
+}
+
+export function repositoryTreePolicyIssues(repoPath: string, commit: string, runner: GitRunner): string[] {
+  if (!OID_PATTERN.test(commit)) return ["invalid_tree_commit"];
+  try {
+    const attributes = gitBuffer(runner, repoPath, ["ls-tree", "-r", "-z", commit, "--", ".gitattributes", "**/.gitattributes"]);
+    if (attributes.byteLength > 0) return ["repository_attributes"];
+    const tree = gitText(runner, repoPath, ["ls-tree", "-r", commit]);
+    if (tree.split("\n").some((line) => line.startsWith("160000 "))) return ["gitlinks_or_submodules"];
+    return [];
+  } catch (error) {
+    return [safeIssue(error)];
+  }
+}
+
 function gitMetadataIssues(gitDirectory: string): string[] {
   const root = path.resolve(gitDirectory);
   if (realpathSync(root) !== root) return ["git_metadata_alias"];
@@ -437,8 +455,10 @@ function gitMetadataIssues(gitDirectory: string): string[] {
       if (++scanned > MAX_SCAN_ENTRIES) return ["git_metadata_scan_limit"];
       const child = path.join(directory, entry.name);
       if (entry.isSymbolicLink()) return ["git_metadata_symlink"];
+      const metadata = lstatSync(child);
       if (entry.isDirectory()) queue.push(child);
       else if (!entry.isFile()) return ["git_metadata_special_file"];
+      else if (metadata.nlink !== 1) return ["git_metadata_hardlink"];
     }
   }
   return [];
@@ -537,9 +557,11 @@ function reportedRepositories(
 export function createGitRunner(gitPath: string, trustedStateRoot: string): GitRunner {
   const executable = realpathSync(gitPath);
   const home = path.join(path.resolve(trustedStateRoot), "git-home");
-  mkdirSync(home, { recursive: true, mode: 0o700 });
+  const templateDir = path.join(home, "empty-template");
+  mkdirSync(templateDir, { recursive: true, mode: 0o700 });
   return {
     gitPath: executable,
+    templateDir,
     env: {
       HOME: home,
       XDG_CONFIG_HOME: home,
@@ -559,7 +581,8 @@ export function createGitRunner(gitPath: string, trustedStateRoot: string): GitR
       PAGER: "cat",
       GIT_EDITOR: "false",
       GIT_SEQUENCE_EDITOR: "false",
-      GIT_SSH_COMMAND: "false"
+      GIT_SSH_COMMAND: "false",
+      GIT_TEMPLATE_DIR: templateDir
     }
   };
 }
@@ -585,6 +608,11 @@ export function runGit(
     "-c", `core.worktree=${cwd}`,
     "-c", "core.bare=false",
     "-c", "credential.helper=",
+    "-c", "gc.auto=0",
+    "-c", "maintenance.auto=0",
+    "-c", "fetch.fsckObjects=true",
+    "-c", "transfer.fsckObjects=true",
+    "-c", "receive.fsckObjects=true",
     "-c", "commit.gpgSign=false",
     "-c", "tag.gpgSign=false",
     "-c", "diff.external=",
@@ -626,6 +654,11 @@ export function runStandaloneGit(runner: GitRunner, cwd: string, args: string[])
     "-c", "core.fileMode=true",
     "-c", "core.autocrlf=false",
     "-c", "credential.helper=",
+    "-c", "gc.auto=0",
+    "-c", "maintenance.auto=0",
+    "-c", "fetch.fsckObjects=true",
+    "-c", "transfer.fsckObjects=true",
+    "-c", "receive.fsckObjects=true",
     "-c", "commit.gpgSign=false",
     "-c", "tag.gpgSign=false",
     "-c", "diff.external=",
@@ -776,7 +809,7 @@ function relativeWorkspacePath(workspaceRoot: string, absolute: string): string 
   return relative;
 }
 
-function stableCandidateId(input: {
+export function repositoryCandidateId(input: {
   workerId: string;
   runId: string;
   workspaceRepo: string;
@@ -874,7 +907,7 @@ function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function isRepositoryInventory(value: unknown): value is RepositoryInventory {
+export function isRepositoryInventory(value: unknown): value is RepositoryInventory {
   if (
     !isRecord(value) ||
     value.version !== REPOSITORY_INVENTORY_VERSION ||

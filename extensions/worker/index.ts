@@ -514,13 +514,13 @@ export function registerWorkerExtension(
   api.registerTool(defineTool({
     name: "worker_fold_prepare",
     label: "Worker Fold Prepare",
-    description: "Prepare an exact multi-repository worker changeset outside authoritative repositories. Select durable repository candidate IDs and map each to one explicit existing local target repository/ref, purpose, merge or squash method, and candidate dependencies. The trusted host revalidates exact candidate and target identities, computes deterministic desired commits or bounded resolution cases, materializes owner-private disposable views, and persists one immutable hash-bound manifest without updating authoritative refs, indexes, worktrees, or files.",
+    description: "Prepare an exact multi-repository worker changeset outside authoritative repositories. Select durable repository candidate IDs and map each to one explicit existing local target repository/ref, purpose, merge or squash method, and candidate dependencies. The trusted host locks selected workers, revalidates exact candidate and target identities, computes deterministic desired commits or bounded resolution cases, materializes disposable views plus immutable exact-object artifacts, and persists one hash-bound manifest without updating authoritative refs, indexes, worktrees, or files.",
     promptSnippet: "Prepare selected durable worker repository candidates as an exact external multi-repository changeset without modifying authoritative targets.",
     promptGuidelines: [
       "worker_fold_prepare use: Call only after inspecting worker_control result/status evidence and deciding the semantic candidate-to-target mapping, method, purpose, and dependency DAG. Use fully qualified existing refs/heads/... targets.",
       inputJsonSchemaGuideline("worker_fold_prepare", WorkerFoldPrepareParams),
       outputJsonSchemaGuideline("worker_fold_prepare", RetainedToolOutputSchemas.worker_fold_prepare),
-      "worker_fold_prepare constraints: Preparation is deterministic and model-free. It revalidates hash-bound candidate inventories, exact OIDs, target cleanliness and policy, and dependency order; creates only external owner-private bundles/views/manifests; never updates target refs, indexes, worktrees, remotes, or files. Conflicts become resolution_required cases. Promotion, review, validation, pushing, release, and conflict resolution are separate parent-owned operations. Only result content is provider-visible; details are internal."
+      "worker_fold_prepare constraints: Preparation is deterministic and model-free. It holds selected worker lifecycle locks and rejects active runs/leases; revalidates hash-bound candidate inventories, exact commit trees, target cleanliness and policy, and dependency order; creates only external owner-private exact-object bundles, disposable views, and manifests; synchronous Git work is not interruptible after it starts; never updates target refs, indexes, worktrees, remotes, or files. Conflicts become resolution_required cases. Promotion, review, validation, pushing, release, and conflict resolution are separate parent-owned operations. Only result content is provider-visible; details are internal."
     ],
     parameters: WorkerFoldPrepareParams,
     renderCall(args, theme) {
@@ -544,15 +544,16 @@ export function registerWorkerExtension(
           dependsOn: [...(item.dependsOn ?? [])]
         }))
       };
-      const candidates = resolveParentFoldCandidates(changeSet, context, dependencies);
-      const { summary } = dependencies.prepareFold({
-        changeSet,
-        candidates,
-        parentSessionFile,
-        foldsRoot: dependencies.foldsRoot,
-        targetRoot: dependencies.targetRoot,
-        createdAt: dependencies.now().toISOString(),
-        isCancelled: () => signal?.aborted === true
+      const { summary } = withLockedParentFoldCandidates(changeSet, context, dependencies, (candidates) => {
+        throwIfAborted(signal);
+        return dependencies.prepareFold({
+          changeSet,
+          candidates,
+          parentSessionFile,
+          foldsRoot: dependencies.foldsRoot,
+          targetRoot: dependencies.targetRoot,
+          createdAt: dependencies.now().toISOString()
+        });
       });
       return {
         content: [{ type: "text", text: formatWorkerFoldPrepareSummary(summary) }],
@@ -631,14 +632,49 @@ function listParentWorkerRecords(roots: WorkerRoots, context: ExtensionContext):
   return records;
 }
 
+function withLockedParentFoldCandidates<T>(
+  changeSet: RepositoryChangeSet,
+  context: ExtensionContext,
+  dependencies: WorkerExtensionDependencies,
+  operation: (candidates: ReturnType<typeof resolveParentFoldCandidates>) => T
+): T {
+  const requested = new Set(changeSet.repositories.map((item) => item.candidateId));
+  const owners = new Map<string, string>();
+  for (const record of listParentWorkerRecords(dependencies.roots, context)) {
+    for (const summary of record.lastRun?.repositoryInventory?.candidates ?? []) {
+      if (!requested.has(summary.candidateId)) continue;
+      if (owners.has(summary.candidateId)) throw new Error(`Worker repository candidate identity is ambiguous: ${summary.candidateId}`);
+      owners.set(summary.candidateId, record.workerId);
+    }
+  }
+  for (const candidateId of requested) {
+    if (!owners.has(candidateId)) throw new Error(`Worker repository candidate is not available to this parent session: ${candidateId}`);
+  }
+  const workerIds = [...new Set(owners.values())].sort();
+  const locks: ReturnType<typeof acquireWorkerOperationLock>[] = [];
+  try {
+    for (const workerId of workerIds) locks.push(acquireWorkerOperationLock(workerPaths(dependencies.roots, workerId).operationLockFile));
+    return operation(resolveParentFoldCandidates(changeSet, context, dependencies));
+  } finally {
+    for (const lock of locks.reverse()) releaseWorkerOperationLock(lock);
+  }
+}
+
 function resolveParentFoldCandidates(
   changeSet: RepositoryChangeSet,
   context: ExtensionContext,
   dependencies: WorkerExtensionDependencies
-): Array<{ candidate: RepositoryInventory["candidates"][number]; workspaceRoot: string }> {
+): Array<{ candidate: RepositoryInventory["candidates"][number]; workspaceRoot: string; inventory: { inventoryFile: string; inventorySha256: string; reportedIssues: RepositoryInventory["reportedIssues"]; scanCoverage: RepositoryInventory["scanCoverage"] } }> {
   const requested = new Set(changeSet.repositories.map((item) => item.candidateId));
-  const resolved = new Map<string, { candidate: RepositoryInventory["candidates"][number]; workspaceRoot: string }>();
+  const resolved = new Map<string, { candidate: RepositoryInventory["candidates"][number]; workspaceRoot: string; inventory: { inventoryFile: string; inventorySha256: string; reportedIssues: RepositoryInventory["reportedIssues"]; scanCoverage: RepositoryInventory["scanCoverage"] } }>();
   for (const record of listParentWorkerRecords(dependencies.roots, context)) {
+    const paths = workerPaths(dependencies.roots, record.workerId);
+    if (record.activeRun || readWorkerLease(paths.leaseFile)) {
+      if (record.lastRun?.repositoryInventory?.candidates.some((item) => requested.has(item.candidateId))) {
+        throw new Error(`Worker repository candidate is unavailable while worker ${record.workerId} has an active run or lease.`);
+      }
+      continue;
+    }
     const run = record.lastRun;
     const summary = run?.repositoryInventory;
     if (!run || run.status !== "handed_off" || !summary || !summary.candidates.some((item) => requested.has(item.candidateId))) continue;
@@ -651,7 +687,16 @@ function resolveParentFoldCandidates(
     for (const candidate of inventory.candidates) {
       if (!requested.has(candidate.candidateId)) continue;
       if (resolved.has(candidate.candidateId)) throw new Error(`Worker repository candidate identity is ambiguous: ${candidate.candidateId}`);
-      resolved.set(candidate.candidateId, { candidate, workspaceRoot: record.workspaceRoot });
+      resolved.set(candidate.candidateId, {
+        candidate,
+        workspaceRoot: record.workspaceRoot,
+        inventory: {
+          inventoryFile: summary.inventoryFile,
+          inventorySha256: summary.inventorySha256,
+          reportedIssues: inventory.reportedIssues.map((item) => ({ ...item })),
+          scanCoverage: { complete: inventory.scanCoverage.complete, limitations: [...inventory.scanCoverage.limitations] }
+        }
+      });
     }
   }
   return changeSet.repositories.map((item) => {
@@ -2558,7 +2603,7 @@ function formatWorkerFoldPrepareSummary(summary: PreparedWorkerFoldSummary): str
     `repositories: ${summary.repositoryCount}`,
     `resolution_cases: ${summary.resolutionCaseCount}`,
     `overlaps: ${summary.overlapCount}`,
-    ...summary.repositories.map((item) => `repository: ${item.candidateId} · ${item.method} · ${item.status} · ${item.targetRepo}#${item.targetRef} · expected ${item.expectedCommit}${item.desiredCommit ? ` · desired ${item.desiredCommit}` : ""} · view ${item.viewPath}`),
+    ...summary.repositories.map((item) => `repository: ${item.candidateId} · ${item.method} · ${item.status} · ${item.targetRepo}#${item.targetRef} · expected ${item.expectedCommit}${item.desiredCommit ? ` · desired ${item.desiredCommit}` : ""} · artifact ${item.artifactFile} · view ${item.viewPath}`),
     `manifest: ${summary.manifestFile}`,
     `manifest_sha256: ${summary.manifestSha256}`
   ].join("\n");

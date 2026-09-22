@@ -224,6 +224,7 @@ const samples: Record<RetainedToolName, unknown> = {
         status: "ready",
         expectedCommit: "c".repeat(40),
         desiredCommit: "d".repeat(40),
+        artifactFile: "/tmp/worker-folds/prepared_aaaaaaaaaaaaaaaaaaaaaaaa/repositories/01/prepared-objects.bundle",
         viewPath: "/tmp/worker-folds/prepared_aaaaaaaaaaaaaaaaaaaaaaaa/repositories/01/view"
       }]
     }

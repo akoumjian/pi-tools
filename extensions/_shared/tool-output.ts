@@ -741,6 +741,7 @@ const WorkerFoldPreparedRepositorySchema = Type.Object({
   status: Type.Union([Type.Literal("ready"), Type.Literal("resolution_required")]),
   expectedCommit: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
   desiredCommit: Type.Optional(Type.String({ pattern: "^[0-9a-f]{40,64}$" })),
+  artifactFile: Type.String({ minLength: 1, maxLength: 2048 }),
   viewPath: Type.String({ minLength: 1, maxLength: 2048 })
 }, { additionalProperties: false });
 

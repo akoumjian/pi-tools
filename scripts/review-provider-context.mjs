@@ -185,11 +185,11 @@ const resultContracts = {
     content: "worker/run/job/session/workspace/task/route state, full typed handoff JSON, errors, canonical result/log paths, and cleanup outcome"
   },
   worker_fold_prepare: {
-    success: "content reports prepared id/hash/status, every candidate-to-target expected/desired identity, disposable view, and manifest path",
+    success: "content reports prepared id/hash/status, every candidate-to-target expected/desired identity, immutable artifact, disposable view, and manifest path",
     progress: "not applicable: one deterministic bounded preparation settles before return",
     error: "invalid/stale/ambiguous candidates, target policy/cleanliness/ref movement, dependency cycles, conflicts, and artifact limits remain model-visible",
     details: "internal immutable prepared-manifest summary and exact repository records",
-    content: "prepared manifest identity/path/hash, dependency-ordered repository methods/status/OIDs/views, and resolution-case count"
+    content: "prepared manifest identity/path/hash, dependency-ordered repository methods/status/OIDs/artifacts/views, and resolution-case count"
   },
   orchestrate: {
     success: "content reports every task id/role/status/routes; completed tasks add model/thinking/duration/tool calls/output and writer worktree/review data",
