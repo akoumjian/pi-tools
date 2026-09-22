@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -16,7 +17,8 @@ const WORKER_ID = "worker_20260922170000_repocand";
 const RUN_ID = "run_20260922170000_repocand";
 
 async function withTempDir(run: (directory: string) => Promise<void>): Promise<void> {
-  const directory = await mkdtemp(path.join(tmpdir(), "pi-worker-repositories-"));
+  const created = await mkdtemp(path.join(tmpdir(), "pi-worker-repositories-"));
+  const directory = await realpath(created);
   try {
     await run(directory);
   } finally {
@@ -114,12 +116,12 @@ test("derives a clean reported candidate from independently pinned Git identitie
     assert.equal(candidate.baseCommit, base);
     assert.equal(candidate.headCommit, git(candidateRepo, "rev-parse", "HEAD"));
     assert.equal(candidate.dirty, false);
-    assert.equal(candidate.changed, true);
+    assert.equal(candidate.committedChanged, true);
     assert.equal(candidate.foldable, true);
-    assert.deepEqual(candidate.changedPaths, ["feature.txt"]);
     assert.equal(candidate.purpose, "Implement candidate support");
     assert.deepEqual(candidate.dependsOn, ["repos/dependency"]);
-    assert.deepEqual(inventory.discrepancies, []);
+    assert.deepEqual(inventory.reportedIssues, []);
+    assert.deepEqual(inventory.scanCoverage, { complete: true, limitations: [] });
     assert.equal(git(source, "rev-parse", "HEAD"), base);
     assert.equal(git(source, "status", "--porcelain"), sourceStatus);
 
@@ -134,6 +136,28 @@ test("derives a clean reported candidate from independently pinned Git identitie
       workspaceRoot: workspace,
       sha256: summary.inventorySha256
     }), inventory);
+  });
+});
+
+test("rejects a clean candidate whose head does not descend from the pinned base", async () => {
+  await withTempDir(async (directory) => {
+    const source = await createSource(directory, "ancestry-source");
+    const workspace = path.join(directory, "workspace");
+    const repo = path.join(workspace, "repos", "unrelated");
+    clone(source, repo);
+    git(repo, "checkout", "-q", "--orphan", "unrelated");
+    git(repo, "rm", "-q", "-rf", ".");
+    await writeFile(path.join(repo, "unrelated.txt"), "unrelated\n");
+    git(repo, "add", "unrelated.txt");
+    git(repo, "commit", "-qm", "unrelated history");
+
+    const pins = pinInitialRepositories([{ source }], path.join(directory, "state"));
+    const inventory = deriveRepositoryInventory(inventoryInput(directory, handoff("repos/unrelated"), pins));
+    const candidate = inventory.candidates[0]!;
+    assert.equal(candidate.dirty, false);
+    assert.equal(candidate.committedChanged, true);
+    assert.equal(candidate.foldable, false);
+    assert.ok(candidate.policyIssues.includes("base_not_ancestor"));
   });
 });
 
@@ -152,8 +176,10 @@ test("keeps dirty and unreported nested repositories visible and refuses symlink
     await writeFile(path.join(dirtyRepo, "README.md"), "dirty\n");
     await writeFile(path.join(unreportedRepo, "change.txt"), "change\n");
     await writeFile(path.join(nestedRepo, "nested.txt"), "nested\n");
-    git(nestedRepo, "add", "nested.txt");
+    await writeFile(path.join(nestedRepo, ".gitignore"), "intentional.tmp\n");
+    git(nestedRepo, "add", "nested.txt", ".gitignore");
     git(nestedRepo, "commit", "-qm", "nested change");
+    await writeFile(path.join(nestedRepo, "intentional.tmp"), "scratch\n");
     git(unreportedRepo, "add", "change.txt");
     git(unreportedRepo, "commit", "-qm", "change");
     const outside = await createSource(directory, "outside");
@@ -171,17 +197,19 @@ test("keeps dirty and unreported nested repositories visible and refuses symlink
     assert.equal(dirty.foldable, false);
     const nested = inventory.candidates.find((candidate) => candidate.workspaceRepo === "repos/dirty/vendor/nested")!;
     assert.equal(nested.foldable, true);
+    assert.equal(nested.dirty, true);
     assert.equal(nested.reported, false);
     const unreported = inventory.candidates.find((candidate) => candidate.workspaceRepo === "repos/group/unreported")!;
     assert.equal(unreported.reported, false);
     assert.equal(unreported.foldable, true);
-    assert.ok(inventory.discrepancies.some((item) => item.kind === "unreported_changed" && item.workspaceRepo === "repos/group/unreported"));
-    assert.ok(inventory.discrepancies.some((item) => item.kind === "unreported_changed" && item.workspaceRepo === "repos/dirty/vendor/nested"));
-    assert.ok(inventory.discrepancies.some((item) => item.kind === "symlink_skipped" && item.workspaceRepo === "repos/linked-repo"));
+    assert.equal(unreported.committedChanged, true);
+    assert.equal(nested.committedChanged, true);
+    assert.deepEqual(inventory.reportedIssues, []);
+    assert.deepEqual(inventory.scanCoverage, { complete: true, limitations: [] });
   });
 });
 
-test("marks unsupported and missing-base repositories non-foldable and reports stale identities", async () => {
+test("fails closed on unsupported repositories and reports stale clean identities", async () => {
   await withTempDir(async (directory) => {
     const workspace = path.join(directory, "workspace");
     const repo = path.join(workspace, "repos", "unsupported");
@@ -190,23 +218,44 @@ test("marks unsupported and missing-base repositories non-foldable and reports s
     await writeFile(path.join(repo, "file.txt"), "content\n");
     git(repo, "add", "file.txt");
     git(repo, "commit", "-qm", "initial");
-    git(repo, "config", "filter.danger.clean", "cat");
+    for (let index = 0; index < 65; index++) {
+      git(repo, "config", `filter.danger${String(index).padStart(2, "0")}.clean`, "cat");
+    }
 
     const first = deriveRepositoryInventory(inventoryInput(directory, handoff("repos/unsupported")));
     const candidate = first.candidates[0]!;
     assert.equal(candidate.foldable, false);
-    assert.ok(candidate.policyIssues.includes("missing_base"));
-    assert.ok(candidate.policyIssues.includes("unsupported_config:filter.danger.clean"));
+    assert.ok(candidate.policyIssues.some((issue) => issue.startsWith("unsupported_config:filter.danger")));
+    assert.ok(candidate.policyIssues.includes("policy_issues_truncated"));
+    assert.ok(candidate.policyIssues.length <= 64);
+
+    assert.equal(candidate.headCommit, undefined);
+
+    const cleanRepo = path.join(workspace, "repos", "clean");
+    await mkdir(cleanRepo, { recursive: true });
+    git(cleanRepo, "init", "-q", "-b", "main");
+    await writeFile(path.join(cleanRepo, "first.txt"), "first\n");
+    git(cleanRepo, "add", "first.txt");
+    git(cleanRepo, "commit", "-qm", "first");
+    const cleanFirst = deriveRepositoryInventory(inventoryInput(directory, handoff("repos/clean")));
+    const staleId = cleanFirst.candidates.find((entry) => entry.workspaceRepo === "repos/clean")!.candidateId;
+    await writeFile(path.join(cleanRepo, "second.txt"), "second\n");
+    git(cleanRepo, "add", "second.txt");
+    git(cleanRepo, "commit", "-qm", "second");
+    const cleanSecond = deriveRepositoryInventory(inventoryInput(directory, handoff("repos/clean")));
+    assert.notEqual(cleanSecond.candidates.find((entry) => entry.workspaceRepo === "repos/clean")?.candidateId, staleId);
+
+    const invalidInventoryFile = path.join(directory, "state", "invalid-repository-candidates.json");
+    assert.throws(() => persistRepositoryInventory(invalidInventoryFile, {
+      ...first,
+      candidates: first.candidates.map((entry, index) => index === 0
+        ? { ...entry, policyIssues: Array.from({ length: 65 }, (_, issueIndex) => `issue_${issueIndex}`) }
+        : entry)
+    }), /Refusing to persist an invalid/);
+    assert.equal(existsSync(invalidInventoryFile), false);
 
     const inventoryFile = path.join(directory, "state", "repository-candidates.json");
     const summary = persistRepositoryInventory(inventoryFile, first);
-    const staleId = candidate.candidateId;
-    await writeFile(path.join(repo, "second.txt"), "second\n");
-    git(repo, "add", "second.txt");
-    git(repo, "commit", "-qm", "second");
-    const second = deriveRepositoryInventory(inventoryInput(directory, handoff("repos/unsupported")));
-    assert.notEqual(second.candidates[0]?.candidateId, staleId);
-
     const tampered = `${await readFile(inventoryFile, "utf8")} `;
     await writeFile(inventoryFile, tampered);
     assert.throws(() => readRepositoryInventory(inventoryFile, {
@@ -218,16 +267,88 @@ test("marks unsupported and missing-base repositories non-foldable and reports s
   });
 });
 
+test("bounds generated repository metadata to persisted record limits", async () => {
+  await withTempDir(async (directory) => {
+    const credentialSource = `https://user:password@example.invalid/${" ".repeat(2_000)}`;
+    const credentialPin = pinInitialRepositories([{ source: credentialSource }], path.join(directory, "credential-state"))[0]!;
+    assert.equal(credentialPin.status, "unsupported");
+    assert.ok(credentialPin.source.length <= 2_048);
+
+    const source = await createSource(directory, "bounded-metadata-source");
+    const workspace = path.join(directory, "workspace");
+    const repo = path.join(workspace, "repos", "bounded-metadata");
+    clone(source, repo);
+    const inventory = deriveRepositoryInventory(inventoryInput(directory, handoff("repos/bounded-metadata"), [{
+      source,
+      canonicalSource: source,
+      status: "unsupported",
+      issue: "x".repeat(160)
+    }]));
+    const candidate = inventory.candidates[0]!;
+    assert.equal(candidate.foldable, false);
+    assert.ok(candidate.policyIssues.some((issue) => issue.startsWith("initial_base_unsupported:")));
+    assert.ok(candidate.policyIssues.every((issue) => issue.length <= 160));
+  });
+});
+
+test("reports overall incomplete scan coverage without per-path scan noise", async () => {
+  await withTempDir(async (directory) => {
+    const workspace = path.join(directory, "workspace");
+    let nested = path.join(workspace, "repos");
+    for (let depth = 0; depth < 14; depth++) {
+      nested = path.join(nested, `depth-${depth}`);
+      await mkdir(nested, { recursive: true });
+    }
+    git(nested, "init", "-q", "-b", "main");
+    await writeFile(path.join(nested, "deep.txt"), "deep\n");
+    git(nested, "add", "deep.txt");
+    git(nested, "commit", "-qm", "deep repository");
+    const workspaceRepo = path.relative(workspace, nested).replaceAll(path.sep, "/");
+    const inventory = deriveRepositoryInventory(inventoryInput(directory, handoff(workspaceRepo)));
+    assert.equal(inventory.candidates.length, 1);
+    assert.equal(inventory.candidates[0]?.workspaceRepo, workspaceRepo);
+    assert.equal(inventory.candidates[0]?.reported, true);
+    assert.deepEqual(inventory.reportedIssues, []);
+    assert.deepEqual(inventory.scanCoverage, { complete: false, limitations: ["depth_limit"] });
+  });
+});
+
 test("reports missing and non-repository handoff paths without trusting them", async () => {
   await withTempDir(async (directory) => {
     const workspace = path.join(directory, "workspace");
     await mkdir(path.join(workspace, "repos", "plain"), { recursive: true });
     const accepted = handoff("repos/plain");
-    accepted.handoff.repositories!.push({ workspaceRepo: "repos/missing", purpose: "Missing" });
+    accepted.handoff.repositories!.push(
+      { workspaceRepo: "repos/missing", purpose: "Missing" },
+      { workspaceRepo: ".", purpose: "Invalid root" }
+    );
     const inventory = deriveRepositoryInventory(inventoryInput(directory, accepted));
     assert.equal(inventory.candidates.length, 0);
-    assert.ok(inventory.discrepancies.some((item) => item.kind === "reported_not_repository" && item.workspaceRepo === "repos/plain"));
-    assert.ok(inventory.discrepancies.some((item) => item.kind === "reported_missing" && item.workspaceRepo === "repos/missing"));
+    assert.ok(inventory.reportedIssues.some((item) => item.kind === "reported_not_repository" && item.workspaceRepo === "repos/plain"));
+    assert.ok(inventory.reportedIssues.some((item) => item.kind === "reported_missing" && item.workspaceRepo === "repos/missing"));
+    assert.ok(inventory.reportedIssues.some((item) => item.kind === "reported_not_repository" && item.workspaceRepo === "."));
+  });
+});
+
+test("reserves candidate capacity for reported repositories", async () => {
+  await withTempDir(async (directory) => {
+    const workspace = path.join(directory, "workspace");
+    const reposRoot = path.join(workspace, "repos");
+    for (let index = 0; index < 33; index++) {
+      await mkdir(path.join(reposRoot, `a-unreported-${String(index).padStart(2, "0")}`, ".git"), { recursive: true });
+    }
+    const reportedRepo = path.join(reposRoot, "z-reported");
+    await mkdir(reportedRepo, { recursive: true });
+    git(reportedRepo, "init", "-q", "-b", "main");
+    await writeFile(path.join(reportedRepo, "reported.txt"), "reported\n");
+    git(reportedRepo, "add", "reported.txt");
+    git(reportedRepo, "commit", "-qm", "reported repository");
+
+    const inventory = deriveRepositoryInventory(inventoryInput(directory, handoff("repos/z-reported")));
+    assert.equal(inventory.candidates.length, 32);
+    assert.ok(inventory.candidates.some((candidate) => candidate.workspaceRepo === "repos/z-reported" && candidate.reported));
+    assert.deepEqual(inventory.reportedIssues, []);
+    assert.deepEqual(inventory.scanCoverage, { complete: false, limitations: ["repository_limit"] });
   });
 });
 
@@ -247,11 +368,46 @@ test("rejects candidate-controlled Git metadata symlinks before invoking reposit
     assert.equal(candidate.foldable, false);
     assert.equal(candidate.source, undefined);
     assert.ok(candidate.policyIssues.includes("git_metadata_symlink"));
-    assert.ok(candidate.policyIssues.includes("missing_base"));
   });
 });
 
-test("bounds changed-path details while retaining the exact total", async () => {
+test("does not inherit a parent repository for an invalid nested Git directory", async () => {
+  await withTempDir(async (directory) => {
+    const workspace = path.join(directory, "workspace");
+    const reposRoot = path.join(workspace, "repos");
+    await mkdir(reposRoot, { recursive: true });
+    git(reposRoot, "init", "-q", "-b", "main");
+    await writeFile(path.join(reposRoot, "root.txt"), "root\n");
+    git(reposRoot, "add", "root.txt");
+    git(reposRoot, "commit", "-qm", "root repository");
+    const phantom = path.join(reposRoot, "phantom");
+    await mkdir(path.join(phantom, ".git"), { recursive: true });
+
+    const inventory = deriveRepositoryInventory(inventoryInput(directory, handoff("repos/phantom")));
+    const candidate = inventory.candidates.find((entry) => entry.workspaceRepo === "repos/phantom")!;
+    assert.equal(candidate.foldable, false);
+    assert.equal(candidate.headCommit, undefined);
+    assert.ok(candidate.policyIssues.some((issue) => issue.startsWith("git_failed:")));
+  });
+});
+
+test("rejects linked common Git metadata before repository inspection", async () => {
+  await withTempDir(async (directory) => {
+    const source = await createSource(directory, "commondir-source");
+    const workspace = path.join(directory, "workspace");
+    const repo = path.join(workspace, "repos", "commondir");
+    clone(source, repo);
+    await writeFile(path.join(repo, ".git", "commondir"), "../../outside-git\n");
+
+    const inventory = deriveRepositoryInventory(inventoryInput(directory, handoff("repos/commondir")));
+    const candidate = inventory.candidates[0]!;
+    assert.equal(candidate.foldable, false);
+    assert.equal(candidate.headCommit, undefined);
+    assert.ok(candidate.policyIssues.includes("linked_common_gitdir"));
+  });
+});
+
+test("records repository-level commit status without enumerating changed files", async () => {
   await withTempDir(async (directory) => {
     const source = await createSource(directory, "bounded-source");
     const workspace = path.join(directory, "workspace");
@@ -265,9 +421,10 @@ test("bounds changed-path details while retaining the exact total", async () => 
     const pins = pinInitialRepositories([{ source }], path.join(directory, "state"));
     const inventory = deriveRepositoryInventory(inventoryInput(directory, handoff("repos/bounded"), pins));
     const candidate = inventory.candidates[0]!;
-    assert.equal(candidate.changedPathCount, 140);
-    assert.equal(candidate.changedPaths.length, 128);
-    assert.equal(candidate.changedPathsTruncated, true);
+    assert.equal(candidate.committedChanged, true);
+    assert.equal(candidate.dirty, false);
     assert.equal(candidate.foldable, true);
+    assert.equal("changedPaths" in candidate, false);
+    assert.equal("changedPathCount" in candidate, false);
   });
 });

@@ -354,7 +354,10 @@ function validateWorkerHandoff(
     }
   }
   for (const repository of handoff.repositories ?? []) {
-    assertWorkspaceRelativePath("repository", repository.workspaceRepo, workspaceRoot);
+    if (Buffer.byteLength(repository.workspaceRepo, "utf8") > 1024) {
+      throw new Error(`Worker handoff repository path exceeds the bounded identity limit: ${repository.workspaceRepo}`);
+    }
+    assertWorkerRepositoryPath(repository.workspaceRepo, workspaceRoot);
   }
   for (const check of handoff.checks ?? []) {
     assertWorkspaceRelativePath("check cwd", check.cwd, workspaceRoot);
@@ -362,10 +365,23 @@ function validateWorkerHandoff(
   }
 }
 
-function assertWorkspaceRelativePath(label: string, value: string, workspaceRoot: string): void {
+function assertWorkerRepositoryPath(value: string, workspaceRoot: string): void {
+  const root = realpathSync(workspaceRoot);
+  const repositoriesRoot = path.join(root, "repos");
+  const resolved = path.resolve(root, value);
+  if (resolved === repositoriesRoot || !resolved.startsWith(`${repositoriesRoot}${path.sep}`)) {
+    throw new Error(`Worker handoff repository path must be below the workspace repos/ directory: ${value}`);
+  }
+  assertWorkspaceRelativePath("repository", value, workspaceRoot, false);
+}
+
+function assertWorkspaceRelativePath(label: string, value: string, workspaceRoot: string, allowRoot = true): void {
   if (path.isAbsolute(value)) throw new Error(`Worker handoff ${label} path must be workspace-relative: ${value}`);
   const root = realpathSync(workspaceRoot);
   const resolved = path.resolve(root, value);
+  if (!allowRoot && resolved === root) {
+    throw new Error(`Worker handoff ${label} path must identify a repository below the workspace root: ${value}`);
+  }
   if (resolved !== root && !resolved.startsWith(`${root}${path.sep}`)) {
     throw new Error(`Worker handoff ${label} path escapes the workspace: ${value}`);
   }

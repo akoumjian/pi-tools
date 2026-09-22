@@ -59,6 +59,13 @@ test("worker paths are stable, provisioned, and state records round-trip atomica
     };
     writeWorkerRecord(paths.recordFile, record);
     assert.deepEqual(readWorkerRecord(paths.recordFile), record);
+
+    const invalid = {
+      ...record,
+      initialRepositories: [{ source: "/tmp/source", status: "unsupported" as const, issue: "x".repeat(161) }]
+    };
+    assert.throws(() => writeWorkerRecord(paths.recordFile, invalid), /Invalid worker record/);
+    assert.deepEqual(readWorkerRecord(paths.recordFile), record);
   });
 });
 

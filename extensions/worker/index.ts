@@ -38,10 +38,12 @@ import {
   persistRepositoryInventory,
   pinInitialRepositories,
   readRepositoryInventory,
+  type InitialRepositoryPin,
   type RepositoryInventory,
   type RepositoryInventorySummary
 } from "./repositories.js";
 import { forkWorkerSession, verifyWorkerSession } from "./session.js";
+import { readWorkerSettings } from "./settings.js";
 import {
   WORKER_RECORD_VERSION,
   acquireWorkerLease,
@@ -63,7 +65,7 @@ import {
   type WorkerRoute
 } from "./state.js";
 
-const WORKER_OPERATIONAL_GUIDANCE = "Keep all writes inside the private workspace, clone local repositories with --no-hardlinks, and do not push remotes. Use worker_task_read to search or read bounded context across central Beads; returned records mark your assigned IDs. Use worker_task_update rather than shell access for notes or status changes, and update only assigned IDs. Shell commands run inside one private Docker container with all of ~/Code read-only and this workspace read-write. Process groups provide normal per-command cancellation; whole-container removal is the final run cleanup boundary. Use normal async-shell tools. Before worker_handoff, inspect every owned job: wait for work that should finish or cancel work that should stop, then verify terminal status with shell_status or shell_read. Finish with exactly one accepted worker_handoff only after every owned job is settled.";
+const WORKER_OPERATIONAL_GUIDANCE = "Keep all writes inside the private workspace. Clone or create every Git repository under the workspace repos/ directory, report it as repos/<name>, use --no-hardlinks for local clones, and do not push remotes. Use worker_task_read to search or read bounded context across central Beads; returned records mark your assigned IDs. Use worker_task_update rather than shell access for notes or status changes, and update only assigned IDs. Shell commands run inside one private Docker container with all of ~/Code read-only and this workspace read-write. Process groups provide normal per-command cancellation; whole-container removal is the final run cleanup boundary. Use normal async-shell tools. Before worker_handoff, inspect every owned job: wait for work that should finish or cancel work that should stop, then verify terminal status with shell_status or shell_read. Finish with exactly one accepted worker_handoff only after every owned job is settled.";
 
 const InitialRepoSchema = Type.Object({
   source: Type.String({ minLength: 1, maxLength: 2048 }),
@@ -74,7 +76,11 @@ const NewWorkerRunSchema = Type.Object({
   kind: Type.Literal("new"),
   taskIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { minItems: 1, maxItems: MAX_WORKER_TASK_IDS }),
   guidance: Type.Optional(Type.String({ minLength: 1, maxLength: 12_000 })),
-  route: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
+  route: Type.Optional(Type.String({
+    minLength: 1,
+    maxLength: 512,
+    description: "Override the configured default provider/model/thinking route for this new worker."
+  })),
   completionDelivery: Type.Optional(CompletionDeliverySchema),
   initialRepos: Type.Optional(Type.Array(InitialRepoSchema, { maxItems: 16 }))
 }, { additionalProperties: false });
@@ -234,6 +240,7 @@ type WorkerExtensionDependencies = {
   roots: WorkerRoots;
   now(): Date;
   random(): string;
+  pinRepositories(requested: readonly { source: string; revision?: string }[], trustedStateRoot: string): InitialRepositoryPin[];
   planContainer?(record: WorkerRecord, runId: string, nonce: string): WorkerContainerReference;
   parkContainer?(container: WorkerContainerReference): void;
   removeContainer(container: WorkerContainerReference): void;
@@ -279,14 +286,17 @@ export function registerWorkerExtension(
   });
 
   api.registerCommand("worker:list", {
-    description: "List managed workers owned by the current chat with concise status, route, task, and run identity",
+    description: "List active managed workers owned by the current chat; pass --all to include settled workers",
     handler: async (args, context) => {
-      if (args.trim() !== "") {
-        context.ui.notify("Usage: /worker:list", "info");
+      const option = args.trim();
+      if (option !== "" && option !== "--all") {
+        context.ui.notify("Usage: /worker:list [--all]", "info");
         return;
       }
       const records = listParentWorkerRecords(dependencies.roots, context);
-      context.ui.notify(formatWorkerList(records), "info");
+      const showAll = option === "--all";
+      const selected = showAll ? records : records.filter(isActiveWorkerRecord);
+      context.ui.notify(formatWorkerList(selected, { showAll, totalCount: records.length }), "info");
     }
   });
 
@@ -408,7 +418,14 @@ export function registerWorkerExtension(
         }
         const workers = records.map(workerControlSummary);
         return {
-          content: [{ type: "text", text: workers.length > 0 ? records.map(formatWorkerRecord).join("\n\n") : "No managed workers belong to this parent session." }],
+          content: [{
+            type: "text",
+            text: workers.length > 0
+              ? params.workerId
+                ? formatWorkerRecord(records[0]!)
+                : formatWorkerList(records, { showAll: true, totalCount: records.length })
+              : "No managed workers belong to this parent session."
+          }],
           details: { action: "status", workers }
         };
       }
@@ -471,10 +488,10 @@ export function registerWorkerExtension(
   api.registerTool(defineTool({
     name: "worker_run",
     label: "Worker Run",
-    description: "Start one or more durable engineering workers or resume exact existing workers. New workers receive stable worker/run/job/session/workspace/task identities immediately, then fork the completed parent session after the current turn is durable. Resume always reuses the exact recorded worker session, workspace, provider, model, and thinking route. Worker processes run asynchronously through the shared async-shell job machinery and return typed semantic handoffs when settled.",
+    description: "Start one or more durable engineering workers or resume exact existing workers. New workers use the configured worker-settings.json default route unless the caller supplies route, receive stable worker/run/job/session/workspace/task identities immediately, then fork the completed parent session after the current turn is durable. Resume always reuses the exact recorded worker session, workspace, provider, model, and thinking route. Worker processes run asynchronously through the shared async-shell job machinery and return typed semantic handoffs when settled.",
     promptSnippet: "Start or resume durable context-rich workers with runs:[...]; returns stable queued receipts immediately and typed asynchronous completion handoffs later.",
     promptGuidelines: [
-      "worker_run use: Use worker_run for substantive engineering that benefits from an independent durable agent session and private workspace; use kind=new with assigned Beads and kind=resume for the exact same worker after feedback or a checkpoint.",
+      "worker_run use: Use worker_run for substantive engineering that benefits from an independent durable agent session and private workspace; use kind=new with assigned Beads and kind=resume for the exact same worker after feedback or a checkpoint. New workers use the worker-settings.json default route unless route explicitly overrides it.",
       inputJsonSchemaGuideline("worker_run", WorkerRunParams),
       outputJsonSchemaGuideline("worker_run", RetainedToolOutputSchemas.worker_run),
       "worker_run constraints: The parent owns grounding, task acceptance, integration, and promotion. A new worker forks the completed current parent turn; a resume cannot change session/workspace/provider/model. Receipts are immediate, process exit is not semantic completion, and cancellation must settle all shell jobs owned by the worker. Only result content is provider-visible; details are internal."
@@ -817,28 +834,30 @@ function prepareNewWorker(
     throw new Error(`Generated worker identity already exists: ${workerId}.`);
   }
   provisionWorkerPaths(paths);
-  const record: WorkerRecord = {
-    version: WORKER_RECORD_VERSION,
-    workerId,
-    sessionId,
-    parentSessionFile: plan.parentSessionFile,
-    workspaceRoot: paths.workspaceRoot,
-    taskIds: plan.taskIds,
-    route: plan.route,
-    initialRepositories: plan.input.initialRepos?.length
-      ? pinInitialRepositories(plan.input.initialRepos, path.join(paths.stateDir, "repository-inspection"))
-      : undefined,
-    status: "queued",
-    activeRun: {
-      runId,
-      jobId,
-      status: "queued",
-      completionDelivery: resolveCompletionDelivery(plan.input.completionDelivery)
-    },
-    updatedAt: now.toISOString()
-  };
-  acquireWorkerRunLease(paths, record.workerId, runId, now);
+  let leaseAcquired = false;
   try {
+    const record: WorkerRecord = {
+      version: WORKER_RECORD_VERSION,
+      workerId,
+      sessionId,
+      parentSessionFile: plan.parentSessionFile,
+      workspaceRoot: paths.workspaceRoot,
+      taskIds: plan.taskIds,
+      route: plan.route,
+      initialRepositories: plan.input.initialRepos?.length
+        ? dependencies.pinRepositories(plan.input.initialRepos, path.join(paths.stateDir, "repository-inspection"))
+        : undefined,
+      status: "queued",
+      activeRun: {
+        runId,
+        jobId,
+        status: "queued",
+        completionDelivery: resolveCompletionDelivery(plan.input.completionDelivery)
+      },
+      updatedAt: now.toISOString()
+    };
+    acquireWorkerRunLease(paths, record.workerId, runId, now);
+    leaseAcquired = true;
     writeWorkerRecord(paths.recordFile, record);
     const runDir = path.join(paths.stateDir, "runs", runId);
     const resultFile = path.join(runDir, "result.json");
@@ -855,13 +874,16 @@ function prepareNewWorker(
       processNonce: randomUUID(),
       kind: "new"
     });
+    return receipt(record);
   } catch (error) {
-    releaseWorkerLease(paths.leaseFile, record.workerId, runId);
+    pending.delete(runId);
+    if (leaseAcquired && existsSync(paths.leaseFile)) {
+      releaseWorkerLease(paths.leaseFile, workerId, runId);
+    }
     rmSync(paths.workspaceRoot, { recursive: true, force: true });
     rmSync(paths.stateDir, { recursive: true, force: true });
     throw error;
   }
-  return receipt(record);
 }
 
 function prepareResumedWorker(
@@ -2052,15 +2074,15 @@ function assertWorkerParentSession(record: WorkerRecord, context: ExtensionConte
   }
 }
 
-function resolveWorkerRoute(requested: string | undefined, context: ExtensionContext): WorkerRoute {
+export function resolveWorkerRoute(requested: string | undefined, context: ExtensionContext): WorkerRoute {
   const fallbackThinkingLevel = (context.thinkingLevel ?? "xhigh") as ThinkingLevel;
+  const route = requested?.trim() || readWorkerSettings().defaultRoute;
   const resolved = resolveExtensionModel({
     registry: context.modelRegistry,
-    requested,
-    currentModel: requested ? undefined : context.model,
+    requested: route,
     fallbackThinkingLevel,
     label: "Worker",
-    noModelMessage: "No worker model is selected. Pass route or select a model."
+    noModelMessage: "No worker route is configured. Set worker-settings.json defaultRoute or pass route."
   });
   return {
     provider: resolved.model.provider,
@@ -2219,9 +2241,10 @@ function appendWorkerControlDetails(lines: string[], details: WorkerControlDetai
       if (details.handoff) lines.push(`  ${details.handoff.handoff.state}: ${truncateOneLine(details.handoff.handoff.summary, 160)}`);
       if (details.repositories) {
         appendBoundedWorkerRows(lines, details.repositories.candidates.map((candidate) =>
-          `${shortWorkerId(candidate.candidateId)} · ${truncateOneLine(candidate.workspaceRepo, 100)} · ${candidate.foldable ? "foldable" : candidate.dirty ? "dirty" : "not foldable"}${candidate.reported ? "" : " · unreported"}`
+          `${shortWorkerId(candidate.candidateId)} · ${truncateOneLine(candidate.workspaceRepo, 100)} · ${candidate.foldable ? "foldable" : candidate.committedChanged ? "committed, blocked" : "no committed delta"}${candidate.dirty ? " · dirty" : " · clean"}${candidate.reported ? "" : " · unreported"}`
         ));
-        if (details.repositories.discrepancies.length > 0) lines.push(`  ${details.repositories.discrepancies.length} repository ${details.repositories.discrepancies.length === 1 ? "discrepancy" : "discrepancies"}`);
+        if (details.repositories.reportedIssues.length > 0) lines.push(`  ${details.repositories.reportedIssues.length} reported repository ${details.repositories.reportedIssues.length === 1 ? "issue" : "issues"}`);
+        if (!details.repositories.scanCoverage.complete) lines.push(`  scan incomplete: ${details.repositories.scanCoverage.limitations.join(", ")}`);
       }
       if (details.repositoryError) lines.push(`  repository error: ${truncateOneLine(details.repositoryError, 160)}`);
       return;
@@ -2365,7 +2388,11 @@ function workerControlSummary(record: WorkerRecord): WorkerControlSummary {
       repositoryInventory: record.lastRun.repositoryInventory ? {
         ...record.lastRun.repositoryInventory,
         candidates: record.lastRun.repositoryInventory.candidates.map((candidate) => ({ ...candidate, policyIssues: [...candidate.policyIssues] })),
-        discrepancies: record.lastRun.repositoryInventory.discrepancies.map((item) => ({ ...item }))
+        reportedIssues: record.lastRun.repositoryInventory.reportedIssues.map((item) => ({ ...item })),
+        scanCoverage: {
+          complete: record.lastRun.repositoryInventory.scanCoverage.complete,
+          limitations: [...record.lastRun.repositoryInventory.scanCoverage.limitations]
+        }
       } : undefined,
       repositoryError: record.lastRun.repositoryError
     } : undefined,
@@ -2399,28 +2426,38 @@ function formatWorkerControlResult(record: WorkerRecord, handoff: AcceptedWorker
 function formatRepositoryInventorySummary(summary: RepositoryInventorySummary | undefined): string[] {
   if (!summary) return [];
   const candidates = summary.candidates.slice(0, 8).map((candidate) =>
-    `candidate: ${candidate.candidateId} · ${candidate.workspaceRepo} · ${candidate.foldable ? "foldable" : candidate.dirty ? "dirty" : "not foldable"}${candidate.reported ? " · reported" : " · unreported"}${candidate.policyIssues.length > 0 ? ` · ${candidate.policyIssues.slice(0, 3).join(",")}` : ""}`
+    `candidate: ${candidate.candidateId} · ${truncateOneLine(candidate.workspaceRepo, 120)} · ${candidate.foldable ? "foldable" : candidate.committedChanged ? "committed, blocked" : "no committed delta"}${candidate.dirty ? " · dirty" : " · clean"}${candidate.reported ? " · reported" : " · unreported"}${candidate.policyIssues.length > 0 ? ` · ${candidate.policyIssues.slice(0, 3).join(",")}` : ""}`
   );
-  const discrepancies = summary.discrepancies.slice(0, 8).map((item) =>
-    `repository_discrepancy: ${item.kind} · ${item.workspaceRepo}`
+  const reportedIssues = summary.reportedIssues.map((item) =>
+    `reported_repository_issue: ${item.kind} · ${truncateOneLine(item.workspaceRepo, 120)}`
   );
   return [
-    `repositories: ${summary.candidateCount} candidates · ${summary.foldableCount} foldable · ${summary.discrepancyCount} discrepancies`,
+    `repositories: ${summary.candidateCount} ${summary.candidateCount === 1 ? "candidate" : "candidates"} · ${summary.foldableCount} foldable · ${summary.reportedIssueCount} reported path issues · scan ${summary.scanCoverage.complete ? "complete" : `incomplete (${summary.scanCoverage.limitations.join(",")})`}`,
     ...candidates,
     summary.candidates.length > candidates.length ? `repository_candidates_omitted: ${summary.candidates.length - candidates.length}` : undefined,
-    ...discrepancies,
-    summary.discrepancies.length > discrepancies.length ? `repository_discrepancies_omitted: ${summary.discrepancies.length - discrepancies.length}` : undefined,
+    ...reportedIssues,
     `repository_inventory: ${summary.inventoryFile}`
   ].filter((line): line is string => line !== undefined);
 }
 
-function formatWorkerList(records: WorkerRecord[]): string {
-  if (records.length === 0) return "No managed workers belong to this chat.";
+function isActiveWorkerRecord(record: WorkerRecord): boolean {
+  return record.status === "queued" || record.status === "running";
+}
+
+function formatWorkerList(
+  records: WorkerRecord[],
+  options: { showAll: boolean; totalCount: number }
+): string {
+  if (records.length === 0) {
+    if (options.totalCount === 0) return "No managed workers belong to this chat.";
+    return `No active managed workers belong to this chat. Use /worker:list --all to include ${options.totalCount} settled ${options.totalCount === 1 ? "worker" : "workers"}.`;
+  }
   const states = formatWorkerStateCounts(countWorkerStates(records.map((record) => record.status)));
   const visibleRecords = records.slice(0, 100);
   const hidden = records.length - visibleRecords.length;
+  const scope = options.showAll ? "managed" : "active managed";
   return [
-    `${records.length} managed ${records.length === 1 ? "worker" : "workers"} in this chat · ${states}`,
+    `${records.length} ${scope} ${records.length === 1 ? "worker" : "workers"} in this chat · ${states}`,
     ...visibleRecords.map((record) => {
       const run = record.activeRun
         ? `active ${record.activeRun.status} · ${record.activeRun.runId}`
@@ -2430,6 +2467,9 @@ function formatWorkerList(records: WorkerRecord[]): string {
       return `- ${record.workerId} · ${record.route.provider}/${record.route.model}:${record.route.thinkingLevel} · ${formatWorkerTasks(record.taskIds)} · ${run}`;
     }),
     hidden > 0 ? `+${hidden} more workers; use /worker:status <worker-id> for any known worker.` : undefined,
+    !options.showAll && options.totalCount > records.length
+      ? `Use /worker:list --all to include ${options.totalCount - records.length} settled ${options.totalCount - records.length === 1 ? "worker" : "workers"}.`
+      : undefined,
     "Use /worker:status <worker-id> for full details."
   ].filter((line): line is string => line !== undefined).join("\n");
 }
@@ -2471,6 +2511,7 @@ function defaultDependencies(): WorkerExtensionDependencies {
     roots: defaultWorkerRoots(),
     now: () => new Date(),
     random: () => randomUUID(),
+    pinRepositories: (requested, trustedStateRoot) => pinInitialRepositories(requested, trustedStateRoot),
     planContainer: (record, runId, nonce) => planWorkerContainer({
       workerId: record.workerId,
       runId,

@@ -10,7 +10,7 @@ Parent surface:
 
 - `worker_run({ runs: [...] })`
 - `worker_control({ action: "status" | "result" | "cancel" | "discard", ... })`
-- `/worker:list`
+- `/worker:list [--all]`
 - `/worker:status <worker-id>`
 - `/worker:view <worker-id> [--stream both|stdout|stderr] [--tail 1..500] [--follow]`
 - `/worker:ack <worker-id>`
@@ -24,7 +24,7 @@ Worker-only RPC surface:
 - `worker_task_update`
 - `shell_start`, `shell_status`, `shell_read`, `shell_cancel`
 
-`/worker:list` is provider-free and shows the total count plus up to 100 concise identities, states, routes, assigned tasks, and active/last runs for workers owned by the exact current chat; if more exist, it reports the omitted count instead of failing. `/worker:status <worker-id>` shows the full canonical record for one listed worker.
+`/worker:list` is provider-free and shows up to 100 active (`queued` or `running`) workers owned by the exact current chat. `/worker:list --all` also includes handed-off, failed, and cancelled workers. Both views report their exact selected count and any omitted rows instead of failing. `/worker:status <worker-id>` shows the full canonical record for one known worker.
 
 The parent owns grounding, assignment acceptance, review, integration, promotion, and task closure.
 
@@ -52,7 +52,7 @@ worker_run({
 })
 ```
 
-`runs` accepts 1–8 entries. One durable worker may have at most 32 unique assigned task IDs across its initial run and all resumptions. New workers use the selected parent route unless `route` is explicit. Resume cannot change the worker session, workspace, provider, model, or thinking level. `completionDelivery` defaults to `steer`: use `steer` to get results as soon as they are ready, and `followUp` for lower-priority tasks that should be investigated after other work is finished.
+`runs` accepts 1–8 entries. One durable worker may have at most 32 unique assigned task IDs across its initial run and all resumptions. New workers use `defaultRoute` from `worker-settings.json` unless `route` is explicit. The resolved provider, model, and thinking level are returned in the receipt and every status/result surface. Resume cannot change the worker session, workspace, provider, model, or thinking level. `completionDelivery` defaults to `steer`: use `steer` to get results as soon as they are ready, and `followUp` for lower-priority tasks that should be investigated after other work is finished.
 
 ```ts
 worker_control({
@@ -73,10 +73,10 @@ worker_control({
 5. The trusted macOS host writes its process marker, verifies an exact run/nonce/parent-PID authorization file, and only then starts Pi RPC with an explicit session file/directory, fixed model route, no built-in tools, no discovered extensions, skills, prompts, themes, or context files, and project trust forced off. Recovery revokes authorization before failed-run cleanup, fencing a host delayed before marker creation. Host-job completion remains pending until the original host process group, including its RPC descendant, has settled.
 6. Pi stays alive through asynchronous shell completions and subsequent model turns until `worker_handoff` writes one accepted result and a later RPC `agent_settled` proves the handoff turn quiescent.
 7. The host writes a separate trusted settlement marker only after rechecking exact session identity and quiescence. The parent accepts recovery only when both the typed handoff and matching settlement marker exist.
-8. After trusted handoff settlement, the host inventories bounded Git repositories below the private `repos` directory without following symlinks, reconciles actual repositories with worker-reported paths, and writes a mode-`0600`, hash-bound repository inventory under the run state directory. Clean committed repositories with a verified base and supported Git policy become foldable candidates; dirty, missing-base, unsupported, unreported, nested, missing, and symlinked cases remain visible but fail closed. The audited Git boundary uses one absolute executable, fixed argv, scrubbed environment, no optional locks, disabled hooks/fsmonitor/credentials/signing/editors/pagers/replace objects, bounded output, and no fetch/push. Candidate IDs bind exact worker/run/path/base/head/tree facts and change if those identities move.
+8. After trusted handoff settlement, the host inventories bounded physical Git repositories below the private `repos` directory without following symlinks and writes a mode-`0600`, hash-bound repository inventory under the run state directory. Each repository candidate records reported/unreported state, exact base/head/tree identities, whether committed head differs from its pinned base, one aggregate dirty flag, foldability, and bounded policy issues; it does not enumerate or count changed files. Worker-reported paths that are missing or not repositories are separate bounded issues. Scan coverage is one explicit complete/incomplete record with bounded limitation kinds rather than per-path scan noise. Host discovery is authoritative, so an otherwise valid unreported or nested repository remains eligible. A verified committed delta whose head descends from its pinned base and whose Git policy is supported is foldable even when the workspace is dirty; the parent inspects that aggregate dirty state later to decide whether uncommitted work is intentional or needs worker correction. Missing-base, no-committed-delta, unrelated-history, and unsupported-policy cases fail closed. The audited Git boundary uses one absolute executable, fixed argv, scrubbed environment, no optional locks, disabled hooks/fsmonitor/credentials/signing/editors/pagers/replace objects, bounded output, and no fetch/push. Candidate IDs bind exact worker/run/path/base/head/tree facts and change if those identities move.
 9. Host-side shell helpers settle normal command groups. A successful typed handoff parks the verified container in a stopped state for the same worker's next run; failed runs, cancellation, uncertain/crashed-adapter recovery, and discard extend exact stop/kill/wait through verified removal as the authoritative cleanup boundary. Completion delivery remains pending until Pi emits the exact same-session custom `message_end` receipt for the worker/run delivery ID. Reload never scans or automatically replays ambiguous history; model-facing `worker_control result` validates and observes the exact result, while user-facing `/worker:ack` explicitly resolves a separately reviewed pending completion.
 
-Durable state lives under `~/.local/share/agent/workers/<worker-id>/`; the private workspace lives under `~/.local/share/agent/workspaces/<worker-id>/` with `repos`, `scratch`, `cache`, `artifacts`, and `tmp` directories.
+Durable state lives under `~/.local/share/agent/workers/<worker-id>/`; the private workspace lives under `~/.local/share/agent/workspaces/<worker-id>/` with `repos`, `scratch`, `cache`, `artifacts`, and `tmp` directories. Workers must clone or create every Git repository below `repos/` and report it as `repos/<name>`; handoff rejects repository paths elsewhere so inventory scope cannot silently omit them.
 
 ## Confinement and authority
 
@@ -109,8 +109,9 @@ An exclusive per-worker run lease prevents concurrent resumes. Cancellation reco
 
 - Requires Node 22.19 or newer, macOS, a running Docker Desktop/Engine with the Docker CLI on trusted parent `PATH`, and local arm64 image `alpine@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce`. Pull it explicitly with `docker pull --platform linux/arm64 alpine@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce` before starting workers; launch fails loudly when it is absent.
 - Requires `bd` on trusted parent `PATH` and an ambient central `personal` route for task updates.
+- Requires `worker-settings.json` with a valid `defaultRoute` such as `provider/model:thinking`. The profile or package config supplies the default; `worker_run.runs[].route` remains the per-new-worker override.
 - This vertical slice bounds each `worker_run` batch to eight but does not yet implement the later configurable cross-run concurrency scheduler or its 1–4 benchmark.
-- This slice derives durable repository candidates and discrepancy records only. `worker_fold_prepare`, review/validation binding, and local exact-ref promotion remain separate later capabilities; neither a handoff nor a candidate authorizes integration.
+- This slice derives durable repository-level candidates, worker-reported path issues, and bounded scan coverage only. `worker_fold_prepare`, review/validation binding, and local exact-ref promotion remain separate later capabilities; neither a handoff nor a candidate authorizes integration.
 - Publication, installation, provider trials, and promotion remain normal parent-owned reviewed operations.
 - The exact stopped container persists across successful handoffs and restarts for resume, so container-root package changes and workspace caches remain available to that worker without allowing background processes to survive between runs. Failed/cancelled/crash-recovered runs and discard remove it; a later permitted resume creates a fresh replacement.
 - The pinned Alpine bootstrap installs a broad Node/Python/build/Git shell toolchain at run start. ARM64 Linux cannot run Xcode, Darwin binaries, or macOS-only validation; those remain parent-owned checks.

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -12,9 +12,10 @@ import { RetainedToolOutputSchemas } from "../extensions/_shared/tool-output.js"
 import { MAX_WORKER_TASK_IDS } from "../extensions/_shared/worker-contract.js";
 import { startManagedAsyncJob, type JobMeta } from "../extensions/async-shell/index.js";
 import type { WorkerContainerReference } from "../extensions/_shared/worker-container.js";
-import { registerWorkerExtension } from "../extensions/worker/index.js";
+import { registerWorkerExtension, resolveWorkerRoute } from "../extensions/worker/index.js";
 import { persistRepositoryInventory } from "../extensions/worker/repositories.js";
 import { forkWorkerSession } from "../extensions/worker/session.js";
+import { normalizeWorkerSettings } from "../extensions/worker/settings.js";
 import {
   WORKER_RECORD_VERSION,
   acquireWorkerLease,
@@ -53,10 +54,10 @@ function fakeApi(): FakeApi {
   } as unknown as FakeApi;
 }
 
-function fakeModel(): Model<Api> {
+function fakeModel(id = "gpt-test"): Model<Api> {
   return {
-    id: "gpt-test",
-    name: "gpt-test",
+    id,
+    name: id,
     api: "openai-responses",
     provider: "openai-codex",
     baseUrl: "https://example.invalid",
@@ -71,6 +72,7 @@ function fakeModel(): Model<Api> {
 
 function parentContext(cwd: string, sessionFile: string, entries: unknown[] = []): ExtensionContext {
   const model = fakeModel();
+  const defaultWorkerModel = fakeModel("gpt-5.6-sol");
   return {
     cwd,
     model,
@@ -82,7 +84,7 @@ function parentContext(cwd: string, sessionFile: string, entries: unknown[] = []
     },
     modelRegistry: {
       hasConfiguredAuth: () => true,
-      getAll: () => [model]
+      getAll: () => [model, defaultWorkerModel]
     },
     isIdle: () => true,
     hasPendingMessages: () => false,
@@ -91,7 +93,8 @@ function parentContext(cwd: string, sessionFile: string, entries: unknown[] = []
 }
 
 async function withTempDir(run: (directory: string) => Promise<void>): Promise<void> {
-  const directory = await mkdtemp(path.join(tmpdir(), "pi-worker-tool-"));
+  const created = await mkdtemp(path.join(tmpdir(), "pi-worker-tool-"));
+  const directory = await realpath(created);
   try {
     await run(directory);
   } finally {
@@ -183,6 +186,31 @@ function completedJob(jobId: string, cwd: string): JobMeta {
   };
 }
 
+test("worker settings select a configured default while explicit routes override it", () => {
+  const context = parentContext("/tmp/parent", "/tmp/parent.jsonl");
+  assert.deepEqual(normalizeWorkerSettings({ defaultRoute: " openai-codex/gpt-5.6-sol:xhigh " }, "fixture"), {
+    defaultRoute: "openai-codex/gpt-5.6-sol:xhigh",
+    configSource: "fixture"
+  });
+  assert.throws(() => normalizeWorkerSettings({}, "fixture"), /defaultRoute/);
+  assert.throws(() => normalizeWorkerSettings({ defaultRoute: "openai-codex/gpt-5.6-sol:xhigh", extra: true }, "fixture"), /unsupported worker setting/);
+  assert.deepEqual(resolveWorkerRoute(undefined, context), {
+    provider: "openai-codex",
+    model: "gpt-5.6-sol",
+    thinkingLevel: "xhigh"
+  });
+  assert.deepEqual(resolveWorkerRoute("openai-codex/gpt-test:xhigh", context), {
+    provider: "openai-codex",
+    model: "gpt-test",
+    thinkingLevel: "xhigh"
+  });
+  const unavailableContext = parentContext("/tmp/parent", "/tmp/parent.jsonl") as ExtensionContext & {
+    modelRegistry: { hasConfiguredAuth(model: Model<Api>): boolean; getAll(): Model<Api>[] };
+  };
+  unavailableContext.modelRegistry.getAll = () => [fakeModel()];
+  assert.throws(() => resolveWorkerRoute(undefined, unavailableContext), /Worker model not found: openai-codex\/gpt-5\.6-sol/);
+});
+
 test("worker_run queues immediately, then forks the completed parent turn before launch", async () => {
   await withTempDir(async (directory) => {
     const parentCwd = path.join(directory, "parent");
@@ -261,6 +289,9 @@ test("worker_run queues immediately, then forks the completed parent turn before
     assert.equal(receipt.sessionFile, undefined);
     assert.equal(receipt.completionDelivery, "followUp");
     assert.equal(receipt.state, "queued");
+    assert.equal((receipt as unknown as { provider: string }).provider, "openai-codex");
+    assert.equal((receipt as unknown as { model: string }).model, "gpt-5.6-sol");
+    assert.equal((receipt as unknown as { thinkingLevel: string }).thinkingLevel, "xhigh");
     assert.equal(launches.length, 0, "launch waits for the parent turn to be durable");
     const candidateRepo = path.join(workerPaths(roots, receipt.workerId).reposDir, "project");
     execFileSync("git", ["clone", "-q", "--no-hardlinks", sourceRepo, candidateRepo]);
@@ -301,7 +332,7 @@ test("worker_run queues immediately, then forks the completed parent turn before
     assert.deepEqual(parkedContainer, plannedContainer, "successful handoff parks the exact worker container");
     assert.equal(api.messages.length, 1);
     assert.match(JSON.stringify(api.messages[0].message), /assignment_complete/);
-    assert.match(JSON.stringify(api.messages[0].message), /openai-codex\/gpt-test:xhigh/);
+    assert.match(JSON.stringify(api.messages[0].message), /openai-codex\/gpt-5\.6-sol:xhigh/);
     assert.deepEqual(api.messages[0].options, { triggerTurn: true, deliverAs: "followUp" });
     assert.equal(record.lastRun?.delivery, "pending");
     assert.equal(record.lastRun?.repositoryInventory?.candidateCount, 1);
@@ -454,6 +485,32 @@ test("worker_run removes a newly provisioned batch entry when a later generated 
         { kind: "new", taskIds: ["personal-second"] }
       ]
     } as never, undefined, undefined, context), /already exists/);
+    const paths = workerPaths(roots, "worker_20260910193000_11111111");
+    assert.equal(existsSync(paths.stateDir), false);
+    assert.equal(existsSync(paths.workspaceRoot), false);
+  });
+});
+
+test("worker_run removes newly provisioned paths when initial repository pinning fails", async () => {
+  await withTempDir(async (directory) => {
+    const parentCwd = path.join(directory, "parent");
+    const parentSessionFile = path.join(directory, "parent.jsonl");
+    await mkdir(parentCwd);
+    await writeFile(parentSessionFile, `${JSON.stringify({ type: "session", version: 3, id: "parent-session", timestamp: "2026-09-10T19:29:00.000Z", cwd: parentCwd })}\n`);
+    const context = parentContext(parentCwd, parentSessionFile);
+    const api = fakeApi();
+    const roots = { stateRoot: path.join(directory, "workers"), workspaceRoot: path.join(directory, "workspaces") };
+    registerWorkerExtension(api, {
+      roots,
+      now: () => new Date("2026-09-10T19:30:00.000Z"),
+      random: () => "11111111-1111-4111-8111-111111111111",
+      pinRepositories: () => { throw new Error("git executable unavailable"); }
+    });
+    const tool = api.tools.find((candidate) => candidate.name === "worker_run");
+    assert.ok(tool?.execute);
+    await assert.rejects(tool.execute("call-pin-failure", {
+      runs: [{ kind: "new", taskIds: ["personal-pin"], initialRepos: [{ source: "/tmp/source" }] }]
+    } as never, undefined, undefined, context), /git executable unavailable/);
     const paths = workerPaths(roots, "worker_20260910193000_11111111");
     assert.equal(existsSync(paths.stateDir), false);
     assert.equal(existsSync(paths.workspaceRoot), false);
@@ -1385,7 +1442,7 @@ test("worker_control lists exact-session workers and validates a typed result be
     const resultFile = path.join(paths.stateDir, "runs", runId, "result.json");
     await mkdir(path.dirname(resultFile), { recursive: true });
     const repositoryInventory = persistRepositoryInventory(path.join(path.dirname(resultFile), "repository-candidates.json"), {
-      version: 1,
+      version: 2,
       workerId,
       runId,
       workspaceRoot: paths.workspaceRoot,
@@ -1403,14 +1460,12 @@ test("worker_control lists exact-session workers and validates a typed result be
         headCommit: "c".repeat(40),
         headTree: "d".repeat(40),
         dirty: false,
-        changed: true,
+        committedChanged: true,
         foldable: true,
-        changedPaths: ["feature.ts"],
-        changedPathCount: 1,
-        changedPathsTruncated: false,
         policyIssues: []
       }],
-      discrepancies: []
+      reportedIssues: [],
+      scanCoverage: { complete: true, limitations: [] }
     });
     await writeFile(resultFile, `${JSON.stringify({
       version: 1,
@@ -1474,6 +1529,9 @@ test("worker_control lists exact-session workers and validates a typed result be
     assert.equal(statusDetails.action, "status");
     assert.deepEqual(statusDetails.workers.map((worker) => worker.workerId), [workerId]);
     assert.equal(statusDetails.workers[0]?.lastRun?.repositoryInventory?.candidateCount, 1);
+    assert.doesNotMatch(JSON.stringify(status.content), /repository_inventory|candidate_aaaaaaaa/);
+    const oneWorkerStatus = await control.execute("control-status-one", { action: "status", workerId } as never, undefined, undefined, context);
+    assert.match(JSON.stringify(oneWorkerStatus.content), /repository_inventory|candidate_aaaaaaaa/);
 
     const inventoryText = await readFile(repositoryInventory.inventoryFile, "utf8");
     await writeFile(repositoryInventory.inventoryFile, `${inventoryText} `);
@@ -1649,7 +1707,7 @@ test("worker:cancel removes a queued run before it can fork or launch", async ()
 });
 
 
-test("worker:list reports only workers owned by the current chat", async () => {
+test("worker:list defaults to active current-chat workers and --all includes settled workers", async () => {
   await withTempDir(async (directory) => {
     const parentCwd = path.join(directory, "parent");
     const parentSessionFile = path.join(directory, "parent.jsonl");
@@ -1712,14 +1770,19 @@ test("worker:list reports only workers owned by the current chat", async () => {
     assert.ok(list);
 
     await list.handler("", context);
-    assert.match(notifications.at(-1) ?? "", /2 managed workers in this chat · 1 running, 1 handed_off/);
+    assert.match(notifications.at(-1) ?? "", /1 active managed worker in this chat · 1 running/);
     assert.match(notifications.at(-1) ?? "", /worker_20260922150000_list0001/);
-    assert.match(notifications.at(-1) ?? "", /personal-beta, personal-gamma/);
-    assert.doesNotMatch(notifications.at(-1) ?? "", /foreign1|personal-foreign/);
+    assert.doesNotMatch(notifications.at(-1) ?? "", /personal-beta|personal-gamma|foreign1|personal-foreign/);
+    assert.match(notifications.at(-1) ?? "", /\/worker:list --all to include 1 settled worker/);
     assert.match(notifications.at(-1) ?? "", /\/worker:status <worker-id>/);
 
+    await list.handler("--all", context);
+    assert.match(notifications.at(-1) ?? "", /2 managed workers in this chat · 1 running, 1 handed_off/);
+    assert.match(notifications.at(-1) ?? "", /personal-beta, personal-gamma/);
+    assert.doesNotMatch(notifications.at(-1) ?? "", /foreign1|personal-foreign/);
+
     await list.handler("unexpected", context);
-    assert.equal(notifications.at(-1), "Usage: /worker:list");
+    assert.equal(notifications.at(-1), "Usage: /worker:list [--all]");
 
     const extraRecords = Array.from({ length: 99 }, (_, index): WorkerRecord => {
       const workerId = `worker_20260922150001_${String(index).padStart(8, "0")}`;
@@ -1741,10 +1804,18 @@ test("worker:list reports only workers owned by the current chat", async () => {
       writeWorkerRecord(paths.recordFile, record);
     }
     await list.handler("", context);
+    assert.match(notifications.at(-1) ?? "", /100 active managed workers in this chat/);
+    assert.doesNotMatch(notifications.at(-1) ?? "", /\+1 more workers/);
+    await list.handler("--all", context);
     assert.match(notifications.at(-1) ?? "", /101 managed workers in this chat/);
     assert.match(notifications.at(-1) ?? "", /\+1 more workers/);
 
-    await Promise.all([...records.slice(0, 2), ...extraRecords].map((record) => rm(workerPaths(roots, record.workerId).stateDir, { recursive: true, force: true })));
+    await Promise.all(extraRecords.map((record) => rm(workerPaths(roots, record.workerId).stateDir, { recursive: true, force: true })));
+    await rm(workerPaths(roots, records[0]!.workerId).stateDir, { recursive: true, force: true });
+    await list.handler("", context);
+    assert.equal(notifications.at(-1), "No active managed workers belong to this chat. Use /worker:list --all to include 1 settled worker.");
+
+    await rm(workerPaths(roots, records[1]!.workerId).stateDir, { recursive: true, force: true });
     await list.handler("", context);
     assert.equal(notifications.at(-1), "No managed workers belong to this chat.");
   });
@@ -1803,7 +1874,7 @@ test("worker_run and worker_control render compact lifecycle snippets", async ()
     const boundedStatus = renderWorkerToolResult(workerControl, { content: [], details: { action: "status", workers: manyWorkers } }, { expanded: true });
     assert.match(boundedStatus, /\+2 more/);
     assert.doesNotMatch(boundedStatus, /00000008/);
-    const controlResult = { content: [], details: { action: "result", workerId, runId: "run_a", jobId: "job_a", status: "handed_off", delivery: "delivered", completionDelivery: "steer", sessionId: "session_a", workspaceRoot: "/tmp/a", taskIds: ["personal-a"], route: baseWorker.route, acknowledgedDelivery: true, handoff: { version: 1, workerId, runId: "run_a", acceptedAt: "2026-09-22T14:00:00.000Z", handoff: { state: "assignment_complete", summary: "done", taskUpdates: [] } }, repositories: { version: 1, workerId, runId: "run_a", workspaceRoot: "/tmp/a", generatedAt: "2026-09-22T14:00:01.000Z", candidates: [{ candidateId: "candidate_aaaaaaaaaaaaaaaaaaaaaaaa", workerId, runId: "run_a", workspaceRepo: "repos/project", reported: true, purpose: "render", dependsOn: [], baseCommit: "a".repeat(40), baseTree: "b".repeat(40), headCommit: "c".repeat(40), headTree: "d".repeat(40), dirty: false, changed: true, foldable: true, changedPaths: ["feature.ts"], changedPathCount: 1, changedPathsTruncated: false, policyIssues: [] }], discrepancies: [] } } };
+    const controlResult = { content: [], details: { action: "result", workerId, runId: "run_a", jobId: "job_a", status: "handed_off", delivery: "delivered", completionDelivery: "steer", sessionId: "session_a", workspaceRoot: "/tmp/a", taskIds: ["personal-a"], route: baseWorker.route, acknowledgedDelivery: true, handoff: { version: 1, workerId, runId: "run_a", acceptedAt: "2026-09-22T14:00:00.000Z", handoff: { state: "assignment_complete", summary: "done", taskUpdates: [] } }, repositories: { version: 2, workerId, runId: "run_a", workspaceRoot: "/tmp/a", generatedAt: "2026-09-22T14:00:01.000Z", candidates: [{ candidateId: "candidate_aaaaaaaaaaaaaaaaaaaaaaaa", workerId, runId: "run_a", workspaceRepo: "repos/project", reported: true, purpose: "render", dependsOn: [], baseCommit: "a".repeat(40), baseTree: "b".repeat(40), headCommit: "c".repeat(40), headTree: "d".repeat(40), dirty: false, committedChanged: true, foldable: true, policyIssues: [] }], reportedIssues: [], scanCoverage: { complete: true, limitations: [] } } } };
     assert.match(renderWorkerToolResult(workerControl, controlResult), /⎿ result · handed_off · worker_202…41146f1 · assignment_complete · 1 candidate/);
     const expandedControlResult = renderWorkerToolResult(workerControl, controlResult, { expanded: true });
     assert.match(expandedControlResult, /run run_a · job job_a · delivered · steer · personal-a/);

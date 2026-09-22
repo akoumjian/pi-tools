@@ -17,7 +17,11 @@ export const WorkerHandoffStateSchema = Type.Union([
 ]);
 
 const WorkerRepositorySchema = Type.Object({
-  workspaceRepo: Type.String({ minLength: 1, maxLength: 1024 }),
+  workspaceRepo: Type.String({
+    minLength: 1,
+    maxLength: 1024,
+    description: "Workspace-relative repository path under repos/, normally repos/<name>."
+  }),
   purpose: Type.String({ minLength: 1, maxLength: 2000 }),
   dependsOn: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 16 }))
 }, { additionalProperties: false });

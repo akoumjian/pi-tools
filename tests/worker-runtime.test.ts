@@ -471,7 +471,8 @@ test("worker_handoff rejects unassigned tasks and workspace path escapes", async
     await withWorkerEnv(directory, async () => {
       const outside = `${directory}-outside`;
       await mkdir(outside, { recursive: true });
-      await symlink(outside, path.join(directory, "escape"));
+      await mkdir(path.join(directory, "repos"), { recursive: true });
+      await symlink(outside, path.join(directory, "repos", "escape"));
       try {
         const api = fakeApi();
         workerRuntimeExtension(api);
@@ -487,9 +488,23 @@ test("worker_handoff rejects unassigned tasks and workspace path escapes", async
         await assert.rejects(
           tool.execute("call-2", {
             ...handoff,
-            repositories: [{ workspaceRepo: "escape/repo", purpose: "outside" }]
+            repositories: [{ workspaceRepo: "repos/escape/repo", purpose: "outside" }]
           } as never, undefined, undefined, context(directory)),
           /resolves outside the workspace/
+        );
+        await assert.rejects(
+          tool.execute("call-3", {
+            ...handoff,
+            repositories: [{ workspaceRepo: ".", purpose: "workspace root" }]
+          } as never, undefined, undefined, context(directory)),
+          /workspace repos\/ directory/
+        );
+        await assert.rejects(
+          tool.execute("call-4", {
+            ...handoff,
+            repositories: [{ workspaceRepo: "project", purpose: "wrong directory" }]
+          } as never, undefined, undefined, context(directory)),
+          /workspace repos\/ directory/
         );
       } finally {
         await rm(outside, { recursive: true, force: true });

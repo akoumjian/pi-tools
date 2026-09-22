@@ -590,21 +590,27 @@ const RepositoryCandidateSummarySchema = Type.Object({
   workspaceRepo: Type.String({ minLength: 1, maxLength: 1024 }),
   reported: Type.Boolean(),
   dirty: Type.Boolean(),
-  changed: Type.Boolean(),
+  committedChanged: Type.Boolean(),
   foldable: Type.Boolean(),
   policyIssues: RepositoryPolicyIssuesSchema
 }, { additionalProperties: false });
 
-const RepositoryDiscrepancySchema = Type.Object({
-  kind: Type.Union([
-    Type.Literal("unreported_changed"),
-    Type.Literal("reported_missing"),
-    Type.Literal("reported_not_repository"),
-    Type.Literal("symlink_skipped"),
-    Type.Literal("scan_limit")
-  ]),
-  workspaceRepo: Type.String({ minLength: 1, maxLength: 1024 }),
-  detail: Type.String({ minLength: 1, maxLength: 512 })
+const ReportedRepositoryIssueSchema = Type.Object({
+  kind: Type.Union([Type.Literal("reported_missing"), Type.Literal("reported_not_repository")]),
+  workspaceRepo: Type.String({ minLength: 1, maxLength: 1024 })
+}, { additionalProperties: false });
+
+const RepositoryScanLimitationSchema = Type.Union([
+  Type.Literal("entry_limit"),
+  Type.Literal("repository_limit"),
+  Type.Literal("depth_limit"),
+  Type.Literal("path_limit"),
+  Type.Literal("unreadable_directory")
+]);
+
+const RepositoryScanCoverageSchema = Type.Object({
+  complete: Type.Boolean(),
+  limitations: Type.Array(RepositoryScanLimitationSchema, { maxItems: 5 })
 }, { additionalProperties: false });
 
 const RepositoryInventorySummarySchema = Type.Object({
@@ -612,9 +618,10 @@ const RepositoryInventorySummarySchema = Type.Object({
   inventorySha256: Type.String({ pattern: "^[0-9a-f]{64}$" }),
   candidateCount: Type.Integer({ minimum: 0, maximum: 32 }),
   foldableCount: Type.Integer({ minimum: 0, maximum: 32 }),
-  discrepancyCount: Type.Integer({ minimum: 0, maximum: 128 }),
+  reportedIssueCount: Type.Integer({ minimum: 0, maximum: 16 }),
   candidates: Type.Array(RepositoryCandidateSummarySchema, { maxItems: 32 }),
-  discrepancies: Type.Array(RepositoryDiscrepancySchema, { maxItems: 128 })
+  reportedIssues: Type.Array(ReportedRepositoryIssueSchema, { maxItems: 16 }),
+  scanCoverage: RepositoryScanCoverageSchema
 }, { additionalProperties: false });
 
 const RepositoryCandidateSchema = Type.Object({
@@ -631,22 +638,20 @@ const RepositoryCandidateSchema = Type.Object({
   headCommit: Type.Optional(Type.String({ pattern: "^[0-9a-f]{40,64}$" })),
   headTree: Type.Optional(Type.String({ pattern: "^[0-9a-f]{40,64}$" })),
   dirty: Type.Boolean(),
-  changed: Type.Boolean(),
+  committedChanged: Type.Boolean(),
   foldable: Type.Boolean(),
-  changedPaths: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 128 }),
-  changedPathCount: Type.Integer({ minimum: 0 }),
-  changedPathsTruncated: Type.Boolean(),
   policyIssues: RepositoryPolicyIssuesSchema
 }, { additionalProperties: false });
 
 const RepositoryInventorySchema = Type.Object({
-  version: Type.Literal(1),
+  version: Type.Literal(2),
   workerId: Type.String({ minLength: 1 }),
   runId: Type.String({ minLength: 1 }),
   workspaceRoot: Type.String({ minLength: 1 }),
   generatedAt: Type.String({ minLength: 1 }),
   candidates: Type.Array(RepositoryCandidateSchema, { maxItems: 32 }),
-  discrepancies: Type.Array(RepositoryDiscrepancySchema, { maxItems: 128 })
+  reportedIssues: Type.Array(ReportedRepositoryIssueSchema, { maxItems: 16 }),
+  scanCoverage: RepositoryScanCoverageSchema
 }, { additionalProperties: false });
 
 const WorkerControlSummarySchema = Type.Object({

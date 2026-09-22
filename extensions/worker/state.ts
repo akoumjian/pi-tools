@@ -6,7 +6,7 @@ import { isAsyncJobProcessAlive } from "../_shared/async-job.js";
 import { isWorkerId } from "../_shared/worker-id.js";
 import type { CompletionDelivery } from "../_shared/completion-delivery.js";
 import type { WorkerContainerReference } from "../_shared/worker-container.js";
-import type { InitialRepositoryPin, RepositoryInventorySummary } from "./repositories.js";
+import { isRepositoryInventorySummary, type InitialRepositoryPin, type RepositoryInventorySummary } from "./repositories.js";
 
 export const WORKER_RECORD_VERSION = 1;
 
@@ -263,6 +263,7 @@ export function releaseWorkerLease(leaseFile: string, workerId: string, runId: s
 
 export function writeWorkerRecord(recordFile: string, record: WorkerRecord): void {
   const target = path.resolve(recordFile);
+  assertValidWorkerRecord(record, target);
   mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
   const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
   writeFileSync(temporary, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
@@ -272,8 +273,14 @@ export function writeWorkerRecord(recordFile: string, record: WorkerRecord): voi
 export function readWorkerRecord(recordFile: string): WorkerRecord {
   const target = path.resolve(recordFile);
   if (!existsSync(target)) throw new Error(`Unknown worker record: ${target}`);
-  const value = JSON.parse(readFileSync(target, "utf8")) as Partial<WorkerRecord>;
+  const value: unknown = JSON.parse(readFileSync(target, "utf8"));
+  assertValidWorkerRecord(value, target);
+  return value;
+}
+
+function assertValidWorkerRecord(value: unknown, target: string): asserts value is WorkerRecord {
   if (
+    !isRecord(value) ||
     value.version !== WORKER_RECORD_VERSION ||
     typeof value.workerId !== "string" ||
     typeof value.sessionId !== "string" ||
@@ -282,12 +289,11 @@ export function readWorkerRecord(recordFile: string): WorkerRecord {
     !Array.isArray(value.taskIds) ||
     !value.route ||
     !validInitialRepositories(value.initialRepositories) ||
-    !validRepositoryInventorySummary(value.lastRun?.repositoryInventory, target, value.lastRun?.runId) ||
-    (value.lastRun?.repositoryError !== undefined && (typeof value.lastRun.repositoryError !== "string" || value.lastRun.repositoryError.length > 512))
+    !validRepositoryInventorySummary(isRecord(value.lastRun) ? value.lastRun.repositoryInventory : undefined, target, isRecord(value.lastRun) ? value.lastRun.runId : undefined) ||
+    (isRecord(value.lastRun) && value.lastRun.repositoryError !== undefined && (typeof value.lastRun.repositoryError !== "string" || value.lastRun.repositoryError.length > 512))
   ) {
     throw new Error(`Invalid worker record: ${target}`);
   }
-  return value as WorkerRecord;
 }
 
 function validInitialRepositories(value: unknown): boolean {
@@ -308,27 +314,9 @@ function validInitialRepositories(value: unknown): boolean {
 
 function validRepositoryInventorySummary(value: unknown, recordFile: string, runId: unknown): boolean {
   if (value === undefined) return true;
-  if (!isRecord(value) || typeof runId !== "string") return false;
+  if (typeof runId !== "string") return false;
   const expected = path.join(path.dirname(recordFile), "runs", runId, "repository-candidates.json");
-  if (typeof value.inventoryFile !== "string" || path.resolve(value.inventoryFile) !== expected) return false;
-  if (typeof value.inventorySha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.inventorySha256)) return false;
-  if (!Array.isArray(value.candidates) || value.candidates.length > 32 || !Array.isArray(value.discrepancies) || value.discrepancies.length > 128) return false;
-  if (value.candidateCount !== value.candidates.length || value.discrepancyCount !== value.discrepancies.length) return false;
-  const foldableCount = value.candidates.filter((candidate) => isRecord(candidate) && candidate.foldable === true).length;
-  if (value.foldableCount !== foldableCount) return false;
-  if (!value.candidates.every((candidate) =>
-    isRecord(candidate) &&
-    typeof candidate.candidateId === "string" && /^candidate_[0-9a-f]{24}$/.test(candidate.candidateId) &&
-    typeof candidate.workspaceRepo === "string" && candidate.workspaceRepo.length > 0 && candidate.workspaceRepo.length <= 1024 &&
-    typeof candidate.reported === "boolean" && typeof candidate.dirty === "boolean" && typeof candidate.changed === "boolean" && typeof candidate.foldable === "boolean" &&
-    Array.isArray(candidate.policyIssues) && candidate.policyIssues.length <= 64 && candidate.policyIssues.every((issue) => typeof issue === "string" && issue.length <= 160)
-  )) return false;
-  return value.discrepancies.every((item) =>
-    isRecord(item) &&
-    ["unreported_changed", "reported_missing", "reported_not_repository", "symlink_skipped", "scan_limit"].includes(String(item.kind)) &&
-    typeof item.workspaceRepo === "string" && item.workspaceRepo.length > 0 && item.workspaceRepo.length <= 1024 &&
-    typeof item.detail === "string" && item.detail.length > 0 && item.detail.length <= 512
-  );
+  return isRepositoryInventorySummary(value, expected);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
