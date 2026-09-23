@@ -1825,8 +1825,9 @@ function rollbackDeferredResolutionLaunch(pending: PendingWorkerRun, dependencie
       integration: { ...integration, phase: "analysis", decisionsFile: undefined, workspaceDecisionsFile: undefined, decisionsSha256: undefined, resolutionRunId: undefined },
       updatedAt: dependencies.now().toISOString()
     };
-    writeWorkerRecord(pending.recordFile, restored);
+    // Release first: a crash here leaves an adoptable queued run, never a completed record with a resolution-run lease.
     releaseWorkerLease(pending.paths.leaseFile, restored.workerId, pending.runId);
+    writeWorkerRecord(pending.recordFile, restored);
     return restored;
   });
 }
@@ -1848,8 +1849,9 @@ function rollbackQueuedResolutionRecovery(paths: WorkerPaths, workerId: string, 
       integration: { ...integration, phase: "analysis", decisionsFile: undefined, workspaceDecisionsFile: undefined, decisionsSha256: undefined, resolutionRunId: undefined },
       updatedAt: dependencies.now().toISOString()
     };
-    writeWorkerRecord(paths.recordFile, restored);
+    // Preserve the same crash invariant during restart-driven rollback.
     releaseWorkerLease(paths.leaseFile, workerId, runId);
+    writeWorkerRecord(paths.recordFile, restored);
     return restored;
   });
 }

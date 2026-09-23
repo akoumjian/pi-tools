@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import {
   closeSync,
+  constants,
   existsSync,
   fstatSync,
   lstatSync,
@@ -26,6 +27,7 @@ const MAX_REPOSITORIES = 32;
 const MAX_SCAN_ENTRIES = 20_000;
 const MAX_SCAN_DEPTH = 12;
 const MAX_GIT_OUTPUT_BYTES = 1024 * 1024;
+const MAX_TREE_LISTING_BYTES = 64 * 1024 * 1024;
 const MAX_PATH_BYTES = 1024;
 const OID_PATTERN = /^[0-9a-f]{40,64}$/;
 
@@ -389,7 +391,7 @@ function inspectRepository(
   };
 }
 
-export function repositoryPolicyIssues(repoPath: string, runner: GitRunner): string[] {
+export function repositoryPolicyIssues(repoPath: string, runner: GitRunner, exactCommit?: string): string[] {
   const issues: string[] = [];
   const gitMarker = path.join(repoPath, ".git");
   const marker = lstatSync(gitMarker);
@@ -433,8 +435,9 @@ export function repositoryPolicyIssues(repoPath: string, runner: GitRunner): str
     const attributes = parseNulPaths(gitBuffer(runner, repoPath, ["ls-files", "--cached", "--others", "-z", "--", ".gitattributes", "**/.gitattributes"]));
     if (attributes.length > 0) return ["repository_attributes"];
     if (hasIndexVisibilityFlags(runner, repoPath)) return ["index_visibility_flags"];
-    const gitlinks = gitText(runner, repoPath, ["ls-tree", "-r", "HEAD"]);
-    if (gitlinks.split("\n").some((line) => line.startsWith("160000 "))) return ["gitlinks_or_submodules"];
+    const policyCommit = exactCommit ?? gitText(runner, repoPath, ["rev-parse", "--verify", "HEAD^{commit}"]).trim();
+    const treeIssues = repositoryTreePolicyIssues(repoPath, policyCommit, runner);
+    if (treeIssues.length > 0) return treeIssues;
     const replacements = gitText(runner, repoPath, ["for-each-ref", "--format=%(refname)", "refs/replace"]);
     if (replacements.trim()) return ["replace_refs"];
   } catch (error) {
@@ -452,32 +455,58 @@ export function repositoryDirty(repoPath: string, runner: GitRunner): boolean {
 export function repositoryTreePolicyIssues(repoPath: string, commit: string, runner: GitRunner): string[] {
   if (!OID_PATTERN.test(commit)) return ["invalid_tree_commit"];
   try {
-    const output = gitBuffer(runner, repoPath, ["ls-tree", "-r", "-z", "--full-tree", commit]);
-    if (output.byteLength === 0) return [];
-    if (output.at(-1) !== 0) throw new Error("malformed_tree_listing");
-    let decoded: string;
-    try { decoded = new TextDecoder("utf-8", { fatal: true }).decode(output); }
-    catch { throw new Error("tree_listing_not_utf8"); }
-    for (const entry of decoded.slice(0, -1).split("\0")) {
-      const separator = entry.indexOf("\t");
-      if (separator <= 0) throw new Error("malformed_tree_entry");
-      const metadata = entry.slice(0, separator);
-      const repositoryPath = entry.slice(separator + 1);
-      const match = /^(\d{6}) (blob|tree|commit) ([0-9a-f]{40,64})$/.exec(metadata);
-      if (!match || !repositoryPath) throw new Error("malformed_tree_entry");
-      const [mode, type] = [match[1], match[2]];
-      const validEntry = (type === "blob" && (mode === "100644" || mode === "100755" || mode === "120000")) || (type === "commit" && mode === "160000") || (type === "tree" && mode === "040000");
-      if (!validEntry) throw new Error("malformed_tree_entry");
-      if (mode === "160000") return ["gitlinks_or_submodules"];
-      const basename = repositoryPath.slice(repositoryPath.lastIndexOf("/") + 1);
-      if (basename.toLowerCase() === ".gitattributes") return ["repository_attributes"];
-    }
-    return [];
+    return withBoundedRepositoryGitOutput(
+      runner,
+      repoPath,
+      ["ls-tree", "-r", "-z", "--full-tree", commit],
+      MAX_TREE_LISTING_BYTES,
+      "tree_listing",
+      (descriptor, size) => parseTreePolicyOutput(descriptor, size)
+    );
   } catch (error) {
     return [safeIssue(error)];
   }
 }
 
+function parseTreePolicyOutput(descriptor: number, size: number): string[] {
+  const issues = new Set<string>();
+  const buffer = Buffer.alloc(64 * 1024);
+  let remainder = Buffer.alloc(0);
+  let position = 0;
+  while (position < size) {
+    const count = readSync(descriptor, buffer, 0, Math.min(buffer.byteLength, size - position), position);
+    if (count <= 0) throw new Error("tree_listing_short_read");
+    const chunk = remainder.byteLength > 0 ? Buffer.concat([remainder, buffer.subarray(0, count)]) : buffer.subarray(0, count);
+    let start = 0;
+    for (let index = 0; index < chunk.byteLength; index += 1) {
+      if (chunk[index] !== 0) continue;
+      parseTreePolicyEntry(chunk.subarray(start, index), issues);
+      start = index + 1;
+    }
+    remainder = Buffer.from(chunk.subarray(start));
+    position += count;
+  }
+  if (remainder.byteLength > 0) throw new Error("malformed_tree_listing");
+  return [...issues].sort();
+}
+
+function parseTreePolicyEntry(raw: Buffer, issues: Set<string>): void {
+  let entry: string;
+  try { entry = new TextDecoder("utf-8", { fatal: true }).decode(raw); }
+  catch { throw new Error("tree_listing_not_utf8"); }
+  const separator = entry.indexOf("\t");
+  if (separator <= 0) throw new Error("malformed_tree_entry");
+  const metadata = entry.slice(0, separator);
+  const repositoryPath = entry.slice(separator + 1);
+  const match = /^(\d{6}) (blob|tree|commit) ([0-9a-f]{40,64})$/.exec(metadata);
+  if (!match || !repositoryPath) throw new Error("malformed_tree_entry");
+  const [mode, type] = [match[1], match[2]];
+  const validEntry = (type === "blob" && (mode === "100644" || mode === "100755" || mode === "120000")) || (type === "commit" && mode === "160000") || (type === "tree" && mode === "040000");
+  if (!validEntry) throw new Error("malformed_tree_entry");
+  if (mode === "160000") issues.add("gitlinks_or_submodules");
+  const basename = repositoryPath.slice(repositoryPath.lastIndexOf("/") + 1);
+  if (basename.toLowerCase() === ".gitattributes") issues.add("repository_attributes");
+}
 function gitMetadataIssues(gitDirectory: string): string[] {
   const root = path.resolve(gitDirectory);
   if (realpathSync(root) !== root) return ["git_metadata_alias"];
@@ -693,11 +722,18 @@ function repositoryGitArgs(cwd: string, gitDirectory: string, args: readonly str
   ];
 }
 
-function hasIndexVisibilityFlags(runner: GitRunner, cwd: string): boolean {
-  const outputFile = path.join(String(runner.env.HOME), `index-visibility-${randomUUID()}.bin`);
-  const output = openSync(outputFile, "wx+", 0o600);
+function withBoundedRepositoryGitOutput<T>(
+  runner: GitRunner,
+  cwd: string,
+  args: readonly string[],
+  maxBytes: number,
+  label: string,
+  consume: (descriptor: number, size: number) => T
+): T {
+  const outputFile = path.join(String(runner.env.HOME), `${label}-${randomUUID()}.bin`);
+  const output = openSync(outputFile, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
   try {
-    const result = spawnSync(runner.gitPath, repositoryGitArgs(cwd, path.join(cwd, ".git"), ["ls-files", "-v", "-z"]), {
+    const result = spawnSync(runner.gitPath, repositoryGitArgs(cwd, path.join(cwd, ".git"), args), {
       cwd,
       env: { ...runner.env, GIT_CEILING_DIRECTORIES: cwd },
       shell: false,
@@ -707,13 +743,29 @@ function hasIndexVisibilityFlags(runner: GitRunner, cwd: string): boolean {
       maxBuffer: MAX_GIT_OUTPUT_BYTES
     });
     if (result.error) throw new Error(`git_spawn_failed:${boundText(result.error.message, 120)}`);
-    if (result.status !== 0) throw new Error("git_failed:ls-files");
-    const metadata = fstatSync(output);
-    if (!metadata.isFile() || metadata.nlink !== 1 || metadata.size > 64 * 1024 * 1024) throw new Error("index_visibility_output_limit");
-    const buffer = Buffer.alloc(64 * 1024);
-    let position = 0; let atStart = true;
-    while (position < metadata.size) {
-      const count = readSync(output, buffer, 0, Math.min(buffer.byteLength, metadata.size - position), position);
+    if (result.status !== 0) throw new Error(`git_failed:${args[0] ?? "command"}`);
+    const before = fstatSync(output);
+    const owned = typeof process.getuid !== "function" || before.uid === process.getuid();
+    if (!before.isFile() || before.nlink !== 1 || !owned || (before.mode & 0o077) !== 0) throw new Error(`${label}_unsafe_output`);
+    if (before.size > maxBytes) throw new Error(`${label}_output_limit`);
+    let value: T | undefined;
+    let consumeError: unknown;
+    try { value = consume(output, before.size); } catch (error) { consumeError = error; }
+    const after = fstatSync(output);
+    if (after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size || after.mode !== before.mode || after.nlink !== before.nlink || after.uid !== before.uid || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) throw new Error(`${label}_output_changed`);
+    if (consumeError) throw consumeError;
+    return value as T;
+  } finally {
+    closeSync(output);
+    rmSync(outputFile, { force: true });
+  }
+}
+
+function hasIndexVisibilityFlags(runner: GitRunner, cwd: string): boolean {
+  return withBoundedRepositoryGitOutput(runner, cwd, ["ls-files", "-v", "-z"], 64 * 1024 * 1024, "index_visibility", (output, size) => {
+    const buffer = Buffer.alloc(64 * 1024); let position = 0; let atStart = true;
+    while (position < size) {
+      const count = readSync(output, buffer, 0, Math.min(buffer.byteLength, size - position), position);
       if (count <= 0) throw new Error("index_visibility_short_read");
       for (let index = 0; index < count; index += 1) {
         const byte = buffer[index]!;
@@ -722,13 +774,8 @@ function hasIndexVisibilityFlags(runner: GitRunner, cwd: string): boolean {
       }
       position += count;
     }
-    const after = fstatSync(output);
-    if (after.dev !== metadata.dev || after.ino !== metadata.ino || after.size !== metadata.size || after.mtimeMs !== metadata.mtimeMs || after.ctimeMs !== metadata.ctimeMs) throw new Error("index_visibility_output_changed");
     return false;
-  } finally {
-    closeSync(output);
-    rmSync(outputFile, { force: true });
-  }
+  });
 }
 
 export function runStandaloneGit(runner: GitRunner, cwd: string, args: string[]): Buffer {

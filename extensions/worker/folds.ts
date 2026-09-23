@@ -442,7 +442,7 @@ function revalidateCandidate(resolved: ResolvedRepositoryCandidate, runner: Retu
   const workspaceRoot = requireCanonicalDirectory(resolved.workspaceRoot, "candidate workspace");
   const repoPath = path.resolve(workspaceRoot, candidate.workspaceRepo);
   if (!isWithin(workspaceRoot, repoPath) || !existsSync(repoPath) || realpathSync(repoPath) !== repoPath) throw new Error(`Worker repository candidate path is stale: ${candidate.candidateId}`);
-  const policyIssues = [...repositoryPolicyIssues(repoPath, runner), ...repositoryTreePolicyIssues(repoPath, candidate.headCommit, runner)];
+  const policyIssues = repositoryPolicyIssues(repoPath, runner, candidate.headCommit);
   if (policyIssues.length > 0) throw new Error(`Worker repository candidate policy changed: ${candidate.candidateId} (${policyIssues.join(",")})`);
   const headCommit = gitText(runner, repoPath, ["rev-parse", "HEAD^{commit}"]).trim();
   const headTree = gitText(runner, repoPath, ["rev-parse", "HEAD^{tree}"]).trim();
@@ -503,7 +503,7 @@ function assertTargetUnchanged(snapshot: TargetSnapshot, runner: ReturnType<type
 
 function assertViewPolicy(repoPath: string, exactCommit: string, runner: ReturnType<typeof createGitRunner>, label: string): void {
   try {
-    const issues = [...repositoryPolicyIssues(repoPath, runner), ...repositoryTreePolicyIssues(repoPath, exactCommit, runner)];
+    const issues = repositoryPolicyIssues(repoPath, runner, exactCommit);
     const dirty = repositoryDirty(repoPath, runner);
     if (issues.length > 0 || dirty) throw new Error(issues.length ? issues.join(",") : "dirty_view");
   } catch (error) {

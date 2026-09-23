@@ -9,7 +9,6 @@ import {
   gitBuffer,
   gitText,
   repositoryPolicyIssues,
-  repositoryTreePolicyIssues,
   runStandaloneGit,
   type GitRunner,
   type InitialRepositoryPin
@@ -124,7 +123,7 @@ export function provisionIntegrationRepository(input: {
   const head = gitText(runner, directory, ["rev-parse", "HEAD^{commit}"]).trim();
   const tree = gitText(runner, directory, ["rev-parse", "HEAD^{tree}"]).trim();
   if (head !== repository.targetExpectedCommit || tree !== repository.targetExpectedTree) throw new Error("Integration repository did not materialize the exact target identity.");
-  if (repositoryPolicyIssues(directory, runner).length || repositoryTreePolicyIssues(directory, head, runner).length) throw new Error("Integration repository has unsupported policy.");
+  if (repositoryPolicyIssues(directory, runner, head).length) throw new Error("Integration repository has unsupported policy.");
   const indexArtifact = persistImmutableCopy(path.join(directory, ".git", "index"), path.join(input.trustedStateRoot, "analysis-index"), MAX_INDEX_BYTES);
   const evidenceDirectory = path.join(input.artifactsDir, "integration-evidence");
   mkdirSync(evidenceDirectory, { recursive: true, mode: 0o700 });
@@ -214,7 +213,7 @@ export function assertPreparedTargetCurrent(repository: PreparedRepositoryFold, 
   const commit = gitText(runner, target, ["show-ref", "--verify", "--hash", repository.targetRef]).trim();
   const tree = gitText(runner, target, ["rev-parse", `${commit}^{tree}`]).trim();
   const status = gitBuffer(runner, target, ["status", "--porcelain=v1", "--untracked-files=all", "-z"]);
-  const policy = [...repositoryPolicyIssues(target, runner), ...repositoryTreePolicyIssues(target, commit, runner)];
+  const policy = repositoryPolicyIssues(target, runner, commit);
   if (commit !== repository.targetExpectedCommit || tree !== repository.targetExpectedTree || status.byteLength > 0 || policy.length > 0) throw new Error("Integration target moved, became dirty, or violated exact policy; prepare a fresh fold.");
 }
 
@@ -270,7 +269,7 @@ function validateResolutionRepository(integration: WorkerIntegrationRecord, work
   if (parents.length !== expectedParents.length || parents.some((parent, index) => parent !== expectedParents[index])) {
     throw new Error(`Integration ${integration.method} resolution has invalid exact parents.`);
   }
-  if (repositoryTreePolicyIssues(repository, head, runner).length > 0) throw new Error("Integration resolution produced an unsupported exact tree.");
+  if (repositoryPolicyIssues(repository, runner, head).length > 0) throw new Error("Integration resolution produced an unsupported exact tree.");
   if (gitBuffer(runner, repository, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"]).byteLength > 0) throw new Error("Integration resolution repository must be clean at handoff.");
   const origin = gitText(runner, repository, ["config", "--local", "--get", "remote.origin.url"]).trim();
   const push = gitText(runner, repository, ["config", "--local", "--get", "remote.origin.pushurl"]).trim();

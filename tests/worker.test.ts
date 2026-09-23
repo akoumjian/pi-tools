@@ -818,6 +818,32 @@ test("restart rolls back an unlaunched queued integration resolution to its park
     assert.equal(parks, 1); assert.equal(removals, 0); assert.equal(api.messages.length, 1); assert.match(JSON.stringify(api.messages[0]?.message), /rolled back.*parent restart/i);
   });
 });
+
+test("restart completes resolution rollback after a crash between lease release and analysis-record restore", async () => {
+  await withTempDir(async (directory) => {
+    const parentCwd = path.join(directory, "parent"); const parentSessionFile = path.join(directory, "parent.jsonl");
+    await mkdir(parentCwd); await writeFile(parentSessionFile, `${JSON.stringify({ type: "session", version: 3, id: "parent-session", timestamp: "2026-09-10T19:29:00.000Z", cwd: parentCwd })}\n`);
+    const roots = { stateRoot: path.join(directory, "workers"), workspaceRoot: path.join(directory, "workspaces") };
+    const workerId = "worker_20260910190001_crashwin"; const analysisRunId = "run_20260910192001_analysis"; const runId = "run_20260910193001_resolve1"; const paths = workerPaths(roots, workerId);
+    provisionWorkerPaths(paths); await mkdir(path.join(paths.stateDir, "integration"), { recursive: true }); await mkdir(path.join(paths.stateDir, "integration-git"), { recursive: true });
+    const decisionsFile = path.join(paths.stateDir, "integration", `decisions-${runId}.json`); const workspaceDecisionsFile = path.join(paths.artifactsDir, `integration-decisions-${runId}.json`);
+    const container: WorkerContainerReference = { version: 1, workerId, runId: analysisRunId, name: "pi-integration-crash-window", nonce: "crash-window-nonce", image: "alpine@test", codeRoot: parentCwd, workspaceRoot: paths.workspaceRoot, containerId: "d".repeat(64) };
+    writeWorkerRecord(paths.recordFile, {
+      version: WORKER_RECORD_VERSION, workerId, sessionId: "worker-session-crash-window", parentSessionFile, workspaceRoot: paths.workspaceRoot, taskIds: ["personal-crash-window"], route: { provider: "openai-codex", model: "gpt-test", thinkingLevel: "xhigh" }, status: "queued", container,
+      integration: { phase: "resolution", preparedId: "prepared_aaaaaaaaaaaaaaaaaaaaaaaa", manifestSha256: "a".repeat(64), candidateId: "candidate_bbbbbbbbbbbbbbbbbbbbbbbb", method: "merge", sourceCandidateIds: ["candidate_bbbbbbbbbbbbbbbbbbbbbbbb"], targetRepo: path.join(directory, "target"), targetRef: "refs/heads/main", targetExpectedCommit: "c".repeat(40), targetExpectedTree: "d".repeat(40), candidateHeadCommit: "e".repeat(40), candidateHeadTree: "f".repeat(40), preparedArtifactFile: path.join(directory, "folds", "prepared_aaaaaaaaaaaaaaaaaaaaaaaa", "repo.bundle"), analysisIndexFile: path.join(paths.stateDir, "integration-git", "analysis-index"), analysisIndexSha256: "1".repeat(64), evidence: [], workspaceRepo: "repos/integration-bbbbbbbbbbbbbbbbbbbbbbbb", contextFile: path.join(paths.stateDir, "integration", "context.json"), workspaceContextFile: path.join(paths.artifactsDir, "integration-context.json"), contextSha256: "2".repeat(64), analysisRunId, analysisSnapshot: { headCommit: "c".repeat(40), headTree: "d".repeat(40), statusSha256: "3".repeat(64), indexSha256: "4".repeat(64), refsSha256: "5".repeat(64), configSha256: "6".repeat(64), metadataSha256: "7".repeat(64) }, decisionsFile, workspaceDecisionsFile, decisionsSha256: "8".repeat(64), resolutionRunId: runId },
+      activeRun: { runId, jobId: "job_20260910193001_resolve1", status: "queued", completionDelivery: "steer" },
+      lastRun: { runId: analysisRunId, jobId: "job_20260910192001_analysis", status: "handed_off", delivery: "delivered", completionDelivery: "steer" }, updatedAt: "2026-09-10T19:30:00.000Z"
+    });
+    // This is the durable crash window: resolution decisions were removed and its lease was released, but the queued resolution record was not yet replaced.
+    assert.equal(existsSync(paths.leaseFile), false); assert.equal(existsSync(decisionsFile), false); assert.equal(existsSync(workspaceDecisionsFile), false);
+    let parks = 0; let removals = 0; const api = fakeApi();
+    registerWorkerExtension(api, { roots, now: () => new Date("2026-09-10T19:32:00.000Z"), parkContainer: (value) => { parks += 1; assert.equal(value.containerId, container.containerId); }, removeContainer: () => { removals += 1; } });
+    await api.emit("session_start", {}, parentContext(parentCwd, parentSessionFile));
+    const restored = readWorkerRecord(paths.recordFile);
+    assert.equal(restored.status, "handed_off"); assert.equal(restored.activeRun, undefined); assert.equal(restored.integration?.phase, "analysis"); assert.equal(restored.container?.containerId, container.containerId);
+    assert.equal(existsSync(paths.leaseFile), false); assert.equal(parks, 1); assert.equal(removals, 0); assert.match(JSON.stringify(api.messages[0]?.message), /rolled back.*parent restart/i);
+  });
+});
 test("restart cleanup failure remains explicitly cancellable after container control recovers", async () => {
   await withTempDir(async (directory) => {
     const parentCwd = path.join(directory, "parent");

@@ -489,6 +489,23 @@ test("exact tree policy parses one full tree and rejects nested case-insensitive
     await chmod(fakeGit, 0o700);
     const malformedRunner = createGitRunner(fakeGit, path.join(directory, "malformed-state"));
     assert.deepEqual(repositoryTreePolicyIssues(repo, git(repo, "rev-parse", "HEAD"), malformedRunner), ["tree_listing_not_utf8"]);
+
+    const unterminatedGit = path.join(directory, "unterminated-git");
+    await writeFile(unterminatedGit, `#!/bin/sh\nprintf '100644 blob ${"a".repeat(40)}\tfile.txt'\n`); await chmod(unterminatedGit, 0o700);
+    assert.deepEqual(repositoryTreePolicyIssues(repo, git(repo, "rev-parse", "HEAD"), createGitRunner(unterminatedGit, path.join(directory, "unterminated-state"))), ["malformed_tree_listing"]);
+
+    const malformedEntryGit = path.join(directory, "malformed-entry-git");
+    await writeFile(malformedEntryGit, "#!/bin/sh\nprintf 'garbage\\0'\n"); await chmod(malformedEntryGit, 0o700);
+    assert.deepEqual(repositoryTreePolicyIssues(repo, git(repo, "rev-parse", "HEAD"), createGitRunner(malformedEntryGit, path.join(directory, "entry-state"))), ["malformed_tree_entry"]);
+  });
+});
+
+test("repository policy reuses exact streamed tree parsing for gitlinks", async () => {
+  await withTempDir(async (directory) => {
+    const repo = await createSource(directory, "gitlink-policy"); const head = git(repo, "rev-parse", "HEAD");
+    git(repo, "update-index", "--add", "--cacheinfo", `160000,${head},nested-module`); git(repo, "commit", "-qm", "gitlink");
+    const runner = createGitRunner(execFileSync("which", ["git"], { encoding: "utf8" }).trim(), path.join(directory, "state"));
+    assert.deepEqual(repositoryPolicyIssues(repo, runner), ["gitlinks_or_submodules"]);
   });
 });
 

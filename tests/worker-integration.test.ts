@@ -114,6 +114,27 @@ test("provisions exact isolated integration inputs and enforces pristine analysi
   assert.throws(() => assertIntegrationPristine(integration, workspace, path.join(state, "git")), /mutated/);
 }));
 
+
+test("integration snapshot accepts a clean committed tree whose exact listing exceeds one MiB", async () => withTemp(async (root) => {
+  const repository = path.join(root, "repository"); await mkdir(repository);
+  git(repository, "init", "--initial-branch=main"); await writeFile(path.join(repository, "README.md"), "large tree\n"); git(repository, "add", "README.md"); commit(repository, "base");
+  const emptyBlobResult = spawnSync("git", ["hash-object", "-w", "--stdin"], { cwd: repository, input: "", encoding: "utf8", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
+  assert.equal(emptyBlobResult.status, 0, emptyBlobResult.stderr); const emptyBlob = emptyBlobResult.stdout.trim();
+  let indexInfo = "";
+  for (let index = 0; index < 8_000; index += 1) indexInfo += `100644 ${emptyBlob}\tlarge-tree/${String(index).padStart(5, "0")}-${"x".repeat(64)}.txt\n`;
+  const indexed = spawnSync("git", ["update-index", "--index-info"], { cwd: repository, input: indexInfo, encoding: "utf8", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_OPTIONAL_LOCKS: "0" } });
+  assert.equal(indexed.status, 0, indexed.stderr); git(repository, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "large exact tree"); git(repository, "checkout-index", "-a", "-f");
+  assert.equal(git(repository, "status", "--porcelain=v1"), "");
+  const listing = execFileSync("git", ["ls-tree", "-r", "-z", "--full-tree", "HEAD"], { cwd: repository, maxBuffer: 8 * 1024 * 1024 });
+  assert.ok(listing.byteLength > 1024 * 1024);
+  const trustedState = path.join(root, "state"); await mkdir(trustedState, { recursive: true });
+  const analysisIndexFile = path.join(trustedState, "analysis-index"); const analysisIndex = await readFile(path.join(repository, ".git", "index"));
+  await writeFile(analysisIndexFile, analysisIndex, { mode: 0o400 }); chmodSync(analysisIndexFile, 0o400);
+  const analysisIndexSha256 = createHash("sha256").update(analysisIndex).digest("hex");
+  const snapshot = snapshotIntegrationRepository(repository, path.join(trustedState, "git"), analysisIndexFile, analysisIndexSha256);
+  assert.equal(snapshot.headCommit, git(repository, "rev-parse", "HEAD^{commit}"));
+  assert.equal(snapshot.headTree, git(repository, "rev-parse", "HEAD^{tree}"));
+}));
 test("rejects context tampering and moved targets", async () => withTemp(async (root) => {
   const { selection, target } = await fixture(root);
   const workspace = path.join(root, "workspace"); await mkdir(path.join(workspace, "artifacts"), { recursive: true });
