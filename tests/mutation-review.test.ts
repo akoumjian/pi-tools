@@ -810,6 +810,9 @@ test("selectMutationReviewModel resolves configured models and auth", () => {
   assert.throws(() => selectMutationReviewModel(registry, "openai-codex/gpt-5.3-codex", spark, "max"), /inherited thinking level.*capped at xhigh/);
   const fable = fakeModel("anthropic", "claude-fable-5");
   assert.throws(() => selectMutationReviewModel(fakeRegistry([fable]), "anthropic/claude-fable-5:xhigh", undefined, "low"), /Claude Fable/);
+  const bedrockFable = fakeModel("amazon-bedrock", "us.anthropic.claude-fable-5-20260901-v1:0");
+  assert.throws(() => selectMutationReviewModel(fakeRegistry([bedrockFable]), "amazon-bedrock/us.anthropic.claude-fable-5-20260901-v1:0:xhigh", undefined, "low"), /Claude Fable/);
+  assert.throws(() => selectMutationReviewModel(fakeRegistry([bedrockFable]), undefined, bedrockFable, "low"), /Claude Fable/);
   assert.throws(() => selectMutationReviewModel(registry, "openai-codex/gpt-5.3-codex-spark", gpt), /no configured auth/);
   assert.throws(() => selectMutationReviewModel(registry, "missing-format", gpt), /not found/);
 });

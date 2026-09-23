@@ -19,6 +19,18 @@ import { assertChildAgentRouteAllowed } from "./model-spec.js";
 
 export type ChildAgentSession = Awaited<ReturnType<typeof createAgentSessionFromServices>>["session"];
 
+export type IsolatedChildSettings = {
+  compaction: { enabled: false };
+  retry: { enabled: false; maxRetries: 0; provider: { maxRetries: 0 } };
+};
+
+export function createIsolatedChildSettings(): IsolatedChildSettings {
+  return {
+    compaction: { enabled: false },
+    retry: { enabled: false, maxRetries: 0, provider: { maxRetries: 0 } }
+  };
+}
+
 export type ChildAgentSessionOptions = {
   cwd: string;
   model: Model<Api>;
@@ -55,9 +67,7 @@ export async function withChildAgentSession<T>(
   const services = await createAgentSessionServices({
     cwd: options.cwd,
     agentDir: getAgentDir(),
-    settingsManager: isolatedSystemPrompt ? SettingsManager.inMemory({
-      retry: { enabled: false, maxRetries: 0, provider: { maxRetries: 0 } }
-    }) : undefined,
+    settingsManager: isolatedSystemPrompt ? SettingsManager.inMemory(createIsolatedChildSettings()) : undefined,
     resourceLoaderOptions: {
       ...(isolatedSystemPrompt ? {
         noExtensions: true,

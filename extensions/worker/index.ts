@@ -84,7 +84,9 @@ import {
   type RepositoryInventorySummary
 } from "./repositories.js";
 import {
+  classifyManagedWorkerReviewFailure,
   formatManagedWorkerReviewRoute,
+  ManagedWorkerReviewExecutionError,
   runManagedWorkerReviewWithRateLimitFallback,
   type ManagedWorkerReviewAttempt,
   type ManagedWorkerReviewExecutionResult,
@@ -623,7 +625,7 @@ export function registerWorkerExtension(
       "worker_review use: Call for the exact settled worker/run/repository after selecting its authoritative candidate; if review requests changes, resume the implementation worker and review the new settled run again.",
       inputJsonSchemaGuideline("worker_review", WorkerReviewParams),
       outputJsonSchemaGuideline("worker_review", RetainedToolOutputSchemas.worker_review),
-      "worker_review constraints: Requires an exact-parent-owned handed-off run, valid hash-bound inventory, already-stopped exact persistent container, and clean foldable candidate. Primary and fallback routes reject max thinking and every Claude Fable model. It never acknowledges delivery or mutates worker/container state. A bounded operation lock covers the primary and, only after a confirmed Anthropic 429 rate_limit_error, one fresh same-provider configured fallback child. Both use trusted in-memory settings, verified review-role text, and only repository-confined read_many/search_many; auth/model/config/transport/5xx/timeout/cancellation/output/policy failures never trigger fallback. Exact attempt routes are visible. Lifecycle/container/HEAD/tree/dirty/policy are rechecked after the overall review; drift fails visibly. The structured verdict/findings/checks are advice only, not validation, attestation, promotion, push, or publication authority. Only result content is provider-visible; details are internal."
+      "worker_review constraints: Requires an exact-parent-owned handed-off run, valid hash-bound inventory, already-stopped exact persistent container, and clean foldable candidate. Primary and fallback routes reject max thinking and every Claude Fable model. It never acknowledges delivery or mutates worker/container state. A bounded operation lock covers the primary and, only after a confirmed Anthropic 429 rate_limit_error plus renewed exact lifecycle/lease, stopped-container timestamp fingerprint, repository/commit, and confinement prechecks, one fresh same-provider configured fallback child. Both use trusted in-memory settings with retries and compaction disabled, stripped provider fallback metadata, exact response-model verification, nonce-delimited JSON candidate evidence, and only repository-confined read_many/search_many with unconditional Git-admin search exclusion; auth/model/config/transport/5xx/timeout/cancellation/output/policy failures never trigger fallback. Ordered attempt routes and safe failure categories are visible without raw provider errors. Lifecycle/container/HEAD/tree/dirty/policy are rechecked after the overall review; drift fails visibly. The structured verdict/findings/checks are advice only, not validation, attestation, promotion, push, or publication authority. Only result content is provider-visible; details are internal."
     ],
     parameters: WorkerReviewParams,
     executionMode: "sequential",
@@ -867,6 +869,38 @@ async function reviewSettledWorker(
     }
     const repository = canonicalWorkerReviewRepository(paths.workspaceRoot, candidate.workspaceRepo);
     verifyWorkerReviewRepository(repository, candidate, paths.stateDir);
+
+    const verifyExactReviewState = (checkSignal?: AbortSignal): void => {
+      throwIfAborted(checkSignal);
+      const current = readWorkerRecord(paths.recordFile);
+      assertWorkerParentSession(current, context);
+      if (current.activeRun || readWorkerLease(paths.leaseFile) || current.status !== "handed_off" || current.lastRun?.runId !== input.runId) {
+        throw new Error("Managed worker changed lifecycle state during review.");
+      }
+      if (!current.container || JSON.stringify(current.container) !== JSON.stringify(record.container)) {
+        throw new Error("Managed worker container record changed during review.");
+      }
+      const currentContainer = dependencies.inspectContainer(current.container);
+      if (JSON.stringify(currentContainer) !== JSON.stringify(containerBefore)) {
+        throw new Error("Managed worker stopped container identity changed during review.");
+      }
+      const currentObserved = readParentWorkerResult(input.workerId, context, dependencies, {
+        operationLocked: true,
+        acknowledgeDelivery: false
+      });
+      const currentCandidate = currentObserved.repositories?.candidates.find((item) => item.workspaceRepo === input.workspaceRepo);
+      if (
+        currentObserved.record.lastRun?.runId !== input.runId || !currentObserved.handoff || !currentCandidate ||
+        JSON.stringify(currentCandidate) !== JSON.stringify(candidate)
+      ) {
+        throw new Error("Managed-worker exact handoff or repository inventory changed during review.");
+      }
+      const currentRepository = canonicalWorkerReviewRepository(paths.workspaceRoot, currentCandidate.workspaceRepo);
+      if (currentRepository !== repository) throw new Error("Managed-worker review confinement root changed during review.");
+      verifyWorkerReviewRepository(currentRepository, currentCandidate, paths.stateDir);
+      throwIfAborted(checkSignal);
+    };
+
     let reviewRoutes: ReturnType<WorkerExtensionDependencies["resolveReviewRoutes"]> | undefined;
     let execution: ManagedWorkerReviewExecutionResult | undefined;
     let reviewFailure: unknown;
@@ -878,29 +912,43 @@ async function reviewSettledWorker(
         rateLimitFallbackRoute: reviewRoutes.rateLimitFallback,
         evidence: buildWorkerReviewEvidence(record, candidate, repository, paths.stateDir),
         focus: input.focus,
-        signal
+        signal,
+        beforeFallback: async (fallbackSignal) => {
+          throwIfAborted(fallbackSignal);
+          verifyExactReviewState(fallbackSignal);
+        }
       });
     } catch (error) {
       reviewFailure = error;
     }
-    const current = readWorkerRecord(paths.recordFile);
-    assertWorkerParentSession(current, context);
-    if (current.activeRun || readWorkerLease(paths.leaseFile) || current.status !== "handed_off" || current.lastRun?.runId !== input.runId) {
-      throw new Error("Managed worker changed lifecycle state during review.");
+    try {
+      // Postconditions always run, including after timeout, cancellation, output,
+      // confinement, provider, and fallback-precondition failures.
+      verifyExactReviewState();
+    } catch {
+      const attempts = execution?.attempts
+        ?? (reviewFailure instanceof ManagedWorkerReviewExecutionError ? reviewFailure.attempts : []);
+      throw new ManagedWorkerReviewExecutionError(attempts, "postcondition_failed");
     }
-    if (!current.container || JSON.stringify(current.container) !== JSON.stringify(record.container)) {
-      throw new Error("Managed worker container record changed during review.");
+    if (reviewFailure !== undefined) {
+      if (reviewFailure instanceof ManagedWorkerReviewExecutionError) throw reviewFailure;
+      const outcome = reviewRoutes ? classifyManagedWorkerReviewFailure(reviewFailure, signal) : "precondition_failed";
+      const attempts: ManagedWorkerReviewAttempt[] = reviewRoutes
+        ? [{ route: formatManagedWorkerReviewRoute(reviewRoutes.primary), outcome }]
+        : [];
+      throw new ManagedWorkerReviewExecutionError(attempts, outcome);
     }
-    const containerAfter = dependencies.inspectContainer(current.container);
-    if (JSON.stringify(containerAfter) !== JSON.stringify(containerBefore)) {
-      throw new Error("Managed worker stopped container identity changed during review.");
+    if (signal?.aborted) throw new ManagedWorkerReviewExecutionError(execution?.attempts ?? [], "cancelled");
+    if (!reviewRoutes || !execution) throw new ManagedWorkerReviewExecutionError([], "failed");
+    let review: ManagedWorkerReviewExecutionResult["review"];
+    try {
+      review = verifyManagedWorkerReviewExecution(execution, reviewRoutes);
+    } catch (error) {
+      throw new ManagedWorkerReviewExecutionError(execution.attempts, classifyManagedWorkerReviewFailure(error, signal));
     }
-    verifyWorkerReviewRepository(repository, candidate, paths.stateDir);
-    if (reviewFailure !== undefined) throw reviewFailure;
-    throwIfAborted(signal);
-    if (!reviewRoutes || !execution) throw new Error("Managed-worker review did not complete.");
-    const review = verifyManagedWorkerReviewExecution(execution, reviewRoutes);
-    if (path.resolve(review.cwd) !== repository) throw new Error("Managed-worker reviewer returned a different repository identity.");
+    if (path.resolve(review.cwd) !== repository) {
+      throw new ManagedWorkerReviewExecutionError(execution.attempts, "route_mismatch");
+    }
     return {
       workerId: input.workerId,
       runId: input.runId,

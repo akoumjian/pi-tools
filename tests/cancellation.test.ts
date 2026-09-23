@@ -125,3 +125,21 @@ test("shared child sessions reject max before loading any child resources", asyn
   );
   assert.equal(ran, false);
 });
+
+test("shared child sessions reject prefixed Bedrock Claude Fable before loading resources", async () => {
+  let ran = false;
+  await assert.rejects(
+    withChildAgentSession(
+      {} as Pick<ExtensionContext, "modelRegistry" | "ui">,
+      {
+        cwd: "/repo",
+        model: { provider: "amazon-bedrock", id: "us.anthropic.claude-fable-5-20260901-v1:0" } as never,
+        thinkingLevel: "xhigh",
+        tools: []
+      },
+      async () => { ran = true; }
+    ),
+    /Claude Fable models cannot be used for subagents/
+  );
+  assert.equal(ran, false);
+});

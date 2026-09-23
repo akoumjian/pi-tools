@@ -179,7 +179,18 @@ test("subagent route policy rejects max and Claude Fable without false positives
     () => assertChildAgentRouteAllowed(fakeModel("anthropic", "claude-fable-5"), "low"),
     /non-Fable model/
   );
+  for (const spec of [
+    "vercel-ai-gateway/anthropic/claude-fable-5:xhigh",
+    "amazon-bedrock/us.anthropic.claude-fable-5-20260901-v1:0:xhigh",
+    "gateway/catalog/CLAUDE.FABLE_5:xhigh"
+  ]) assert.throws(() => assertSubagentRouteSpecAllowed(spec), /Claude Fable/);
+  assert.throws(
+    () => assertChildAgentRouteAllowed(fakeModel("amazon-bedrock", "us.anthropic.claude-fable-5-20260901-v1:0"), "xhigh"),
+    /Claude Fable/
+  );
   assert.doesNotThrow(() => assertSubagentRouteAllowed({ provider: "anthropic", model: "claude-opus-5-5", thinkingLevel: "xhigh" }));
   assert.doesNotThrow(() => assertSubagentRouteAllowed({ provider: "example", model: "claude-fablet-5", thinkingLevel: "high" }));
   assert.doesNotThrow(() => assertSubagentRouteAllowed({ provider: "example", model: "my-fable-model", thinkingLevel: "off" }));
+  assert.doesNotThrow(() => assertSubagentRouteAllowed({ provider: "example", model: "notclaude-fable-5", thinkingLevel: "off" }));
+  assert.doesNotThrow(() => assertSubagentRouteAllowed({ provider: "example", model: "vendor/claude-fablet-5", thinkingLevel: "off" }));
 });

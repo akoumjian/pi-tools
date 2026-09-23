@@ -50,7 +50,7 @@ export function formatModelName(model: Pick<Model<Api>, "provider" | "id">): str
 export function assertSubagentRouteAllowed(route: SubagentRoute, label = "Subagent route"): void {
   const rendered = `${route.provider}/${route.model}:${route.thinkingLevel}`;
   assertSubagentThinkingLevelAllowed(route.thinkingLevel, `${label} ${rendered}`);
-  if (isClaudeFableModelId(route.model)) {
+  if (isClaudeFableModelReference(`${route.provider}/${route.model}`)) {
     throw new Error(`${label} ${rendered} is not allowed: Claude Fable models cannot be used for subagents. Choose a non-Fable model.`);
   }
 }
@@ -65,10 +65,11 @@ export function assertSubagentThinkingLevelAllowed(thinkingLevel: string, label 
 export function assertSubagentRouteSpecAllowed(spec: string, label = "Subagent route"): void {
   const parsed = parseOptionalModelThinkingPair(spec);
   if (!parsed) return;
-  const slash = parsed.model.indexOf("/");
-  const provider = slash > 0 ? parsed.model.slice(0, slash) : "configured";
-  const model = slash > 0 ? parsed.model.slice(slash + 1) : parsed.model;
-  assertSubagentRouteAllowed({ provider, model, thinkingLevel: parsed.thinkingLevel }, label);
+  const rendered = `${parsed.model}:${parsed.thinkingLevel}`;
+  assertSubagentThinkingLevelAllowed(parsed.thinkingLevel, `${label} ${rendered}`);
+  if (isClaudeFableModelReference(parsed.model)) {
+    throw new Error(`${label} ${rendered} is not allowed: Claude Fable models cannot be used for subagents. Choose a non-Fable model.`);
+  }
 }
 
 export function assertChildAgentRouteAllowed(
@@ -79,8 +80,13 @@ export function assertChildAgentRouteAllowed(
   assertSubagentRouteAllowed({ provider: model.provider, model: model.id, thinkingLevel }, label);
 }
 
-function isClaudeFableModelId(modelId: string): boolean {
-  return /^claude-fable(?:-|$)/i.test(modelId.trim());
+/**
+ * Match the Claude model family token in direct, gateway-prefixed, and
+ * Bedrock-style catalog references without rejecting unrelated names such as
+ * `claude-fablet`, `fable`, or `notclaude-fable`.
+ */
+export function isClaudeFableModelReference(reference: string): boolean {
+  return /(?:^|[\/.:])claude[-_.]fable(?=$|[-_./:])/i.test(reference.trim());
 }
 
 export function resolveExtensionModel(options: ResolveExtensionModelOptions): ResolvedExtensionModel {

@@ -27,6 +27,7 @@ import {
 import { persistRepositoryInventory, repositoryCandidateId } from "../extensions/worker/repositories.js";
 import { forkWorkerSession } from "../extensions/worker/session.js";
 import { normalizeWorkerSettings } from "../extensions/worker/settings.js";
+import { ManagedWorkerReviewExecutionError } from "../extensions/worker/review.js";
 import type { ManagedWorkerReviewExecutionResult, ManagedWorkerReviewPlanInput, ManagedWorkerReviewResult } from "../extensions/worker/review.js";
 import {
   WORKER_RECORD_VERSION,
@@ -67,6 +68,20 @@ function fakeApi(): FakeApi {
       for (const handler of handlers.get(name) ?? []) await handler(event, context);
     }
   } as unknown as FakeApi;
+}
+
+function stoppedContainerIdentity(containerId: string, exitCode = 0, overrides: Partial<{ status: string; startedAt: string; finishedAt: string; oomKilled: boolean; error: string; restartCount: number }> = {}) {
+  return {
+    containerId,
+    exitCode,
+    status: "exited",
+    startedAt: "2026-09-10T19:00:00.000000000Z",
+    finishedAt: "2026-09-10T19:30:00.000000000Z",
+    oomKilled: false,
+    error: "",
+    restartCount: 0,
+    ...overrides
+  };
 }
 
 function fakeModel(id = "gpt-test"): Model<Api> {
@@ -450,6 +465,8 @@ test("worker settings select a configured default while explicit routes override
   assert.throws(() => normalizeWorkerSettings({}, "fixture"), /defaultRoute/);
   assert.throws(() => normalizeWorkerSettings({ defaultRoute: "openai-codex/gpt-5.6-sol:max" }, "fixture"), /capped at xhigh/);
   assert.throws(() => normalizeWorkerSettings({ defaultRoute: "anthropic/claude-fable-5:xhigh" }, "fixture"), /Claude Fable/);
+  assert.throws(() => normalizeWorkerSettings({ defaultRoute: "vercel-ai-gateway/anthropic/claude-fable-5:xhigh" }, "fixture"), /Claude Fable/);
+  assert.throws(() => normalizeWorkerSettings({ defaultRoute: "amazon-bedrock/us.anthropic.claude-fable-5-20260901-v1:0:xhigh" }, "fixture"), /Claude Fable/);
   assert.throws(() => normalizeWorkerSettings({ defaultRoute: "openai-codex/gpt-5.6-sol:xhigh", reviewRoute: "anthropic/claude-opus-5-5:max" }, "fixture"), /capped at xhigh/);
   assert.throws(() => normalizeWorkerSettings({ defaultRoute: "openai-codex/gpt-5.6-sol:xhigh", reviewRoute: "anthropic/claude-fable-5:xhigh" }, "fixture"), /Claude Fable/);
   assert.throws(() => normalizeWorkerSettings({ defaultRoute: "openai-codex/gpt-5.6-sol:xhigh", reviewRoute: "anthropic/claude-opus-5-5:xhigh", reviewRateLimitFallbackRoute: "anthropic/claude-opus-5:max" }, "fixture"), /capped at xhigh/);
@@ -465,6 +482,7 @@ test("worker settings select a configured default while explicit routes override
     thinkingLevel: "xhigh"
   });
   assert.throws(() => resolveWorkerRoute("openai-codex/gpt-test:max", context), /capped at xhigh/);
+  assert.throws(() => resolveWorkerRoute("vercel-ai-gateway/anthropic/claude-fable-5:xhigh", context), /Claude Fable/);
   const maxParentContext = { ...context, thinkingLevel: "max" } as ExtensionContext;
   assert.throws(() => resolveWorkerRoute("openai-codex/gpt-test", maxParentContext), /inherited thinking level.*capped at xhigh/);
   const unavailableContext = parentContext("/tmp/parent", "/tmp/parent.jsonl") as ExtensionContext & {
@@ -1828,7 +1846,7 @@ test("worker_review is observational across resumed runs and returns bounded str
       inspectContainer(container) {
         inspections += 1;
         assert.deepEqual(container, persistentContainer);
-        return { containerId: persistentContainer.containerId! , exitCode: 0 };
+        return stoppedContainerIdentity(persistentContainer.containerId!);
       },
       parkContainer() { throw new Error("review must never park or mutate the container"); },
       resolveReviewRoutes: () => ({ primary: { model: reviewModel, thinkingLevel: "xhigh" } }),
@@ -1879,13 +1897,13 @@ test("worker_review checks stopped-container identity around the complete primar
     const primaryModel = { ...fakeModel("opus"), provider: "anthropic" } as Model<Api>;
     const fallbackModel = { ...fakeModel("secondary"), provider: "anthropic" } as Model<Api>;
     let inspections = 0;
-    let containerExitCode = 0;
+    let containerStartedAt = "2026-09-10T19:00:00.000000000Z";
     const api = fakeApi();
     registerWorkerExtension(api, {
       roots: fixture.roots,
       inspectContainer: () => {
         inspections += 1;
-        return { containerId: fixture.container.containerId!, exitCode: containerExitCode };
+        return stoppedContainerIdentity(fixture.container.containerId!, 0, { startedAt: containerStartedAt });
       },
       resolveReviewRoutes: () => ({
         primary: { model: primaryModel, thinkingLevel: "xhigh" },
@@ -1894,7 +1912,9 @@ test("worker_review checks stopped-container identity around the complete primar
       reviewWorker: async (_context, input) => {
         assert.equal(inspections, 1, "container is inspected once before the overall operation");
         assert.equal(existsSync(fixture.paths.operationLockFile), true);
-        containerExitCode = 9;
+        await input.beforeFallback?.(new AbortController().signal);
+        assert.equal(inspections, 2, "fallback precheck re-inspects the exact stopped container under the operation lock");
+        containerStartedAt = "2026-09-10T19:20:00.000000000Z";
         return {
           review: {
             ...completedReviewExecution(input).review,
@@ -1912,8 +1932,54 @@ test("worker_review checks stopped-container identity around the complete primar
       workerId: fixture.workerId,
       runId: fixture.runId,
       workspaceRepo: "repos/project"
-    } as never, undefined, undefined, parentContext(parentCwd, parentSessionFile)), /stopped container identity changed/);
-    assert.equal(inspections, 2, "container is inspected once after the complete fallback operation");
+    } as never, undefined, undefined, parentContext(parentCwd, parentSessionFile)), /postcondition_failed.*anthropic\/secondary:xhigh — completed/i);
+    assert.equal(inspections, 3, "container is inspected before primary, before fallback, and after the complete operation");
+  });
+});
+
+test("worker_review pre-fallback revalidation detects a stopped-container start/stop cycle before fallback starts", async () => {
+  await withTempDir(async (directory) => {
+    const parentCwd = path.join(directory, "parent");
+    const parentSessionFile = path.join(directory, "parent.jsonl");
+    await mkdir(parentCwd);
+    await writeFile(parentSessionFile, "parent\n");
+    const fixture = await provisionWorkerReviewFixture(directory, parentSessionFile, parentCwd);
+    const primaryModel = { ...fakeModel("opus"), provider: "anthropic" } as Model<Api>;
+    const fallbackModel = { ...fakeModel("secondary"), provider: "anthropic" } as Model<Api>;
+    const originalStartedAt = "2026-09-10T19:00:00.000000000Z";
+    let startedAt = originalStartedAt;
+    let inspections = 0;
+    let fallbackStarted = false;
+    const api = fakeApi();
+    registerWorkerExtension(api, {
+      roots: fixture.roots,
+      inspectContainer: () => {
+        inspections += 1;
+        return stoppedContainerIdentity(fixture.container.containerId!, 0, { startedAt });
+      },
+      resolveReviewRoutes: () => ({
+        primary: { model: primaryModel, thinkingLevel: "xhigh" },
+        rateLimitFallback: { model: fallbackModel, thinkingLevel: "xhigh" }
+      }),
+      reviewWorker: async (_context, input) => {
+        startedAt = "2026-09-10T19:25:00.000000000Z";
+        await assert.rejects(async () => { await input.beforeFallback!(new AbortController().signal); }, /stopped container identity changed/);
+        fallbackStarted = false;
+        startedAt = originalStartedAt;
+        throw new ManagedWorkerReviewExecutionError(
+          [{ route: "anthropic/opus:xhigh", outcome: "rate_limited" }],
+          "precondition_failed"
+        );
+      }
+    });
+    const tool = api.tools.find((candidate) => candidate.name === "worker_review")!;
+    await assert.rejects(() => tool.execute!("fallback-cycle", {
+      workerId: fixture.workerId,
+      runId: fixture.runId,
+      workspaceRepo: "repos/project"
+    } as never, undefined, undefined, parentContext(parentCwd, parentSessionFile)), /precondition_failed.*anthropic\/opus:xhigh — rate_limited/i);
+    assert.equal(fallbackStarted, false);
+    assert.equal(inspections, 3, "initial, before-fallback, and post-failure inspections all run");
   });
 });
 
@@ -1928,7 +1994,7 @@ test("worker_review rejects wrong ownership, run identity, active workers, and r
     const api = fakeApi();
     registerWorkerExtension(api, {
       roots: fixture.roots,
-      inspectContainer: () => ({ containerId: fixture.container.containerId!, exitCode: 0 }),
+      inspectContainer: () => stoppedContainerIdentity(fixture.container.containerId!),
       resolveReviewRoutes: () => ({ primary: { model: fakeModel(), thinkingLevel: "xhigh" } }),
       reviewWorker: async () => { reviews += 1; throw new Error("review should not run"); }
     });
@@ -1966,7 +2032,7 @@ test("worker_review fails closed for inventory, repository, lifecycle, container
     const reviewModel = fakeModel();
     const baseDependencies = {
       roots: fixture.roots,
-      inspectContainer: () => ({ containerId: fixture.container.containerId!, exitCode: 0 }),
+      inspectContainer: () => stoppedContainerIdentity(fixture.container.containerId!),
       resolveReviewRoutes: () => ({ primary: { model: reviewModel, thinkingLevel: "xhigh" as const } })
     };
     const completed = (reviewInput: ManagedWorkerReviewPlanInput) => completedReviewExecution(reviewInput, { checks: "Inspected." });
@@ -2001,7 +2067,7 @@ test("worker_review fails closed for inventory, repository, lifecycle, container
       }
     });
     tool = api.tools.find((candidate) => candidate.name === "worker_review")!;
-    await assert.rejects(() => tool.execute!("lifecycle", input as never, undefined, undefined, context), /changed lifecycle state/);
+    await assert.rejects(() => tool.execute!("lifecycle", input as never, undefined, undefined, context), /postcondition_failed.*openai-codex\/gpt-test:xhigh — completed/i);
     const raced = readWorkerRecord(fixture.paths.recordFile);
     writeWorkerRecord(fixture.paths.recordFile, { ...raced, status: "handed_off", activeRun: undefined });
 
@@ -2009,22 +2075,22 @@ test("worker_review fails closed for inventory, repository, lifecycle, container
     api = fakeApi();
     registerWorkerExtension(api, {
       ...baseDependencies,
-      inspectContainer: () => ({ containerId: fixture.container.containerId!, exitCode: inspections++ === 0 ? 0 : 9 }),
+      inspectContainer: () => stoppedContainerIdentity(fixture.container.containerId!, inspections++ === 0 ? 0 : 9),
       reviewWorker: async (_context, reviewInput) => completed(reviewInput)
     });
     tool = api.tools.find((candidate) => candidate.name === "worker_review")!;
-    await assert.rejects(() => tool.execute!("container-drift", input as never, undefined, undefined, context), /container identity changed/);
+    await assert.rejects(() => tool.execute!("container-drift", input as never, undefined, undefined, context), /postcondition_failed.*openai-codex\/gpt-test:xhigh — completed/i);
 
     const beforeFailure = await readFile(fixture.paths.recordFile);
     inspections = 0;
     api = fakeApi();
     registerWorkerExtension(api, {
       ...baseDependencies,
-      inspectContainer: () => { inspections += 1; return { containerId: fixture.container.containerId!, exitCode: 0 }; },
+      inspectContainer: () => { inspections += 1; return stoppedContainerIdentity(fixture.container.containerId!); },
       reviewWorker: async () => { const error = new Error("review timed out"); error.name = "TimeoutError"; throw error; }
     });
     tool = api.tools.find((candidate) => candidate.name === "worker_review")!;
-    await assert.rejects(() => tool.execute!("review-timeout", input as never, undefined, undefined, context), { name: "TimeoutError" });
+    await assert.rejects(() => tool.execute!("review-timeout", input as never, undefined, undefined, context), /timed_out.*openai-codex\/gpt-test:xhigh — timed_out/i);
     assert.equal(inspections, 2, "review failure still rechecks stopped container state");
     assert.deepEqual(await readFile(fixture.paths.recordFile), beforeFailure, "review failure must not mutate delivery or lifecycle state");
 
@@ -2032,12 +2098,12 @@ test("worker_review fails closed for inventory, repository, lifecycle, container
     api = fakeApi();
     registerWorkerExtension(api, {
       ...baseDependencies,
-      inspectContainer: () => { inspections += 1; return { containerId: fixture.container.containerId!, exitCode: 0 }; },
+      inspectContainer: () => { inspections += 1; return stoppedContainerIdentity(fixture.container.containerId!); },
       resolveReviewRoutes: () => { throw new Error("fallback model is not authenticated"); },
       reviewWorker: async () => { throw new Error("review should not start"); }
     });
     tool = api.tools.find((candidate) => candidate.name === "worker_review")!;
-    await assert.rejects(() => tool.execute!("review-route-failure", input as never, undefined, undefined, context), /fallback model is not authenticated/);
+    await assert.rejects(() => tool.execute!("review-route-failure", input as never, undefined, undefined, context), /precondition_failed.*route outcomes: none/i);
     assert.equal(inspections, 2, "route validation failure still rechecks stopped container state");
   });
 });
@@ -2670,6 +2736,7 @@ test("worker_fold_resolve dispatches one exact immutable analysis worker", async
     await assert.rejects(() => executeResolve("mixed-phase", { kind: "start", preparedId: preparedDetails.preparedId, manifestSha256: preparedDetails.manifestSha256, candidateId, taskIds: ["personal-resolve"], context: Object.fromEntries(["decisions","projectRules","acceptanceCriteria","dependencies","candidateRationale","candidateChecks","reviewFindings","invariants","nonGoals","priorities","openQuestions","authorResponses"].map((key) => [key, key === "acceptanceCriteria" ? ["Produce an exact conflict resolution."] : []])), workerId: sourceWorkerId }), /start requires only/);
     await assert.rejects(() => executeResolve("wrong-hash", { kind: "start", preparedId: preparedDetails.preparedId, manifestSha256: "0".repeat(64), candidateId, taskIds: ["personal-resolve"], context: Object.fromEntries(["decisions","projectRules","acceptanceCriteria","dependencies","candidateRationale","candidateChecks","reviewFindings","invariants","nonGoals","priorities","openQuestions","authorResponses"].map((key) => [key, key === "acceptanceCriteria" ? ["Produce an exact conflict resolution."] : []])) }), /hash mismatch/);
     await assert.rejects(() => executeResolve("max-route", { kind: "start", preparedId: preparedDetails.preparedId, manifestSha256: preparedDetails.manifestSha256, candidateId, taskIds: ["personal-resolve"], route: "openai-codex/gpt-test:max", context: Object.fromEntries(["decisions","projectRules","acceptanceCriteria","dependencies","candidateRationale","candidateChecks","reviewFindings","invariants","nonGoals","priorities","openQuestions","authorResponses"].map((key) => [key, key === "acceptanceCriteria" ? ["Produce an exact conflict resolution."] : []])) }), /capped at xhigh/);
+    await assert.rejects(() => executeResolve("fable-route", { kind: "start", preparedId: preparedDetails.preparedId, manifestSha256: preparedDetails.manifestSha256, candidateId, taskIds: ["personal-resolve"], route: "amazon-bedrock/us.anthropic.claude-fable-5-20260901-v1:0:xhigh", context: Object.fromEntries(["decisions","projectRules","acceptanceCriteria","dependencies","candidateRationale","candidateChecks","reviewFindings","invariants","nonGoals","priorities","openQuestions","authorResponses"].map((key) => [key, key === "acceptanceCriteria" ? ["Produce an exact conflict resolution."] : []])) }), /Claude Fable/);
     const started = await executeResolve("resolve-start", { kind: "start", preparedId: preparedDetails.preparedId, manifestSha256: preparedDetails.manifestSha256, candidateId, taskIds: ["personal-resolve"], context: Object.fromEntries(["decisions","projectRules","acceptanceCriteria","dependencies","candidateRationale","candidateChecks","reviewFindings","invariants","nonGoals","priorities","openQuestions","authorResponses"].map((key) => [key, key === "acceptanceCriteria" ? ["Produce an exact conflict resolution."] : []])) });
     assert.equal(Check(RetainedToolOutputSchemas.worker_fold_resolve, started), true);
     const details = started.details as { workerId: string; phase: string; contextSha256: string; preparedId: string };

@@ -159,6 +159,12 @@ export function parkWorkerContainer(dockerPath: string, reference: WorkerContain
 export type StoppedWorkerContainerIdentity = {
   containerId: string;
   exitCode?: number;
+  status: string;
+  startedAt: string;
+  finishedAt: string;
+  oomKilled: boolean;
+  error: string;
+  restartCount: number;
 };
 
 /** Read-only exact identity/state check. Never starts, stops, kills, or removes the container. */
@@ -172,7 +178,16 @@ export function inspectStoppedWorkerContainer(
   const inspected = inspectWorkerContainer(dockerPath, reference);
   if (!inspected) throw new Error(`Docker worker container ${reference.name} is missing.`);
   if (inspected.state.Running) throw new Error(`Docker worker container ${reference.name} is running; settled review requires it to remain stopped.`);
-  return { containerId: inspected.id, ...(inspected.state.ExitCode === undefined ? {} : { exitCode: inspected.state.ExitCode }) };
+  return {
+    containerId: inspected.id,
+    ...(inspected.state.ExitCode === undefined ? {} : { exitCode: inspected.state.ExitCode }),
+    status: inspected.state.Status,
+    startedAt: inspected.state.StartedAt,
+    finishedAt: inspected.state.FinishedAt,
+    oomKilled: inspected.state.OOMKilled,
+    error: inspected.state.Error,
+    restartCount: inspected.restartCount
+  };
 }
 
 export function settleWorkerContainer(dockerPath: string, reference: WorkerContainerReference): void {
@@ -339,7 +354,7 @@ function waitForWorkerContainerReady(
 function inspectWorkerContainer(
   dockerPath: string,
   reference: WorkerContainerReference
-): { id: string; state: { Running: boolean; ExitCode?: number }; labels: Record<string, string> } | undefined {
+): { id: string; state: { Running: boolean; ExitCode?: number; Status: string; StartedAt: string; FinishedAt: string; OOMKilled: boolean; Error: string }; labels: Record<string, string>; restartCount: number } | undefined {
   const target = reference.containerId ?? reference.name;
   let output: string;
   try {
@@ -350,11 +365,17 @@ function inspectWorkerContainer(
   }
   const values = JSON.parse(output) as Array<{
     Id?: unknown;
-    State?: { Running?: unknown; ExitCode?: unknown };
+    State?: { Running?: unknown; ExitCode?: unknown; Status?: unknown; StartedAt?: unknown; FinishedAt?: unknown; OOMKilled?: unknown; Error?: unknown };
     Config?: { Labels?: unknown };
+    RestartCount?: unknown;
   }>;
   const value = values[0];
-  if (!value || typeof value.Id !== "string" || typeof value.State?.Running !== "boolean") {
+  if (
+    !value || typeof value.Id !== "string" || typeof value.State?.Running !== "boolean" ||
+    typeof value.State.Status !== "string" || typeof value.State.StartedAt !== "string" ||
+    typeof value.State.FinishedAt !== "string" || typeof value.State.OOMKilled !== "boolean" ||
+    typeof value.State.Error !== "string" || typeof value.RestartCount !== "number"
+  ) {
     throw new Error(`Docker returned invalid inspection data for ${reference.name}.`);
   }
   const labels = value.Config?.Labels;
@@ -374,9 +395,15 @@ function inspectWorkerContainer(
     id: value.Id,
     state: {
       Running: value.State.Running,
-      ExitCode: typeof value.State.ExitCode === "number" ? value.State.ExitCode : undefined
+      ExitCode: typeof value.State.ExitCode === "number" ? value.State.ExitCode : undefined,
+      Status: value.State.Status,
+      StartedAt: value.State.StartedAt,
+      FinishedAt: value.State.FinishedAt,
+      OOMKilled: value.State.OOMKilled,
+      Error: value.State.Error
     },
-    labels: typedLabels
+    labels: typedLabels,
+    restartCount: value.RestartCount
   };
 }
 
