@@ -42,6 +42,7 @@ const client = new RpcClient({
     ...(config.integration ? { PI_WORKER_INTEGRATION: JSON.stringify(config.integration) } : {}),
     PI_WORKER_BD_PATH: config.bdPath,
     PI_WORKER_BEADS_ROUTE: JSON.stringify(config.beadsRoute),
+    GIT_OPTIONAL_LOCKS: "0",
     ...(config.shellExecution.kind === "docker"
       ? {
           PI_WORKER_CONTAINER: JSON.stringify(config.shellExecution.container),

@@ -265,8 +265,9 @@ export function resolvePiCliPath(): string {
 }
 
 function workerShellEnvironment(execution: WorkerShellExecution): NodeJS.ProcessEnv {
-  if (execution.kind === "native-test") return { PI_WORKER_NATIVE_TEST_SHELL: "1" };
+  if (execution.kind === "native-test") return { PI_WORKER_NATIVE_TEST_SHELL: "1", GIT_OPTIONAL_LOCKS: "0" };
   return {
+    GIT_OPTIONAL_LOCKS: "0",
     PI_WORKER_CONTAINER: JSON.stringify(execution.container),
     PI_WORKER_DOCKER_PATH: execution.dockerPath
   };

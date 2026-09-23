@@ -790,6 +790,34 @@ test("session restart does not invalidate a queued run leased by another live pa
   });
 });
 
+
+
+test("restart rolls back an unlaunched queued integration resolution to its parked analysis checkpoint", async () => {
+  await withTempDir(async (directory) => {
+    const parentCwd = path.join(directory, "parent"); const parentSessionFile = path.join(directory, "parent.jsonl");
+    await mkdir(parentCwd); await writeFile(parentSessionFile, `${JSON.stringify({ type: "session", version: 3, id: "parent-session", timestamp: "2026-09-10T19:29:00.000Z", cwd: parentCwd })}\n`);
+    const roots = { stateRoot: path.join(directory, "workers"), workspaceRoot: path.join(directory, "workspaces") };
+    const workerId = "worker_20260910190000_rollback"; const analysisRunId = "run_20260910192000_analysis"; const runId = "run_20260910193000_resolve1"; const paths = workerPaths(roots, workerId);
+    provisionWorkerPaths(paths); await mkdir(path.join(paths.stateDir, "integration"), { recursive: true }); await mkdir(path.join(paths.stateDir, "integration-git"), { recursive: true });
+    const decisionsFile = path.join(paths.stateDir, "integration", `decisions-${runId}.json`); const workspaceDecisionsFile = path.join(paths.artifactsDir, `integration-decisions-${runId}.json`);
+    await writeFile(decisionsFile, "decisions\n", { mode: 0o400 }); await writeFile(workspaceDecisionsFile, "decisions\n", { mode: 0o400 });
+    const container: WorkerContainerReference = { version: 1, workerId, runId: analysisRunId, name: "pi-integration-rollback", nonce: "rollback-nonce", image: "alpine@test", codeRoot: parentCwd, workspaceRoot: paths.workspaceRoot, containerId: "e".repeat(64) };
+    writeWorkerRecord(paths.recordFile, {
+      version: WORKER_RECORD_VERSION, workerId, sessionId: "worker-session-rollback", parentSessionFile, workspaceRoot: paths.workspaceRoot, taskIds: ["personal-rollback"], route: { provider: "openai-codex", model: "gpt-test", thinkingLevel: "xhigh" }, status: "queued", container,
+      integration: { phase: "resolution", preparedId: "prepared_aaaaaaaaaaaaaaaaaaaaaaaa", manifestSha256: "a".repeat(64), candidateId: "candidate_bbbbbbbbbbbbbbbbbbbbbbbb", method: "merge", sourceCandidateIds: ["candidate_bbbbbbbbbbbbbbbbbbbbbbbb"], targetRepo: path.join(directory, "target"), targetRef: "refs/heads/main", targetExpectedCommit: "c".repeat(40), targetExpectedTree: "d".repeat(40), candidateHeadCommit: "e".repeat(40), candidateHeadTree: "f".repeat(40), preparedArtifactFile: path.join(directory, "folds", "prepared_aaaaaaaaaaaaaaaaaaaaaaaa", "repo.bundle"), analysisIndexFile: path.join(paths.stateDir, "integration-git", "analysis-index"), analysisIndexSha256: "1".repeat(64), evidence: [], workspaceRepo: "repos/integration-bbbbbbbbbbbbbbbbbbbbbbbb", contextFile: path.join(paths.stateDir, "integration", "context.json"), workspaceContextFile: path.join(paths.artifactsDir, "integration-context.json"), contextSha256: "2".repeat(64), analysisRunId, analysisSnapshot: { headCommit: "c".repeat(40), headTree: "d".repeat(40), statusSha256: "3".repeat(64), indexSha256: "4".repeat(64), refsSha256: "5".repeat(64), configSha256: "6".repeat(64), metadataSha256: "7".repeat(64) }, decisionsFile, workspaceDecisionsFile, decisionsSha256: "8".repeat(64), resolutionRunId: runId },
+      activeRun: { runId, jobId: "job_20260910193000_resolve1", status: "queued", completionDelivery: "steer" },
+      lastRun: { runId: analysisRunId, jobId: "job_20260910192000_analysis", status: "handed_off", delivery: "delivered", completionDelivery: "steer" }, updatedAt: "2026-09-10T19:30:00.000Z"
+    });
+    acquireWorkerLease(paths.leaseFile, { version: 1, workerId, runId, parentPid: 2_147_483_000, acquiredAt: "2026-09-10T19:30:00.000Z" });
+    let parks = 0; let removals = 0; const api = fakeApi();
+    registerWorkerExtension(api, { roots, now: () => new Date("2026-09-10T19:32:00.000Z"), parkContainer: (value) => { parks += 1; assert.equal(value.containerId, container.containerId); }, removeContainer: () => { removals += 1; } });
+    await api.emit("session_start", {}, parentContext(parentCwd, parentSessionFile));
+    const restored = readWorkerRecord(paths.recordFile);
+    assert.equal(restored.status, "handed_off"); assert.equal(restored.activeRun, undefined); assert.equal(restored.integration?.phase, "analysis"); assert.equal(restored.container?.containerId, container.containerId);
+    assert.equal(existsSync(decisionsFile), false); assert.equal(existsSync(workspaceDecisionsFile), false); assert.equal(existsSync(paths.leaseFile), false);
+    assert.equal(parks, 1); assert.equal(removals, 0); assert.equal(api.messages.length, 1); assert.match(JSON.stringify(api.messages[0]?.message), /rolled back.*parent restart/i);
+  });
+});
 test("restart cleanup failure remains explicitly cancellable after container control recovers", async () => {
   await withTempDir(async (directory) => {
     const parentCwd = path.join(directory, "parent");
@@ -1005,6 +1033,7 @@ test("session restart adopts a settled durable worker handoff", async () => {
       resultFile,
       settledAt: "2026-09-10T19:31:01.000Z"
     })}\n`);
+    const container: WorkerContainerReference = { version: 1, workerId, runId, name: "pi-worker-adopt", nonce: "adopt-nonce", image: "alpine@test", codeRoot: parentCwd, workspaceRoot: paths.workspaceRoot, containerId: "f".repeat(64) };
     writeWorkerRecord(paths.recordFile, {
       version: WORKER_RECORD_VERSION,
       workerId,
@@ -1014,12 +1043,16 @@ test("session restart adopts a settled durable worker handoff", async () => {
       taskIds: ["personal-adopt"],
       route: { provider: "openai-codex", model: "gpt-test", thinkingLevel: "xhigh" },
       status: "running",
+      container,
       activeRun: { runId, jobId, status: "running", pid: 2_147_483_000, resultFile, settledFile },
       updatedAt: "2026-09-10T19:30:00.000Z"
     });
+    let parks = 0; let removals = 0;
     registerWorkerExtension(api, {
       roots,
-      now: () => new Date("2026-09-10T19:32:00.000Z")
+      now: () => new Date("2026-09-10T19:32:00.000Z"),
+      parkContainer: (value) => { parks += 1; assert.equal(value.containerId, container.containerId); },
+      removeContainer: () => { removals += 1; }
     });
     await api.emit("session_start", {}, context);
 
@@ -1027,6 +1060,8 @@ test("session restart adopts a settled durable worker handoff", async () => {
     assert.equal(recovered.status, "handed_off");
     assert.equal(recovered.activeRun, undefined);
     assert.equal(recovered.lastRun?.resultFile, resultFile);
+    assert.equal(recovered.container?.containerId, container.containerId);
+    assert.equal(parks, 1); assert.equal(removals, 0);
     assert.equal(api.messages.length, 1);
     assert.match(JSON.stringify(api.messages[0].message), /ready_for_review/);
   });
@@ -2092,5 +2127,115 @@ test("worker_fold_resolve dispatches one exact immutable analysis worker", async
     assert.match(renderWorkerToolCall(resolve, { request: { kind: "start", candidateId } }), /Worker Resolve\(start analysis/);
     assert.match(renderWorkerToolCall(resolve, {}), /integration.*pending input/);
     assert.match(renderWorkerToolResult(resolve, started), /analysis/);
+  });
+});
+
+test("integration lifecycle parks before validation, persists one lineage candidate, fails closed, and re-prepares the resolved candidate", async () => {
+  await withTempDir(async (directory) => {
+    const parentCwd = path.join(directory, "parent"); const parentSessionFile = path.join(directory, "parent.jsonl");
+    const targetRoot = path.join(directory, "targets"); const target = path.join(targetRoot, "project");
+    await mkdir(parentCwd, { recursive: true }); await mkdir(target, { recursive: true });
+    await writeFile(parentSessionFile, `${JSON.stringify({ type: "session", version: 3, id: "parent-session", timestamp: "2026-09-23T03:00:00.000Z", cwd: parentCwd })}\n`);
+    gitFixture(target, "init", "--initial-branch=main"); await writeFile(path.join(target, "shared.txt"), "base\n"); gitFixture(target, "add", "shared.txt"); gitFixture(target, "commit", "-qm", "base");
+    const baseCommit = gitFixture(target, "rev-parse", "HEAD^{commit}"); const baseTree = gitFixture(target, "rev-parse", "HEAD^{tree}");
+    const roots = { stateRoot: path.join(directory, "workers"), workspaceRoot: path.join(directory, "workspaces") };
+    const sourceWorkerId = "worker_20260923030000_12345678"; const sourceRunId = "run_20260923030000_87654321"; const sourcePaths = workerPaths(roots, sourceWorkerId);
+    provisionWorkerPaths(sourcePaths); const sourceRepo = path.join(sourcePaths.reposDir, "project"); gitFixture(directory, "clone", "--no-hardlinks", target, sourceRepo);
+    await writeFile(path.join(sourceRepo, "shared.txt"), "candidate\n"); gitFixture(sourceRepo, "add", "shared.txt"); gitFixture(sourceRepo, "commit", "-qm", "candidate");
+    const candidateHead = gitFixture(sourceRepo, "rev-parse", "HEAD^{commit}"); const candidateTree = gitFixture(sourceRepo, "rev-parse", "HEAD^{tree}");
+    await writeFile(path.join(target, "shared.txt"), "target\n"); gitFixture(target, "add", "shared.txt"); gitFixture(target, "commit", "-qm", "target");
+    const candidateId = repositoryCandidateId({ workerId: sourceWorkerId, runId: sourceRunId, workspaceRepo: "repos/project", baseCommit, headCommit: candidateHead, headTree: candidateTree });
+    const sourceInventory = persistRepositoryInventory(path.join(sourcePaths.stateDir, "runs", sourceRunId, "repository-candidates.json"), {
+      version: 2, workerId: sourceWorkerId, runId: sourceRunId, workspaceRoot: sourcePaths.workspaceRoot, generatedAt: "2026-09-23T03:00:01.000Z",
+      candidates: [{ candidateId, workerId: sourceWorkerId, runId: sourceRunId, workspaceRepo: "repos/project", reported: true, purpose: "conflict", dependsOn: [], source: target, baseCommit, baseTree, headCommit: candidateHead, headTree: candidateTree, dirty: false, committedChanged: true, foldable: true, policyIssues: [] }], reportedIssues: [], scanCoverage: { complete: true, limitations: [] }
+    });
+    writeWorkerRecord(sourcePaths.recordFile, { version: WORKER_RECORD_VERSION, workerId: sourceWorkerId, sessionId: "019c0000-0000-7000-8000-000000000222", parentSessionFile, workspaceRoot: sourcePaths.workspaceRoot, taskIds: ["personal-source"], route: { provider: "openai-codex", model: "gpt-test", thinkingLevel: "xhigh" }, status: "handed_off", lastRun: { runId: sourceRunId, jobId: "job_20260923030000_source01", status: "handed_off", completionDelivery: "steer", repositoryInventory: sourceInventory }, updatedAt: "2026-09-23T03:00:01.000Z" });
+
+    type Launch = { request: any; completion: ReturnType<typeof deferred<JobMeta>> };
+    const launches: Launch[] = []; const lifecycle: string[] = []; let traceSettlement = false; let containerSequence = 0; let failNextLaunch = false;
+    const api = fakeApi(); const foldsRoot = path.join(directory, "folds");
+    registerWorkerExtension(api, {
+      roots, foldsRoot, targetRoot,
+      now: () => { if (traceSettlement) lifecycle.push("trusted-validation"); return new Date("2026-09-23T03:01:00.000Z"); },
+      planContainer: (record, runId, nonce) => ({ version: 1, workerId: record.workerId, runId, name: `pi-lifecycle-${containerSequence += 1}`, nonce, image: "alpine@test", codeRoot: parentCwd, workspaceRoot: record.workspaceRoot, containerId: String(containerSequence).repeat(64).slice(0, 64) }),
+      parkContainer: () => { lifecycle.push("park"); },
+      removeContainer: () => { lifecycle.push("remove"); },
+      launch: (_extensionApi, _context, request) => {
+        if (failNextLaunch) { failNextLaunch = false; throw new Error("post-attempt launch failure"); }
+        const completion = deferred<JobMeta>(); launches.push({ request, completion });
+        return { jobId: request.jobId, completion: completion.promise, snapshot: () => completedJob(request.jobId, request.record.workspaceRoot), cancel(): void {}, container: request.container };
+      }
+    });
+    const prepare = api.tools.find((item) => item.name === "worker_fold_prepare"); const resolve = api.tools.find((item) => item.name === "worker_fold_resolve"); const control = api.tools.find((item) => item.name === "worker_control");
+    assert.ok(prepare?.execute); assert.ok(resolve?.execute); assert.ok(control?.execute);
+    const context = parentContext(parentCwd, parentSessionFile);
+    const prepared = await prepare.execute("prepare-lifecycle", { repositories: [{ candidateId, targetRepo: target, targetRef: "refs/heads/main", purpose: "resolve", method: "merge" }] } as never, undefined, undefined, context);
+    const preparedDetails = prepared.details as { preparedId: string; manifestSha256: string };
+    const integrationContext = Object.fromEntries(["decisions","projectRules","acceptanceCriteria","dependencies","candidateRationale","candidateChecks","reviewFindings","invariants","nonGoals","priorities","openQuestions","authorResponses"].map((key) => [key, key === "acceptanceCriteria" ? ["Resolve exactly."] : []]));
+
+    const launchAnalysis = async (): Promise<{ workerId: string; paths: ReturnType<typeof workerPaths> }> => {
+      const started = await resolve.execute!("start-lifecycle", { request: { kind: "start", preparedId: preparedDetails.preparedId, manifestSha256: preparedDetails.manifestSha256, candidateId, taskIds: ["personal-resolve"], context: integrationContext } } as never, undefined, undefined, context);
+      const workerId = (started.details as { workerId: string }).workerId; const paths = workerPaths(roots, workerId);
+      await api.emit("turn_end", {}, context); const launched = launches.at(-1)!; const active = readWorkerRecord(paths.recordFile).activeRun!;
+      await mkdir(path.dirname(launched.request.resultFile), { recursive: true });
+      await writeFile(launched.request.resultFile, `${JSON.stringify({ version: 1, workerId, runId: active.runId, acceptedAt: "2026-09-23T03:01:01.000Z", handoff: { state: "checkpoint", summary: "plan", taskUpdates: [] } })}\n`);
+      await writeHostSettlement(launched.request.resultFile, workerId, active.runId, readWorkerRecord(paths.recordFile).sessionId);
+      launched.completion.resolve(completedJob(active.jobId, paths.workspaceRoot));
+      for (let attempt = 0; attempt < 100 && readWorkerRecord(paths.recordFile).activeRun; attempt += 1) await new Promise((done) => setTimeout(done, 10));
+      assert.equal(readWorkerRecord(paths.recordFile).status, "handed_off");
+      await control.execute!("ack-analysis", { action: "result", workerId } as never, undefined, undefined, context);
+      return { workerId, paths };
+    };
+
+    const successful = await launchAnalysis();
+    const resumed = await resolve.execute!("resume-lifecycle", { request: { kind: "resume", workerId: successful.workerId, message: "resolve", settledDecisions: ["Preserve both sides."] } } as never, undefined, undefined, context);
+    assert.equal((resumed.details as { phase: string }).phase, "resolution"); await api.emit("turn_end", {}, context);
+    const successLaunch = launches.at(-1)!; const successRecord = readWorkerRecord(successful.paths.recordFile); const successRepo = path.join(successRecord.workspaceRoot, successRecord.integration!.workspaceRepo);
+    assert.throws(() => gitFixture(successRepo, "merge", "--no-commit", "refs/heads/integration-candidate"));
+    await writeFile(path.join(successRepo, "shared.txt"), "resolved lifecycle\n"); gitFixture(successRepo, "add", "shared.txt"); gitFixture(successRepo, "commit", "-qm", "resolve lifecycle conflict");
+    await writeFile(successLaunch.request.resultFile, `${JSON.stringify({ version: 1, workerId: successful.workerId, runId: successRecord.activeRun!.runId, acceptedAt: "2026-09-23T03:01:02.000Z", handoff: { state: "ready_for_review", summary: "resolved", taskUpdates: [], repositories: [{ workspaceRepo: successRecord.integration!.workspaceRepo, purpose: "resolved" }] } })}\n`);
+    await writeHostSettlement(successLaunch.request.resultFile, successful.workerId, successRecord.activeRun!.runId, successRecord.sessionId);
+    lifecycle.length = 0; traceSettlement = true; successLaunch.completion.resolve(completedJob(successRecord.activeRun!.jobId, successful.paths.workspaceRoot));
+    for (let attempt = 0; attempt < 100 && readWorkerRecord(successful.paths.recordFile).activeRun; attempt += 1) await new Promise((done) => setTimeout(done, 10));
+    traceSettlement = false;
+    const settled = readWorkerRecord(successful.paths.recordFile); assert.equal(settled.status, "handed_off"); assert.equal(lifecycle[0], "park");
+    assert.equal(settled.lastRun?.repositoryInventory?.candidateCount, 1); assert.equal(settled.lastRun?.repositoryError, undefined);
+    const resolvedCandidate = settled.lastRun!.repositoryInventory!.candidates[0]!; assert.ok(resolvedCandidate.lineage); assert.equal(resolvedCandidate.lineage!.resolutionRunId, settled.lastRun!.runId);
+    const preparedAgain = await prepare.execute("prepare-resolved", { repositories: [{ candidateId: resolvedCandidate.candidateId, targetRepo: target, targetRef: "refs/heads/main", purpose: "fold resolved candidate", method: "merge" }] } as never, undefined, undefined, context);
+    assert.notEqual((preparedAgain.details as { status: string }).status, "resolution_required");
+
+    const invalid = await launchAnalysis();
+    await resolve.execute!("resume-invalid", { request: { kind: "resume", workerId: invalid.workerId, message: "resolve invalidly", settledDecisions: ["Test rejection."] } } as never, undefined, undefined, context); await api.emit("turn_end", {}, context);
+    const invalidLaunch = launches.at(-1)!; const invalidRecord = readWorkerRecord(invalid.paths.recordFile); const invalidRepo = path.join(invalidRecord.workspaceRoot, invalidRecord.integration!.workspaceRepo);
+    await writeFile(path.join(invalidRepo, "shared.txt"), "invalid one-parent result\n"); gitFixture(invalidRepo, "add", "shared.txt"); gitFixture(invalidRepo, "commit", "-qm", "invalid resolution");
+    await writeFile(invalidLaunch.request.resultFile, `${JSON.stringify({ version: 1, workerId: invalid.workerId, runId: invalidRecord.activeRun!.runId, acceptedAt: "2026-09-23T03:01:03.000Z", handoff: { state: "ready_for_review", summary: "invalid", taskUpdates: [], repositories: [{ workspaceRepo: invalidRecord.integration!.workspaceRepo, purpose: "invalid" }] } })}\n`);
+    await writeHostSettlement(invalidLaunch.request.resultFile, invalid.workerId, invalidRecord.activeRun!.runId, invalidRecord.sessionId);
+    lifecycle.length = 0; traceSettlement = true; invalidLaunch.completion.resolve(completedJob(invalidRecord.activeRun!.jobId, invalid.paths.workspaceRoot));
+    for (let attempt = 0; attempt < 100 && readWorkerRecord(invalid.paths.recordFile).activeRun; attempt += 1) await new Promise((done) => setTimeout(done, 10));
+    traceSettlement = false;
+    const failed = readWorkerRecord(invalid.paths.recordFile); assert.equal(failed.status, "failed"); assert.deepEqual(lifecycle.slice(0, 2), ["park", "remove"]); assert.equal(failed.lastRun?.repositoryError, undefined); assert.match(failed.lastRun?.error ?? "", /invalid exact parents/);
+
+    const recovered = await launchAnalysis();
+    await resolve.execute!("resume-recovery", { request: { kind: "resume", workerId: recovered.workerId, message: "resolve before recovery", settledDecisions: ["Recover exactly."] } } as never, undefined, undefined, context); await api.emit("turn_end", {}, context);
+    const recoveryLaunch = launches.at(-1)!; let recoveryRecord = readWorkerRecord(recovered.paths.recordFile); const recoveryRepo = path.join(recoveryRecord.workspaceRoot, recoveryRecord.integration!.workspaceRepo);
+    assert.throws(() => gitFixture(recoveryRepo, "merge", "--no-commit", "refs/heads/integration-candidate")); await writeFile(path.join(recoveryRepo, "shared.txt"), "resolved by recovery\n"); gitFixture(recoveryRepo, "add", "shared.txt"); gitFixture(recoveryRepo, "commit", "-qm", "resolve before recovery");
+    await writeFile(recoveryLaunch.request.resultFile, `${JSON.stringify({ version: 1, workerId: recovered.workerId, runId: recoveryRecord.activeRun!.runId, acceptedAt: "2026-09-23T03:01:04.000Z", handoff: { state: "ready_for_review", summary: "recovered resolution", taskUpdates: [], repositories: [{ workspaceRepo: recoveryRecord.integration!.workspaceRepo, purpose: "recovered" }] } })}\n`);
+    await writeHostSettlement(recoveryLaunch.request.resultFile, recovered.workerId, recoveryRecord.activeRun!.runId, recoveryRecord.sessionId);
+    recoveryRecord = { ...recoveryRecord, activeRun: { ...recoveryRecord.activeRun!, pid: 99_999_999 }, updatedAt: "2026-09-23T03:00:00.000Z" }; writeWorkerRecord(recovered.paths.recordFile, recoveryRecord);
+    const recoveryLifecycle: string[] = []; const recoveryApi = fakeApi(); registerWorkerExtension(recoveryApi, { roots, foldsRoot, targetRoot, now: () => new Date("2026-09-23T03:02:00.000Z"), parkContainer: () => recoveryLifecycle.push("park"), removeContainer: () => recoveryLifecycle.push("remove") });
+    await recoveryApi.emit("session_start", {}, context);
+    const recoveredRecord = readWorkerRecord(recovered.paths.recordFile); assert.equal(recoveredRecord.status, "handed_off"); assert.deepEqual(recoveryLifecycle, ["park"]); assert.equal(recoveredRecord.lastRun?.repositoryInventory?.candidateCount, 1); assert.equal(recoveredRecord.lastRun?.repositoryError, undefined);
+
+    const prelaunch = await launchAnalysis();
+    await resolve.execute!("resume-prelaunch-rollback", { request: { kind: "resume", workerId: prelaunch.workerId, message: "defer then rollback", settledDecisions: ["Rollback safely."] } } as never, undefined, undefined, context);
+    const queuedPrelaunch = readWorkerRecord(prelaunch.paths.recordFile); const prelaunchDecisions = queuedPrelaunch.integration!.decisionsFile!; const prelaunchMessages = api.messages.length;
+    const otherSession = path.join(directory, "other-parent.jsonl"); await writeFile(otherSession, `${JSON.stringify({ type: "session", version: 3, id: "other-parent", timestamp: "2026-09-23T03:02:30.000Z", cwd: parentCwd })}\n`);
+    await api.emit("turn_end", {}, parentContext(parentCwd, otherSession));
+    const prelaunchRestored = readWorkerRecord(prelaunch.paths.recordFile); assert.equal(prelaunchRestored.status, "handed_off"); assert.equal(prelaunchRestored.integration?.phase, "analysis"); assert.ok(prelaunchRestored.container); assert.equal(existsSync(prelaunchDecisions), false); assert.equal(api.messages.length, prelaunchMessages + 1); assert.match(JSON.stringify(api.messages.at(-1)?.message), /rolled back before worker execution/i);
+
+    const attempted = await launchAnalysis();
+    await resolve.execute!("resume-attempted-failure", { request: { kind: "resume", workerId: attempted.workerId, message: "attempt launch", settledDecisions: ["Proceed."] } } as never, undefined, undefined, context);
+    failNextLaunch = true; lifecycle.length = 0; await api.emit("turn_end", {}, context);
+    const launchFailed = readWorkerRecord(attempted.paths.recordFile); assert.equal(launchFailed.status, "failed"); assert.equal(launchFailed.container, undefined); assert.equal(launchFailed.integration?.phase, "resolution"); assert.match(launchFailed.lastRun?.error ?? "", /post-attempt launch failure/); assert.deepEqual(lifecycle, ["remove"]);
   });
 });

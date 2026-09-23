@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { closeSync, existsSync, openSync } from "node:fs";
 import { chmod, link, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -295,6 +295,23 @@ test("bounds generated repository metadata to persisted record limits", async ()
   });
 });
 
+
+
+test("repository discovery stays complete with more than twenty thousand ordinary files", async () => {
+  await withTempDir(async (directory) => {
+    const source = await createSource(directory, "many-files-source");
+    const workspace = path.join(directory, "workspace");
+    const repo = path.join(workspace, "repos", "project");
+    clone(source, repo);
+    await writeFile(path.join(repo, ".gitignore"), "bulk/\n");
+    git(repo, "add", ".gitignore"); git(repo, "commit", "-qm", "ignore generated bulk");
+    const bulk = path.join(repo, "bulk"); await mkdir(bulk);
+    for (let index = 0; index < 20_100; index += 1) closeSync(openSync(path.join(bulk, `file-${String(index).padStart(5, "0")}.tmp`), "w"));
+    const inventory = deriveRepositoryInventory(inventoryInput(directory, handoff("repos/project")));
+    assert.equal(inventory.candidates.length, 1);
+    assert.deepEqual(inventory.scanCoverage, { complete: true, limitations: [] });
+  });
+});
 test("reports overall incomplete scan coverage without per-path scan noise", async () => {
   await withTempDir(async (directory) => {
     const workspace = path.join(directory, "workspace");

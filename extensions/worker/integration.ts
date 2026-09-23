@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmodSync, closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync, openSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
 import path from "node:path";
 import { resolveExecutable } from "../_shared/executable.js";
 import type { WorkerHandoff } from "../_shared/worker-contract.js";
@@ -8,7 +8,6 @@ import {
   createGitRunner,
   gitBuffer,
   gitText,
-  runGit,
   repositoryPolicyIssues,
   repositoryTreePolicyIssues,
   runStandaloneGit,
@@ -154,8 +153,7 @@ export function provisionIntegrationRepository(input: {
 }
 
 function verifyPreparedIntegrationArtifact(file: string, expectedHash: string): void {
-  const content = readBoundedRegularFile(file, MAX_PREPARED_ARTIFACT_BYTES, true, "Prepared integration artifact");
-  if (sha256(content) !== expectedHash) throw new Error("Prepared integration artifact hash mismatch.");
+  if (hashBoundedRegularFile(file, MAX_PREPARED_ARTIFACT_BYTES, true, "Prepared integration artifact") !== expectedHash) throw new Error("Prepared integration artifact hash mismatch.");
 }
 
 export function snapshotIntegrationRepository(repositoryPath: string, trustedStateRoot: string, analysisIndexFile: string, analysisIndexSha256: string): WorkerIntegrationSnapshot {
@@ -171,7 +169,7 @@ export function snapshotIntegrationRepository(repositoryPath: string, trustedSta
     headCommit,
     headTree,
     statusSha256: commandHash(gitBuffer(statusRunner, repository, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching", "--ignore-submodules=none"])),
-    indexSha256: commandHash(gitBuffer(runner, repository, ["ls-files", "--stage", "-z"])),
+    indexSha256: semanticIndexHash(repository, runner, trustedStateRoot),
     refsSha256: commandHash(gitBuffer(runner, repository, ["for-each-ref", "--format=%(refname)%00%(objectname)", "refs/"])),
     configSha256: commandHash(gitBuffer(runner, repository, ["config", "--local", "--no-includes", "--null", "--list"])),
     metadataSha256: gitMetadataHash(repository)
@@ -265,19 +263,39 @@ function validateResolutionRepository(integration: WorkerIntegrationRecord, work
   const candidateRef = gitText(runner, repository, ["rev-parse", "refs/heads/integration-candidate^{commit}"]).trim();
   if (targetRef !== integration.targetExpectedCommit || candidateRef !== integration.candidateHeadCommit) throw new Error("Integration exact input refs changed during resolution.");
   if (!OID_PATTERN.test(head) || !OID_PATTERN.test(tree) || head === integration.targetExpectedCommit || tree === integration.targetExpectedTree) throw new Error("Integration resolution must produce a new committed tree.");
-  gitBuffer(runner, repository, ["merge-base", "--is-ancestor", integration.targetExpectedCommit, head]);
-  if (integration.method === "merge") {
-    gitBuffer(runner, repository, ["merge-base", "--is-ancestor", integration.candidateHeadCommit, head]);
-  } else {
-    const candidateAncestry = runGit(runner, repository, ["merge-base", "--is-ancestor", integration.candidateHeadCommit, head], { allowedStatuses: [0, 1] });
-    const merges = gitText(runner, repository, ["rev-list", "--merges", `${integration.targetExpectedCommit}..${head}`]).trim();
-    if (candidateAncestry.status === 0 || merges) throw new Error("Integration squash resolution must be linear and exclude candidate ancestry.");
+  const parents = gitText(runner, repository, ["rev-list", "--parents", "-n", "1", head]).trim().split(/\s+/).slice(1);
+  const expectedParents = integration.method === "merge"
+    ? [integration.targetExpectedCommit, integration.candidateHeadCommit]
+    : [integration.targetExpectedCommit];
+  if (parents.length !== expectedParents.length || parents.some((parent, index) => parent !== expectedParents[index])) {
+    throw new Error(`Integration ${integration.method} resolution has invalid exact parents.`);
   }
   if (repositoryTreePolicyIssues(repository, head, runner).length > 0) throw new Error("Integration resolution produced an unsupported exact tree.");
   if (gitBuffer(runner, repository, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"]).byteLength > 0) throw new Error("Integration resolution repository must be clean at handoff.");
   const origin = gitText(runner, repository, ["config", "--local", "--get", "remote.origin.url"]).trim();
   const push = gitText(runner, repository, ["config", "--local", "--get", "remote.origin.pushurl"]).trim();
   if (origin !== integration.preparedArtifactFile || push !== "/dev/null") throw new Error("Integration resolution changed its no-push remote configuration.");
+}
+
+function semanticIndexHash(repository: string, runner: GitRunner, trustedStateRoot: string): string {
+  const objectDirectory = mkdtempSync(path.join(path.resolve(trustedStateRoot), "semantic-index-"));
+  try {
+    const semanticRunner: GitRunner = {
+      ...runner,
+      env: {
+        ...runner.env,
+        GIT_INDEX_FILE: path.join(repository, ".git", "index"),
+        GIT_OBJECT_DIRECTORY: objectDirectory,
+        GIT_ALTERNATE_OBJECT_DIRECTORIES: path.join(repository, ".git", "objects"),
+        GIT_OPTIONAL_LOCKS: "0"
+      }
+    };
+    const tree = gitText(semanticRunner, repository, ["write-tree"]).trim();
+    if (!OID_PATTERN.test(tree)) throw new Error("Integration semantic index tree identity is invalid.");
+    return commandHash(Buffer.from(`${tree}\n`));
+  } finally {
+    rmSync(objectDirectory, { recursive: true, force: true });
+  }
 }
 
 function gitMetadataHash(repository: string): string {
@@ -393,8 +411,25 @@ function readBoundedRegularFile(file: string, maxBytes: number, immutable: boole
     const content = Buffer.alloc(before.size + 1);
     const count = readSync(descriptor, content, 0, content.byteLength, 0);
     const after = fstatSync(descriptor);
-    if (count !== before.size || after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size || after.mtimeMs !== before.mtimeMs) throw new Error(`${label} changed during its bounded read.`);
+    if (count !== before.size || after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) throw new Error(`${label} changed during its bounded read.`);
     return content.subarray(0, count);
+  } finally { closeSync(descriptor); }
+}
+
+function hashBoundedRegularFile(file: string, maxBytes: number, immutable: boolean, label: string): string {
+  const descriptor = openSync(path.resolve(file), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const before = fstatSync(descriptor);
+    if (!before.isFile() || before.nlink !== 1 || before.size > maxBytes || (immutable && ((before.mode & 0o077) !== 0 || (before.mode & 0o222) !== 0))) throw new Error(`${label} is not a bounded single-link regular file${immutable ? " with immutable owner-only mode" : ""}.`);
+    const hash = createHash("sha256"); const buffer = Buffer.alloc(64 * 1024); let position = 0;
+    while (position < before.size) {
+      const count = readSync(descriptor, buffer, 0, Math.min(buffer.byteLength, before.size - position), position);
+      if (count <= 0) throw new Error(`${label} changed during its bounded read.`);
+      hash.update(buffer.subarray(0, count)); position += count;
+    }
+    const after = fstatSync(descriptor);
+    if (position !== before.size || after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) throw new Error(`${label} changed during its bounded read.`);
+    return hash.digest("hex");
   } finally { closeSync(descriptor); }
 }
 

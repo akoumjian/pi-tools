@@ -1,3 +1,5 @@
+import { execFileSync } from "node:child_process";
+import { mkdirSync, writeFileSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
 
@@ -8,6 +10,15 @@ export default function workerFauxProviderExtension(api: ExtensionAPI): void {
   const workspaceRoot = process.env.PI_WORKER_WORKSPACE_ROOT;
   if (!workspaceRoot) throw new Error("Worker faux provider requires PI_WORKER_WORKSPACE_ROOT.");
   const postHandoffMarker = `${workspaceRoot}/post-handoff-side-effect`;
+  const gitLockProbe = `${workspaceRoot}/scratch/git-lock-probe`;
+  let requiredGitMutationLocks = false;
+  try {
+    mkdirSync(gitLockProbe, { recursive: true });
+    execFileSync("git", ["init", "-q"], { cwd: gitLockProbe, stdio: "ignore" });
+    writeFileSync(`${gitLockProbe}/probe.txt`, "required lock probe\n");
+    execFileSync("git", ["add", "probe.txt"], { cwd: gitLockProbe, stdio: "ignore" });
+    requiredGitMutationLocks = true;
+  } catch { /* surfaced through the typed test handoff */ }
   const faux = fauxProvider({
     api: "worker-faux-api",
     provider: PROVIDER,
@@ -27,6 +38,8 @@ export default function workerFauxProviderExtension(api: ExtensionAPI): void {
       const checks = {
         exactParentContext: serialized.includes("PARENT_EXACT_MARKER"),
         workerPrompt: serialized.includes("WORKER_PROMPT_MARKER"),
+        gitOptionalLocksDisabled: process.env.GIT_OPTIONAL_LOCKS === "0",
+        requiredGitMutationLocks,
         projectPoisonAbsent: !(context.systemPrompt ?? "").includes("WORKSPACE_SYSTEM_POISON") && !serialized.includes("WORKSPACE_SYSTEM_POISON"),
         exactTools: JSON.stringify(toolNames) === JSON.stringify(["shell_cancel", "shell_read", "shell_start", "shell_status", "worker_handoff", "worker_task_read", "worker_task_update"])
       };

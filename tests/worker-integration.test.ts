@@ -105,7 +105,12 @@ test("provisions exact isolated integration inputs and enforces pristine analysi
   validateStoppedIntegrationHandoff({ state: "checkpoint", summary: "plan", taskUpdates: [] }, integration, workspace, path.join(state, "git"));
   validateStoppedIntegrationHandoff({ state: "blocked", summary: "terminal blocker", taskUpdates: [] }, integration, workspace, path.join(state, "git"));
   assert.throws(() => validateStoppedIntegrationHandoff({ state: "ready_for_review", summary: "wrong", taskUpdates: [] }, integration, workspace, path.join(state, "git")), /checkpoint, needs_input/);
-  await writeFile(path.join(repositoryPath, ".git", "logs", "HEAD"), "forged reflog\n", { flag: "a" });
+  const emptyBlob = git(repositoryPath, "hash-object", "-w", "--stdin");
+  let indexInfo = "";
+  for (let index = 0; index < 24_000; index += 1) indexInfo += `100644 ${emptyBlob}\tsemantic-index/${String(index).padStart(5, "0")}-${"x".repeat(32)}.txt\n`;
+  const indexed = spawnSync("git", ["update-index", "--index-info"], { cwd: repositoryPath, input: indexInfo, encoding: "utf8", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_OPTIONAL_LOCKS: "0" } });
+  assert.equal(indexed.status, 0, indexed.stderr);
+  assert.ok((await import("node:fs/promises").then(({ stat }) => stat(path.join(repositoryPath, ".git", "index")))).size > 1024 * 1024);
   assert.throws(() => assertIntegrationPristine(integration, workspace, path.join(state, "git")), /mutated/);
 }));
 
@@ -146,6 +151,10 @@ test("accepts only a clean committed resolution and emits exact integration line
   };
   const handoff = { state: "ready_for_review" as const, summary: "resolved", taskUpdates: [], repositories: [{ workspaceRepo: "repos/integration", purpose: "resolved prepared conflict" }] };
   validateStoppedIntegrationHandoff(handoff, integration, workspace, path.join(state, "git"));
+  const exactMergeHead = git(repositoryPath, "rev-parse", "HEAD");
+  await writeFile(path.join(repositoryPath, "extra-merge-commit.txt"), "extra\n"); git(repositoryPath, "add", "extra-merge-commit.txt"); commit(repositoryPath, "forbidden extra merge commit");
+  assert.throws(() => validateStoppedIntegrationHandoff(handoff, integration, workspace, path.join(state, "git")), /merge resolution has invalid exact parents/);
+  git(repositoryPath, "reset", "--hard", exactMergeHead);
   validateStoppedIntegrationHandoff({ state: "failed", summary: "terminal failure", taskUpdates: [] }, integration, workspace, path.join(state, "git"));
   const inventory = deriveRepositoryInventory({
     workerId: "worker_20260923000000_aaaaaaaa", runId: integration.resolutionRunId!, workspaceRoot: workspace, reposRoot: path.join(workspace, "repos"),
@@ -180,8 +189,12 @@ test("accepts exact linear squash shape and rejects candidate ancestry or merge 
   };
   const handoff = { state: "assignment_complete" as const, summary: "squashed", taskUpdates: [], repositories: [{ workspaceRepo: "repos/integration", purpose: "squashed" }] };
   validateStoppedIntegrationHandoff(handoff, integration, workspace, path.join(state, "git"));
+  const exactSquashHead = git(repositoryPath, "rev-parse", "HEAD");
+  await writeFile(path.join(repositoryPath, "extra-squash-commit.txt"), "extra\n"); git(repositoryPath, "add", "extra-squash-commit.txt"); commit(repositoryPath, "forbidden extra squash commit");
+  assert.throws(() => validateStoppedIntegrationHandoff(handoff, integration, workspace, path.join(state, "git")), /squash resolution has invalid exact parents/);
+  git(repositoryPath, "reset", "--hard", exactSquashHead);
   git(repositoryPath, "reset", "--hard", integration.targetExpectedCommit);
   git(repositoryPath, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "merge", "--no-ff", "-s", "ours", "-m", "forbidden merge", "refs/heads/integration-candidate");
   await writeFile(path.join(repositoryPath, "merge-only.txt"), "changed tree\n"); git(repositoryPath, "add", "merge-only.txt"); git(repositoryPath, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--amend", "--no-edit");
-  assert.throws(() => validateStoppedIntegrationHandoff(handoff, integration, workspace, path.join(state, "git")), /squash resolution must be linear/);
+  assert.throws(() => validateStoppedIntegrationHandoff(handoff, integration, workspace, path.join(state, "git")), /squash resolution has invalid exact parents/);
 }));

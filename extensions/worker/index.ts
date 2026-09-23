@@ -1482,7 +1482,13 @@ async function startPendingWorker(
         if (active.get(record.workerId)?.runId === activeRun.runId) active.delete(record.workerId);
       });
   } catch (error) {
-    if (!launchAttempted && rollbackDeferredResolutionLaunch(pending, dependencies)) return;
+    if (!launchAttempted) {
+      const restored = rollbackDeferredResolutionLaunch(pending, dependencies);
+      if (restored) {
+        sendWorkerResolutionRollback(api, restored, pending.runId, "Resolution resume was rolled back before worker execution because deferred launch did not begin.");
+        return;
+      }
+    }
     if (launchedHandle) {
       try {
         await cancelAttachedWorker(launchedHandle, record, pending.paths, dependencies);
@@ -1551,7 +1557,7 @@ async function completeWorkerRun(
   } else if (handoff && current.integration) {
     throw new Error(`Integration worker ${current.workerId}/${runId} has no exact container to stop before validation.`);
   } else if (!handoff) {
-    await settlePersistedWorkerShells(pending.paths, current.workerId, runId, dependencies);
+    await settlePersistedWorkerShells(pending.paths, current.workerId, runId, dependencies, false);
   }
   if (handoff && status === "handed_off") {
     try {
@@ -1803,13 +1809,13 @@ function persistWorkerCleanupUncertainty(
   });
 }
 
-function rollbackDeferredResolutionLaunch(pending: PendingWorkerRun, dependencies: WorkerExtensionDependencies): boolean {
+function rollbackDeferredResolutionLaunch(pending: PendingWorkerRun, dependencies: WorkerExtensionDependencies): WorkerRecord | undefined {
   return withWorkerOperationLock(pending.paths, () => {
     const latest = readWorkerRecord(pending.recordFile);
     const integration = latest.integration;
-    if (pending.kind !== "resume" || integration?.phase !== "resolution" || integration.resolutionRunId !== pending.runId || !latest.activeRun || latest.activeRun.runId !== pending.runId) return false;
+    if (pending.kind !== "resume" || integration?.phase !== "resolution" || integration.resolutionRunId !== pending.runId || !latest.activeRun || !["queued", "running"].includes(latest.activeRun.status) || latest.activeRun.runId !== pending.runId) return undefined;
     const lease = readWorkerLease(pending.paths.leaseFile);
-    if (!lease || lease.workerId !== latest.workerId || lease.runId !== pending.runId || lease.parentPid !== process.pid) return false;
+    if (!lease || lease.workerId !== latest.workerId || lease.runId !== pending.runId || lease.parentPid !== process.pid) return undefined;
     if (integration.decisionsFile) rmSync(integration.decisionsFile, { force: true });
     if (integration.workspaceDecisionsFile) rmSync(integration.workspaceDecisionsFile, { force: true });
     const restored: WorkerRecord = {
@@ -1821,8 +1827,46 @@ function rollbackDeferredResolutionLaunch(pending: PendingWorkerRun, dependencie
     };
     writeWorkerRecord(pending.recordFile, restored);
     releaseWorkerLease(pending.paths.leaseFile, restored.workerId, pending.runId);
-    return true;
+    return restored;
   });
+}
+
+function rollbackQueuedResolutionRecovery(paths: WorkerPaths, workerId: string, runId: string, dependencies: WorkerExtensionDependencies): WorkerRecord | undefined {
+  return withWorkerOperationLock(paths, () => {
+    const latest = readWorkerRecord(paths.recordFile);
+    const integration = latest.integration;
+    const lease = readWorkerLease(paths.leaseFile);
+    if (latest.workerId !== workerId || latest.activeRun?.runId !== runId || latest.activeRun.status !== "queued" || integration?.phase !== "resolution" || integration.resolutionRunId !== runId) return undefined;
+    if (!lease || lease.workerId !== workerId || lease.runId !== runId || lease.parentPid !== process.pid) return undefined;
+    assertIntegrationRecordLayout(integration, latest.workspaceRoot, paths.stateDir);
+    if (integration.decisionsFile) rmSync(integration.decisionsFile, { force: true });
+    if (integration.workspaceDecisionsFile) rmSync(integration.workspaceDecisionsFile, { force: true });
+    const restored: WorkerRecord = {
+      ...latest,
+      status: "handed_off",
+      activeRun: undefined,
+      integration: { ...integration, phase: "analysis", decisionsFile: undefined, workspaceDecisionsFile: undefined, decisionsSha256: undefined, resolutionRunId: undefined },
+      updatedAt: dependencies.now().toISOString()
+    };
+    writeWorkerRecord(paths.recordFile, restored);
+    releaseWorkerLease(paths.leaseFile, workerId, runId);
+    return restored;
+  });
+}
+
+function sendWorkerResolutionRollback(api: ExtensionAPI, record: WorkerRecord, rolledBackRunId: string, reason: string): void {
+  api.sendMessage({
+    customType: "worker-run",
+    content: [
+      `worker resolution rollback: ${record.workerId}/${rolledBackRunId}`,
+      reason,
+      `restored: analysis checkpoint ${record.integration?.analysisRunId ?? "unknown"}`,
+      `route: ${record.route.provider}/${record.route.model}:${record.route.thinkingLevel}`,
+      `workspace: ${record.workspaceRoot}`
+    ].join("\n"),
+    display: true,
+    details: { deliveryId: `worker-rollback:${record.workerId}:${rolledBackRunId}`, workerId: record.workerId, runId: rolledBackRunId, record, reason }
+  }, { triggerTurn: true, deliverAs: "steer" });
 }
 
 function failWorkerLaunch(
@@ -2106,8 +2150,23 @@ async function reconcileRecoveredWorkerRun(
   }
 
   if (!claimWorkerRecoveryLease(paths, record, run.runId, dependencies)) return false;
+  if (run.status === "queued" && record.integration?.phase === "resolution" && record.integration.resolutionRunId === run.runId) {
+    if (!record.container || !dependencies.parkContainer) {
+      persistWorkerCleanupUncertainty(paths, run.runId, "Queued integration resolution lost its exact parked container before rollback.", true, dependencies);
+      return false;
+    }
+    try { dependencies.parkContainer(record.container); }
+    catch (cause) {
+      persistWorkerCleanupUncertainty(paths, run.runId, cause instanceof Error ? cause.message : String(cause), true, dependencies);
+      return false;
+    }
+    const restored = rollbackQueuedResolutionRecovery(paths, record.workerId, run.runId, dependencies);
+    if (!restored) return false;
+    sendWorkerResolutionRollback(api, restored, run.runId, "Queued resolution resume was rolled back after parent restart before worker execution began.");
+    return true;
+  }
   try {
-    await settlePersistedWorkerShells(paths, record.workerId, run.runId, dependencies);
+    await settlePersistedWorkerShells(paths, record.workerId, run.runId, dependencies, false);
   } catch (cause) {
     persistWorkerCleanupUncertainty(
       paths,

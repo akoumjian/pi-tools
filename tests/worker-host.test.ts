@@ -148,6 +148,8 @@ test("worker host completes an exact-fork fake-provider run while ignoring works
     assert.equal(accepted.handoff.state, "assignment_complete");
     assert.match(accepted.handoff.summary, /verified the exact fork/);
     assert.match(JSON.stringify(accepted.handoff.taskUpdates), /exactParentContext.*true/);
+    assert.match(JSON.stringify(accepted.handoff.taskUpdates), /gitOptionalLocksDisabled.*true/);
+    assert.match(JSON.stringify(accepted.handoff.taskUpdates), /requiredGitMutationLocks.*true/);
     assert.equal(existsSync(path.join(workspaceRoot, "poison-loaded")), false);
     assert.equal(existsSync(path.join(workspaceRoot, "post-handoff-side-effect")), false);
     const workerSession = await readFile(forked.sessionFile, "utf8");

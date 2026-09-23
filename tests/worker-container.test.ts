@@ -35,6 +35,7 @@ test("worker container environment excludes host credentials and routes mutable 
   assert.equal(env.HOME, workspace);
   assert.equal(env.PATH, "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
   assert.equal(env.XDG_CACHE_HOME, path.join(workspace, "cache"));
+  assert.equal(env.GIT_OPTIONAL_LOCKS, "0");
   assert.equal(env.ANTHROPIC_API_KEY, undefined);
   assert.equal(env.SSH_AUTH_SOCK, undefined);
   assert.equal(env.BEADS_DIR, undefined);
@@ -67,6 +68,7 @@ test("worker container process uses the trusted host helper and preserves only s
     assert.equal(config.env.ANTHROPIC_API_KEY, undefined);
     assert.equal(config.env.PI_WORKER_JOB_TOKEN, undefined);
     assert.equal(config.env.HOME, container.workspaceRoot);
+    assert.equal(config.env.GIT_OPTIONAL_LOCKS, "0");
     assert.equal(prepared.env.PI_WORKER_JOB_TOKEN, "host-token");
   });
 });

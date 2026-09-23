@@ -793,9 +793,9 @@ test("integration handoff admission performs only phase and shape checks while t
       const integration = {
         phase: "analysis", preparedId: "prepared_aaaaaaaaaaaaaaaaaaaaaaaa", manifestSha256: "a".repeat(64), candidateId: "candidate_bbbbbbbbbbbbbbbbbbbbbbbb", method: "merge",
         sourceCandidateIds: ["candidate_bbbbbbbbbbbbbbbbbbbbbbbb"], targetRepo: path.join(directory, "target"), targetRef: "refs/heads/main",
-        targetExpectedCommit: "c".repeat(40), targetExpectedTree: "d".repeat(40), candidateHeadCommit: "e".repeat(40), candidateHeadTree: "f".repeat(40), preparedArtifactFile: path.join(directory, "prepared.bundle"),
+        targetExpectedCommit: "c".repeat(40), targetExpectedTree: "d".repeat(40), candidateHeadCommit: "e".repeat(40), candidateHeadTree: "f".repeat(40), preparedArtifactFile: path.join(directory, "prepared.bundle"), analysisIndexFile: path.join(directory, "state", "integration-git", "analysis-index"), analysisIndexSha256: "8".repeat(64), evidence: [],
         workspaceRepo: "repos/integration-bbbbbbbbbbbbbbbbbbbbbbbb", contextFile: path.join(directory, "forged-context.json"), workspaceContextFile: path.join(directory, "artifacts", "integration-context.json"),
-        contextSha256: "1".repeat(64), analysisRunId: "run-test", analysisSnapshot: { headCommit: "c".repeat(40), headTree: "d".repeat(40), statusSha256: "2".repeat(64), indexSha256: "3".repeat(64), refsSha256: "4".repeat(64), configSha256: "5".repeat(64), metadataSha256: "7".repeat(64), objectsSha256: "6".repeat(64) }
+        contextSha256: "1".repeat(64), analysisRunId: "run-test", analysisSnapshot: { headCommit: "c".repeat(40), headTree: "d".repeat(40), statusSha256: "2".repeat(64), indexSha256: "3".repeat(64), refsSha256: "4".repeat(64), configSha256: "5".repeat(64), metadataSha256: "7".repeat(64) }
       };
       process.env.PI_WORKER_INTEGRATION = JSON.stringify(integration);
       const api = fakeApi(); workerRuntimeExtension(api);

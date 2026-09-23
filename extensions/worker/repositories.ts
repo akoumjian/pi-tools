@@ -1,13 +1,18 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import {
+  closeSync,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  readSync,
   readdirSync,
   realpathSync,
   renameSync,
+  rmSync,
   statSync,
   writeFileSync
 } from "node:fs";
@@ -427,8 +432,7 @@ export function repositoryPolicyIssues(repoPath: string, runner: GitRunner): str
   try {
     const attributes = parseNulPaths(gitBuffer(runner, repoPath, ["ls-files", "--cached", "--others", "-z", "--", ".gitattributes", "**/.gitattributes"]));
     if (attributes.length > 0) return ["repository_attributes"];
-    const indexEntries = parseNulPaths(gitBuffer(runner, repoPath, ["ls-files", "-v", "-z"]));
-    if (indexEntries.some((entry) => entry[0] === "S" || (entry[0] !== undefined && entry[0] >= "a" && entry[0] <= "z"))) return ["index_visibility_flags"];
+    if (hasIndexVisibilityFlags(runner, repoPath)) return ["index_visibility_flags"];
     const gitlinks = gitText(runner, repoPath, ["ls-tree", "-r", "HEAD"]);
     if (gitlinks.split("\n").some((line) => line.startsWith("160000 "))) return ["gitlinks_or_submodules"];
     const replacements = gitText(runner, repoPath, ["for-each-ref", "--format=%(refname)", "refs/replace"]);
@@ -492,13 +496,11 @@ function gitMetadataIssues(gitDirectory: string): string[] {
       const child = path.join(directory, entry.name);
       if (entry.isSymbolicLink()) return ["git_metadata_symlink"];
       const metadata = lstatSync(child);
+      const relative = path.relative(root, child);
+      if (relative === "objects" && entry.isDirectory()) continue;
       if (entry.isDirectory()) queue.push(child);
       else if (!entry.isFile()) return ["git_metadata_special_file"];
-      else {
-        const relative = path.relative(root, child);
-        const objectContent = relative.startsWith(`objects${path.sep}`);
-        if (!objectContent && metadata.nlink !== 1) return ["git_metadata_hardlink"];
-      }
+      else if (metadata.nlink !== 1) return ["git_metadata_hardlink"];
     }
   }
   return [];
@@ -543,12 +545,12 @@ function discoverRepositories(
       continue;
     }
     for (const entry of entries) {
+      if (entry.name === ".git" || entry.isSymbolicLink() || !entry.isDirectory()) continue;
       if (++scanned > MAX_SCAN_ENTRIES) {
         limitations.add("entry_limit");
         stop = true;
         break;
       }
-      if (entry.name === ".git" || entry.isSymbolicLink() || !entry.isDirectory()) continue;
       if (next.depth >= MAX_SCAN_DEPTH) {
         limitations.add("depth_limit");
         continue;
@@ -638,7 +640,34 @@ export function runGit(
   args: string[],
   options: GitRunOptions = {}
 ): { stdout: Buffer; status: number } {
-  const common = [
+  const gitDirectory = path.join(cwd, ".git");
+  const commitEnvironment = options.deterministicCommitIdentity ? {
+    GIT_AUTHOR_NAME: "Pi Worker Fold",
+    GIT_AUTHOR_EMAIL: "worker-fold@localhost",
+    GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z",
+    GIT_COMMITTER_NAME: "Pi Worker Fold",
+    GIT_COMMITTER_EMAIL: "worker-fold@localhost",
+    GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z"
+  } : {};
+  const result = spawnSync(runner.gitPath, repositoryGitArgs(cwd, gitDirectory, args), {
+    cwd,
+    env: { ...runner.env, ...commitEnvironment, GIT_CEILING_DIRECTORIES: cwd },
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 5_000,
+    killSignal: "SIGKILL",
+    maxBuffer: MAX_GIT_OUTPUT_BYTES
+  });
+  if (result.error) throw new Error(`git_spawn_failed:${boundText(result.error.message, 120)}`);
+  const status = result.status ?? -1;
+  if (!(options.allowedStatuses ?? [0]).includes(status)) throw new Error(`git_failed:${args[0] ?? "command"}`);
+  const output = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout ?? "");
+  if (output.byteLength > MAX_GIT_OUTPUT_BYTES) throw new Error("git_output_limit");
+  return { stdout: output, status };
+}
+
+function repositoryGitArgs(cwd: string, gitDirectory: string, args: readonly string[]): string[] {
+  return [
     "--no-optional-locks",
     "-c", "core.hooksPath=/dev/null",
     "-c", "core.fsmonitor=false",
@@ -657,32 +686,49 @@ export function runGit(
     "-c", "tag.gpgSign=false",
     "-c", "diff.external=",
     "-c", "core.attributesFile=/dev/null",
-    "-c", "core.excludesFile=/dev/null"
+    "-c", "core.excludesFile=/dev/null",
+    `--git-dir=${gitDirectory}`,
+    `--work-tree=${cwd}`,
+    ...args
   ];
-  const gitDirectory = path.join(cwd, ".git");
-  const commitEnvironment = options.deterministicCommitIdentity ? {
-    GIT_AUTHOR_NAME: "Pi Worker Fold",
-    GIT_AUTHOR_EMAIL: "worker-fold@localhost",
-    GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z",
-    GIT_COMMITTER_NAME: "Pi Worker Fold",
-    GIT_COMMITTER_EMAIL: "worker-fold@localhost",
-    GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z"
-  } : {};
-  const result = spawnSync(runner.gitPath, [...common, `--git-dir=${gitDirectory}`, `--work-tree=${cwd}`, ...args], {
-    cwd,
-    env: { ...runner.env, ...commitEnvironment, GIT_CEILING_DIRECTORIES: cwd },
-    shell: false,
-    stdio: ["ignore", "pipe", "pipe"],
-    timeout: 5_000,
-    killSignal: "SIGKILL",
-    maxBuffer: MAX_GIT_OUTPUT_BYTES
-  });
-  if (result.error) throw new Error(`git_spawn_failed:${boundText(result.error.message, 120)}`);
-  const status = result.status ?? -1;
-  if (!(options.allowedStatuses ?? [0]).includes(status)) throw new Error(`git_failed:${args[0] ?? "command"}`);
-  const output = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout ?? "");
-  if (output.byteLength > MAX_GIT_OUTPUT_BYTES) throw new Error("git_output_limit");
-  return { stdout: output, status };
+}
+
+function hasIndexVisibilityFlags(runner: GitRunner, cwd: string): boolean {
+  const outputFile = path.join(String(runner.env.HOME), `index-visibility-${randomUUID()}.bin`);
+  const output = openSync(outputFile, "wx+", 0o600);
+  try {
+    const result = spawnSync(runner.gitPath, repositoryGitArgs(cwd, path.join(cwd, ".git"), ["ls-files", "-v", "-z"]), {
+      cwd,
+      env: { ...runner.env, GIT_CEILING_DIRECTORIES: cwd },
+      shell: false,
+      stdio: ["ignore", output, "pipe"],
+      timeout: 10_000,
+      killSignal: "SIGKILL",
+      maxBuffer: MAX_GIT_OUTPUT_BYTES
+    });
+    if (result.error) throw new Error(`git_spawn_failed:${boundText(result.error.message, 120)}`);
+    if (result.status !== 0) throw new Error("git_failed:ls-files");
+    const metadata = fstatSync(output);
+    if (!metadata.isFile() || metadata.nlink !== 1 || metadata.size > 64 * 1024 * 1024) throw new Error("index_visibility_output_limit");
+    const buffer = Buffer.alloc(64 * 1024);
+    let position = 0; let atStart = true;
+    while (position < metadata.size) {
+      const count = readSync(output, buffer, 0, Math.min(buffer.byteLength, metadata.size - position), position);
+      if (count <= 0) throw new Error("index_visibility_short_read");
+      for (let index = 0; index < count; index += 1) {
+        const byte = buffer[index]!;
+        if (atStart && (byte === 83 || (byte >= 97 && byte <= 122))) return true;
+        atStart = byte === 0;
+      }
+      position += count;
+    }
+    const after = fstatSync(output);
+    if (after.dev !== metadata.dev || after.ino !== metadata.ino || after.size !== metadata.size || after.mtimeMs !== metadata.mtimeMs || after.ctimeMs !== metadata.ctimeMs) throw new Error("index_visibility_output_changed");
+    return false;
+  } finally {
+    closeSync(output);
+    rmSync(outputFile, { force: true });
+  }
 }
 
 export function runStandaloneGit(runner: GitRunner, cwd: string, args: string[]): Buffer {
