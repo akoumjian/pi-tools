@@ -689,6 +689,29 @@ const WorkerFoldPrepareDetailsSchema = Type.Object({
   repositories: Type.Array(WorkerFoldPreparedRepositorySchema, { minItems: 1, maxItems: 16 })
 }, { additionalProperties: false });
 
+const WorkerFoldPromotedRepositorySchema = Type.Object({
+  candidateId: Type.String({ pattern: "^candidate_[0-9a-f]{24}$" }),
+  targetRepo: Type.String({ minLength: 1, maxLength: 1024 }),
+  targetRef: Type.String({ pattern: "^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,239}$" }),
+  expectedCommit: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
+  desiredCommit: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
+  checkedOut: Type.Boolean(),
+  status: Type.Union([Type.Literal("pending"), Type.Literal("objects_imported"), Type.Literal("ref_updated"), Type.Literal("completed"), Type.Literal("quarantined")]),
+  error: Type.Optional(Type.String({ maxLength: 1000 }))
+}, { additionalProperties: false });
+
+const WorkerFoldPromoteDetailsSchema = Type.Object({
+  promotionId: Type.String({ pattern: "^promotion_[0-9a-f]{24}$" }),
+  journalFile: Type.String({ minLength: 1, maxLength: 2048 }),
+  status: Type.Union([Type.Literal("promoting"), Type.Literal("partial"), Type.Literal("completed"), Type.Literal("quarantined")]),
+  preparedId: Type.String({ pattern: "^prepared_[0-9a-f]{24}$" }),
+  manifestSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }),
+  repositoryCount: Type.Integer({ minimum: 1, maximum: 16 }),
+  completedCount: Type.Integer({ minimum: 0, maximum: 16 }),
+  error: Type.Optional(Type.String({ maxLength: 1000 })),
+  repositories: Type.Array(WorkerFoldPromotedRepositorySchema, { minItems: 1, maxItems: 16 })
+}, { additionalProperties: false });
+
 export const RetainedToolOutputSchemas = {
   shell_start: finalResultSchema(ShellStartDetailsSchema),
   shell_status: finalResultSchema(ShellStatusDetailsSchema),
@@ -705,7 +728,8 @@ export const RetainedToolOutputSchemas = {
   worker_run: finalResultSchema(WorkerRunDetailsSchema),
   worker_control: finalResultSchema(WorkerControlDetailsSchema),
   worker_fold_prepare: finalResultSchema(WorkerFoldPrepareDetailsSchema),
-  worker_fold_resolve: finalResultSchema(WorkerFoldResolveDetailsSchema)
+  worker_fold_resolve: finalResultSchema(WorkerFoldResolveDetailsSchema),
+  worker_fold_promote: finalResultSchema(WorkerFoldPromoteDetailsSchema)
 } satisfies Record<string, TSchema>;
 
 export type RetainedToolName = keyof typeof RetainedToolOutputSchemas;

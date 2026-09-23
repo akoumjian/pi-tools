@@ -22,7 +22,8 @@ const retainedToolNames = [
   "worker_run",
   "worker_control",
   "worker_fold_prepare",
-  "worker_fold_resolve"
+  "worker_fold_resolve",
+  "worker_fold_promote"
 ] as const;
 
 function anthropicWireSchema(parameters: unknown): unknown {
@@ -107,6 +108,7 @@ test("provider context review command renders sanitized prompt, tool declaration
     assert.match(artifact.systemPrompt, /worker_control constraints:/);
     assert.match(artifact.systemPrompt, /worker_fold_prepare constraints:/);
     assert.match(artifact.systemPrompt, /worker_fold_resolve constraints:/);
+    assert.match(artifact.systemPrompt, /worker_fold_promote constraints:/);
     assert.doesNotMatch(artifact.systemPrompt, /Batch-native tool usage:/);
     assert.doesNotMatch(artifact.systemPrompt, /hunk_session/);
 

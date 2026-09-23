@@ -238,6 +238,27 @@ const samples: Record<RetainedToolName, unknown> = {
       phase: "analysis", method: "merge", preparedId: "prepared_aaaaaaaaaaaaaaaaaaaaaaaa", manifestSha256: "a".repeat(64), candidateId: "candidate_bbbbbbbbbbbbbbbbbbbbbbbb", contextSha256: "b".repeat(64)
     }
   },
+  worker_fold_promote: {
+    content: [text("promotion complete")],
+    details: {
+      promotionId: "promotion_cccccccccccccccccccccccc",
+      journalFile: "/tmp/worker-promotions/promotion_cccccccccccccccccccccccc/journal.json",
+      status: "completed",
+      preparedId: "prepared_aaaaaaaaaaaaaaaaaaaaaaaa",
+      manifestSha256: "a".repeat(64),
+      repositoryCount: 1,
+      completedCount: 1,
+      repositories: [{
+        candidateId: "candidate_bbbbbbbbbbbbbbbbbbbbbbbb",
+        targetRepo: "/tmp/targets/project",
+        targetRef: "refs/heads/main",
+        expectedCommit: "c".repeat(40),
+        desiredCommit: "d".repeat(40),
+        checkedOut: true,
+        status: "completed"
+      }]
+    }
+  },
   worker_control: {
     content: [text("Worker status")],
     details: {

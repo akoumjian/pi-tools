@@ -426,8 +426,7 @@ export function readPreparedWorkerFold(foldsRoot: string, preparedId: string, ex
       runStandaloneGit(runner, verifyDirectory, ["init", "--initial-branch=main", `--template=${runner.templateDir}`, verifyRepo]);
       const expectedHeads = artifactHeadMap(repository.artifact);
       verifyBundle(runner, verifyRepo, artifact, expectedHeads, repository.artifact.prerequisites);
-      const refspecs = [...expectedHeads.keys()].sort().map((ref) => `${ref}:${ref}`);
-      gitBuffer(runner, verifyRepo, ["fetch", "--no-write-fetch-head", "--no-tags", "--no-recurse-submodules", artifact, ...refspecs]);
+      gitBuffer(runner, verifyRepo, ["bundle", "unbundle", artifact]);
       gitBuffer(runner, verifyRepo, ["fsck", "--strict", "--connectivity-only", "--no-dangling", ...expectedHeads.values()]);
       verifyPreparedObjects(repository, verifyRepo, runner);
     } finally {
