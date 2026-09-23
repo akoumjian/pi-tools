@@ -256,18 +256,30 @@ async function runManagedWorkerReviewAttempt(
       extensionFactories: [createConfinedManagedReviewToolsExtension(input.cwd, (reason) => { confinementFailure ??= reason; })],
       signal: scope.signal,
       onEvent: (event: AgentSessionEvent) => {
-        if (event.type === "tool_execution_start") toolCallCount += 1;
+        if (event.type === "tool_execution_start") {
+          toolCallCount += 1;
+          if (!(MANAGED_WORKER_REVIEW_TOOLS as readonly string[]).includes(event.toolName)) {
+            confinementFailure ??= `Managed-worker review confinement blocked disallowed tool ${event.toolName}.`;
+          }
+        }
       }
     }, async (session) => {
       assertExactManagedReviewTools(session.getActiveToolNames());
       await session.prompt(buildManagedWorkerReviewTask(input.evidence, input.focus), { source: "extension" });
       throwIfAborted(scope.signal);
-      if (confinementFailure) throw new Error("Managed-worker review confinement blocked a forbidden tool request.");
       const assistants = session.messages.filter((message): message is AssistantMessage => {
         return !!message && typeof message === "object" && (message as { role?: unknown }).role === "assistant";
       });
       if (assistants.length === 0) throw new Error("Managed-worker reviewer finished without an assistant response.");
-      for (const message of assistants) assertExactManagedReviewResponseRoute(message, exactModel);
+      for (const message of assistants) {
+        assertExactManagedReviewResponseRoute(message, exactModel);
+        for (const item of message.content) {
+          if (item.type === "toolCall" && !(MANAGED_WORKER_REVIEW_TOOLS as readonly string[]).includes(item.name)) {
+            confinementFailure ??= `Managed-worker review confinement blocked disallowed tool ${item.name}.`;
+          }
+        }
+      }
+      if (confinementFailure) throw new Error("Managed-worker review confinement blocked a forbidden tool request.");
       const assistant = assistants.at(-1)!;
       if (assistant.stopReason === "error" || assistant.stopReason === "aborted") {
         const message = assistant.errorMessage ?? `Managed-worker reviewer stopped with ${assistant.stopReason}.`;
@@ -292,6 +304,7 @@ async function runManagedWorkerReviewAttempt(
     });
   } catch (error) {
     throwIfAborted(scope.signal, `Managed-worker review timed out after ${timeoutMs ?? MANAGED_WORKER_REVIEW_TIMEOUT_MS}ms.`);
+    if (confinementFailure) throw new Error("Managed-worker review confinement blocked a forbidden tool request.");
     throw error;
   } finally {
     scope.dispose();

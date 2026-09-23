@@ -51,7 +51,7 @@ export function formatModelName(model: Pick<Model<Api>, "provider" | "id">): str
 export function assertSubagentRouteAllowed(route: SubagentRoute, label = "Subagent route"): void {
   const rendered = `${route.provider}/${route.model}:${route.thinkingLevel}`;
   assertSubagentThinkingLevelAllowed(route.thinkingLevel, `${label} ${rendered}`);
-  if (isClaudeFableModelReference(`${route.provider}/${route.model}`) || (route.modelName !== undefined && isClaudeFableModelReference(route.modelName))) {
+  if (isClaudeFableModelReference(`${route.provider}/${route.model}`) || (route.modelName !== undefined && isClaudeFableModelName(route.modelName))) {
     throw new Error(`${label} ${rendered} is not allowed: Claude Fable models cannot be used for subagents. Choose a non-Fable model.`);
   }
 }
@@ -88,6 +88,11 @@ export function assertChildAgentRouteAllowed(
  */
 export function isClaudeFableModelReference(reference: string): boolean {
   return /(?:^|[\/.:])claude(?:[-_.]|\s)+fable(?=$|[-_./:\s])/i.test(reference.trim());
+}
+
+/** Match human-readable resolved catalog names without substring false positives. */
+export function isClaudeFableModelName(name: string): boolean {
+  return /(?:^|[^a-z0-9])claude(?:[-_.]|\s)+fable(?=$|[^a-z0-9])/i.test(name.trim());
 }
 
 export function resolveExtensionModel(options: ResolveExtensionModelOptions): ResolvedExtensionModel {

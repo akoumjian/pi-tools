@@ -483,6 +483,25 @@ test("worker settings select a configured default while explicit routes override
   });
   assert.throws(() => resolveWorkerRoute("openai-codex/gpt-test:max", context), /capped at xhigh/);
   assert.throws(() => resolveWorkerRoute("vercel-ai-gateway/anthropic/claude-fable-5:xhigh", context), /Claude Fable/);
+  for (const name of ["Anthropic Claude Fable 5", "Anthropic: Claude Fable 5", "Prod Claude Fable 5", "(Claude Fable 5)"]) {
+    const namedContext = parentContext("/tmp/parent", "/tmp/parent.jsonl") as ExtensionContext & {
+      modelRegistry: { hasConfiguredAuth(model: Model<Api>): boolean; getAll(): Model<Api>[] };
+    };
+    namedContext.modelRegistry.getAll = () => [{ ...fakeModel("gpt-test"), name }];
+    assert.throws(() => resolveWorkerRoute("openai-codex/gpt-test:xhigh", namedContext), /Claude Fable/);
+  }
+  const namedDefaultContext = parentContext("/tmp/parent", "/tmp/parent.jsonl") as ExtensionContext & {
+    modelRegistry: { hasConfiguredAuth(model: Model<Api>): boolean; getAll(): Model<Api>[] };
+  };
+  namedDefaultContext.modelRegistry.getAll = () => [{ ...fakeModel("gpt-5.6-sol"), name: "Anthropic Claude Fable 5" }];
+  assert.throws(() => resolveWorkerRoute(undefined, namedDefaultContext), /Claude Fable/);
+  for (const name of ["Claude Fablet 5", "notclaude fable 5"]) {
+    const allowedContext = parentContext("/tmp/parent", "/tmp/parent.jsonl") as ExtensionContext & {
+      modelRegistry: { hasConfiguredAuth(model: Model<Api>): boolean; getAll(): Model<Api>[] };
+    };
+    allowedContext.modelRegistry.getAll = () => [{ ...fakeModel("gpt-test"), name }];
+    assert.doesNotThrow(() => resolveWorkerRoute("openai-codex/gpt-test:xhigh", allowedContext));
+  }
   const maxParentContext = { ...context, thinkingLevel: "max" } as ExtensionContext;
   assert.throws(() => resolveWorkerRoute("openai-codex/gpt-test", maxParentContext), /inherited thinking level.*capped at xhigh/);
   const unavailableContext = parentContext("/tmp/parent", "/tmp/parent.jsonl") as ExtensionContext & {
@@ -1985,7 +2004,7 @@ test("worker_review pre-fallback revalidation detects a stopped-container start/
   });
 });
 
-test("worker_review pre-fallback revalidation requires the exact accepted handoff state", async () => {
+test("worker_review pre-fallback revalidation binds the complete accepted handoff payload", async () => {
   await withTempDir(async (directory) => {
     const parentCwd = path.join(directory, "parent");
     const parentSessionFile = path.join(directory, "parent.jsonl");
@@ -2007,7 +2026,15 @@ test("worker_review pre-fallback revalidation requires the exact accepted handof
       }),
       reviewWorker: async (_context, input) => {
         const parsed = JSON.parse(originalResult) as { handoff: Record<string, unknown> };
-        await writeFile(resultFile, `${JSON.stringify({ ...parsed, handoff: { ...parsed.handoff, state: "blocked" } })}\n`);
+        await writeFile(resultFile, `${JSON.stringify({
+          ...parsed,
+          handoff: {
+            ...parsed.handoff,
+            summary: "mutated while state remains accepted",
+            taskUpdates: [{ taskId: "personal-mutated", update: "changed" }],
+            repositories: [{ workspaceRepo: "repos/other", purpose: "changed claim" }]
+          }
+        })}\n`);
         try {
           await assert.rejects(async () => { await input.beforeFallback!(new AbortController().signal); }, /exact handoff or repository inventory changed/);
         } finally {
@@ -2787,6 +2814,9 @@ test("worker_fold_resolve dispatches one exact immutable analysis worker", async
     await assert.rejects(() => executeResolve("wrong-hash", { kind: "start", preparedId: preparedDetails.preparedId, manifestSha256: "0".repeat(64), candidateId, taskIds: ["personal-resolve"], context: Object.fromEntries(["decisions","projectRules","acceptanceCriteria","dependencies","candidateRationale","candidateChecks","reviewFindings","invariants","nonGoals","priorities","openQuestions","authorResponses"].map((key) => [key, key === "acceptanceCriteria" ? ["Produce an exact conflict resolution."] : []])) }), /hash mismatch/);
     await assert.rejects(() => executeResolve("max-route", { kind: "start", preparedId: preparedDetails.preparedId, manifestSha256: preparedDetails.manifestSha256, candidateId, taskIds: ["personal-resolve"], route: "openai-codex/gpt-test:max", context: Object.fromEntries(["decisions","projectRules","acceptanceCriteria","dependencies","candidateRationale","candidateChecks","reviewFindings","invariants","nonGoals","priorities","openQuestions","authorResponses"].map((key) => [key, key === "acceptanceCriteria" ? ["Produce an exact conflict resolution."] : []])) }), /capped at xhigh/);
     await assert.rejects(() => executeResolve("fable-route", { kind: "start", preparedId: preparedDetails.preparedId, manifestSha256: preparedDetails.manifestSha256, candidateId, taskIds: ["personal-resolve"], route: "amazon-bedrock/us.anthropic.claude-fable-5-20260901-v1:0:xhigh", context: Object.fromEntries(["decisions","projectRules","acceptanceCriteria","dependencies","candidateRationale","candidateChecks","reviewFindings","invariants","nonGoals","priorities","openQuestions","authorResponses"].map((key) => [key, key === "acceptanceCriteria" ? ["Produce an exact conflict resolution."] : []])) }), /Claude Fable/);
+    const namedIntegrationContext = parentContext(parentCwd, parentSessionFile) as ExtensionContext & { modelRegistry: { hasConfiguredAuth(model: Model<Api>): boolean; getAll(): Model<Api>[] } };
+    namedIntegrationContext.modelRegistry.getAll = () => [{ ...fakeModel("profile-opaque"), provider: "amazon-bedrock", name: "Anthropic Claude Fable 5" } as Model<Api>];
+    await assert.rejects(() => resolve.execute!("fable-name-route", { request: { kind: "start", preparedId: preparedDetails.preparedId, manifestSha256: preparedDetails.manifestSha256, candidateId, taskIds: ["personal-resolve"], route: "amazon-bedrock/profile-opaque:xhigh", context: Object.fromEntries(["decisions","projectRules","acceptanceCriteria","dependencies","candidateRationale","candidateChecks","reviewFindings","invariants","nonGoals","priorities","openQuestions","authorResponses"].map((key) => [key, key === "acceptanceCriteria" ? ["Produce an exact conflict resolution."] : []])) } } as never, undefined, undefined, namedIntegrationContext), /Claude Fable/);
     const started = await executeResolve("resolve-start", { kind: "start", preparedId: preparedDetails.preparedId, manifestSha256: preparedDetails.manifestSha256, candidateId, taskIds: ["personal-resolve"], context: Object.fromEntries(["decisions","projectRules","acceptanceCriteria","dependencies","candidateRationale","candidateChecks","reviewFindings","invariants","nonGoals","priorities","openQuestions","authorResponses"].map((key) => [key, key === "acceptanceCriteria" ? ["Produce an exact conflict resolution."] : []])) });
     assert.equal(Check(RetainedToolOutputSchemas.worker_fold_resolve, started), true);
     const details = started.details as { workerId: string; phase: string; contextSha256: string; preparedId: string };

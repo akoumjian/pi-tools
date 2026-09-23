@@ -626,7 +626,7 @@ export function registerWorkerExtension(
       "worker_review use: Call for the exact settled worker/run/repository after selecting its authoritative candidate; if review requests changes, resume the implementation worker and review the new settled run again.",
       inputJsonSchemaGuideline("worker_review", WorkerReviewParams),
       outputJsonSchemaGuideline("worker_review", RetainedToolOutputSchemas.worker_review),
-      "worker_review constraints: Requires an exact-parent-owned handed-off run, valid hash-bound inventory, already-stopped exact persistent container, and clean foldable candidate. Primary and fallback routes reject max thinking and every Claude Fable model. It never acknowledges delivery or mutates worker/container state. A bounded operation lock covers the primary and, only after a confirmed Anthropic 429 rate_limit_error plus renewed exact lifecycle/lease, stopped-container timestamp fingerprint, repository/commit, and confinement prechecks, one fresh same-provider configured fallback child. Both use trusted in-memory settings with retries and compaction disabled, stripped provider fallback metadata, exact every-turn response-model/name verification, Unicode-safe nonce-delimited JSON candidate evidence, and only repository-confined read_many/search_many with unconditional Git-admin search exclusion; recoverable ENOENT/schema tool errors remain model-visible while true escapes terminate; auth/model/config/transport/5xx/timeout/cancellation/output/policy failures never trigger fallback. Only actually started routes appear in ordered attempt history; safe route/config failures retain sanitized host guidance without raw provider errors. Lifecycle/container/HEAD/tree/dirty/policy are rechecked after the overall review; drift fails visibly. The structured verdict/findings/checks are advice only, not validation, attestation, promotion, push, or publication authority. Only result content is provider-visible; details are internal."
+      "worker_review constraints: Requires an exact-parent-owned handed-off run, valid hash-bound inventory, already-stopped exact persistent container, and clean foldable candidate. Primary and fallback routes reject max thinking and every Claude Fable model. It never acknowledges delivery or mutates worker/container state. A bounded operation lock covers the primary and, only after a confirmed Anthropic 429 rate_limit_error plus renewed exact lifecycle/lease, complete accepted handoff payload, stopped-container timestamp fingerprint, repository/commit, and confinement prechecks, one fresh same-provider configured fallback child. Both use trusted in-memory settings with retries and compaction disabled, stripped provider fallback metadata, exact every-turn response-model/name verification, Unicode-safe nonce-delimited JSON candidate evidence, and only repository-confined read_many/search_many with unconditional Git-admin search exclusion; recoverable ENOENT/schema tool errors remain model-visible while true escapes and inactive disallowed-tool requests terminate; auth/model/config/transport/5xx/timeout/cancellation/output/policy failures never trigger fallback. Only actually started routes appear in ordered attempt history; safe route/config failures retain sanitized host guidance without raw provider errors. Lifecycle/container/HEAD/tree/dirty/policy are rechecked after the overall review; drift fails visibly. The structured verdict/findings/checks are advice only, not validation, attestation, promotion, push, or publication authority. Only result content is provider-visible; details are internal."
     ],
     parameters: WorkerReviewParams,
     executionMode: "sequential",
@@ -857,6 +857,7 @@ async function reviewSettledWorker(
     if (observed.handoff.handoff.state !== "ready_for_review" && observed.handoff.handoff.state !== "assignment_complete") {
       throw new Error(`worker_review requires a completed handoff, not ${observed.handoff.handoff.state}.`);
     }
+    const acceptedHandoffPayload = JSON.stringify(observed.handoff.handoff);
     if (!record.container || record.container.workerId !== input.workerId) {
       throw new Error(`worker_review requires worker ${input.workerId}'s exact persisted container identity.`);
     }
@@ -893,7 +894,8 @@ async function reviewSettledWorker(
       const currentHandoffState = currentObserved.handoff?.handoff.state;
       if (
         currentObserved.record.lastRun?.runId !== input.runId || !currentObserved.handoff ||
-        (currentHandoffState !== "ready_for_review" && currentHandoffState !== "assignment_complete") || !currentCandidate ||
+        (currentHandoffState !== "ready_for_review" && currentHandoffState !== "assignment_complete") ||
+        JSON.stringify(currentObserved.handoff.handoff) !== acceptedHandoffPayload || !currentCandidate ||
         JSON.stringify(currentCandidate) !== JSON.stringify(candidate)
       ) {
         throw new Error("Managed-worker exact handoff or repository inventory changed during review.");
@@ -3056,6 +3058,7 @@ export function resolveWorkerRoute(requested: string | undefined, context: Exten
     label: "Worker",
     noModelMessage: "No worker route is configured. Set worker-settings.json defaultRoute or pass route."
   });
+  assertChildAgentRouteAllowed(resolved.model, resolved.thinkingLevel, "Worker resolved route");
   const workerRoute = {
     provider: resolved.model.provider,
     model: resolved.model.id,

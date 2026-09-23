@@ -194,6 +194,53 @@ test("managed review lets the model recover from ENOENT and harmless malformed t
   }
 });
 
+test("managed review treats inactive disallowed write_many and bash calls as fatal confinement", async () => {
+  for (const toolName of ["write_many", "bash"]) {
+    const root = await mkdtemp(path.join(tmpdir(), `pi-managed-review-disallowed-${toolName}-`));
+    const faux = fauxProvider({ provider: "anthropic", api: `managed-review-disallowed-${toolName}-api`, models: [{ id: "opus", reasoning: true }] });
+    faux.setResponses([
+      fauxAssistantMessage([{ type: "toolCall", id: `disallowed-${toolName}`, name: toolName, arguments: toolName === "bash" ? { command: "echo no" } : { writes: [{ path: "no.txt", content: "no" }] } }] as never, { stopReason: "toolUse" }),
+      fauxAssistantMessage("VERDICT: APPROVE\n## Findings\nNone.\n## Checks\nMust not be accepted.")
+    ]);
+    try {
+      await assert.rejects(() => runManagedWorkerReviewWithRateLimitFallback(childContext(faux, []), {
+        cwd: root,
+        primaryRoute: { model: faux.getModel("opus") as Model<Api>, thinkingLevel: "xhigh" },
+        evidence: "exact",
+        timeoutMs: 5_000
+      }), /confinement_failed.*anthropic\/opus:xhigh — confinement_failed/i);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("managed review classifies symlink escapes and nested Git-admin reads as fatal confinement", async () => {
+  const fixture = await mkdtemp(path.join(tmpdir(), "pi-managed-review-fatal-paths-"));
+  const root = path.join(fixture, "repo");
+  await mkdir(path.join(root, "nested", ".git"), { recursive: true });
+  await writeFile(path.join(root, "nested", ".git", "config"), "secret\n");
+  await writeFile(path.join(fixture, "outside.txt"), "outside\n");
+  await symlink(path.join(fixture, "outside.txt"), path.join(root, "escape-link"));
+  try {
+    for (const requestedPath of ["escape-link", "nested/.git/config"]) {
+      const faux = fauxProvider({ provider: "anthropic", api: `managed-review-fatal-${requestedPath.replaceAll("/", "-")}-api`, models: [{ id: "opus", reasoning: true }] });
+      faux.setResponses([
+        fauxAssistantMessage([{ type: "toolCall", id: "fatal-read", name: "read_many", arguments: { files: [{ path: requestedPath }] } }] as never, { stopReason: "toolUse" }),
+        fauxAssistantMessage("VERDICT: APPROVE\n## Findings\nNone.\n## Checks\nMust not be accepted.")
+      ]);
+      await assert.rejects(() => runManagedWorkerReviewWithRateLimitFallback(childContext(faux, []), {
+        cwd: root,
+        primaryRoute: { model: faux.getModel("opus") as Model<Api>, thinkingLevel: "xhigh" },
+        evidence: "exact",
+        timeoutMs: 5_000
+      }), /confinement_failed.*anthropic\/opus:xhigh — confinement_failed/i);
+    }
+  } finally {
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
 test("managed review route history categorizes a blocked confinement attempt", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "pi-managed-review-confinement-outcome-"));
   const faux = fauxProvider({ provider: "anthropic", api: "managed-review-confinement-api", models: [{ id: "opus", reasoning: true }] });
@@ -232,9 +279,9 @@ test("managed review search execution excludes Git administrative data after hos
       searches: [{ kind: "files", path: ".", glob: "{.git/**,**/.git/**,.env}", maxResults: 100 }]
     });
     const rendered = (result.content[0] as { text: string }).text;
-    assert.match(rendered, /\.env/);
-    assert.doesNotMatch(rendered, /\n(?:\.\/)?\.git\//);
-    assert.doesNotMatch(rendered, /SECRET_CONFIG|SECRET_LOG|NESTED_SECRET_LOG/);
+    const resultPaths = rendered.split("\n").filter((line) => line.startsWith("./"));
+    assert.deepEqual(resultPaths, ["./.env"]);
+    assert.equal(resultPaths.some((line) => line.includes("nested/.git") || line.includes("/.git/")), false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -308,7 +355,7 @@ test("managed review rejects max and Claude Fable routes before starting either 
       { id: "claude-fable-5", reasoning: true },
       { id: "vercel-ai-gateway/anthropic/claude-fable-5", reasoning: true },
       { id: "us.anthropic.claude-fable-5-20260901-v1:0", reasoning: true },
-      { id: "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/profile-opaque", name: "Claude Fable 5", reasoning: true }
+      { id: "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/profile-opaque", name: "Anthropic: Claude Fable 5", reasoning: true }
     ]
   });
   try {

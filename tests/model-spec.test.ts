@@ -189,7 +189,7 @@ test("subagent route policy rejects max and Claude Fable without false positives
     /Claude Fable/
   );
   assert.throws(
-    () => assertChildAgentRouteAllowed({ ...fakeModel("amazon-bedrock", "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/profile-opaque"), name: "Claude Fable 5" }, "xhigh"),
+    () => assertChildAgentRouteAllowed({ ...fakeModel("amazon-bedrock", "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/profile-opaque"), name: "Anthropic Claude Fable 5" }, "xhigh"),
     /Claude Fable/
   );
   assert.doesNotThrow(() => assertSubagentRouteAllowed({ provider: "anthropic", model: "claude-opus-5-5", thinkingLevel: "xhigh" }));

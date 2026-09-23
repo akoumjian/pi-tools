@@ -133,7 +133,7 @@ test("shared child sessions reject prefixed Bedrock Claude Fable before loading 
       {} as Pick<ExtensionContext, "modelRegistry" | "ui">,
       {
         cwd: "/repo",
-        model: { provider: "amazon-bedrock", id: "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/profile-opaque", name: "Claude Fable 5" } as never,
+        model: { provider: "amazon-bedrock", id: "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/profile-opaque", name: "Prod Claude Fable 5" } as never,
         thinkingLevel: "xhigh",
         tools: []
       },
