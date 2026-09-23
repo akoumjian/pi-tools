@@ -20,12 +20,14 @@ import {
   buildResumeWorkerPrompt,
   registerWorkerExtension,
   resolveWorkerReviewRoute,
+  resolveWorkerReviewRoutes,
   resolveWorkerRoute,
   WorkerFoldResolveParams
 } from "../extensions/worker/index.js";
 import { persistRepositoryInventory, repositoryCandidateId } from "../extensions/worker/repositories.js";
 import { forkWorkerSession } from "../extensions/worker/session.js";
 import { normalizeWorkerSettings } from "../extensions/worker/settings.js";
+import type { ManagedWorkerReviewExecutionResult, ManagedWorkerReviewPlanInput, ManagedWorkerReviewResult } from "../extensions/worker/review.js";
 import {
   WORKER_RECORD_VERSION,
   acquireWorkerLease,
@@ -81,6 +83,30 @@ function fakeModel(id = "gpt-test"): Model<Api> {
     contextWindow: 100_000,
     maxTokens: 10_000
   } as Model<Api>;
+}
+
+function completedReviewExecution(
+  input: ManagedWorkerReviewPlanInput,
+  overrides: Partial<ManagedWorkerReviewResult> = {}
+): ManagedWorkerReviewExecutionResult {
+  const route = `${input.primaryRoute.model.provider}/${input.primaryRoute.model.id}:${input.primaryRoute.thinkingLevel}`;
+  return {
+    review: {
+      status: "completed",
+      cwd: input.cwd,
+      model: `${input.primaryRoute.model.provider}/${input.primaryRoute.model.id}`,
+      thinkingLevel: input.primaryRoute.thinkingLevel,
+      startedAt: "2026-09-10T19:32:00.000Z",
+      completedAt: "2026-09-10T19:32:01.000Z",
+      durationMs: 1000,
+      verdict: "approve",
+      findings: "None.",
+      checks: "Inspected exact diff and files.",
+      toolCallCount: 1,
+      ...overrides
+    },
+    attempts: [{ route, outcome: "completed" }]
+  };
 }
 
 function parentContext(cwd: string, sessionFile: string, entries: unknown[] = []): ExtensionContext {
@@ -402,6 +428,25 @@ test("worker settings select a configured default while explicit routes override
     defaultRoute: "openai-codex/gpt-5.6-sol:xhigh",
     reviewRoute: "openrouter/vendor/model:variant:xhigh"
   }, "fixture").reviewRoute, "openrouter/vendor/model:variant:xhigh");
+  assert.deepEqual(normalizeWorkerSettings({
+    defaultRoute: "openai-codex/gpt-5.6-sol:xhigh",
+    reviewRoute: "anthropic/claude-opus-5-5:xhigh",
+    reviewRateLimitFallbackRoute: "anthropic/claude-opus-5:xhigh"
+  }, "fixture"), {
+    defaultRoute: "openai-codex/gpt-5.6-sol:xhigh",
+    reviewRoute: "anthropic/claude-opus-5-5:xhigh",
+    reviewRateLimitFallbackRoute: "anthropic/claude-opus-5:xhigh",
+    configSource: "fixture"
+  });
+  assert.throws(() => normalizeWorkerSettings({
+    defaultRoute: "openai-codex/gpt-5.6-sol:xhigh",
+    reviewRateLimitFallbackRoute: "anthropic/claude-opus-5:xhigh"
+  }, "fixture"), /requires reviewRoute/);
+  assert.throws(() => normalizeWorkerSettings({
+    defaultRoute: "openai-codex/gpt-5.6-sol:xhigh",
+    reviewRoute: "anthropic/claude-opus-5-5:xhigh",
+    reviewRateLimitFallbackRoute: "openai-codex/gpt-test:xhigh"
+  }, "fixture"), /same exact provider/);
   assert.throws(() => normalizeWorkerSettings({}, "fixture"), /defaultRoute/);
   assert.throws(() => normalizeWorkerSettings({ defaultRoute: "openai-codex/gpt-5.6-sol:xhigh", extra: true }, "fixture"), /unsupported worker setting/);
   assert.deepEqual(resolveWorkerRoute(undefined, context), {
@@ -428,11 +473,20 @@ test("worker settings select a configured default while explicit routes override
     reviewRoute: "openai-codex/gpt-test:xhigh",
     configSource: "fixture"
   }), { model: context.model, thinkingLevel: "xhigh" });
+  assert.deepEqual(resolveWorkerReviewRoutes(context, {
+    defaultRoute: "openai-codex/gpt-5.6-sol:xhigh",
+    reviewRoute: "openai-codex/gpt-test:xhigh",
+    reviewRateLimitFallbackRoute: "openai-codex/gpt-5.6-sol:xhigh",
+    configSource: "fixture"
+  }), {
+    primary: { model: context.model, thinkingLevel: "xhigh" },
+    rateLimitFallback: { model: context.modelRegistry.getAll().find((model) => model.id === "gpt-5.6-sol"), thinkingLevel: "xhigh" }
+  });
   assert.throws(() => resolveWorkerReviewRoute(context, {
     defaultRoute: "openai-codex/gpt-5.6-sol:xhigh",
     reviewRoute: "openai-codex/missing:xhigh",
     configSource: "fixture"
-  }), /Managed-worker review model not found/);
+  }), /Managed-worker review primary model not found/);
   const authlessContext = parentContext("/tmp/parent", "/tmp/parent.jsonl") as ExtensionContext & {
     modelRegistry: { hasConfiguredAuth(model: Model<Api>): boolean; getAll(): Model<Api>[] };
   };
@@ -1747,23 +1801,11 @@ test("worker_review is observational across resumed runs and returns bounded str
         return { containerId: persistentContainer.containerId! , exitCode: 0 };
       },
       parkContainer() { throw new Error("review must never park or mutate the container"); },
-      resolveReviewRoute: () => ({ model: reviewModel, thinkingLevel: "xhigh" }),
+      resolveReviewRoutes: () => ({ primary: { model: reviewModel, thinkingLevel: "xhigh" } }),
       reviewWorker: async (_context, input) => {
         assert.equal(existsSync(fixture.paths.operationLockFile), true);
         reviewInput = input;
-        return {
-          status: "completed",
-          cwd: input.cwd,
-          model: "openai-codex/gpt-test",
-          thinkingLevel: "xhigh",
-          startedAt: "2026-09-10T19:32:00.000Z",
-          completedAt: "2026-09-10T19:32:01.000Z",
-          durationMs: 1000,
-          verdict: "approve",
-          findings: "None.",
-          checks: "Inspected exact diff and files.",
-          toolCallCount: 4
-        };
+        return completedReviewExecution(input, { toolCallCount: 4 });
       }
     });
     const tool = api.tools.find((candidate) => candidate.name === "worker_review");
@@ -1782,16 +1824,66 @@ test("worker_review is observational across resumed runs and returns bounded str
     assert.match(reviewInput?.evidence ?? "", /-base/);
     assert.match(reviewInput?.evidence ?? "", /\+review me/);
     assert.doesNotMatch(reviewInput?.evidence ?? "", /implemented exact review target|npm test|PARENT_TRANSCRIPT_POISON/);
-    const details = result.details as { verdict: string; findings: string; checks: string; model: string };
+    const details = result.details as { verdict: string; findings: string; checks: string; model: string; attempts: Array<{ route: string; outcome: string }> };
     assert.equal(details.verdict, "approve");
     assert.equal(details.findings, "None.");
     assert.equal(details.model, "openai-codex/gpt-test");
+    assert.deepEqual(details.attempts, [{ route: "openai-codex/gpt-test:xhigh", outcome: "completed" }]);
+    assert.match((result.content[0] as { text: string }).text, /1\. openai-codex\/gpt-test:xhigh — completed/);
     assert.match((result.content[0] as { text: string }).text, /Verdict: approve/);
     assert.deepEqual(await readFile(fixture.paths.recordFile), recordBefore, "review must not acknowledge delivery or rewrite worker state");
     assert.equal(readWorkerRecord(fixture.paths.recordFile).lastRun?.delivery, "pending");
     const reacquired = acquireWorkerOperationLock(fixture.paths.operationLockFile);
     releaseWorkerOperationLock(reacquired);
     assert.equal(gitFixture(fixture.repository, "status", "--porcelain=v1", "--untracked-files=all"), "");
+  });
+});
+
+test("worker_review checks stopped-container identity around the complete primary-plus-fallback operation", async () => {
+  await withTempDir(async (directory) => {
+    const parentCwd = path.join(directory, "parent");
+    const parentSessionFile = path.join(directory, "parent.jsonl");
+    await mkdir(parentCwd);
+    await writeFile(parentSessionFile, "parent\n");
+    const fixture = await provisionWorkerReviewFixture(directory, parentSessionFile, parentCwd);
+    const primaryModel = { ...fakeModel("opus"), provider: "anthropic" } as Model<Api>;
+    const fallbackModel = { ...fakeModel("secondary"), provider: "anthropic" } as Model<Api>;
+    let inspections = 0;
+    let containerExitCode = 0;
+    const api = fakeApi();
+    registerWorkerExtension(api, {
+      roots: fixture.roots,
+      inspectContainer: () => {
+        inspections += 1;
+        return { containerId: fixture.container.containerId!, exitCode: containerExitCode };
+      },
+      resolveReviewRoutes: () => ({
+        primary: { model: primaryModel, thinkingLevel: "xhigh" },
+        rateLimitFallback: { model: fallbackModel, thinkingLevel: "xhigh" }
+      }),
+      reviewWorker: async (_context, input) => {
+        assert.equal(inspections, 1, "container is inspected once before the overall operation");
+        assert.equal(existsSync(fixture.paths.operationLockFile), true);
+        containerExitCode = 9;
+        return {
+          review: {
+            ...completedReviewExecution(input).review,
+            model: "anthropic/secondary"
+          },
+          attempts: [
+            { route: "anthropic/opus:xhigh", outcome: "rate_limited" },
+            { route: "anthropic/secondary:xhigh", outcome: "completed" }
+          ]
+        };
+      }
+    });
+    const tool = api.tools.find((candidate) => candidate.name === "worker_review")!;
+    await assert.rejects(() => tool.execute!("fallback-container-drift", {
+      workerId: fixture.workerId,
+      runId: fixture.runId,
+      workspaceRepo: "repos/project"
+    } as never, undefined, undefined, parentContext(parentCwd, parentSessionFile)), /stopped container identity changed/);
+    assert.equal(inspections, 2, "container is inspected once after the complete fallback operation");
   });
 });
 
@@ -1807,7 +1899,7 @@ test("worker_review rejects wrong ownership, run identity, active workers, and r
     registerWorkerExtension(api, {
       roots: fixture.roots,
       inspectContainer: () => ({ containerId: fixture.container.containerId!, exitCode: 0 }),
-      resolveReviewRoute: () => ({ model: fakeModel(), thinkingLevel: "xhigh" }),
+      resolveReviewRoutes: () => ({ primary: { model: fakeModel(), thinkingLevel: "xhigh" } }),
       reviewWorker: async () => { reviews += 1; throw new Error("review should not run"); }
     });
     const tool = api.tools.find((candidate) => candidate.name === "worker_review");
@@ -1823,7 +1915,7 @@ test("worker_review rejects wrong ownership, run identity, active workers, and r
     registerWorkerExtension(runningApi, {
       roots: fixture.roots,
       inspectContainer: () => { throw new Error("container is running"); },
-      resolveReviewRoute: () => ({ model: fakeModel(), thinkingLevel: "xhigh" }),
+      resolveReviewRoutes: () => ({ primary: { model: fakeModel(), thinkingLevel: "xhigh" } }),
       reviewWorker: async () => { reviews += 1; throw new Error("review should not run"); }
     });
     const running = runningApi.tools.find((candidate) => candidate.name === "worker_review");
@@ -1845,14 +1937,14 @@ test("worker_review fails closed for inventory, repository, lifecycle, container
     const baseDependencies = {
       roots: fixture.roots,
       inspectContainer: () => ({ containerId: fixture.container.containerId!, exitCode: 0 }),
-      resolveReviewRoute: () => ({ model: reviewModel, thinkingLevel: "xhigh" as const })
+      resolveReviewRoutes: () => ({ primary: { model: reviewModel, thinkingLevel: "xhigh" as const } })
     };
-    const completed = (cwd: string) => ({ status: "completed" as const, cwd, model: "openai-codex/gpt-test", thinkingLevel: "xhigh" as const, startedAt: "2026-09-10T19:32:00.000Z", completedAt: "2026-09-10T19:32:01.000Z", durationMs: 1000, verdict: "approve" as const, findings: "None.", checks: "Inspected.", toolCallCount: 1 });
+    const completed = (reviewInput: ManagedWorkerReviewPlanInput) => completedReviewExecution(reviewInput, { checks: "Inspected." });
     const inventoryFile = readWorkerRecord(fixture.paths.recordFile).lastRun!.repositoryInventory!.inventoryFile;
     const inventoryText = await readFile(inventoryFile, "utf8");
     await writeFile(inventoryFile, `${inventoryText} `);
     let api = fakeApi();
-    registerWorkerExtension(api, { ...baseDependencies, reviewWorker: async (_context, reviewInput) => completed(reviewInput.cwd) });
+    registerWorkerExtension(api, { ...baseDependencies, reviewWorker: async (_context, reviewInput) => completed(reviewInput) });
     let tool = api.tools.find((candidate) => candidate.name === "worker_review")!;
     await assert.rejects(() => tool.execute!("inventory", input as never, undefined, undefined, context), /inventory hash mismatch/);
     await writeFile(inventoryFile, inventoryText);
@@ -1875,7 +1967,7 @@ test("worker_review fails closed for inventory, repository, lifecycle, container
       reviewWorker: async (_context, reviewInput) => {
         const current = readWorkerRecord(fixture.paths.recordFile);
         writeWorkerRecord(fixture.paths.recordFile, { ...current, status: "running", activeRun: { runId: "run_20260910193000_race0001", jobId: "job_20260910193000_race0001", status: "running" } });
-        return completed(reviewInput.cwd);
+        return completed(reviewInput);
       }
     });
     tool = api.tools.find((candidate) => candidate.name === "worker_review")!;
@@ -1888,7 +1980,7 @@ test("worker_review fails closed for inventory, repository, lifecycle, container
     registerWorkerExtension(api, {
       ...baseDependencies,
       inspectContainer: () => ({ containerId: fixture.container.containerId!, exitCode: inspections++ === 0 ? 0 : 9 }),
-      reviewWorker: async (_context, reviewInput) => completed(reviewInput.cwd)
+      reviewWorker: async (_context, reviewInput) => completed(reviewInput)
     });
     tool = api.tools.find((candidate) => candidate.name === "worker_review")!;
     await assert.rejects(() => tool.execute!("container-drift", input as never, undefined, undefined, context), /container identity changed/);
@@ -1905,6 +1997,18 @@ test("worker_review fails closed for inventory, repository, lifecycle, container
     await assert.rejects(() => tool.execute!("review-timeout", input as never, undefined, undefined, context), { name: "TimeoutError" });
     assert.equal(inspections, 2, "review failure still rechecks stopped container state");
     assert.deepEqual(await readFile(fixture.paths.recordFile), beforeFailure, "review failure must not mutate delivery or lifecycle state");
+
+    inspections = 0;
+    api = fakeApi();
+    registerWorkerExtension(api, {
+      ...baseDependencies,
+      inspectContainer: () => { inspections += 1; return { containerId: fixture.container.containerId!, exitCode: 0 }; },
+      resolveReviewRoutes: () => { throw new Error("fallback model is not authenticated"); },
+      reviewWorker: async () => { throw new Error("review should not start"); }
+    });
+    tool = api.tools.find((candidate) => candidate.name === "worker_review")!;
+    await assert.rejects(() => tool.execute!("review-route-failure", input as never, undefined, undefined, context), /fallback model is not authenticated/);
+    assert.equal(inspections, 2, "route validation failure still rechecks stopped container state");
   });
 });
 

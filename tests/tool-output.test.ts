@@ -221,6 +221,7 @@ const samples: Record<RetainedToolName, unknown> = {
       completedAt: "2026-09-10T19:00:01.000Z",
       durationMs: 1000,
       toolCallCount: 3,
+      attempts: [{ route: "anthropic/claude-opus-test:xhigh", outcome: "completed" }],
       verdict: "request_changes",
       findings: "High: fix exact issue.",
       checks: "Inspected exact files."

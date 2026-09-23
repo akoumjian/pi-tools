@@ -10,8 +10,10 @@ import {
   MAX_MANAGED_WORKER_REVIEW_CHECKS_CHARS,
   assertManagedReviewToolCallWithinRoot,
   buildManagedWorkerReviewTask,
+  isConfirmedAnthropicRateLimitMessage,
   parseManagedWorkerReviewOutput,
-  runManagedWorkerReview
+  runManagedWorkerReview,
+  runManagedWorkerReviewWithRateLimitFallback
 } from "../extensions/worker/review.js";
 
 function toolCall(toolName: string, input: unknown): ToolCallEvent {
@@ -166,5 +168,209 @@ test("managed review timeout aborts only the dedicated child", async () => {
     }), (error: unknown) => error instanceof Error && error.name === "TimeoutError");
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+
+test("managed review rate-limit classifier requires exact Anthropic 429 and rate_limit_error evidence", () => {
+  const anthropic = { provider: "anthropic" } as Model<Api>;
+  const other = { provider: "other" } as Model<Api>;
+  assert.equal(isConfirmedAnthropicRateLimitMessage(anthropic, 'HTTP 429 {"error":{"type":"rate_limit_error","message":"slow down"}}'), true);
+  assert.equal(isConfirmedAnthropicRateLimitMessage(anthropic, '429 {"error":{"type":"rate_limit_error"}}'), true);
+  assert.equal(isConfirmedAnthropicRateLimitMessage(anthropic, 'statusCode: 429 {"type":"rate_limit_error"}'), true);
+  for (const message of [
+    'HTTP 429 too many requests',
+    '{"error":{"type":"rate_limit_error"}}',
+    'HTTP 529 {"error":{"type":"overloaded_error"}}',
+    'HTTP 500 upstream after HTTP 429 {"error":{"type":"rate_limit_error"}}',
+    'HTTP 429 {"error":{"type":"overloaded_error"},"note":"rate_limit_error"}',
+    'rate limit reached',
+    'status 1429 rate_limit_error'
+  ]) assert.equal(isConfirmedAnthropicRateLimitMessage(anthropic, message), false, message);
+  assert.equal(isConfirmedAnthropicRateLimitMessage(other, 'HTTP 429 {"error":{"type":"rate_limit_error"}}'), false);
+});
+
+test("managed review plan rejects a cross-provider fallback before starting a child", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-managed-review-cross-provider-"));
+  const anthropic = fauxProvider({ provider: "anthropic", api: "managed-review-primary-api", models: [{ id: "opus", reasoning: true }] });
+  const openai = fauxProvider({ provider: "openai-codex", api: "managed-review-fallback-api", models: [{ id: "secondary", reasoning: true }] });
+  try {
+    await assert.rejects(() => runManagedWorkerReviewWithRateLimitFallback(childContext(anthropic, []), {
+      cwd: root,
+      primaryRoute: { model: anthropic.getModel("opus") as Model<Api>, thinkingLevel: "xhigh" },
+      rateLimitFallbackRoute: { model: openai.getModel("secondary") as Model<Api>, thinkingLevel: "xhigh" },
+      evidence: "exact"
+    }), /fallback must use the same provider/);
+    assert.equal(anthropic.state.callCount, 0);
+    assert.equal(openai.state.callCount, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("managed review primary success does not start the configured fallback", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-managed-review-primary-"));
+  const faux = fauxProvider({
+    provider: "anthropic",
+    api: "managed-review-primary-api",
+    models: [{ id: "opus", reasoning: true }, { id: "secondary", reasoning: true }]
+  });
+  faux.setResponses([fauxAssistantMessage("VERDICT: APPROVE\n## Findings\nNone.\n## Checks\nPrimary only.")]);
+  try {
+    const result = await runManagedWorkerReviewWithRateLimitFallback(childContext(faux, []), {
+      cwd: root,
+      primaryRoute: { model: faux.getModel("opus") as Model<Api>, thinkingLevel: "xhigh" },
+      rateLimitFallbackRoute: { model: faux.getModel("secondary") as Model<Api>, thinkingLevel: "xhigh" },
+      evidence: "exact",
+      timeoutMs: 5_000
+    });
+    assert.equal(faux.state.callCount, 1);
+    assert.deepEqual(result.attempts, [{ route: "anthropic/opus:xhigh", outcome: "completed" }]);
+    assert.equal(result.review.model, "anthropic/opus");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("confirmed primary Anthropic rate limit starts one fresh isolated fallback with hostile project resources ignored", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-managed-review-fallback-"));
+  const marker = path.join(root, "fallback-poison-executed");
+  await mkdir(path.join(root, ".pi", "extensions"), { recursive: true });
+  await writeFile(path.join(root, ".pi", "settings.json"), JSON.stringify({
+    npmCommand: `sh -c 'printf bad > ${marker}'`,
+    extensions: [".pi/extensions/poison.js"],
+    sentinel: "FALLBACK_POISON_SETTINGS"
+  }));
+  await writeFile(path.join(root, ".pi", "SYSTEM.md"), "FALLBACK_POISON_SYSTEM\n");
+  await writeFile(path.join(root, ".pi", "extensions", "poison.js"), `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(marker)}, "bad"); export default () => {};\n`);
+  const faux = fauxProvider({
+    provider: "anthropic",
+    api: "managed-review-fallback-api",
+    models: [{ id: "opus", reasoning: true }, { id: "secondary", reasoning: true }]
+  });
+  const envelopes: Array<{ context: Context; modelId: string }> = [];
+  faux.setResponses([
+    (context, _options, _state, model) => {
+      envelopes.push({ context, modelId: model.id });
+      return fauxAssistantMessage("", {
+        stopReason: "error",
+        errorMessage: 'HTTP 429 {"error":{"type":"rate_limit_error","message":"capacity"}}'
+      });
+    },
+    (context, _options, _state, model) => {
+      envelopes.push({ context, modelId: model.id });
+      return fauxAssistantMessage("VERDICT: APPROVE\n## Findings\nNone.\n## Checks\nFresh fallback.");
+    }
+  ]);
+  try {
+    const result = await runManagedWorkerReviewWithRateLimitFallback(childContext(faux, []), {
+      cwd: root,
+      primaryRoute: { model: faux.getModel("opus") as Model<Api>, thinkingLevel: "xhigh" },
+      rateLimitFallbackRoute: { model: faux.getModel("secondary") as Model<Api>, thinkingLevel: "xhigh" },
+      evidence: "exact",
+      timeoutMs: 5_000
+    });
+    assert.deepEqual(envelopes.map((item) => item.modelId), ["opus", "secondary"]);
+    assert.notEqual(envelopes[0]!.context, envelopes[1]!.context, "fallback must receive a fresh context object");
+    assert.doesNotMatch(JSON.stringify(envelopes[1]!.context), /rate_limit_error|FALLBACK_POISON/);
+    assert.deepEqual(result.attempts, [
+      { route: "anthropic/opus:xhigh", outcome: "rate_limited" },
+      { route: "anthropic/secondary:xhigh", outcome: "completed" }
+    ]);
+    assert.equal(result.review.model, "anthropic/secondary");
+    await assert.rejects(readFile(marker), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("fallback failure is visible and never starts a third attempt", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-managed-review-fallback-fail-"));
+  const faux = fauxProvider({
+    provider: "anthropic",
+    api: "managed-review-fallback-fail-api",
+    models: [{ id: "opus", reasoning: true }, { id: "secondary", reasoning: true }]
+  });
+  const limited = () => fauxAssistantMessage("", {
+    stopReason: "error",
+    errorMessage: 'HTTP 429 {"error":{"type":"rate_limit_error","message":"capacity"}}'
+  });
+  faux.setResponses([limited(), limited()]);
+  try {
+    await assert.rejects(() => runManagedWorkerReviewWithRateLimitFallback(childContext(faux, []), {
+      cwd: root,
+      primaryRoute: { model: faux.getModel("opus") as Model<Api>, thinkingLevel: "xhigh" },
+      rateLimitFallbackRoute: { model: faux.getModel("secondary") as Model<Api>, thinkingLevel: "xhigh" },
+      evidence: "exact",
+      timeoutMs: 5_000
+    }), /fallback anthropic\/secondary:xhigh failed after confirmed rate limit from anthropic\/opus:xhigh: HTTP 429/);
+    assert.equal(faux.state.callCount, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("non-rate-limit, malformed-output, timeout, and cancellation failures never start fallback", async () => {
+  const cases: Array<{ name: string; response: ReturnType<typeof fauxAssistantMessage> | ((controller: AbortController) => ReturnType<typeof fauxAssistantMessage>); pattern: RegExp; timeoutMs?: number }> = [
+    { name: "overload", response: fauxAssistantMessage("", { stopReason: "error", errorMessage: 'HTTP 529 {"error":{"type":"overloaded_error"}}' }), pattern: /529/ },
+    { name: "transport", response: fauxAssistantMessage("", { stopReason: "error", errorMessage: "connection reset" }), pattern: /connection reset/ },
+    { name: "malformed", response: fauxAssistantMessage("not structured"), pattern: /required VERDICT/ }
+  ];
+  for (const item of cases) {
+    const root = await mkdtemp(path.join(tmpdir(), `pi-managed-review-${item.name}-`));
+    const faux = fauxProvider({ provider: "anthropic", api: `managed-review-${item.name}-api`, models: [{ id: "opus", reasoning: true }, { id: "secondary", reasoning: true }] });
+    faux.setResponses([item.response as ReturnType<typeof fauxAssistantMessage>]);
+    try {
+      await assert.rejects(() => runManagedWorkerReviewWithRateLimitFallback(childContext(faux, []), {
+        cwd: root,
+        primaryRoute: { model: faux.getModel("opus") as Model<Api>, thinkingLevel: "xhigh" },
+        rateLimitFallbackRoute: { model: faux.getModel("secondary") as Model<Api>, thinkingLevel: "xhigh" },
+        evidence: "exact",
+        timeoutMs: 5_000
+      }), item.pattern);
+      assert.equal(faux.state.callCount, 1, item.name);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+
+  const timeoutRoot = await mkdtemp(path.join(tmpdir(), "pi-managed-review-plan-timeout-"));
+  const timeoutFaux = fauxProvider({ provider: "anthropic", api: "managed-review-plan-timeout-api", models: [{ id: "opus", reasoning: true }, { id: "secondary", reasoning: true }] });
+  timeoutFaux.setResponses([async () => {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    return fauxAssistantMessage("VERDICT: APPROVE\n## Findings\nNone.\n## Checks\nLate.");
+  }]);
+  try {
+    await assert.rejects(() => runManagedWorkerReviewWithRateLimitFallback(childContext(timeoutFaux, []), {
+      cwd: timeoutRoot,
+      primaryRoute: { model: timeoutFaux.getModel("opus") as Model<Api>, thinkingLevel: "xhigh" },
+      rateLimitFallbackRoute: { model: timeoutFaux.getModel("secondary") as Model<Api>, thinkingLevel: "xhigh" },
+      evidence: "exact",
+      timeoutMs: 20
+    }), { name: "TimeoutError" });
+    assert.ok(timeoutFaux.state.callCount <= 1);
+  } finally {
+    await rm(timeoutRoot, { recursive: true, force: true });
+  }
+
+  const cancelRoot = await mkdtemp(path.join(tmpdir(), "pi-managed-review-plan-cancel-"));
+  const cancelFaux = fauxProvider({ provider: "anthropic", api: "managed-review-plan-cancel-api", models: [{ id: "opus", reasoning: true }, { id: "secondary", reasoning: true }] });
+  const controller = new AbortController();
+  cancelFaux.setResponses([() => {
+    controller.abort(new Error("parent cancelled review"));
+    return fauxAssistantMessage("", { stopReason: "error", errorMessage: 'HTTP 429 {"error":{"type":"rate_limit_error"}}' });
+  }]);
+  try {
+    await assert.rejects(() => runManagedWorkerReviewWithRateLimitFallback(childContext(cancelFaux, []), {
+      cwd: cancelRoot,
+      primaryRoute: { model: cancelFaux.getModel("opus") as Model<Api>, thinkingLevel: "xhigh" },
+      rateLimitFallbackRoute: { model: cancelFaux.getModel("secondary") as Model<Api>, thinkingLevel: "xhigh" },
+      evidence: "exact",
+      signal: controller.signal,
+      timeoutMs: 5_000
+    }), /parent cancelled review/);
+    assert.equal(cancelFaux.state.callCount, 1);
+  } finally {
+    await rm(cancelRoot, { recursive: true, force: true });
   }
 });

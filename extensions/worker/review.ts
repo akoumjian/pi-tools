@@ -25,6 +25,21 @@ export type ManagedWorkerReviewInput = {
   timeoutMs?: number;
 };
 
+export type ManagedWorkerReviewRoute = {
+  model: Model<Api>;
+  thinkingLevel: ThinkingLevel;
+};
+
+export type ManagedWorkerReviewPlanInput = Omit<ManagedWorkerReviewInput, "model" | "thinkingLevel"> & {
+  primaryRoute: ManagedWorkerReviewRoute;
+  rateLimitFallbackRoute?: ManagedWorkerReviewRoute;
+};
+
+export type ManagedWorkerReviewAttempt = {
+  route: string;
+  outcome: "completed" | "rate_limited";
+};
+
 export type ManagedWorkerReviewResult = {
   status: "completed";
   cwd: string;
@@ -39,12 +54,90 @@ export type ManagedWorkerReviewResult = {
   checks: string;
 };
 
+export type ManagedWorkerReviewExecutionResult = {
+  review: ManagedWorkerReviewResult;
+  attempts: ManagedWorkerReviewAttempt[];
+};
+
+export class ConfirmedAnthropicRateLimitError extends Error {
+  readonly route: string;
+
+  constructor(route: string, message: string) {
+    super(message);
+    this.name = "ConfirmedAnthropicRateLimitError";
+    this.route = route;
+  }
+}
+
 export async function runManagedWorkerReview(
   context: Pick<ExtensionContext, "modelRegistry" | "ui">,
   input: ManagedWorkerReviewInput
 ): Promise<ManagedWorkerReviewResult> {
-  const startedAt = new Date();
+  return runManagedWorkerReviewAttempt(context, input, input.timeoutMs ?? MANAGED_WORKER_REVIEW_TIMEOUT_MS);
+}
+
+/** One overall timeout and at most one fresh same-provider fallback after a confirmed primary Anthropic 429. */
+export async function runManagedWorkerReviewWithRateLimitFallback(
+  context: Pick<ExtensionContext, "modelRegistry" | "ui">,
+  input: ManagedWorkerReviewPlanInput
+): Promise<ManagedWorkerReviewExecutionResult> {
+  if (input.rateLimitFallbackRoute && input.rateLimitFallbackRoute.model.provider !== input.primaryRoute.model.provider) {
+    throw new Error("Managed-worker review rate-limit fallback must use the same provider as the primary route.");
+  }
   const scope = createAbortScope(input.signal, input.timeoutMs ?? MANAGED_WORKER_REVIEW_TIMEOUT_MS);
+  const primaryRoute = formatManagedWorkerReviewRoute(input.primaryRoute);
+  try {
+    try {
+      const review = await runManagedWorkerReviewAttempt(context, {
+        cwd: input.cwd,
+        model: input.primaryRoute.model,
+        thinkingLevel: input.primaryRoute.thinkingLevel,
+        evidence: input.evidence,
+        focus: input.focus,
+        signal: scope.signal
+      }, undefined);
+      return { review, attempts: [{ route: primaryRoute, outcome: "completed" }] };
+    } catch (error) {
+      throwIfAborted(scope.signal);
+      if (!(error instanceof ConfirmedAnthropicRateLimitError) || !input.rateLimitFallbackRoute) throw error;
+      const fallbackRoute = formatManagedWorkerReviewRoute(input.rateLimitFallbackRoute);
+      try {
+        const review = await runManagedWorkerReviewAttempt(context, {
+          cwd: input.cwd,
+          model: input.rateLimitFallbackRoute.model,
+          thinkingLevel: input.rateLimitFallbackRoute.thinkingLevel,
+          evidence: input.evidence,
+          focus: input.focus,
+          signal: scope.signal
+        }, undefined);
+        return {
+          review,
+          attempts: [
+            { route: primaryRoute, outcome: "rate_limited" },
+            { route: fallbackRoute, outcome: "completed" }
+          ]
+        };
+      } catch (fallbackError) {
+        throwIfAborted(scope.signal);
+        const message = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+        throw new Error(
+          `Managed-worker review fallback ${fallbackRoute} failed after confirmed rate limit from ${primaryRoute}: ${message}`,
+          { cause: fallbackError }
+        );
+      }
+    }
+  } finally {
+    scope.dispose();
+  }
+}
+
+async function runManagedWorkerReviewAttempt(
+  context: Pick<ExtensionContext, "modelRegistry" | "ui">,
+  input: ManagedWorkerReviewInput,
+  timeoutMs: number | undefined
+): Promise<ManagedWorkerReviewResult> {
+  const startedAt = new Date();
+  const scope = createAbortScope(input.signal, timeoutMs);
   let toolCallCount = 0;
   const systemPrompt = managedWorkerRoleSkillText("review");
   try {
@@ -66,7 +159,11 @@ export async function runManagedWorkerReview(
       const assistant = getFinalAssistant(session.messages);
       if (!assistant) throw new Error("Managed-worker reviewer finished without an assistant response.");
       if (assistant.stopReason === "error" || assistant.stopReason === "aborted") {
-        throw new Error(assistant.errorMessage ?? `Managed-worker reviewer stopped with ${assistant.stopReason}.`);
+        const message = assistant.errorMessage ?? `Managed-worker reviewer stopped with ${assistant.stopReason}.`;
+        if (assistant.stopReason === "error" && isConfirmedAnthropicRateLimitMessage(input.model, message)) {
+          throw new ConfirmedAnthropicRateLimitError(formatManagedWorkerReviewRoute(input), message);
+        }
+        throw new Error(message);
       }
       const parsed = parseManagedWorkerReviewOutput(assistantText(assistant));
       const completedAt = new Date();
@@ -83,11 +180,27 @@ export async function runManagedWorkerReview(
       };
     });
   } catch (error) {
-    throwIfAborted(scope.signal, `Managed-worker review timed out after ${input.timeoutMs ?? MANAGED_WORKER_REVIEW_TIMEOUT_MS}ms.`);
+    throwIfAborted(scope.signal, `Managed-worker review timed out after ${timeoutMs ?? MANAGED_WORKER_REVIEW_TIMEOUT_MS}ms.`);
     throw error;
   } finally {
     scope.dispose();
   }
+}
+
+export function isConfirmedAnthropicRateLimitMessage(model: Pick<Model<Api>, "provider">, message: string): boolean {
+  if (model.provider !== "anthropic" || /overloaded_error/i.test(message)) return false;
+  const statusCodes = [
+    ...Array.from(message.matchAll(/\bHTTP(?:\/\d+(?:\.\d+)?)?\s*(?:status\s*)?[:=]?\s*(\d{3})\b/gi), (match) => Number(match[1])),
+    ...Array.from(message.matchAll(/\b(?:status(?:Code)?|httpStatus)\s*["']?\s*[:=]?\s*(\d{3})\b/gi), (match) => Number(match[1]))
+  ];
+  const leadingStatus = /^\s*(\d{3})(?=\s|:|$)/.exec(message);
+  if (leadingStatus) statusCodes.push(Number(leadingStatus[1]));
+  if (!statusCodes.includes(429) || statusCodes.some((status) => status !== 429)) return false;
+  return /(?:^|[\s"'{:,])rate_limit_error(?:$|[\s"'},:])/i.test(message);
+}
+
+export function formatManagedWorkerReviewRoute(route: Pick<ManagedWorkerReviewRoute, "model" | "thinkingLevel">): string {
+  return `${formatModelName(route.model)}:${route.thinkingLevel}`;
 }
 
 export function buildManagedWorkerReviewTask(evidence: string, focus?: string): string {

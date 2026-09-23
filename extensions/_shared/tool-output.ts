@@ -456,6 +456,11 @@ const WorkerRunDetailsSchema = Type.Object({
   runs: Type.Array(WorkerRunReceiptSchema, { minItems: 1, maxItems: 8 })
 }, { additionalProperties: false });
 
+const WorkerReviewAttemptSchema = Type.Object({
+  route: Type.String({ minLength: 1, maxLength: 512 }),
+  outcome: Type.Union([Type.Literal("completed"), Type.Literal("rate_limited")])
+}, { additionalProperties: false });
+
 const WorkerReviewDetailsSchema = Type.Object({
   workerId: Type.String({ minLength: 1, maxLength: 128 }),
   runId: Type.String({ minLength: 1, maxLength: 128 }),
@@ -469,6 +474,7 @@ const WorkerReviewDetailsSchema = Type.Object({
   completedAt: Type.String({ minLength: 1, maxLength: 64 }),
   durationMs: NonNegativeNumberSchema,
   toolCallCount: NonNegativeIntegerSchema,
+  attempts: Type.Array(WorkerReviewAttemptSchema, { minItems: 1, maxItems: 2 }),
   verdict: Type.Union([Type.Literal("approve"), Type.Literal("request_changes"), Type.Literal("blocked")]),
   findings: Type.String({ minLength: 1, maxLength: 24000 }),
   checks: Type.String({ minLength: 1, maxLength: 8000 })

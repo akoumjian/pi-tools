@@ -53,7 +53,9 @@ export async function withChildAgentSession<T>(
   const services = await createAgentSessionServices({
     cwd: options.cwd,
     agentDir: getAgentDir(),
-    settingsManager: isolatedSystemPrompt ? SettingsManager.inMemory({}) : undefined,
+    settingsManager: isolatedSystemPrompt ? SettingsManager.inMemory({
+      retry: { enabled: false, maxRetries: 0, provider: { maxRetries: 0 } }
+    }) : undefined,
     resourceLoaderOptions: {
       ...(isolatedSystemPrompt ? {
         noExtensions: true,
