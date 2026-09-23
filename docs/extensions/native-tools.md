@@ -139,7 +139,7 @@ The slim prompt removes Pi's default `Available tools`/`Guidelines` prose and in
 - Caller globs use one `--glob=<glob>` argument. For `kind: "files"`, the path follows `--files --`; for `kind: "content"`, the pattern follows `--regexp` and the path follows a separate `--` option terminator. Leading-dash patterns and paths therefore remain data rather than ripgrep options.
 - Requested `--ignore-case`, `--fixed-strings`, and bounded `--context` behavior is unchanged. The public tool schema and output contracts are unchanged.
 - Spawns the resolved `rg` executable with the active cwd, captures up to 120 KB of stdout per search; on overflow `rg` is `SIGTERM`'d and the result is marked truncated. Stderr is capped at 16 KB. After completion, the per-search output is further trimmed to `maxResults` lines.
-- Child sessions that expose `search_many` reuse this same hardened implementation. Confined orchestrator sessions additionally reject traversal and symlink escapes before execution, so no separate child adapter is required. Managed worker RPC does not expose `search_many`; manually invoking `rg` through worker shell is outside this tool boundary.
+- Child sessions that expose `search_many` reuse this same hardened implementation. Managed worker RPC does not expose `search_many`; manually invoking `rg` through worker shell is outside this tool boundary.
 - Exits other than 0 (match) or 1 (no match) throw with the captured stderr.
 
 ### write_many / edit_many

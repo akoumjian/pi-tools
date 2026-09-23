@@ -447,109 +447,6 @@ const ThinkingLevelSchema = Type.Union([
   Type.Literal("max")
 ]);
 
-const RouteAttemptSchema = Type.Object({
-  model: Type.String({ minLength: 1 }),
-  status: Type.Union([Type.Literal("rejected"), Type.Literal("failed"), Type.Literal("completed")]),
-  failureKind: Type.Optional(Type.Union([
-    Type.Literal("aborted"),
-    Type.Literal("auth"),
-    Type.Literal("rate_limit"),
-    Type.Literal("transient"),
-    Type.Literal("other"),
-    Type.Literal("reviewer_unavailable")
-  ])),
-  error: Type.Optional(Type.String())
-}, { additionalProperties: false });
-
-const WriterWorktreeSchema = Type.Object({
-  branch: Type.String({ minLength: 1 }),
-  path: Type.String({ minLength: 1 }),
-  baseCommit: Type.String({ minLength: 1 }),
-  action: Type.Union([Type.Literal("removed"), Type.Literal("kept")])
-}, { additionalProperties: false });
-
-const WriterReviewAttemptSchema = Type.Object({
-  model: Type.String({ minLength: 1 }),
-  status: Type.Union([
-    Type.Literal("rejected"),
-    Type.Literal("failed"),
-    Type.Literal("unparseable"),
-    Type.Literal("approve"),
-    Type.Literal("request_changes")
-  ]),
-  error: Type.Optional(Type.String())
-}, { additionalProperties: false });
-
-const WriterReviewSchema = Type.Object({
-  status: Type.Union([
-    Type.Literal("approve"),
-    Type.Literal("request_changes"),
-    Type.Literal("unparseable"),
-    Type.Literal("failed")
-  ]),
-  model: Type.Optional(Type.String({ minLength: 1 })),
-  thinkingLevel: Type.Optional(ThinkingLevelSchema),
-  output: Type.Optional(Type.String()),
-  durationMs: Type.Optional(NonNegativeNumberSchema),
-  deniedCalls: Type.Optional(Type.Array(Type.String())),
-  attempts: Type.Array(WriterReviewAttemptSchema),
-  error: Type.Optional(Type.String())
-}, { additionalProperties: false });
-
-const OrchestratedTaskResultSchema = Type.Object({
-  id: Type.String({ minLength: 1 }),
-  role: Type.Union([Type.Literal("reader"), Type.Literal("planner"), Type.Literal("writer")]),
-  status: Type.Union([Type.Literal("completed"), Type.Literal("failed")]),
-  error: Type.Optional(Type.String()),
-  output: Type.String(),
-  model: Type.String({ minLength: 1 }),
-  thinkingLevel: ThinkingLevelSchema,
-  toolCallCount: NonNegativeIntegerSchema,
-  durationMs: NonNegativeNumberSchema,
-  deniedCalls: Type.Array(Type.String()),
-  routeAttempts: Type.Array(RouteAttemptSchema),
-  worktree: Type.Optional(WriterWorktreeSchema),
-  commit: Type.Optional(Type.String({ minLength: 1 })),
-  changedFiles: Type.Optional(Type.Array(Type.String())),
-  review: Type.Optional(WriterReviewSchema)
-}, { additionalProperties: false });
-
-const OrchestrateDetailsSchema = Type.Object({
-  mode: Type.Union([Type.Literal("read-only"), Type.Literal("read-write")]),
-  configSource: Type.String({ minLength: 1 }),
-  results: Type.Array(OrchestratedTaskResultSchema, { maxItems: 8 })
-}, { additionalProperties: false });
-
-const ReconcileFoldedSchema = Type.Object({
-  branch: Type.String({ minLength: 1 }),
-  changedFiles: Type.Array(Type.String())
-}, { additionalProperties: false });
-
-const ReconcileSkippedSchema = Type.Object({
-  branch: Type.String({ minLength: 1 }),
-  status: Type.Union([
-    Type.Literal("conflict"),
-    Type.Literal("validation_failed"),
-    Type.Literal("merge_failed"),
-    Type.Literal("invalid")
-  ]),
-  reason: Type.String()
-}, { additionalProperties: false });
-
-const ReconcileOverlapSchema = Type.Object({
-  left: Type.String({ minLength: 1 }),
-  right: Type.String({ minLength: 1 }),
-  files: Type.Array(Type.String())
-}, { additionalProperties: false });
-
-const ReconcileSharedProperties = {
-  folded: Type.Array(ReconcileFoldedSchema, { maxItems: 8 }),
-  skipped: Type.Array(ReconcileSkippedSchema, { maxItems: 8 }),
-  overlaps: Type.Array(ReconcileOverlapSchema),
-  validation: Type.Union([Type.Literal("passed-per-fold"), Type.Literal("unvalidated")]),
-  cleanedBranches: Type.Array(Type.String(), { maxItems: 8 })
-};
-
 const WorkerRunReceiptSchema = Type.Object({
   workerId: Type.String({ minLength: 1 }),
   runId: Type.String({ minLength: 1 }),
@@ -802,26 +699,6 @@ const WorkerFoldPrepareDetailsSchema = Type.Object({
   repositories: Type.Array(WorkerFoldPreparedRepositorySchema, { minItems: 1, maxItems: 16 })
 }, { additionalProperties: false });
 
-const ReconcileDetailsSchema = Type.Union([
-  Type.Object({
-    status: Type.Literal("merged"),
-    integrationBranch: Type.String({ minLength: 1 }),
-    integrationPath: Type.String({ minLength: 1 }),
-    mergeCommit: Type.String({ minLength: 1 }),
-    ...ReconcileSharedProperties
-  }, { additionalProperties: false }),
-  Type.Object({
-    status: Type.Literal("declined"),
-    integrationBranch: Type.String({ minLength: 1 }),
-    integrationPath: Type.String({ minLength: 1 }),
-    ...ReconcileSharedProperties
-  }, { additionalProperties: false }),
-  Type.Object({
-    status: Type.Literal("nothing_merged"),
-    ...ReconcileSharedProperties
-  }, { additionalProperties: false })
-]);
-
 export const RetainedToolOutputSchemas = {
   shell_start: finalResultSchema(ShellStartDetailsSchema),
   shell_status: finalResultSchema(ShellStatusDetailsSchema),
@@ -838,9 +715,7 @@ export const RetainedToolOutputSchemas = {
   worker_run: finalResultSchema(WorkerRunDetailsSchema),
   worker_control: finalResultSchema(WorkerControlDetailsSchema),
   worker_fold_prepare: finalResultSchema(WorkerFoldPrepareDetailsSchema),
-  worker_fold_resolve: finalResultSchema(WorkerFoldResolveDetailsSchema),
-  orchestrate: finalResultSchema(OrchestrateDetailsSchema),
-  reconcile: finalResultSchema(ReconcileDetailsSchema)
+  worker_fold_resolve: finalResultSchema(WorkerFoldResolveDetailsSchema)
 } satisfies Record<string, TSchema>;
 
 export type RetainedToolName = keyof typeof RetainedToolOutputSchemas;

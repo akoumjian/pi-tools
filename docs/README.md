@@ -2,10 +2,6 @@
 
 Deep-dive documentation for each extension shipped by `@akoumjian/pi-tools`. The top-level [`README.md`](../README.md) has a short overview and quick reference; the files here go into purpose, schema, behavior, caps, result shape, rendering, and setup for each extension.
 
-Planning docs:
-
-- [Orchestrator](plans/orchestrator.md) — ultracode-style, model-routed orchestration with deterministic worktree/reconciliation design.
-
 Index (extensions load in this order; see `package.json#pi.extensions`):
 
 1. [tui-scrollback](extensions/tui-scrollback.md) — preserve terminal scrollback across Pi redraws.
@@ -25,7 +21,6 @@ Index (extensions load in this order; see `package.json#pi.extensions`):
 15. [theme-preview](extensions/theme-preview.md) — `/themes:preview` live theme showcase.
 16. [review-subagent](extensions/review-subagent.md) — `/review` tool-using review subagent workflow.
 17. [tool-display](extensions/tool-display.md) — opt-in display wrapper for `document_parse`.
-18. [orchestrator](extensions/orchestrator.md) — bounded model-routed readers/planners/writers with worktree review and reconciliation.
 
 ## Conventions used in these docs
 

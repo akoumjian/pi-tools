@@ -12,7 +12,7 @@ Reusable extensions for the [Pi coding agent](https://pi.dev/). The package focu
 - provider-free active-context clipboard snapshots via `/context:copy`
 - robust chunked context compaction via `/compacter`
 - a `/review` subagent workflow
-- bounded reader/planner/writer orchestration with isolated worktrees and deterministic reconciliation
+- durable Docker-confined managed workers with exact-session lifecycle and deterministic fold preparation
 - TUI niceties: tmux/scrollback compatibility, theme preview, compact tool renderers, file-reference picker
 
 Profile-specific assets (personal AGENTS context, auth, model defaults, themes) live in a separate consumer package or local Pi profile, not in this repository.
@@ -67,8 +67,6 @@ Tools (LLM-callable):
 - `searxng_search` — search through a configured SearXNG instance
 - `web_fetch_many` — fetch + cache + readability-extract URLs, hand off non-HTML to `document_parse`
 - `document_parse` — parse PDFs, Office files, spreadsheets, images via LiteParse (opt-in display wrapper)
-- `orchestrate` — run bounded reader/planner tasks and provider-aware confined writer tasks with explicit fallback/review attempts
-- `reconcile` — deterministically fold reviewed `orch/*` branches and ask once before merging into the clean parent
 
 Commands:
 
@@ -88,7 +86,6 @@ Commands:
 - `/themes:preview [theme-name]`
 - `/review`, `/review:setup`, `/review:status`, `/review:cancel`, `/review:send-last`
 - `/docparser:doctor`
-- `/orchestrator:setup`, `/orchestrator:status`
 
 The load order in `package.json#pi.extensions` is intentional: terminal patches first, safety before async shell, workers immediately after their shared async-shell runtime, completion-notifications after async shell so it can read completion barriers, native batch tools before manual-retry, manual-retry before context-export and compacter so both copied and summarized context use the same retry filtering, and optional display overrides last.
 
@@ -286,18 +283,6 @@ The package ships progressively disclosed role skills for the managed-worker par
 
 ---
 
-### orchestrator
-
-[Full docs](docs/extensions/orchestrator.md).
-
-**Purpose.** Delegate focused readers/planners and confined writers to isolated in-process sessions. Readers use bounded parallelism; writers use bounded provider-aware concurrency while git setup/reconciliation remain serial. Explicit fallback routes, independent reviewer attempts, worktree branches, commits, files, errors, and next actions are returned model-visibly.
-
-**Provides.** `orchestrate`, `reconcile`; `/orchestrator:setup`, `/orchestrator:status`; managed `orch/*` worktrees, distinct-provider review, deterministic fold validation, and a final human merge gate.
-
-**Setup.** Run `/orchestrator:setup --worker provider/model[:thinking] --reviewer other-provider/model[:thinking]` once per machine. `/orchestrator:status` shows routes, concurrency caps, fallback policy, tools, guidance, and validation.
-
----
-
 ### tool-display
 
 [Full docs](docs/extensions/tool-display.md).
@@ -317,7 +302,6 @@ Reusable defaults live under `config/`:
 - `tool-safety-settings.json` → `tool-safety-policy.md`
 - `mutation-review-settings.json` → `mutation-review-guidance.md`
 - `review-subagent-settings.json` → `review-subagent-guidance.md`
-- `orchestrator-settings.json`
 - `tool-display-settings.json`
 - `file-open-settings.json`
 - `searxng.env.example`

@@ -19,10 +19,6 @@ when they touch credential-looking paths.
   paths such as `.env` files, key/token templates, example configs, and test
   fixtures. Local handling of these files is routine development work;
   exposure only becomes reviewable when material would leave the machine.
-- Any file changes inside managed scratch worktrees (for example paths under
-  `.pi/orchestrator/worktrees/` or `ORCHESTRATOR_WORKTREE_ROOT`), including
-  deletions and rewrites: these branches are disposable and reach real
-  branches only through separately reviewed merges.
 - Local validation commands such as tests, type checks, linters, formatters,
   builds, search/list commands, and other commands that do not publish, deploy,
   rewrite history, change system configuration, or access secrets.

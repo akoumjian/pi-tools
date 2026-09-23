@@ -25,8 +25,7 @@ const extensionPaths = [
   "extensions/mutation-review/index.ts",
   "extensions/searxng-search/index.ts",
   "extensions/web-fetch/index.ts",
-  "extensions/tool-display/index.ts",
-  "extensions/orchestrator/index.ts"
+  "extensions/tool-display/index.ts"
 ].map((entry) => path.join(repoRoot, entry));
 
 const loaded = await discoverAndLoadExtensions(extensionPaths, repoRoot, "/tmp/pi-tools-provider-context-agent");
@@ -197,20 +196,6 @@ const resultContracts = {
     error: "prepared/context/decision tampering, moved targets, non-pristine analysis, wrong states, route/session mismatch, and invalid resolved candidates remain model-visible",
     details: "internal structured integration-worker receipt and exact phase identities",
     content: "durable worker receipt, analysis-or-resolution phase, prepared manifest/candidate identity, context hash, and decisions hash when resumed"
-  },
-  orchestrate: {
-    success: "content reports every task id/role/status/routes; completed tasks add model/thinking/duration/tool calls/output and writer worktree/review data",
-    progress: "partial content reports completed/total tasks and bounded writer/provider/git-setup status",
-    error: "per-task preflight/provider/task/worktree/reviewer failures include route classifications and actionable disposition",
-    details: "internal structured run/config/results mirror; providers must rely on content",
-    content: "all route attempts, errors, branch/path/commit/files, review attempts/verdicts, and reconcile next action"
-  },
-  reconcile: {
-    success: "content reports integration branch, folds/skips/overlaps/validation, optional merge commit/cleanup, and declined integration path",
-    progress: "not applicable: deterministic folds culminate in one human gate and final report",
-    error: "dirty parent, invalid/moved branches, conflicts and validation failures are reported without force merge",
-    details: "internal structured reconciliation report",
-    content: "all branch ids, skip reasons, validation state, user decision, and declined/manual-review integration path"
   }
 };
 const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };

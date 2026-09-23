@@ -19,7 +19,6 @@ import toolSafetyExtension, {
   evaluateBash,
   evaluatePathMutations,
   evaluatePathReads,
-  evaluateReadOnlyOrchestrate,
   evaluateWebFetchMany,
   evaluateWorkerControl,
   parseApprovalModelPreference,
@@ -1035,16 +1034,6 @@ test("worker_control allows every valid exact-session lifecycle action without s
   }
 });
 
-test("read-only orchestrate tasks are allowed but future writer shapes require review", () => {
-  assert.deepEqual(evaluateReadOnlyOrchestrate({
-    tasks: [
-      { id: "read", task: "Inspect package metadata", role: "reader", model: "openai-codex/gpt-5.6-sol", thinkingLevel: "xhigh" },
-      { id: "plan", task: "Plan validation", role: "planner" }
-    ]
-  }).action, "allow");
-  assert.equal(evaluateReadOnlyOrchestrate({ tasks: [{ task: "Implement it", role: "worker" }] }).action, "review");
-  assert.equal(evaluateReadOnlyOrchestrate({ tasks: [{ task: "Inspect", role: "reader", cwd: "/tmp" }] }).action, "review");
-});
 
 test("document_parse is treated as project-local read access", () => {
   const decision = evaluateDocumentParse(

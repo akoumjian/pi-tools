@@ -264,42 +264,6 @@ const samples: Record<RetainedToolName, unknown> = {
         updatedAt: "2026-09-10T19:32:00.000Z"
       }]
     }
-  },
-  orchestrate: {
-    content: [text("Orchestrate: 0/1 tasks succeeded")],
-    details: {
-      mode: "read-only",
-      configSource: "/repo/config/orchestrator-settings.json",
-      results: [{
-        id: "task-1",
-        role: "reader",
-        status: "failed",
-        error: "Provider unavailable",
-        output: "",
-        model: "openai-codex/gpt-5.6-sol",
-        thinkingLevel: "medium",
-        toolCallCount: 0,
-        durationMs: 0,
-        deniedCalls: [],
-        routeAttempts: [{
-          model: "openai-codex/gpt-5.6-sol",
-          status: "failed",
-          failureKind: "transient",
-          error: "Provider unavailable"
-        }]
-      }]
-    }
-  },
-  reconcile: {
-    content: [text("Nothing merged")],
-    details: {
-      status: "nothing_merged",
-      folded: [],
-      skipped: [{ branch: "orch/missing", status: "invalid", reason: "Branch does not exist." }],
-      overlaps: [],
-      validation: "unvalidated",
-      cleanedBranches: []
-    }
   }
 };
 
@@ -393,9 +357,6 @@ test("conditional output variants preserve runtime-only boundaries", () => {
     details: imageDetails
   }), false, "read_many rejects impossible extra text content blocks");
 
-  assert.equal(Check(RetainedToolOutputSchemas.orchestrate, { ...(samples.orchestrate as object), isError: true }), false, "raw execute isError is not a tool-result field");
-  assert.equal(Check(RetainedToolOutputSchemas.reconcile, { ...(samples.reconcile as object), isError: true }), false, "raw execute isError is not a tool-result field");
-
   assert.equal(Check(RetainedToolOutputSchemas.shell_status, {
     content: [text("Job status")],
     details: { job: jobMeta, output: { stdout: "tail", stderr: "" } }
@@ -430,19 +391,4 @@ test("conditional output variants preserve runtime-only boundaries", () => {
       warnings: ["OCR fallback used"]
     }
   }), true, "document_parse accepts optional screenshot and warning handoffs");
-
-  assert.equal(Check(RetainedToolOutputSchemas.reconcile, {
-    content: [text("Merged integration")],
-    details: {
-      status: "merged",
-      integrationBranch: "orch/integration-1",
-      integrationPath: "/repo/.pi/worktrees/integration-1",
-      mergeCommit: hash,
-      folded: [{ branch: "orch/task-1", changedFiles: ["a.ts"] }],
-      skipped: [],
-      overlaps: [],
-      validation: "passed-per-fold",
-      cleanedBranches: ["orch/task-1"]
-    }
-  }), true, "reconcile accepts its merged report variant");
 });

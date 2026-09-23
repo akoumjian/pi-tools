@@ -22,9 +22,7 @@ const retainedToolNames = [
   "worker_run",
   "worker_control",
   "worker_fold_prepare",
-  "worker_fold_resolve",
-  "orchestrate",
-  "reconcile"
+  "worker_fold_resolve"
 ] as const;
 
 function anthropicWireSchema(parameters: unknown): unknown {
@@ -109,13 +107,12 @@ test("provider context review command renders sanitized prompt, tool declaration
     assert.match(artifact.systemPrompt, /worker_control constraints:/);
     assert.match(artifact.systemPrompt, /worker_fold_prepare constraints:/);
     assert.match(artifact.systemPrompt, /worker_fold_resolve constraints:/);
-    assert.match(artifact.systemPrompt, /orchestrate constraints:/);
     assert.doesNotMatch(artifact.systemPrompt, /Batch-native tool usage:/);
     assert.doesNotMatch(artifact.systemPrompt, /hunk_session/);
 
     const names = artifact.activeTools.map((tool) => tool.name);
     const sortedRetainedToolNames = [...retainedToolNames].sort();
-    assert.deepEqual([...names].sort(), sortedRetainedToolNames, "review covers exactly the 18 retained custom tools");
+    assert.deepEqual([...names].sort(), sortedRetainedToolNames, "review covers exactly the retained custom tools");
     assert.deepEqual(Object.keys(RetainedToolOutputSchemas).sort(), sortedRetainedToolNames, "authoritative output schemas cover every retained tool");
     assert.equal(names.includes("hunk_session"), false);
     assert.equal(names.includes("bash"), false);
