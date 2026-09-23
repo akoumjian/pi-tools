@@ -24,6 +24,43 @@ export type WorkerLease = {
   acquiredAt: string;
 };
 
+export type WorkerIntegrationSnapshot = {
+  headCommit: string;
+  headTree: string;
+  statusSha256: string;
+  indexSha256: string;
+  refsSha256: string;
+  configSha256: string;
+  metadataSha256: string;
+  objectsSha256: string;
+};
+
+export type WorkerIntegrationRecord = {
+  phase: "analysis" | "resolution";
+  preparedId: string;
+  manifestSha256: string;
+  candidateId: string;
+  method: "merge" | "squash";
+  sourceCandidateIds: string[];
+  targetRepo: string;
+  targetRef: string;
+  targetExpectedCommit: string;
+  targetExpectedTree: string;
+  candidateHeadCommit: string;
+  candidateHeadTree: string;
+  preparedArtifactFile: string;
+  workspaceRepo: string;
+  contextFile: string;
+  workspaceContextFile: string;
+  contextSha256: string;
+  analysisRunId: string;
+  analysisSnapshot: WorkerIntegrationSnapshot;
+  decisionsFile?: string;
+  workspaceDecisionsFile?: string;
+  decisionsSha256?: string;
+  resolutionRunId?: string;
+};
+
 export type WorkerRecord = {
   version: typeof WORKER_RECORD_VERSION;
   workerId: string;
@@ -34,6 +71,7 @@ export type WorkerRecord = {
   taskIds: string[];
   route: WorkerRoute;
   initialRepositories?: InitialRepositoryPin[];
+  integration?: WorkerIntegrationRecord;
   status: "queued" | "running" | "handed_off" | "failed" | "cancelled";
   container?: WorkerContainerReference;
   activeRun?: {
@@ -292,11 +330,35 @@ function assertValidWorkerRecord(value: unknown, target: string): asserts value 
     !Array.isArray(value.taskIds) ||
     !value.route ||
     !validInitialRepositories(value.initialRepositories) ||
+    !validIntegrationRecord(value.integration) ||
     !validRepositoryInventorySummary(isRecord(value.lastRun) ? value.lastRun.repositoryInventory : undefined, target, isRecord(value.lastRun) ? value.lastRun.runId : undefined) ||
     (isRecord(value.lastRun) && value.lastRun.repositoryError !== undefined && (typeof value.lastRun.repositoryError !== "string" || value.lastRun.repositoryError.length > 512))
   ) {
     throw new Error(`Invalid worker record: ${target}`);
   }
+}
+
+function validIntegrationRecord(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (!isRecord(value) || (value.phase !== "analysis" && value.phase !== "resolution") || (value.method !== "merge" && value.method !== "squash")) return false;
+  const bounded = ["preparedId", "manifestSha256", "candidateId", "targetRepo", "targetRef", "preparedArtifactFile", "workspaceRepo", "contextFile", "workspaceContextFile", "contextSha256", "analysisRunId"];
+  if (bounded.some((key) => typeof value[key] !== "string" || !(value[key] as string) || Buffer.byteLength(value[key] as string, "utf8") > 4096)) return false;
+  if (!path.isAbsolute(String(value.targetRepo)) || !path.isAbsolute(String(value.preparedArtifactFile)) || !path.isAbsolute(String(value.contextFile)) || !path.isAbsolute(String(value.workspaceContextFile))) return false;
+  if (!/^refs\/heads\/[A-Za-z0-9._/-]+$/.test(String(value.targetRef)) || !/^repos\/integration-[0-9a-f]{24}$/.test(String(value.workspaceRepo))) return false;
+  if (!/^prepared_[0-9a-f]{24}$/.test(String(value.preparedId)) || !/^candidate_[0-9a-f]{24}$/.test(String(value.candidateId)) || !/^[0-9a-f]{64}$/.test(String(value.manifestSha256)) || !/^[0-9a-f]{64}$/.test(String(value.contextSha256)) || !/^run_[A-Za-z0-9_-]{1,120}$/.test(String(value.analysisRunId))) return false;
+  if (!Array.isArray(value.sourceCandidateIds) || value.sourceCandidateIds.length !== 1 || value.sourceCandidateIds[0] !== value.candidateId) return false;
+  for (const key of ["targetExpectedCommit", "targetExpectedTree", "candidateHeadCommit", "candidateHeadTree"]) if (typeof value[key] !== "string" || !/^[0-9a-f]{40,64}$/.test(value[key] as string)) return false;
+  if (!validIntegrationSnapshot(value.analysisSnapshot)) return false;
+  const decisions = [value.decisionsFile, value.workspaceDecisionsFile, value.decisionsSha256, value.resolutionRunId];
+  if (value.phase === "resolution") return decisions.every((item) => typeof item === "string" && item.length > 0 && Buffer.byteLength(item, "utf8") <= 4096) && path.isAbsolute(String(value.decisionsFile)) && path.isAbsolute(String(value.workspaceDecisionsFile)) && /^[0-9a-f]{64}$/.test(String(value.decisionsSha256)) && /^run_[A-Za-z0-9_-]{1,120}$/.test(String(value.resolutionRunId)) && value.resolutionRunId !== value.analysisRunId;
+  return decisions.every((item) => item === undefined);
+}
+
+function validIntegrationSnapshot(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  for (const key of ["headCommit", "headTree"]) if (typeof value[key] !== "string" || !/^[0-9a-f]{40,64}$/.test(value[key] as string)) return false;
+  for (const key of ["statusSha256", "indexSha256", "refsSha256", "configSha256", "metadataSha256", "objectsSha256"]) if (typeof value[key] !== "string" || !/^[0-9a-f]{64}$/.test(value[key] as string)) return false;
+  return true;
 }
 
 function validInitialRepositories(value: unknown): boolean {

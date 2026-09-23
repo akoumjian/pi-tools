@@ -6,7 +6,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { startManagedAsyncJob, type ManagedAsyncJobHandle } from "../async-shell/index.js";
 import { resolveExecutable } from "../_shared/executable.js";
 import type { WorkerContainerReference } from "../_shared/worker-container.js";
-import type { WorkerRecord } from "./state.js";
+import type { WorkerIntegrationRecord, WorkerRecord } from "./state.js";
 
 export type WorkerBeadsRoute = {
   prefix: "personal";
@@ -30,6 +30,7 @@ export type WorkerHostConfig = {
   asyncJobRoot: string;
   parentContextSnapshot?: string;
   taskIds: string[];
+  integration?: WorkerIntegrationRecord;
   resultFile: string;
   settledFile: string;
   processFile: string;
@@ -111,6 +112,7 @@ export function launchWorkerHost(
     asyncJobRoot: path.join(stateRoot, "async-shell"),
     parentContextSnapshot: input.parentContextSnapshot,
     taskIds: [...input.record.taskIds],
+    integration: input.record.integration,
     resultFile: input.resultFile,
     settledFile: path.join(input.runDir, "settled.json"),
     processFile: input.processFile,
@@ -159,6 +161,7 @@ export function launchWorkerHost(
       PI_WORKER_ASYNC_JOB_ROOT: config.asyncJobRoot,
       ...(config.parentContextSnapshot ? { PI_WORKER_PARENT_CONTEXT_SNAPSHOT: config.parentContextSnapshot } : {}),
       PI_WORKER_TASK_IDS: JSON.stringify(input.record.taskIds),
+      ...(input.record.integration ? { PI_WORKER_INTEGRATION: JSON.stringify(input.record.integration) } : {}),
       PI_WORKER_BD_PATH: config.bdPath,
       PI_WORKER_BEADS_ROUTE: JSON.stringify(config.beadsRoute),
       ...shellEnvironment

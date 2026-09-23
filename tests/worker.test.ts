@@ -13,7 +13,7 @@ import { MAX_WORKER_TASK_IDS } from "../extensions/_shared/worker-contract.js";
 import { startManagedAsyncJob, type JobMeta } from "../extensions/async-shell/index.js";
 import type { WorkerContainerReference } from "../extensions/_shared/worker-container.js";
 import { registerWorkerExtension, resolveWorkerRoute } from "../extensions/worker/index.js";
-import { persistRepositoryInventory } from "../extensions/worker/repositories.js";
+import { persistRepositoryInventory, repositoryCandidateId } from "../extensions/worker/repositories.js";
 import { forkWorkerSession } from "../extensions/worker/session.js";
 import { normalizeWorkerSettings } from "../extensions/worker/settings.js";
 import {
@@ -2024,5 +2024,66 @@ test("worker_fold_prepare resolves exact-session candidates and returns a strict
       /active run or lease/
     );
     releaseWorkerLease(paths.leaseFile, workerId, "run_20260922220200_resume00");
+  });
+});
+
+test("worker_fold_resolve dispatches one exact immutable analysis worker", async () => {
+  await withTempDir(async (directory) => {
+    const parentCwd = path.join(directory, "parent"); const parentSessionFile = path.join(directory, "parent.jsonl");
+    const targetRoot = path.join(directory, "targets"); const target = path.join(targetRoot, "project");
+    await mkdir(parentCwd, { recursive: true }); await mkdir(target, { recursive: true }); await writeFile(parentSessionFile, "parent\n");
+    gitFixture(target, "init", "--initial-branch=main"); await writeFile(path.join(target, "shared.txt"), "base\n"); gitFixture(target, "add", "shared.txt"); gitFixture(target, "commit", "-qm", "base");
+    const baseCommit = gitFixture(target, "rev-parse", "HEAD^{commit}"); const baseTree = gitFixture(target, "rev-parse", "HEAD^{tree}");
+    const roots = { stateRoot: path.join(directory, "workers"), workspaceRoot: path.join(directory, "workspaces") };
+    const sourceWorkerId = "worker_20260922230000_12345678"; const sourceRunId = "run_20260922230000_87654321"; const sourcePaths = workerPaths(roots, sourceWorkerId);
+    provisionWorkerPaths(sourcePaths); const candidateRepo = path.join(sourcePaths.reposDir, "project"); gitFixture(directory, "clone", "--no-hardlinks", target, candidateRepo);
+    await writeFile(path.join(candidateRepo, "shared.txt"), "candidate\n"); gitFixture(candidateRepo, "add", "shared.txt"); gitFixture(candidateRepo, "commit", "-qm", "candidate");
+    const headCommit = gitFixture(candidateRepo, "rev-parse", "HEAD^{commit}"); const headTree = gitFixture(candidateRepo, "rev-parse", "HEAD^{tree}");
+    await writeFile(path.join(target, "shared.txt"), "target\n"); gitFixture(target, "add", "shared.txt"); gitFixture(target, "commit", "-qm", "target");
+    const candidateId = repositoryCandidateId({ workerId: sourceWorkerId, runId: sourceRunId, workspaceRepo: "repos/project", baseCommit, headCommit, headTree });
+    const repositoryInventory = persistRepositoryInventory(path.join(sourcePaths.stateDir, "runs", sourceRunId, "repository-candidates.json"), {
+      version: 2, workerId: sourceWorkerId, runId: sourceRunId, workspaceRoot: sourcePaths.workspaceRoot, generatedAt: "2026-09-22T23:00:00.000Z",
+      candidates: [{ candidateId, workerId: sourceWorkerId, runId: sourceRunId, workspaceRepo: "repos/project", reported: true, purpose: "conflicting candidate", dependsOn: [], source: target, baseCommit, baseTree, headCommit, headTree, dirty: false, committedChanged: true, foldable: true, policyIssues: [] }],
+      reportedIssues: [], scanCoverage: { complete: true, limitations: [] }
+    });
+    writeWorkerRecord(sourcePaths.recordFile, { version: WORKER_RECORD_VERSION, workerId: sourceWorkerId, sessionId: "019c0000-0000-7000-8000-000000000111", parentSessionFile, workspaceRoot: sourcePaths.workspaceRoot, taskIds: ["personal-source"], route: { provider: "openai-codex", model: "gpt-test", thinkingLevel: "xhigh" }, status: "handed_off", lastRun: { runId: sourceRunId, jobId: "job_20260922230000_abcdefgh", status: "handed_off", completionDelivery: "steer", repositoryInventory }, updatedAt: "2026-09-22T23:00:00.000Z" });
+    const api = fakeApi(); const foldsRoot = path.join(directory, "folds");
+    registerWorkerExtension(api, { roots, foldsRoot, targetRoot, now: () => new Date("2026-09-22T23:01:00.000Z") });
+    const prepare = api.tools.find((item) => item.name === "worker_fold_prepare"); const resolve = api.tools.find((item) => item.name === "worker_fold_resolve"); const run = api.tools.find((item) => item.name === "worker_run");
+    assert.ok(prepare?.execute); assert.ok(resolve?.execute); assert.ok(run?.execute);
+    const prepared = await prepare.execute("prepare-conflict", { repositories: [{ candidateId, targetRepo: target, targetRef: "refs/heads/main", purpose: "resolve conflict", method: "merge" }] } as never, undefined, undefined, parentContext(parentCwd, parentSessionFile));
+    const preparedDetails = prepared.details as { preparedId: string; manifestSha256: string; status: string; resolutionCaseCount: number };
+    assert.equal(preparedDetails.status, "resolution_required"); assert.equal(preparedDetails.resolutionCaseCount, 1);
+    await assert.rejects(() => resolve.execute!("mixed-phase", { kind: "start", preparedId: preparedDetails.preparedId, manifestSha256: preparedDetails.manifestSha256, candidateId, taskIds: ["personal-resolve"], context: Object.fromEntries(["decisions","projectRules","acceptanceCriteria","dependencies","candidateRationale","candidateChecks","reviewFindings","invariants","nonGoals","priorities","openQuestions","authorResponses"].map((key) => [key, key === "acceptanceCriteria" ? ["Produce an exact conflict resolution."] : []])), workerId: sourceWorkerId } as never, undefined, undefined, parentContext(parentCwd, parentSessionFile)), /start requires only/);
+    await assert.rejects(() => resolve.execute!("wrong-hash", { kind: "start", preparedId: preparedDetails.preparedId, manifestSha256: "0".repeat(64), candidateId, taskIds: ["personal-resolve"], context: Object.fromEntries(["decisions","projectRules","acceptanceCriteria","dependencies","candidateRationale","candidateChecks","reviewFindings","invariants","nonGoals","priorities","openQuestions","authorResponses"].map((key) => [key, key === "acceptanceCriteria" ? ["Produce an exact conflict resolution."] : []])) } as never, undefined, undefined, parentContext(parentCwd, parentSessionFile)), /hash mismatch/);
+    const started = await resolve.execute("resolve-start", { kind: "start", preparedId: preparedDetails.preparedId, manifestSha256: preparedDetails.manifestSha256, candidateId, taskIds: ["personal-resolve"], context: Object.fromEntries(["decisions","projectRules","acceptanceCriteria","dependencies","candidateRationale","candidateChecks","reviewFindings","invariants","nonGoals","priorities","openQuestions","authorResponses"].map((key) => [key, key === "acceptanceCriteria" ? ["Produce an exact conflict resolution."] : []])) } as never, undefined, undefined, parentContext(parentCwd, parentSessionFile));
+    assert.equal(Check(RetainedToolOutputSchemas.worker_fold_resolve, started), true);
+    const details = started.details as { workerId: string; phase: string; contextSha256: string; preparedId: string };
+    assert.equal(details.phase, "analysis"); assert.equal(details.preparedId, preparedDetails.preparedId); assert.match(details.contextSha256, /^[0-9a-f]{64}$/);
+    const createdPaths = workerPaths(roots, details.workerId); const created = readWorkerRecord(createdPaths.recordFile);
+    assert.equal(created.integration?.phase, "analysis"); assert.equal(created.integration?.manifestSha256, preparedDetails.manifestSha256);
+    assert.equal(gitFixture(path.join(created.workspaceRoot, created.integration!.workspaceRepo), "rev-parse", "HEAD^{commit}"), gitFixture(target, "rev-parse", "HEAD^{commit}"));
+    assert.equal(gitFixture(path.join(created.workspaceRoot, created.integration!.workspaceRepo), "rev-parse", "refs/heads/integration-candidate^{commit}"), headCommit);
+    assert.equal((await (await import("node:fs/promises")).stat(created.integration!.workspaceContextFile)).mode & 0o777, 0o400);
+    const analysisRunId = created.integration!.analysisRunId; const analysisJobId = created.activeRun!.jobId;
+    releaseWorkerLease(createdPaths.leaseFile, created.workerId, analysisRunId);
+    const sessionFile = path.join(createdPaths.sessionDir, "session.jsonl");
+    await writeFile(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: created.sessionId, timestamp: "2026-09-22T23:01:01.000Z", cwd: created.workspaceRoot, parentSession: parentSessionFile })}\n`);
+    const resultFile = path.join(createdPaths.stateDir, "runs", analysisRunId, "result.json"); await mkdir(path.dirname(resultFile), { recursive: true });
+    await writeFile(resultFile, `${JSON.stringify({ version: 1, workerId: created.workerId, runId: analysisRunId, acceptedAt: "2026-09-22T23:01:02.000Z", handoff: { state: "checkpoint", summary: "exact conflict plan", taskUpdates: [] } })}\n`);
+    const { activeRun: _settledRun, ...settledBase } = created;
+    writeWorkerRecord(createdPaths.recordFile, { ...settledBase, sessionFile, status: "handed_off", lastRun: { runId: analysisRunId, jobId: analysisJobId, status: "handed_off", completionDelivery: "steer", delivery: "delivered", resultFile }, updatedAt: "2026-09-22T23:01:02.000Z" });
+    await assert.rejects(() => run.execute!("generic-resume", { runs: [{ kind: "resume", workerId: details.workerId, message: "wrong path" }] } as never, undefined, undefined, parentContext(parentCwd, parentSessionFile)), /must resume through worker_fold_resolve/);
+    await writeFile(path.join(target, "moved.txt"), "moved\n"); gitFixture(target, "add", "moved.txt"); gitFixture(target, "commit", "-qm", "target moved");
+    await assert.rejects(() => resolve.execute!("moved-target", { kind: "resume", workerId: details.workerId, message: "resolve", settledDecisions: ["Preserve both intended behaviors."] } as never, undefined, undefined, parentContext(parentCwd, parentSessionFile)), /target moved/);
+    gitFixture(target, "reset", "--hard", created.integration!.targetExpectedCommit);
+    await assert.rejects(() => resolve.execute!("blank-decisions", { kind: "resume", workerId: details.workerId, message: "resolve", settledDecisions: ["   "] } as never, undefined, undefined, parentContext(parentCwd, parentSessionFile)), /bounded non-empty decisions/);
+    const resumed = await resolve.execute!("resolve-resume", { kind: "resume", workerId: details.workerId, message: "resolve exactly", settledDecisions: ["Preserve both intended behaviors."] } as never, undefined, undefined, parentContext(parentCwd, parentSessionFile));
+    assert.equal(Check(RetainedToolOutputSchemas.worker_fold_resolve, resumed), true);
+    const resumedDetails = resumed.details as { workerId: string; sessionId: string; workspaceRoot: string; phase: string; decisionsSha256: string };
+    assert.equal(resumedDetails.workerId, details.workerId); assert.equal(resumedDetails.sessionId, created.sessionId); assert.equal(resumedDetails.workspaceRoot, created.workspaceRoot); assert.equal(resumedDetails.phase, "resolution"); assert.match(resumedDetails.decisionsSha256, /^[0-9a-f]{64}$/);
+    const resolving = readWorkerRecord(createdPaths.recordFile); assert.equal(resolving.integration?.resolutionRunId, resolving.activeRun?.runId); assert.equal((await (await import("node:fs/promises")).stat(resolving.integration!.workspaceDecisionsFile!)).mode & 0o777, 0o400);
+    assert.match(renderWorkerToolCall(resolve, { kind: "start", candidateId }), /Worker Resolve\(start analysis/);
+    assert.match(renderWorkerToolResult(resolve, started), /analysis/);
   });
 });

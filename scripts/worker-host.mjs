@@ -39,6 +39,7 @@ const client = new RpcClient({
     PI_WORKER_ASYNC_JOB_ROOT: config.asyncJobRoot,
     ...(config.parentContextSnapshot ? { PI_WORKER_PARENT_CONTEXT_SNAPSHOT: config.parentContextSnapshot } : {}),
     PI_WORKER_TASK_IDS: JSON.stringify(config.taskIds),
+    ...(config.integration ? { PI_WORKER_INTEGRATION: JSON.stringify(config.integration) } : {}),
     PI_WORKER_BD_PATH: config.bdPath,
     PI_WORKER_BEADS_ROUTE: JSON.stringify(config.beadsRoute),
     ...(config.shellExecution.kind === "docker"

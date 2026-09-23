@@ -786,3 +786,22 @@ test("worker RPC argv pins exact session resources and only the worker tool surf
   assert.ok(resolvePiCliPath().endsWith("/dist/cli.js"));
   assert.equal(defaultWorkerExtensionPaths().length, 2);
 });
+
+test("integration handoff admission rejects forged immutable artifact layout", async () => {
+  await withTempDir(async (directory) => {
+    await withWorkerEnv(directory, async () => {
+      const integration = {
+        phase: "analysis", preparedId: "prepared_aaaaaaaaaaaaaaaaaaaaaaaa", manifestSha256: "a".repeat(64), candidateId: "candidate_bbbbbbbbbbbbbbbbbbbbbbbb", method: "merge",
+        sourceCandidateIds: ["candidate_bbbbbbbbbbbbbbbbbbbbbbbb"], targetRepo: path.join(directory, "target"), targetRef: "refs/heads/main",
+        targetExpectedCommit: "c".repeat(40), targetExpectedTree: "d".repeat(40), candidateHeadCommit: "e".repeat(40), candidateHeadTree: "f".repeat(40), preparedArtifactFile: path.join(directory, "prepared.bundle"),
+        workspaceRepo: "repos/integration-bbbbbbbbbbbbbbbbbbbbbbbb", contextFile: path.join(directory, "forged-context.json"), workspaceContextFile: path.join(directory, "artifacts", "integration-context.json"),
+        contextSha256: "1".repeat(64), analysisRunId: "run-test", analysisSnapshot: { headCommit: "c".repeat(40), headTree: "d".repeat(40), statusSha256: "2".repeat(64), indexSha256: "3".repeat(64), refsSha256: "4".repeat(64), configSha256: "5".repeat(64), metadataSha256: "7".repeat(64), objectsSha256: "6".repeat(64) }
+      };
+      process.env.PI_WORKER_INTEGRATION = JSON.stringify(integration);
+      const api = fakeApi(); workerRuntimeExtension(api);
+      const tool = api.tools.find((item) => item.name === "worker_handoff"); assert.ok(tool?.execute);
+      await assert.rejects(() => tool.execute!("integration-forged", { state: "checkpoint", summary: "analysis", taskUpdates: [] } as never, undefined, undefined, context(directory)), /context artifact identity is invalid/);
+      assert.equal(existsSync(path.join(directory, "run", "result.json")), false);
+    }, { PI_WORKER_INTEGRATION: "" });
+  });
+});

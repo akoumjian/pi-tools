@@ -35,9 +35,24 @@ import { cancelPersistedAsyncShellJobsForOwner, handleAsyncShellViewerCommand, t
 import {
   defaultWorkerFoldsRoot,
   prepareRepositoryChangeSet,
+  readPreparedWorkerFold,
+  type PreparedRepositoryFold,
   type PreparedWorkerFoldSummary,
   type RepositoryChangeSet
 } from "./folds.js";
+import {
+  assertIntegrationPristine,
+  assertIntegrationRecordLayout,
+  assertPreparedTargetCurrent,
+  normalizeIntegrationContext,
+  persistIntegrationEnvelope,
+  provisionIntegrationRepository,
+  validateIntegrationHandoff,
+  verifyIntegrationArtifact,
+  INTEGRATION_CONTEXT_KEYS,
+  type IntegrationContextBundle,
+  type NormalizedIntegrationContextBundle
+} from "./integration.js";
 import { launchWorkerHost, readWorkerHostProcess, readWorkerHostSettlement } from "./runner.js";
 import { readWorkerRuntimeHandoff, type AcceptedWorkerHandoff } from "./runtime.js";
 import {
@@ -46,6 +61,7 @@ import {
   pinInitialRepositories,
   readRepositoryInventory,
   type InitialRepositoryPin,
+  type RepositoryIntegrationLineage,
   type RepositoryInventory,
   type RepositoryInventorySummary
 } from "./repositories.js";
@@ -65,6 +81,7 @@ import {
   releaseWorkerOperationLock,
   workerPaths,
   writeWorkerRecord,
+  type WorkerIntegrationRecord,
   type WorkerLease,
   type WorkerPaths,
   type WorkerRecord,
@@ -113,6 +130,22 @@ const WorkerIdSchema = Type.String({
   pattern: WORKER_ID_PATTERN
 });
 
+const IntegrationStringListSchema = Type.Array(Type.String({ minLength: 1, maxLength: 4000 }), { maxItems: 32 });
+const IntegrationContextSchema = Type.Object({ ...Object.fromEntries(INTEGRATION_CONTEXT_KEYS.filter((key) => key !== "evidencePaths").map((key) => [key, IntegrationStringListSchema])), evidencePaths: Type.Optional(IntegrationStringListSchema) }, { additionalProperties: false });
+export const WorkerFoldResolveParams = Type.Object({
+  kind: Type.Union([Type.Literal("start"), Type.Literal("resume")]),
+  preparedId: Type.Optional(Type.String({ pattern: "^prepared_[0-9a-f]{24}$" })),
+  manifestSha256: Type.Optional(Type.String({ pattern: "^[0-9a-f]{64}$" })),
+  candidateId: Type.Optional(Type.String({ pattern: "^candidate_[0-9a-f]{24}$" })),
+  taskIds: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { minItems: 1, maxItems: MAX_WORKER_TASK_IDS })),
+  context: Type.Optional(IntegrationContextSchema),
+  route: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
+  workerId: Type.Optional(WorkerIdSchema),
+  message: Type.Optional(Type.String({ minLength: 1, maxLength: 12000 })),
+  settledDecisions: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4000 }), { minItems: 1, maxItems: 32 })),
+  completionDelivery: Type.Optional(CompletionDeliverySchema)
+}, { additionalProperties: false });
+
 export const WorkerControlParams = Type.Object({
   action: Type.Union([
     Type.Literal("status"),
@@ -140,6 +173,9 @@ export const WorkerFoldPrepareParams = Type.Object({
 export type WorkerRunInput = Static<typeof WorkerRunParams>;
 export type WorkerControlInput = Static<typeof WorkerControlParams>;
 export type WorkerFoldPrepareInput = Static<typeof WorkerFoldPrepareParams>;
+export type WorkerFoldResolveInput =
+  | { kind: "start"; preparedId: string; manifestSha256: string; candidateId: string; taskIds: string[]; context: IntegrationContextBundle; route?: string; completionDelivery?: "steer" | "followUp" }
+  | { kind: "resume"; workerId: string; message: string; settledDecisions: string[]; completionDelivery?: "steer" | "followUp" };
 export type WorkerRunReceipt = {
   workerId: string;
   runId: string;
@@ -156,6 +192,15 @@ export type WorkerRunReceipt = {
 };
 
 type WorkerRunDetails = { runs: WorkerRunReceipt[] };
+type WorkerFoldResolveDetails = WorkerRunReceipt & {
+  phase: "analysis" | "resolution";
+  method: "merge" | "squash";
+  preparedId: string;
+  manifestSha256: string;
+  candidateId: string;
+  contextSha256: string;
+  decisionsSha256?: string;
+};
 
 type WorkerControlSummary = {
   workerId: string;
@@ -165,6 +210,7 @@ type WorkerControlSummary = {
   workspaceRoot: string;
   taskIds: string[];
   route: WorkerRoute;
+  integration?: { phase: "analysis" | "resolution"; method: "merge" | "squash"; preparedId: string; manifestSha256: string; candidateId: string; contextSha256: string; analysisRunId: string; decisionsSha256?: string; resolutionRunId?: string };
   container?: { name: string; containerId?: string; runId: string };
   activeRun?: {
     runId: string;
@@ -205,6 +251,7 @@ type WorkerControlDetails =
       workspaceRoot: string;
       taskIds: string[];
       route: WorkerRoute;
+      integration?: WorkerControlSummary["integration"];
       resultFile?: string;
       stdoutLog?: string;
       stderrLog?: string;
@@ -231,6 +278,7 @@ type PlannedWorkerRun =
       parentSessionFile: string;
       route: WorkerRoute;
       taskIds: string[];
+      integrationStart?: { preparedId: string; manifestSha256: string; candidateId: string; context: NormalizedIntegrationContextBundle; repository: PreparedRepositoryFold };
     }
   | {
       kind: "resume";
@@ -238,6 +286,7 @@ type PlannedWorkerRun =
       parentSessionFile: string;
       paths: WorkerPaths;
       existing: WorkerRecord;
+      integrationResume?: { decisions: string[] };
     };
 
 type WorkerLaunchRequest = {
@@ -559,6 +608,86 @@ export function registerWorkerExtension(
         content: [{ type: "text", text: formatWorkerFoldPrepareSummary(summary) }],
         details: summary
       };
+    }
+  }));
+
+  api.registerTool(defineTool({
+    name: "worker_fold_resolve",
+    label: "Worker Fold Resolve",
+    description: "Start or resume an explicit two-phase managed integration worker for one exact resolution_required prepared repository. Start persists a parent-curated immutable IntegrationContextBundle and provisions exact target/candidate inputs for analysis-only checkpointing. Resume keeps the exact session/workspace/route, adds immutable settled decisions, and permits committed resolution work. No hidden model call, promotion, review, validation, or authoritative target mutation occurs.",
+    promptSnippet: "Start an analysis-only integration worker for one exact prepared conflict, or resume that exact worker with settled parent decisions.",
+    promptGuidelines: [
+      "worker_fold_resolve use: start binds preparedId/hash/candidateId, assigned task IDs, route, and a complete bounded parent-curated context; resume the returned worker only after reading its checkpoint or needs_input handoff and settling decisions.",
+      inputJsonSchemaGuideline("worker_fold_resolve", WorkerFoldResolveParams),
+      outputJsonSchemaGuideline("worker_fold_resolve", RetainedToolOutputSchemas.worker_fold_resolve),
+      "worker_fold_resolve constraints: Analysis is immutable and may hand off only checkpoint or needs_input. Resolution is an exact-session resume with immutable decisions and may hand off only completed states. Moved targets, tampered prepared/context state, repository mutation during analysis, generic resume, credentials, push, implicit rebase, review, validation, and promotion fail closed. Only result content is provider-visible; details are internal."
+    ],
+    parameters: WorkerFoldResolveParams,
+    renderCall(args, theme) { return renderWorkerFoldResolveCall(args as WorkerFoldResolveInput, theme); },
+    renderResult(result, options, theme, context) { return renderWorkerFoldResolveResult(result as AgentToolResult<WorkerFoldResolveDetails>, options, theme, context); },
+    executionMode: "sequential",
+    async execute(_toolCallId, params, signal, onUpdate, context): Promise<AgentToolResult<WorkerFoldResolveDetails>> {
+      throwIfAborted(signal);
+      assertWorkerFoldResolveInput(params);
+      const parentSessionFile = context.sessionManager.getSessionFile();
+      if (!parentSessionFile) throw new Error("worker_fold_resolve requires a persisted parent session.");
+      let plan: PlannedWorkerRun;
+      if (params.kind === "start") {
+        validatePersonalTaskIds(params.taskIds);
+        const manifest = readPreparedWorkerFold(dependencies.foldsRoot, params.preparedId, parentSessionFile);
+        if (manifest.manifestSha256 !== params.manifestSha256) throw new Error("Prepared integration manifest hash mismatch.");
+        const repository = manifest.repositories.find((item) => item.candidateId === params.candidateId);
+        if (!repository || repository.status !== "resolution_required") throw new Error("worker_fold_resolve start requires one resolution_required prepared repository.");
+        plan = {
+          kind: "new",
+          input: { kind: "new", taskIds: [...params.taskIds], route: params.route, completionDelivery: params.completionDelivery },
+          parentSessionFile: path.resolve(parentSessionFile),
+          route: resolveWorkerRoute(params.route, context),
+          taskIds: uniqueStrings(params.taskIds),
+          integrationStart: {
+            preparedId: manifest.preparedId,
+            manifestSha256: manifest.manifestSha256,
+            candidateId: params.candidateId,
+            context: normalizeIntegrationContext(params.context, dependencies.targetRoot),
+            repository
+          }
+        };
+      } else {
+        const paths = workerPaths(dependencies.roots, params.workerId);
+        const existing = readWorkerRecord(paths.recordFile);
+        assertWorkerParentSession(existing, context);
+        if (!existing.integration || existing.integration.phase !== "analysis") throw new Error("worker_fold_resolve resume requires a settled analysis integration worker.");
+        if (existing.status !== "handed_off" || existing.lastRun?.status !== "handed_off" || existing.lastRun.runId !== existing.integration.analysisRunId) throw new Error("worker_fold_resolve resume requires the exact successful analysis handoff.");
+        if (existing.activeRun || existing.lastRun?.delivery === "pending") throw new Error("Integration analysis result must be settled and acknowledged before resume.");
+        if (!existing.sessionFile) throw new Error("Integration worker has no exact session to resume.");
+        const handoff = existing.lastRun?.resultFile ? readMatchingWorkerHandoff(existing.lastRun.resultFile, existing.workerId, existing.lastRun.runId) : undefined;
+        if (!handoff || (handoff.handoff.state !== "checkpoint" && handoff.handoff.state !== "needs_input")) throw new Error("Integration analysis did not produce a checkpoint or needs_input handoff.");
+        verifyWorkerSession({ sessionFile: existing.sessionFile, sessionId: existing.sessionId, workspaceRoot: existing.workspaceRoot, parentSessionFile: existing.parentSessionFile });
+        plan = {
+          kind: "resume",
+          input: { kind: "resume", workerId: params.workerId, message: params.message, completionDelivery: params.completionDelivery },
+          parentSessionFile: path.resolve(parentSessionFile),
+          paths,
+          existing,
+          integrationResume: { decisions: normalizeSettledDecisions(params.settledDecisions) }
+        };
+      }
+      const receipt = prepareWorkerPlans([plan], context, dependencies, pending)[0]!;
+      const record = readWorkerRecord(workerPaths(dependencies.roots, receipt.workerId).recordFile);
+      const integration = record.integration!;
+      const details: WorkerFoldResolveDetails = {
+        ...receipt,
+        phase: integration.phase,
+        method: integration.method,
+        preparedId: integration.preparedId,
+        manifestSha256: integration.manifestSha256,
+        candidateId: integration.candidateId,
+        contextSha256: integration.contextSha256,
+        decisionsSha256: integration.decisionsSha256
+      };
+      const text = formatWorkerFoldResolveReceipt(details);
+      onUpdate?.({ content: [{ type: "text", text }], details });
+      return { content: [{ type: "text", text }], details };
     }
   }));
 
@@ -927,6 +1056,7 @@ function planWorkerRuns(
       throw new Error(`Worker ${existing.workerId} can only resume from its exact parent session ${existing.parentSessionFile}.`);
     }
     if (existing.activeRun) throw new Error(`Worker ${existing.workerId} already has active run ${existing.activeRun.runId}.`);
+    if (existing.integration) throw new Error(`Integration worker ${existing.workerId} must resume through worker_fold_resolve.`);
     if (existing.lastRun?.delivery === "pending") {
       throw new Error(`Worker ${existing.workerId} completion delivery is still pending; inspect it with worker_control result or use /worker:ack before resuming.`);
     }
@@ -990,6 +1120,58 @@ function prepareNewWorker(
   provisionWorkerPaths(paths);
   let leaseAcquired = false;
   try {
+    let integration: WorkerIntegrationRecord | undefined;
+    let integrationInitialRepository: InitialRepositoryPin | undefined;
+    if (plan.integrationStart) {
+    const manifest = readPreparedWorkerFold(dependencies.foldsRoot, plan.integrationStart.preparedId, plan.parentSessionFile);
+    if (manifest.manifestSha256 !== plan.integrationStart.manifestSha256) throw new Error("Prepared integration manifest changed before worker provisioning.");
+    const repository = manifest.repositories.find((item) => item.candidateId === plan.integrationStart!.candidateId);
+    if (!repository || repository.status !== "resolution_required") throw new Error("Prepared integration resolution case is unavailable.");
+    assertPreparedTargetCurrent(repository, path.join(paths.stateDir, "integration-target-inspection"));
+    const contextValue = {
+      version: 1,
+      preparedId: manifest.preparedId,
+      manifestSha256: manifest.manifestSha256,
+      candidateId: repository.candidateId,
+      method: repository.method,
+      target: { repo: repository.targetRepo, ref: repository.targetRef, commit: repository.targetExpectedCommit, tree: repository.targetExpectedTree },
+      candidate: { commit: repository.candidateHeadCommit, tree: repository.candidateHeadTree, baseCommit: repository.candidateBaseCommit, baseTree: repository.candidateBaseTree },
+      context: plan.integrationStart.context
+    };
+    const contextArtifact = persistIntegrationEnvelope({
+      destination: path.join(paths.stateDir, "integration", "context.json"),
+      workspaceCopy: path.join(paths.artifactsDir, "integration-context.json"),
+      value: contextValue
+    });
+    const workspaceRepo = `repos/integration-${repository.candidateId.slice("candidate_".length)}`;
+    const provisioned = provisionIntegrationRepository({
+      selection: { manifest, repository, preparedDirectory: path.join(dependencies.foldsRoot, manifest.preparedId) },
+      repositoryPath: path.join(paths.workspaceRoot, workspaceRepo),
+      trustedStateRoot: path.join(paths.stateDir, "integration-git")
+    });
+    integrationInitialRepository = provisioned.initialRepository;
+    integration = {
+      phase: "analysis",
+      preparedId: manifest.preparedId,
+      manifestSha256: manifest.manifestSha256,
+      candidateId: repository.candidateId,
+      method: repository.method,
+      sourceCandidateIds: [repository.candidateId],
+      targetRepo: repository.targetRepo,
+      targetRef: repository.targetRef,
+      targetExpectedCommit: repository.targetExpectedCommit,
+      targetExpectedTree: repository.targetExpectedTree,
+      candidateHeadCommit: repository.candidateHeadCommit,
+      candidateHeadTree: repository.candidateHeadTree,
+      preparedArtifactFile: provisioned.artifactFile,
+      workspaceRepo,
+      contextFile: contextArtifact.file,
+      workspaceContextFile: contextArtifact.workspaceFile,
+      contextSha256: contextArtifact.sha256,
+      analysisRunId: runId,
+      analysisSnapshot: provisioned.snapshot
+    };
+    }
     const record: WorkerRecord = {
       version: WORKER_RECORD_VERSION,
       workerId,
@@ -998,9 +1180,10 @@ function prepareNewWorker(
       workspaceRoot: paths.workspaceRoot,
       taskIds: plan.taskIds,
       route: plan.route,
-      initialRepositories: plan.input.initialRepos?.length
+      initialRepositories: integrationInitialRepository ? [integrationInitialRepository] : plan.input.initialRepos?.length
         ? dependencies.pinRepositories(plan.input.initialRepos, path.join(paths.stateDir, "repository-inspection"))
         : undefined,
+      integration,
       status: "queued",
       activeRun: {
         runId,
@@ -1021,7 +1204,7 @@ function prepareNewWorker(
       parentSessionFile: plan.parentSessionFile,
       recordFile: paths.recordFile,
       paths,
-      prompt: buildNewWorkerPrompt(record, plan.input.guidance, plan.input.initialRepos),
+      prompt: integration ? buildIntegrationAnalysisPrompt(record) : buildNewWorkerPrompt(record, plan.input.guidance, plan.input.initialRepos),
       resultFile,
       runDir,
       processFile: path.join(runDir, "host-process.json"),
@@ -1063,9 +1246,40 @@ function prepareResumedWorker(
     plan.existing = existing;
     const taskIds = uniqueStrings([...existing.taskIds, ...(input.addTaskIds ?? [])]);
     validatePersonalTaskIds(taskIds);
+    let integration = existing.integration;
+    let decisionArtifact: { file: string; workspaceFile: string; sha256: string } | undefined;
+    if (plan.integrationResume) {
+      if (!integration || integration.phase !== "analysis") throw new Error("Integration resolution resume requires analysis phase state.");
+      assertIntegrationRecordLayout(integration, paths.workspaceRoot, paths.stateDir);
+      assertIntegrationPristine(integration, paths.workspaceRoot, path.join(paths.stateDir, "integration-git"));
+      const manifest = readPreparedWorkerFold(dependencies.foldsRoot, integration.preparedId, plan.parentSessionFile);
+      if (manifest.manifestSha256 !== integration.manifestSha256) throw new Error("Prepared integration manifest changed before resolution resume.");
+      const repository = manifest.repositories.find((item) => item.candidateId === integration!.candidateId);
+      if (!repository || repository.status !== "resolution_required") throw new Error("Prepared integration resolution case is unavailable.");
+      assertPreparedIntegrationBinding(integration, repository, dependencies.foldsRoot, "resolution resume");
+      assertPreparedTargetCurrent(repository, path.join(paths.stateDir, "integration-target-inspection"));
+      verifyIntegrationArtifact(integration.contextFile, integration.contextSha256);
+      verifyIntegrationArtifact(integration.workspaceContextFile, integration.contextSha256);
+      decisionArtifact = persistIntegrationEnvelope({
+        destination: path.join(paths.stateDir, "integration", `decisions-${runId}.json`),
+        workspaceCopy: path.join(paths.artifactsDir, `integration-decisions-${runId}.json`),
+        value: { version: 1, preparedId: integration.preparedId, candidateId: integration.candidateId, analysisRunId: integration.analysisRunId, resolutionRunId: runId, decisions: plan.integrationResume.decisions.map((item) => item.trim()) }
+      });
+      integration = {
+        ...integration,
+        phase: "resolution",
+        decisionsFile: decisionArtifact.file,
+        workspaceDecisionsFile: decisionArtifact.workspaceFile,
+        decisionsSha256: decisionArtifact.sha256,
+        resolutionRunId: runId
+      };
+    } else if (integration) {
+      throw new Error(`Integration worker ${existing.workerId} must resume through worker_fold_resolve.`);
+    }
     const record: WorkerRecord = {
       ...existing,
       taskIds,
+      integration,
       status: "queued",
       activeRun: {
         runId,
@@ -1075,8 +1289,10 @@ function prepareResumedWorker(
       },
       updatedAt: now.toISOString()
     };
-    acquireWorkerRunLease(paths, record.workerId, runId, now);
+    let leaseAcquired = false;
     try {
+      acquireWorkerRunLease(paths, record.workerId, runId, now);
+      leaseAcquired = true;
       writeWorkerRecord(paths.recordFile, record);
       const runDir = path.join(paths.stateDir, "runs", runId);
       const resultFile = path.join(runDir, "result.json");
@@ -1087,7 +1303,7 @@ function prepareResumedWorker(
         parentSessionFile: plan.parentSessionFile,
         recordFile: paths.recordFile,
         paths,
-        prompt: buildResumeWorkerPrompt(record, input.message, parentContextSnapshot),
+        prompt: integration?.phase === "resolution" ? buildIntegrationResolutionPrompt(record, input.message, parentContextSnapshot) : buildResumeWorkerPrompt(record, input.message, parentContextSnapshot),
         resultFile,
         runDir,
         parentContextSnapshot,
@@ -1096,8 +1312,14 @@ function prepareResumedWorker(
         kind: "resume"
       });
     } catch (error) {
-      writeWorkerRecord(paths.recordFile, existing);
-      releaseWorkerLease(paths.leaseFile, record.workerId, runId);
+      if (leaseAcquired) {
+        writeWorkerRecord(paths.recordFile, existing);
+        releaseWorkerLease(paths.leaseFile, record.workerId, runId);
+      }
+      if (decisionArtifact) {
+        rmSync(decisionArtifact.file, { force: true });
+        rmSync(decisionArtifact.workspaceFile, { force: true });
+      }
       throw error;
     }
     return receipt(record);
@@ -1299,6 +1521,7 @@ async function completeWorkerRun(
     try {
       readMatchingHostSettlement(path.join(pending.runDir, "settled.json"), current, runId, pending.resultFile);
       handoff = readMatchingWorkerHandoff(pending.resultFile, current.workerId, runId);
+      validateSettledIntegration(current, handoff, pending.paths, dependencies);
       status = "handed_off";
     } catch (cause) {
       error = cause instanceof Error ? cause.message : String(cause);
@@ -1328,6 +1551,65 @@ async function completeWorkerRun(
   });
 }
 
+function assertPreparedIntegrationBinding(integration: WorkerIntegrationRecord, repository: PreparedRepositoryFold, foldsRoot: string, phase: string): void {
+  const artifactFile = path.resolve(foldsRoot, integration.preparedId, repository.artifact.file);
+  const valid = repository.candidateId === integration.candidateId && repository.method === integration.method &&
+    repository.targetRepo === integration.targetRepo && repository.targetRef === integration.targetRef &&
+    repository.targetExpectedCommit === integration.targetExpectedCommit && repository.targetExpectedTree === integration.targetExpectedTree &&
+    repository.candidateHeadCommit === integration.candidateHeadCommit && repository.candidateHeadTree === integration.candidateHeadTree &&
+    integration.sourceCandidateIds.length === 1 && integration.sourceCandidateIds[0] === repository.candidateId && artifactFile === integration.preparedArtifactFile;
+  if (!valid) throw new Error(`Prepared integration identities changed before ${phase}.`);
+}
+
+function validateSettledIntegration(record: WorkerRecord, handoff: AcceptedWorkerHandoff, paths: WorkerPaths, dependencies: WorkerExtensionDependencies): void {
+  const integration = record.integration;
+  if (!integration) return;
+  assertIntegrationRecordLayout(integration, record.workspaceRoot, paths.stateDir);
+  const expectedRunId = integration.phase === "analysis" ? integration.analysisRunId : integration.resolutionRunId;
+  if (!expectedRunId || record.activeRun?.runId !== expectedRunId) throw new Error("Integration phase/run identity changed before settlement.");
+  validateIntegrationHandoff(handoff.handoff, integration, record.workspaceRoot, path.join(paths.stateDir, "integration-runtime"));
+  const manifest = readPreparedWorkerFold(dependencies.foldsRoot, integration.preparedId, record.parentSessionFile);
+  if (manifest.manifestSha256 !== integration.manifestSha256) throw new Error("Integration prepared manifest changed before settlement.");
+  const repository = manifest.repositories.find((item) => item.candidateId === integration.candidateId);
+  if (!repository || repository.status !== "resolution_required") throw new Error("Integration resolution case is unavailable at settlement.");
+  assertPreparedIntegrationBinding(integration, repository, dependencies.foldsRoot, "settlement");
+  assertPreparedTargetCurrent(repository, path.join(paths.stateDir, "integration-target-inspection"));
+  if (integration.phase === "resolution") {
+    const lineage = integrationLineage(integration);
+    const inventory = deriveRepositoryInventory({
+      workerId: record.workerId,
+      runId: integration.resolutionRunId!,
+      workspaceRoot: record.workspaceRoot,
+      reposRoot: paths.reposDir,
+      handoff,
+      initialRepositories: record.initialRepositories,
+      generatedAt: dependencies.now().toISOString(),
+      trustedStateRoot: path.join(paths.stateDir, "integration-settlement-inventory"),
+      integrationLineage: { workspaceRepo: integration.workspaceRepo, lineage }
+    });
+    const candidate = inventory.candidates[0];
+    if (!inventory.scanCoverage.complete || inventory.candidates.length !== 1 || inventory.reportedIssues.length !== 0 || !candidate || candidate.workspaceRepo !== integration.workspaceRepo || !candidate.reported || !candidate.foldable || !candidate.lineage) {
+      throw new Error("Integration resolution must settle as exactly one complete foldable lineage-bearing candidate.");
+    }
+  }
+}
+
+function integrationLineage(integration: WorkerIntegrationRecord): RepositoryIntegrationLineage {
+  if (integration.phase !== "resolution" || !integration.decisionsSha256 || !integration.resolutionRunId) throw new Error("Integration resolution lineage is incomplete.");
+  return {
+    kind: "integration_resolution",
+    preparedId: integration.preparedId,
+    manifestSha256: integration.manifestSha256,
+    sourceCandidateIds: [...integration.sourceCandidateIds],
+    contextSha256: integration.contextSha256,
+    decisionsSha256: integration.decisionsSha256,
+    analysisRunId: integration.analysisRunId,
+    resolutionRunId: integration.resolutionRunId,
+    targetExpectedCommit: integration.targetExpectedCommit,
+    targetExpectedTree: integration.targetExpectedTree
+  };
+}
+
 function finalizeWorkerRunRecord(input: {
   api: ExtensionAPI;
   paths: WorkerPaths;
@@ -1354,7 +1636,7 @@ function finalizeWorkerRunRecord(input: {
     ) return undefined;
     let repositoryInventory: RepositoryInventorySummary | undefined;
     let repositoryError: string | undefined;
-    if (input.status === "handed_off" && input.handoff) {
+    if (input.status === "handed_off" && input.handoff && input.record.integration?.phase !== "analysis") {
       try {
         const inventory = deriveRepositoryInventory({
           workerId: current.workerId,
@@ -1364,7 +1646,11 @@ function finalizeWorkerRunRecord(input: {
           handoff: input.handoff,
           initialRepositories: current.initialRepositories,
           generatedAt: input.dependencies.now().toISOString(),
-          trustedStateRoot: path.join(path.dirname(input.resultFile), "repository-inspection")
+          trustedStateRoot: path.join(path.dirname(input.resultFile), "repository-inspection"),
+          integrationLineage: current.integration?.phase === "resolution" ? {
+            workspaceRepo: current.integration.workspaceRepo,
+            lineage: integrationLineage(current.integration)
+          } : undefined
         });
         repositoryInventory = persistRepositoryInventory(
           path.join(path.dirname(input.resultFile), "repository-candidates.json"),
@@ -1540,6 +1826,7 @@ function sendWorkerCompletion(
     `process: ${job.status}${job.exitCode === undefined ? "" : ` exit=${job.exitCode}`}`,
     `semantic: ${record.status}`,
     `route: ${record.route.provider}/${record.route.model}:${record.route.thinkingLevel}`,
+    record.integration ? `integration: ${record.integration.phase} · ${record.integration.preparedId} · context ${record.integration.contextSha256}${record.integration.decisionsSha256 ? ` · decisions ${record.integration.decisionsSha256}` : ""}` : undefined,
     ...formatRepositoryInventorySummary(record.lastRun?.repositoryInventory),
     record.lastRun?.repositoryError ? `repository_error: ${record.lastRun.repositoryError}` : undefined,
     handoff ? `handoff: ${handoff.handoff.state} — ${handoff.handoff.summary}` : undefined,
@@ -2278,6 +2565,47 @@ function buildNewWorkerPrompt(
   ].filter((part): part is string => part !== undefined).join("\n\n");
 }
 
+function buildIntegrationAnalysisPrompt(record: WorkerRecord): string {
+  const integration = record.integration!;
+  return [
+    `You are integration worker ${record.workerId} in ANALYSIS-ONLY phase for prepared fold ${integration.preparedId}.`,
+    `Read the immutable parent-curated context at ${integration.workspaceContextFile}.`,
+    `Inspect ${integration.workspaceRepo} for prepared ${integration.method} integration at exact target ${integration.targetExpectedCommit} and exact candidate ref refs/heads/integration-candidate (${integration.candidateHeadCommit}).`,
+    "Do not modify repository HEAD, refs, index, worktree, ignored/untracked files, config, or object database. Analyze the conflict, propose an exact plan, identify questions and assumptions, and finish only with worker_handoff state checkpoint or needs_input. Any repository mutation or completion claim is rejected.",
+    WORKER_OPERATIONAL_GUIDANCE
+  ].join("\n\n");
+}
+
+function buildIntegrationResolutionPrompt(record: WorkerRecord, message: string, parentContextSnapshot: string): string {
+  const integration = record.integration!;
+  return [
+    `Resume integration worker ${record.workerId} in RESOLUTION phase for prepared fold ${integration.preparedId}.`,
+    `The original immutable context is ${integration.workspaceContextFile}; settled parent decisions are ${integration.workspaceDecisionsFile}.`,
+    `Resolve only ${integration.workspaceRepo} using prepared method ${integration.method}. Start from exact target ${integration.targetExpectedCommit}; integrate exact candidate ${integration.candidateHeadCommit} from refs/heads/integration-candidate according to settled decisions. Commit the result locally, do not push, and report ${integration.workspaceRepo} in worker_handoff.`,
+    `Fresh parent context snapshot: ${parentContextSnapshot}`,
+    `Parent resume message: ${message}`,
+    WORKER_OPERATIONAL_GUIDANCE
+  ].join("\n\n");
+}
+
+function formatWorkerFoldResolveReceipt(details: WorkerFoldResolveDetails): string {
+  return [
+    `integration_worker: ${details.workerId}`,
+    `run: ${details.runId}`,
+    `phase: ${details.phase}`,
+    `method: ${details.method}`,
+    `prepared_fold: ${details.preparedId}`,
+    `manifest_sha256: ${details.manifestSha256}`,
+    `candidate: ${details.candidateId}`,
+    `context_sha256: ${details.contextSha256}`,
+    details.decisionsSha256 ? `decisions_sha256: ${details.decisionsSha256}` : undefined,
+    `session: ${details.sessionId}`,
+    `workspace: ${details.workspaceRoot}`,
+    `route: ${details.provider}/${details.model}:${details.thinkingLevel}`,
+    `state: ${details.state}`
+  ].filter((line): line is string => line !== undefined).join("\n");
+}
+
 function buildResumeWorkerPrompt(record: WorkerRecord, message: string, parentContextSnapshot: string): string {
   return [
     `Resume managed worker ${record.workerId} in the exact existing session and workspace.`,
@@ -2360,6 +2688,23 @@ function renderWorkerFoldPrepareResult(
   const summary = `${details.status} · ${shortWorkerId(details.preparedId)} · ${details.repositoryCount} ${details.repositoryCount === 1 ? "repository" : "repositories"}${details.resolutionCaseCount > 0 ? ` · ${details.resolutionCaseCount} resolution ${details.resolutionCaseCount === 1 ? "case" : "cases"}` : ""}${details.overlapCount > 0 ? ` · ${details.overlapCount} ${details.overlapCount === 1 ? "overlap" : "overlaps"}` : ""}`;
   const lines = [workerToolResult(summary, details.status === "ready" ? "success" : "warning", theme)];
   if (options.expanded) appendBoundedWorkerRows(lines, details.repositories.map((item) => `${shortWorkerId(item.candidateId)} · ${item.method} · ${item.status} · ${truncateOneLine(item.targetRef, 80)}`));
+  return new Text(lines.join("\n"), 0, 0);
+}
+
+function renderWorkerFoldResolveCall(args: WorkerFoldResolveInput, theme: WorkerRenderTheme): Text {
+  const phase = args.kind === "resume" ? "resume resolution" : "start analysis";
+  const identity = args.kind === "resume" ? shortWorkerId(args.workerId) : shortWorkerId(args.candidateId);
+  return new Text(workerToolCall("Worker Resolve", `${phase} · ${identity}`, theme), 0, 0);
+}
+
+function renderWorkerFoldResolveResult(result: AgentToolResult<WorkerFoldResolveDetails>, options: WorkerRenderOptions, theme: WorkerRenderTheme, context?: WorkerRenderContext): Text {
+  const error = renderWorkerToolError(result, theme, context);
+  if (error !== undefined) return error;
+  if (options.isPartial) return new Text(workerToolResult("starting integration worker", "warning", theme), 0, 0);
+  const details = result.details;
+  if (!details) return new Text(workerToolResult("integration worker queued", "muted", theme), 0, 0);
+  const lines = [workerToolResult(`${details.phase}/${details.method} · ${shortWorkerId(details.workerId)} · ${shortWorkerId(details.preparedId)} · ${details.state}`, "warning", theme)];
+  if (options.expanded) appendBoundedWorkerRows(lines, [`${details.provider}/${details.model}:${details.thinkingLevel}`, `context ${details.contextSha256}${details.decisionsSha256 ? ` · decisions ${details.decisionsSha256}` : ""}`]);
   return new Text(lines.join("\n"), 0, 0);
 }
 
@@ -2528,6 +2873,20 @@ function formatWorkerRunReceipt(value: WorkerRunReceipt): string {
   ].join("\n");
 }
 
+function integrationSummary(integration: WorkerIntegrationRecord | undefined): WorkerControlSummary["integration"] {
+  return integration ? {
+    phase: integration.phase,
+    method: integration.method,
+    preparedId: integration.preparedId,
+    manifestSha256: integration.manifestSha256,
+    candidateId: integration.candidateId,
+    contextSha256: integration.contextSha256,
+    analysisRunId: integration.analysisRunId,
+    decisionsSha256: integration.decisionsSha256,
+    resolutionRunId: integration.resolutionRunId
+  } : undefined;
+}
+
 function workerControlSummary(record: WorkerRecord): WorkerControlSummary {
   return {
     workerId: record.workerId,
@@ -2537,6 +2896,7 @@ function workerControlSummary(record: WorkerRecord): WorkerControlSummary {
     workspaceRoot: record.workspaceRoot,
     taskIds: [...record.taskIds],
     route: { ...record.route },
+    integration: integrationSummary(record.integration),
     container: record.container ? {
       name: record.container.name,
       containerId: record.container.containerId,
@@ -2563,7 +2923,7 @@ function workerControlSummary(record: WorkerRecord): WorkerControlSummary {
       error: record.lastRun.error,
       repositoryInventory: record.lastRun.repositoryInventory ? {
         ...record.lastRun.repositoryInventory,
-        candidates: record.lastRun.repositoryInventory.candidates.map((candidate) => ({ ...candidate, policyIssues: [...candidate.policyIssues] })),
+        candidates: record.lastRun.repositoryInventory.candidates.map((candidate) => ({ ...candidate, policyIssues: [...candidate.policyIssues], lineage: candidate.lineage ? { ...candidate.lineage, sourceCandidateIds: [...candidate.lineage.sourceCandidateIds] } : undefined })),
         reportedIssues: record.lastRun.repositoryInventory.reportedIssues.map((item) => ({ ...item })),
         scanCoverage: {
           complete: record.lastRun.repositoryInventory.scanCoverage.complete,
@@ -2669,6 +3029,7 @@ function formatWorkerRecord(record: WorkerRecord): string {
     `Session: ${record.sessionId}${record.sessionFile ? ` · ${record.sessionFile}` : " · fork pending"}`,
     `Workspace: ${record.workspaceRoot}`,
     `Route: ${formatModelName({ provider: record.route.provider, id: record.route.model })}:${record.route.thinkingLevel}`,
+    record.integration ? `Integration: ${record.integration.phase} · ${record.integration.preparedId} · ${record.integration.candidateId} · context ${record.integration.contextSha256}${record.integration.decisionsSha256 ? ` · decisions ${record.integration.decisionsSha256}` : ""}` : undefined,
     `Tasks: ${record.taskIds.join(", ")}`,
     record.container ? `Container: ${record.container.name} · ${record.container.containerId?.slice(0, 12) ?? "planned"} · created for ${record.container.runId}` : "Container: not created",
     record.activeRun ? `Active run: ${record.activeRun.runId} · ${record.activeRun.jobId} · ${record.activeRun.status}` : undefined,
@@ -2681,6 +3042,26 @@ function formatWorkerRecord(record: WorkerRecord): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function assertWorkerFoldResolveInput(value: Static<typeof WorkerFoldResolveParams>): asserts value is WorkerFoldResolveInput {
+  if (value.kind === "start") {
+    if (!value.preparedId || !value.manifestSha256 || !value.candidateId || !value.taskIds || !value.context || value.workerId !== undefined || value.message !== undefined || value.settledDecisions !== undefined) {
+      throw new Error("worker_fold_resolve start requires only preparedId, manifestSha256, candidateId, taskIds, context, and optional route/completionDelivery.");
+    }
+    return;
+  }
+  if (!value.workerId || !value.message || !value.settledDecisions || value.preparedId !== undefined || value.manifestSha256 !== undefined || value.candidateId !== undefined || value.taskIds !== undefined || value.context !== undefined || value.route !== undefined) {
+    throw new Error("worker_fold_resolve resume requires only workerId, message, settledDecisions, and optional completionDelivery.");
+  }
+}
+
+function normalizeSettledDecisions(values: readonly string[]): string[] {
+  const normalized = values.map((value) => value.trim());
+  if (normalized.length < 1 || normalized.some((value) => !value) || Buffer.byteLength(JSON.stringify(normalized), "utf8") > 128 * 1024) {
+    throw new Error("worker_fold_resolve settledDecisions must contain bounded non-empty decisions.");
+  }
+  return normalized;
 }
 
 function uniqueStrings(values: readonly string[]): string[] {

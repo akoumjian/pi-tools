@@ -569,6 +569,15 @@ const WorkerRunDetailsSchema = Type.Object({
   runs: Type.Array(WorkerRunReceiptSchema, { minItems: 1, maxItems: 8 })
 }, { additionalProperties: false });
 
+const WorkerFoldResolveDetailsSchema = Type.Object({
+  workerId: Type.String({ minLength: 1 }), runId: Type.String({ minLength: 1 }), jobId: Type.String({ minLength: 1 }), sessionId: Type.String({ minLength: 1 }),
+  sessionFile: Type.Optional(Type.String({ minLength: 1 })), workspaceRoot: Type.String({ minLength: 1 }), taskIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: MAX_WORKER_TASK_IDS }),
+  provider: Type.String({ minLength: 1 }), model: Type.String({ minLength: 1 }), thinkingLevel: Type.String({ minLength: 1 }), completionDelivery: CompletionDeliverySchema,
+  state: Type.Union([Type.Literal("queued"), Type.Literal("running")]), phase: Type.Union([Type.Literal("analysis"), Type.Literal("resolution")]), method: Type.Union([Type.Literal("merge"), Type.Literal("squash")]),
+  preparedId: Type.String({ pattern: "^prepared_[0-9a-f]{24}$" }), manifestSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }), candidateId: Type.String({ pattern: "^candidate_[0-9a-f]{24}$" }),
+  contextSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }), decisionsSha256: Type.Optional(Type.String({ pattern: "^[0-9a-f]{64}$" }))
+}, { additionalProperties: false });
+
 const WorkerStatusSchema = Type.Union([
   Type.Literal("queued"),
   Type.Literal("running"),
@@ -583,6 +592,31 @@ const WorkerRouteSchema = Type.Object({
   thinkingLevel: Type.String({ minLength: 1 })
 }, { additionalProperties: false });
 
+const RepositoryIntegrationLineageSchema = Type.Object({
+  kind: Type.Literal("integration_resolution"),
+  preparedId: Type.String({ pattern: "^prepared_[0-9a-f]{24}$" }),
+  manifestSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }),
+  sourceCandidateIds: Type.Array(Type.String({ pattern: "^candidate_[0-9a-f]{24}$" }), { minItems: 1, maxItems: 16 }),
+  contextSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }),
+  decisionsSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }),
+  analysisRunId: Type.String({ minLength: 1 }),
+  resolutionRunId: Type.String({ minLength: 1 }),
+  targetExpectedCommit: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
+  targetExpectedTree: Type.String({ pattern: "^[0-9a-f]{40,64}$" })
+}, { additionalProperties: false });
+
+const WorkerIntegrationSummarySchema = Type.Object({
+  phase: Type.Union([Type.Literal("analysis"), Type.Literal("resolution")]),
+  method: Type.Union([Type.Literal("merge"), Type.Literal("squash")]),
+  preparedId: Type.String({ pattern: "^prepared_[0-9a-f]{24}$" }),
+  manifestSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }),
+  candidateId: Type.String({ pattern: "^candidate_[0-9a-f]{24}$" }),
+  contextSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }),
+  analysisRunId: Type.String({ minLength: 1 }),
+  decisionsSha256: Type.Optional(Type.String({ pattern: "^[0-9a-f]{64}$" })),
+  resolutionRunId: Type.Optional(Type.String({ minLength: 1 }))
+}, { additionalProperties: false });
+
 const RepositoryPolicyIssuesSchema = Type.Array(Type.String({ maxLength: 160 }), { maxItems: 64 });
 
 const RepositoryCandidateSummarySchema = Type.Object({
@@ -592,7 +626,8 @@ const RepositoryCandidateSummarySchema = Type.Object({
   dirty: Type.Boolean(),
   committedChanged: Type.Boolean(),
   foldable: Type.Boolean(),
-  policyIssues: RepositoryPolicyIssuesSchema
+  policyIssues: RepositoryPolicyIssuesSchema,
+  lineage: Type.Optional(RepositoryIntegrationLineageSchema)
 }, { additionalProperties: false });
 
 const ReportedRepositoryIssueSchema = Type.Object({
@@ -640,7 +675,8 @@ const RepositoryCandidateSchema = Type.Object({
   dirty: Type.Boolean(),
   committedChanged: Type.Boolean(),
   foldable: Type.Boolean(),
-  policyIssues: RepositoryPolicyIssuesSchema
+  policyIssues: RepositoryPolicyIssuesSchema,
+  lineage: Type.Optional(RepositoryIntegrationLineageSchema)
 }, { additionalProperties: false });
 
 const RepositoryInventorySchema = Type.Object({
@@ -662,6 +698,7 @@ const WorkerControlSummarySchema = Type.Object({
   workspaceRoot: Type.String({ minLength: 1 }),
   taskIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: MAX_WORKER_TASK_IDS }),
   route: WorkerRouteSchema,
+  integration: Type.Optional(WorkerIntegrationSummarySchema),
   container: Type.Optional(Type.Object({
     name: Type.String({ minLength: 1 }),
     containerId: Type.Optional(Type.String({ minLength: 1 })),
@@ -709,6 +746,7 @@ const WorkerControlDetailsSchema = Type.Union([
     workspaceRoot: Type.String({ minLength: 1 }),
     taskIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: MAX_WORKER_TASK_IDS }),
     route: WorkerRouteSchema,
+    integration: Type.Optional(WorkerIntegrationSummarySchema),
     resultFile: Type.Optional(Type.String({ minLength: 1 })),
     stdoutLog: Type.Optional(Type.String({ minLength: 1 })),
     stderrLog: Type.Optional(Type.String({ minLength: 1 })),
@@ -792,6 +830,7 @@ export const RetainedToolOutputSchemas = {
   worker_run: finalResultSchema(WorkerRunDetailsSchema),
   worker_control: finalResultSchema(WorkerControlDetailsSchema),
   worker_fold_prepare: finalResultSchema(WorkerFoldPrepareDetailsSchema),
+  worker_fold_resolve: finalResultSchema(WorkerFoldResolveDetailsSchema),
   orchestrate: finalResultSchema(OrchestrateDetailsSchema),
   reconcile: finalResultSchema(ReconcileDetailsSchema)
 } satisfies Record<string, TSchema>;

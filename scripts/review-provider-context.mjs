@@ -191,6 +191,13 @@ const resultContracts = {
     details: "internal immutable prepared-manifest summary and exact repository records",
     content: "prepared manifest identity/path/hash, dependency-ordered repository methods/status/OIDs/artifacts/views, and resolution-case count"
   },
+  worker_fold_resolve: {
+    success: "content reports exact worker/run/session/workspace/route, phase, prepared manifest/candidate identity, and immutable context/decisions hashes",
+    progress: "partial content reports the same durable two-phase integration receipt before deferred post-turn launch",
+    error: "prepared/context/decision tampering, moved targets, non-pristine analysis, wrong states, route/session mismatch, and invalid resolved candidates remain model-visible",
+    details: "internal structured integration-worker receipt and exact phase identities",
+    content: "durable worker receipt, analysis-or-resolution phase, prepared manifest/candidate identity, context hash, and decisions hash when resumed"
+  },
   orchestrate: {
     success: "content reports every task id/role/status/routes; completed tasks add model/thinking/duration/tool calls/output and writer worktree/review data",
     progress: "partial content reports completed/total tasks and bounded writer/provider/git-setup status",

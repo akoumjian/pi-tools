@@ -229,6 +229,15 @@ const samples: Record<RetainedToolName, unknown> = {
       }]
     }
   },
+  worker_fold_resolve: {
+    content: [text("integration worker queued")],
+    details: {
+      workerId: "worker_20260910190000_12345678", runId: "run_20260910190000_87654321", jobId: "job_20260910190000_abcdefgh",
+      sessionId: "019c0000-0000-7000-8000-000000000001", workspaceRoot: "/tmp/workspaces/worker_20260910190000_12345678",
+      taskIds: ["personal-test"], provider: "openai-codex", model: "gpt-test", thinkingLevel: "xhigh", completionDelivery: "steer", state: "queued",
+      phase: "analysis", method: "merge", preparedId: "prepared_aaaaaaaaaaaaaaaaaaaaaaaa", manifestSha256: "a".repeat(64), candidateId: "candidate_bbbbbbbbbbbbbbbbbbbbbbbb", contextSha256: "b".repeat(64)
+    }
+  },
   worker_control: {
     content: [text("Worker status")],
     details: {

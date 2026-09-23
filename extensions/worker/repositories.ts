@@ -34,6 +34,19 @@ export type InitialRepositoryPin = {
   issue?: string;
 };
 
+export type RepositoryIntegrationLineage = {
+  kind: "integration_resolution";
+  preparedId: string;
+  manifestSha256: string;
+  sourceCandidateIds: string[];
+  contextSha256: string;
+  decisionsSha256: string;
+  analysisRunId: string;
+  resolutionRunId: string;
+  targetExpectedCommit: string;
+  targetExpectedTree: string;
+};
+
 export type RepositoryCandidate = {
   candidateId: string;
   workerId: string;
@@ -51,6 +64,7 @@ export type RepositoryCandidate = {
   committedChanged: boolean;
   foldable: boolean;
   policyIssues: string[];
+  lineage?: RepositoryIntegrationLineage;
 };
 
 export type ReportedRepositoryIssue = {
@@ -84,6 +98,7 @@ export type RepositoryCandidateSummary = {
   committedChanged: boolean;
   foldable: boolean;
   policyIssues: string[];
+  lineage?: RepositoryIntegrationLineage;
 };
 
 export type RepositoryInventorySummary = {
@@ -142,6 +157,7 @@ export function deriveRepositoryInventory(input: {
   generatedAt: string;
   trustedStateRoot: string;
   gitPath?: string;
+  integrationLineage?: { workspaceRepo: string; lineage: RepositoryIntegrationLineage };
 }): RepositoryInventory {
   const workspaceRoot = requireCanonicalDirectory(input.workspaceRoot, "worker workspace");
   const reposRoot = requireCanonicalDirectory(input.reposRoot, "worker repositories");
@@ -174,7 +190,8 @@ export function deriveRepositoryInventory(input: {
       reported: report !== undefined,
       purpose: report?.purpose,
       dependsOn: [...(report?.dependsOn ?? [])],
-      ...inspection
+      ...inspection,
+      ...(input.integrationLineage?.workspaceRepo === workspaceRepo ? { lineage: { ...input.integrationLineage.lineage, sourceCandidateIds: [...input.integrationLineage.lineage.sourceCandidateIds] } } : {})
     });
   }
 
@@ -860,7 +877,8 @@ function summarizeRepositoryInventory(
       dirty: candidate.dirty,
       committedChanged: candidate.committedChanged,
       foldable: candidate.foldable,
-      policyIssues: [...candidate.policyIssues]
+      policyIssues: [...candidate.policyIssues],
+      ...(candidate.lineage ? { lineage: { ...candidate.lineage, sourceCandidateIds: [...candidate.lineage.sourceCandidateIds] } } : {})
     })),
     reportedIssues: inventory.reportedIssues.map((item) => ({ ...item })),
     scanCoverage: {
@@ -890,7 +908,7 @@ export function isRepositoryInventorySummary(value: unknown, inventoryFile: stri
     typeof candidate.candidateId === "string" && /^candidate_[0-9a-f]{24}$/.test(candidate.candidateId) &&
     typeof candidate.workspaceRepo === "string" && candidate.workspaceRepo.length > 0 && Buffer.byteLength(candidate.workspaceRepo, "utf8") <= MAX_PATH_BYTES &&
     typeof candidate.reported === "boolean" && typeof candidate.dirty === "boolean" && typeof candidate.committedChanged === "boolean" && typeof candidate.foldable === "boolean" &&
-    Array.isArray(candidate.policyIssues) && candidate.policyIssues.length <= 64 && candidate.policyIssues.every((issue) => typeof issue === "string" && issue.length <= 160)
+    Array.isArray(candidate.policyIssues) && candidate.policyIssues.length <= 64 && candidate.policyIssues.every((issue) => typeof issue === "string" && issue.length <= 160) && validIntegrationLineage(candidate.lineage)
   )) return false;
   return value.reportedIssues.every((item) =>
     isRecord(item) &&
@@ -966,8 +984,20 @@ function isRepositoryCandidate(value: unknown): value is RepositoryCandidate {
     typeof value.reported === "boolean" && Array.isArray(value.dependsOn) && value.dependsOn.length <= 16 && value.dependsOn.every((item) => typeof item === "string" && item.length > 0 && item.length <= 1024) &&
     typeof value.dirty === "boolean" && typeof value.committedChanged === "boolean" && typeof value.foldable === "boolean" &&
     Array.isArray(value.policyIssues) && value.policyIssues.length <= 64 && value.policyIssues.every((item) => typeof item === "string" && item.length <= 160) &&
-    optionalString(value.purpose) && optionalString(value.source) && optionalOid(value.baseCommit) && optionalOid(value.baseTree) && optionalOid(value.headCommit) && optionalOid(value.headTree) &&
+    optionalString(value.purpose) && optionalString(value.source) && validIntegrationLineage(value.lineage) && optionalOid(value.baseCommit) && optionalOid(value.baseTree) && optionalOid(value.headCommit) && optionalOid(value.headTree) &&
     ((value.baseCommit === undefined) === (value.baseTree === undefined)) && ((value.headCommit === undefined) === (value.headTree === undefined));
+}
+
+
+function validIntegrationLineage(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (!isRecord(value) || value.kind !== "integration_resolution" || typeof value.preparedId !== "string" || !/^prepared_[0-9a-f]{24}$/.test(value.preparedId) || typeof value.manifestSha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.manifestSha256)) return false;
+  if (!Array.isArray(value.sourceCandidateIds) || value.sourceCandidateIds.length < 1 || value.sourceCandidateIds.length > 16 || value.sourceCandidateIds.some((item) => typeof item !== "string" || !/^candidate_[0-9a-f]{24}$/.test(item)) || new Set(value.sourceCandidateIds).size !== value.sourceCandidateIds.length) return false;
+  for (const key of ["contextSha256", "decisionsSha256"] as const) if (typeof value[key] !== "string" || !/^[0-9a-f]{64}$/.test(value[key])) return false;
+  for (const key of ["analysisRunId", "resolutionRunId"] as const) if (typeof value[key] !== "string" || !/^run_[A-Za-z0-9_-]{1,120}$/.test(value[key])) return false;
+  if (value.analysisRunId === value.resolutionRunId) return false;
+  for (const key of ["targetExpectedCommit", "targetExpectedTree"] as const) if (typeof value[key] !== "string" || !OID_PATTERN.test(value[key])) return false;
+  return true;
 }
 
 function optionalString(value: unknown): boolean {
