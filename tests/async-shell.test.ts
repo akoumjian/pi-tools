@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { visibleWidth, type TUI } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import asyncShellExtension, {
+  ASYNC_SHELL_ACTIVITY_STATUS_KEY,
   activeAsyncShellJobCount,
   activeAsyncShellJobsForOwner,
   buildAsyncShellStatusText,
@@ -99,6 +100,20 @@ function required<T>(value: T | undefined, name: string): T {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitWithRefTimeout<T>(promise: Promise<T>, timeoutMs = 2_000): Promise<T> {
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error(`Timed out after ${timeoutMs}ms waiting for completion.`)), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
 }
 
 async function withEnv(values: Record<string, string | undefined>, run: () => Promise<void>): Promise<void> {
@@ -196,8 +211,18 @@ test("async-shell activity status is compact, themed, exact-session scoped, and 
     assert.equal(renderAsyncShellActivityStatus(0, theme), undefined);
     assert.equal(renderAsyncShellActivityStatus(3, theme), "<warning>sh3</warning>");
     assert.equal(visibleWidth(renderAsyncShellActivityStatus(123, plainTheme)!), 5, "the count stays narrow");
+    const footerLine = new Map([
+      [ASYNC_SHELL_ACTIVITY_STATUS_KEY, renderAsyncShellActivityStatus(34, plainTheme)!],
+      ["mutation-review", "mutation review running · 12 tool calls · search_many"]
+    ]);
+    const narrowFooter = truncateToWidth(
+      [...footerLine.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([, text]) => text).join(" "),
+      12,
+      "..."
+    );
+    assert.match(narrowFooter, /^sh34 /, "the priority status key keeps the compact count before verbose statuses");
     await api.emit("session_start", { reason: "startup" }, context);
-    assert.deepEqual(statuses.at(-1), { key: "pi-tools-async-activity", text: undefined });
+    assert.deepEqual(statuses.at(-1), { key: ASYNC_SHELL_ACTIVITY_STATUS_KEY, text: undefined });
     await writeJobMeta(dir, "job_20260923165959_stale001", { status: "running", pid: 2_147_483_647 });
     assert.equal(activeAsyncShellJobCount(context), 0, "detached stale metadata is not active UI state");
 
@@ -207,8 +232,7 @@ test("async-shell activity status is compact, themed, exact-session scoped, and 
       notifyOnExit: false
     });
     assert.equal(activeAsyncShellJobCount(context), 0, "managed worker host jobs stay out of the shell count");
-    await delay(120);
-    await internal.completion;
+    await waitWithRefTimeout(internal.completion);
 
     const shellStart = required(api.registeredTools.find((candidate) => candidate.name === "shell_start"), "shell_start tool");
     const run = shellStart.execute(
@@ -226,6 +250,13 @@ test("async-shell activity status is compact, themed, exact-session scoped, and 
     await delay(40);
     assert.equal(activeAsyncShellJobCount(context), 2);
     assert.ok(statuses.some((status) => status.text === "<warning>sh2</warning>"));
+    const nextTheme = {
+      fg(color: string, text: string): string { return `[${color}]${text}[/${color}]`; },
+      bold(text: string): string { return text; }
+    } as unknown as Theme;
+    (context.ui as { theme: Theme }).theme = nextTheme;
+    await api.emit("input", { text: "refresh theme" }, context);
+    assert.deepEqual(statuses.at(-1), { key: ASYNC_SHELL_ACTIVITY_STATUS_KEY, text: "[warning]sh2[/warning]" });
     const otherSession = {
       ...context,
       sessionManager: { getSessionId: () => "other-session" }
@@ -235,16 +266,120 @@ test("async-shell activity status is compact, themed, exact-session scoped, and 
     await run;
     assert.equal(activeAsyncShellJobCount(context), 0);
     assert.ok(statuses.some((status) => status.text === "<warning>sh1</warning>"), "concurrent completion decrements the canonical count");
-    assert.deepEqual(statuses.at(-1), { key: "pi-tools-async-activity", text: undefined });
+    assert.deepEqual(statuses.at(-1), { key: ASYNC_SHELL_ACTIVITY_STATUS_KEY, text: undefined });
     assert.equal(api.sentMessages.length, 0, "activity status adds no provider-visible messages");
 
     await api.emit("session_shutdown", { reason: "reload" }, context);
-    assert.deepEqual(statuses.at(-1), { key: "pi-tools-async-activity", text: undefined });
+    assert.deepEqual(statuses.at(-1), { key: ASYNC_SHELL_ACTIVITY_STATUS_KEY, text: undefined });
     const tuiStatusCount = statuses.length;
     const rpcContext = { ...context, mode: "rpc", hasUI: true } as ExtensionContext;
     await api.emit("session_start", { reason: "resume" }, rpcContext);
     await api.emit("session_shutdown", { reason: "reload" }, rpcContext);
     assert.equal(statuses.length, tuiStatusCount, "RPC/headless modes receive no activity UI requests");
+  });
+});
+
+test("async-shell activity survives a fresh module reload and old completion clears the new listener", async () => {
+  await withTempDir(async (dir) => {
+    const originalApi = createFakeApi();
+    asyncShellExtension(originalApi);
+    const originalStatuses: Array<string | undefined> = [];
+    const context = {
+      ...createContext(dir),
+      mode: "tui",
+      hasUI: true,
+      sessionManager: { getSessionId: () => "reload-activity-session" },
+      ui: {
+        theme: plainTheme,
+        setStatus(_key: string, text: string | undefined): void { originalStatuses.push(text); }
+      }
+    } as unknown as ExtensionContext;
+    await originalApi.emit("session_start", { reason: "startup" }, context);
+    const shellStart = required(originalApi.registeredTools.find((candidate) => candidate.name === "shell_start"), "shell_start tool");
+    const running = shellStart.execute(
+      "reload-call",
+      { commands: [{ command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("setTimeout(() => {}, 240)")}`, cwd: dir, notifyOnExit: false }] } as never,
+      new AbortController().signal,
+      undefined,
+      context
+    );
+    await delay(35);
+    assert.equal(activeAsyncShellJobCount(context), 1);
+    await originalApi.emit("session_shutdown", { reason: "reload" }, context);
+
+    const freshModule = await import(`../extensions/async-shell/index.js?activity-reload=${Date.now()}`);
+    const freshApi = createFakeApi();
+    freshModule.default(freshApi);
+    const freshStatuses: Array<string | undefined> = [];
+    const freshContext = {
+      ...context,
+      ui: {
+        theme: plainTheme,
+        setStatus(_key: string, text: string | undefined): void { freshStatuses.push(text); }
+      }
+    } as ExtensionContext;
+    await freshApi.emit("session_start", { reason: "reload" }, freshContext);
+    assert.equal(freshModule.activeAsyncShellJobCount(freshContext), 1, "the fresh module reuses the canonical live job map");
+    assert.equal(freshStatuses.at(-1), "sh1");
+    await waitWithRefTimeout(running, 2_000);
+    assert.equal(freshModule.activeAsyncShellJobCount(freshContext), 0);
+    assert.equal(freshStatuses.at(-1), undefined, "the old lifecycle owner notifies the new listener");
+    await freshApi.emit("session_shutdown", { reason: "quit" }, freshContext);
+  });
+});
+
+test("async-shell rejects an incompatible process-global runtime holder", () => {
+  const moduleUrl = new URL("../extensions/async-shell/index.js", import.meta.url).href;
+  const script = [
+    `Reflect.set(globalThis, Symbol.for("@akoumjian/pi-tools/async-shell-runtime"), { version: 99, jobs: new Map(), activityListeners: new Set() });`,
+    `await import(${JSON.stringify(moduleUrl)});`
+  ].join("\n");
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8" });
+  assert.notEqual(result.status, 0);
+  assert.match(`${result.stdout}${result.stderr}`, /Incompatible async-shell runtime holder/);
+});
+
+test("async-shell activity listener failures do not block another live listener", async () => {
+  await withTempDir(async (dir) => {
+    const throwingApi = createFakeApi();
+    const observingApi = createFakeApi();
+    asyncShellExtension(throwingApi);
+    asyncShellExtension(observingApi);
+    const base = {
+      ...createContext(dir),
+      mode: "tui",
+      hasUI: true,
+      sessionManager: { getSessionId: () => "listener-failure-session" }
+    } as ExtensionContext;
+    const throwingContext = {
+      ...base,
+      ui: {
+        theme: plainTheme,
+        setStatus(_key: string, text: string | undefined): void { if (text !== undefined) throw new Error("display failed"); }
+      }
+    } as ExtensionContext;
+    const observed: Array<string | undefined> = [];
+    const observingContext = {
+      ...base,
+      ui: {
+        theme: plainTheme,
+        setStatus(_key: string, text: string | undefined): void { observed.push(text); }
+      }
+    } as ExtensionContext;
+    await throwingApi.emit("session_start", { reason: "startup" }, throwingContext);
+    await observingApi.emit("session_start", { reason: "startup" }, observingContext);
+    const shellStart = required(observingApi.registeredTools.find((candidate) => candidate.name === "shell_start"), "shell_start tool");
+    await waitWithRefTimeout(shellStart.execute(
+      "listener-failure-call",
+      { commands: [{ command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("setTimeout(() => process.exit(7), 90)")}`, cwd: dir, notifyOnExit: false }] } as never,
+      new AbortController().signal,
+      undefined,
+      observingContext
+    ), 2_000);
+    assert.ok(observed.includes("sh1"), "the healthy listener still observes the failed job while active");
+    assert.equal(observed.at(-1), undefined, "failure completion clears the count");
+    await throwingApi.emit("session_shutdown", { reason: "quit" }, throwingContext);
+    await observingApi.emit("session_shutdown", { reason: "quit" }, observingContext);
   });
 });
 
@@ -1083,6 +1218,17 @@ test("shell_cancel transitions a running job to cancelled and suppresses complet
   await withTempDir(async (dir) => {
     const api = createFakeApi();
     asyncShellExtension(api);
+    const statuses: Array<string | undefined> = [];
+    const context = {
+      ...createContext(dir),
+      mode: "tui",
+      hasUI: true,
+      ui: {
+        theme: plainTheme,
+        setStatus(_key: string, text: string | undefined): void { statuses.push(text); }
+      }
+    } as unknown as ExtensionContext;
+    await api.emit("session_start", { reason: "startup" }, context);
     const shellStart = required(api.registeredTools.find((tool) => tool.name === "shell_start"), "shell_start tool");
     const shellCancel = required(api.registeredTools.find((tool) => tool.name === "shell_cancel"), "shell_cancel tool");
     const shellStatus = required(api.registeredTools.find((tool) => tool.name === "shell_status"), "shell_status tool");
@@ -1095,21 +1241,24 @@ test("shell_cancel transitions a running job to cancelled and suppresses complet
       { commands: [{ command: "sleep 30", cwd: dir }] } as never,
       new AbortController().signal,
       undefined,
-      createContext(dir)
+      context
     );
     const jobId = (started.details as { jobs: Array<{ jobId: string }> }).jobs[0].jobId;
 
-    const cancelled = await shellCancel.execute("tool-call-id", { jobId, signal: "SIGTERM" } as never, new AbortController().signal, undefined, createContext(dir));
+    assert.equal(statuses.at(-1), "sh1", "a still-running shell_start job is counted");
+    const cancelled = await shellCancel.execute("tool-call-id", { jobId, signal: "SIGTERM" } as never, new AbortController().signal, undefined, context);
     assert.equal((cancelled.details as { job: { notifyOnExit: boolean } }).job.notifyOnExit, false);
     await delay(500);
 
-    const status = await shellStatus.execute("tool-call-id", { jobId } as never, new AbortController().signal, undefined, createContext(dir));
+    const status = await shellStatus.execute("tool-call-id", { jobId } as never, new AbortController().signal, undefined, context);
     const job = (status.details as { job: { status: string; notifyOnExit: boolean; signal?: string | null } }).job;
     assert.equal(job.status, "cancelled");
     assert.equal(job.notifyOnExit, false);
     assert.equal(job.signal, "SIGTERM");
     await delay(50);
     assert.equal(api.sentMessages.length, 0);
+    assert.equal(statuses.at(-1), undefined, "shell cancellation clears activity");
+    await api.emit("session_shutdown", { reason: "quit" }, context);
   });
 });
 

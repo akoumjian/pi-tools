@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -8,12 +8,14 @@ import test from "node:test";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { Check } from "typebox/value";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 import { RetainedToolOutputSchemas } from "../extensions/_shared/tool-output.js";
 import { MAX_WORKER_TASK_IDS } from "../extensions/_shared/worker-contract.js";
 import { managedWorkerRoleSkillText } from "../extensions/_shared/role-skills.js";
-import { startManagedAsyncJob, type JobMeta } from "../extensions/async-shell/index.js";
+import { ASYNC_SHELL_ACTIVITY_STATUS_KEY, startManagedAsyncJob, type JobMeta } from "../extensions/async-shell/index.js";
 import type { WorkerContainerReference } from "../extensions/_shared/worker-container.js";
 import {
+  WORKER_ACTIVITY_STATUS_KEY,
   activeWorkerCountForContext,
   buildIntegrationAnalysisPrompt,
   buildIntegrationResolutionPrompt,
@@ -120,6 +122,15 @@ const workerRenderTheme = {
   fg: (_color: string, text: string) => text,
   bold: (text: string) => text
 };
+
+function enableWorkerActivityUI(context: ExtensionContext, statuses: Array<string | undefined>): void {
+  Object.assign(context, { mode: "tui", hasUI: true });
+  context.ui = {
+    theme: workerRenderTheme,
+    notify(): void {},
+    setStatus(_key: string, text: string | undefined): void { statuses.push(text); }
+  } as unknown as ExtensionContext["ui"];
+}
 
 function renderWorkerToolCall(tool: ToolDefinition, args: unknown): string {
   assert.ok(tool.renderCall, `${tool.name} should define renderCall`);
@@ -326,8 +337,20 @@ test("worker activity status is compact, themed, exact-parent scoped, and record
 
     assert.equal(renderWorkerActivityStatus(0, theme), undefined);
     assert.equal(renderWorkerActivityStatus(2, theme), "<accent>w2</accent>");
+    const uncolored = { fg: (_color: string, text: string): string => text };
+    const footerStatuses = new Map([
+      [WORKER_ACTIVITY_STATUS_KEY, renderWorkerActivityStatus(12, uncolored)!],
+      [ASYNC_SHELL_ACTIVITY_STATUS_KEY, "sh34"],
+      ["mutation-review", "mutation review running · 12 tool calls · search_many"]
+    ]);
+    const narrowFooter = truncateToWidth(
+      [...footerStatuses.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([, text]) => text).join(" "),
+      12,
+      "..."
+    );
+    assert.match(narrowFooter, /^w12 sh34 /, "priority keys keep both counts before verbose statuses at a realistic narrow width");
     await api.emit("session_start", { reason: "startup" }, context);
-    assert.deepEqual(statuses.at(-1), { key: "pi-tools-worker-activity", text: undefined });
+    assert.deepEqual(statuses.at(-1), { key: WORKER_ACTIVITY_STATUS_KEY, text: undefined });
 
     const record = (workerId: string, sessionFile: string, status: WorkerRecord["status"]): WorkerRecord => ({
       version: WORKER_RECORD_VERSION,
@@ -349,14 +372,25 @@ test("worker activity status is compact, themed, exact-parent scoped, and record
     writeWorkerRecord(first.recordFile, record("worker_20260923170000_active01", parentSessionFile, "queued"));
     writeWorkerRecord(second.recordFile, record("worker_20260923170000_active02", parentSessionFile, "running"));
     writeWorkerRecord(unrelated.recordFile, record("worker_20260923170000_other001", otherSessionFile, "running"));
-    assert.equal(activeWorkerCountForContext(roots, context), 2);
-    assert.deepEqual(statuses.at(-1), { key: "pi-tools-worker-activity", text: "<accent>w2</accent>" });
+    const stale = workerPaths(roots, "worker_20260923170000_stale001");
+    writeWorkerRecord(stale.recordFile, record("worker_20260923170000_stale001", parentSessionFile, "handed_off"));
+    const malformed = workerPaths(roots, "worker_20260923170000_corrupt1");
+    await mkdir(malformed.stateDir, { recursive: true });
+    await writeFile(malformed.recordFile, "{malformed\n");
+    const missing = workerPaths(roots, "worker_20260923170000_missing1");
+    await mkdir(missing.stateDir, { recursive: true });
+    assert.equal(activeWorkerCountForContext(roots, context), 2, "malformed, missing, stale, and other-parent records are skipped independently");
+    assert.deepEqual(statuses.at(-1), { key: WORKER_ACTIVITY_STATUS_KEY, text: "<accent>w2</accent>" });
+    const nextTheme = { fg(color: string, text: string): string { return `[${color}]${text}[/${color}]`; } };
+    (context.ui as { theme: typeof nextTheme }).theme = nextTheme;
+    await api.emit("input", { text: "refresh theme" }, context);
+    assert.deepEqual(statuses.at(-1), { key: WORKER_ACTIVITY_STATUS_KEY, text: "[accent]w2[/accent]" });
 
     writeWorkerRecord(first.recordFile, record("worker_20260923170000_active01", parentSessionFile, "handed_off"));
-    assert.deepEqual(statuses.at(-1), { key: "pi-tools-worker-activity", text: "<accent>w1</accent>" });
+    assert.deepEqual(statuses.at(-1), { key: WORKER_ACTIVITY_STATUS_KEY, text: "[accent]w1[/accent]" });
     writeWorkerRecord(second.recordFile, record("worker_20260923170000_active02", parentSessionFile, "cancelled"));
     assert.equal(activeWorkerCountForContext(roots, context), 0);
-    assert.deepEqual(statuses.at(-1), { key: "pi-tools-worker-activity", text: undefined });
+    assert.deepEqual(statuses.at(-1), { key: WORKER_ACTIVITY_STATUS_KEY, text: undefined });
     assert.equal(api.messages.length, 0, "activity status never sends a session/provider message");
 
     await api.emit("session_shutdown", { reason: "reload" }, context);
@@ -370,6 +404,133 @@ test("worker activity status is compact, themed, exact-parent scoped, and record
   });
 });
 
+test("worker activity survives fresh modules, listener failures, replacement starts, and old shutdown", async () => {
+  await withTempDir(async (directory) => {
+    const roots = { stateRoot: path.join(directory, "workers"), workspaceRoot: path.join(directory, "workspaces") };
+    const parentSessionFile = path.join(directory, "parent.jsonl");
+    await writeFile(parentSessionFile, "\n");
+    const makeContext = (statuses: Array<string | undefined>, throwOnActive = false): ExtensionContext => {
+      const context = parentContext(directory, parentSessionFile);
+      Object.assign(context, { mode: "tui", hasUI: true });
+      context.ui = {
+        theme: workerRenderTheme,
+        notify(): void {},
+        setStatus(_key: string, text: string | undefined): void {
+          if (throwOnActive && text !== undefined) throw new Error("display failed");
+          statuses.push(text);
+        }
+      } as unknown as ExtensionContext["ui"];
+      return context;
+    };
+
+    const oldApi = fakeApi();
+    registerWorkerExtension(oldApi, { roots });
+    const oldStatuses: Array<string | undefined> = [];
+    const oldContext = makeContext(oldStatuses, true);
+    await oldApi.emit("session_start", { reason: "startup" }, oldContext);
+
+    const freshModule = await import(`../extensions/worker/index.js?activity-reload=${Date.now()}`);
+    const freshState = await import(`../extensions/worker/state.js?activity-reload=${Date.now()}`);
+    const newApi = fakeApi();
+    freshModule.registerWorkerExtension(newApi, { roots });
+    const newStatuses: Array<string | undefined> = [];
+    const newContext = makeContext(newStatuses);
+    await newApi.emit("session_start", { reason: "reload" }, newContext);
+
+    let freshStateNotifications = 0;
+    const unsubscribeFreshState = freshState.subscribeWorkerRecordChanges(() => { freshStateNotifications += 1; });
+    const workerId = "worker_20260923170000_reload01";
+    const paths = workerPaths(roots, workerId);
+    writeWorkerRecord(paths.recordFile, {
+      version: WORKER_RECORD_VERSION,
+      workerId,
+      sessionId: "reload-worker-session",
+      parentSessionFile,
+      workspaceRoot: paths.workspaceRoot,
+      taskIds: ["personal-reload"],
+      route: { provider: "openai-codex", model: "gpt-test", thinkingLevel: "xhigh" },
+      status: "running",
+      activeRun: { runId: "run_20260923170000_reload01", jobId: "job_20260923170000_reload01", status: "running" },
+      updatedAt: "2026-09-23T17:00:00.000Z"
+    });
+    assert.equal(freshStateNotifications, 1, "a fresh state module shares old lifecycle notifications");
+    assert.equal(newStatuses.at(-1), "w1", "the fresh extension listener survives another listener throwing");
+    await oldApi.emit("session_shutdown", { reason: "reload" }, oldContext);
+
+    const replacementStatuses: Array<string | undefined> = [];
+    const replacementContext = makeContext(replacementStatuses);
+    await newApi.emit("session_start", { reason: "resume" }, replacementContext);
+    const callsBeforeReplacementWrite = newStatuses.length;
+    writeWorkerRecord(paths.recordFile, {
+      ...readWorkerRecord(paths.recordFile),
+      status: "handed_off",
+      activeRun: undefined,
+      lastRun: { runId: "run_20260923170000_reload01", jobId: "job_20260923170000_reload01", status: "handed_off" }
+    });
+    assert.equal(newStatuses.length, callsBeforeReplacementWrite, "a consecutive session_start unsubscribes only the superseded listener");
+    assert.equal(replacementStatuses.at(-1), undefined);
+    unsubscribeFreshState();
+    await newApi.emit("session_shutdown", { reason: "quit" }, replacementContext);
+  });
+});
+
+test("worker state rejects an incompatible process-global listener holder", () => {
+  const moduleUrl = new URL("../extensions/worker/state.js", import.meta.url).href;
+  const script = [
+    `Reflect.set(globalThis, Symbol.for("@akoumjian/pi-tools/worker-record-runtime"), { version: 99, listeners: new Set() });`,
+    `await import(${JSON.stringify(moduleUrl)});`
+  ].join("\n");
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8" });
+  assert.notEqual(result.status, 0);
+  assert.match(`${result.stdout}${result.stderr}`, /Incompatible worker-record runtime holder/);
+});
+
+test("worker activity activation token blocks stale adoption repaint after shutdown and session replacement", async () => {
+  await withTempDir(async (directory) => {
+    const roots = { stateRoot: path.join(directory, "workers"), workspaceRoot: path.join(directory, "workspaces") };
+    const parentSessionFile = path.join(directory, "parent.jsonl");
+    await writeFile(parentSessionFile, "\n");
+    const adoptions = [deferred<void>(), deferred<void>()];
+    let adoptionIndex = 0;
+    const api = fakeApi();
+    registerWorkerExtension(api, {
+      roots,
+      adoptRuns: async () => adoptions[adoptionIndex++].promise
+    });
+    const statusesA: Array<string | undefined> = [];
+    const contextA = parentContext(directory, parentSessionFile);
+    Object.assign(contextA, { mode: "tui", hasUI: true, ui: {
+      theme: workerRenderTheme,
+      notify(): void {},
+      setStatus(_key: string, text: string | undefined): void { statusesA.push(text); }
+    }});
+    const startingA = api.emit("session_start", { reason: "startup" }, contextA);
+    await Promise.resolve();
+    await api.emit("session_shutdown", { reason: "reload" }, contextA);
+    adoptions[0].resolve();
+    await startingA;
+    assert.deepEqual(statusesA, [undefined], "adoption finishing after shutdown cannot repaint the cleared status");
+
+    const statusesB: Array<string | undefined> = [];
+    const statusesC: Array<string | undefined> = [];
+    const contextB = { ...contextA, ui: { ...contextA.ui, setStatus(_key: string, text: string | undefined): void { statusesB.push(text); } } } as ExtensionContext;
+    const contextC = { ...contextA, ui: { ...contextA.ui, setStatus(_key: string, text: string | undefined): void { statusesC.push(text); } } } as ExtensionContext;
+    const thirdAdoption = deferred<void>();
+    adoptions.push(thirdAdoption);
+    const startingB = api.emit("session_start", { reason: "resume" }, contextB);
+    await Promise.resolve();
+    const startingC = api.emit("session_start", { reason: "resume" }, contextC);
+    await Promise.resolve();
+    adoptions[1].resolve();
+    await startingB;
+    assert.deepEqual(statusesB, [], "superseded adoption cannot paint its stale context");
+    thirdAdoption.resolve();
+    await startingC;
+    assert.deepEqual(statusesC, [undefined]);
+    await api.emit("session_shutdown", { reason: "quit" }, contextC);
+  });
+});
+
 test("worker_run queues immediately, then forks the completed parent turn before launch", async () => {
   await withTempDir(async (directory) => {
     const parentCwd = path.join(directory, "parent");
@@ -380,6 +541,8 @@ test("worker_run queues immediately, then forks the completed parent turn before
       JSON.stringify({ type: "custom", id: "before", parentId: null, timestamp: "2026-09-10T19:29:01.000Z", customType: "before-worker", data: {} })
     ].join("\n") + "\n");
     const context = parentContext(parentCwd, parentSessionFile);
+    const activityStatuses: Array<string | undefined> = [];
+    enableWorkerActivityUI(context, activityStatuses);
     const api = fakeApi();
     const roots = { stateRoot: path.join(directory, "workers"), workspaceRoot: path.join(directory, "workspaces") };
     const sourceRepo = path.join(directory, "source-repo");
@@ -428,6 +591,7 @@ test("worker_run queues immediately, then forks the completed parent turn before
         };
       }
     });
+    await api.emit("session_start", { reason: "startup" }, context);
     const tool = api.tools.find((candidate) => candidate.name === "worker_run");
     assert.ok(tool?.execute);
 
@@ -448,6 +612,7 @@ test("worker_run queues immediately, then forks the completed parent turn before
     assert.equal(receipt.sessionFile, undefined);
     assert.equal(receipt.completionDelivery, "followUp");
     assert.equal(receipt.state, "queued");
+    assert.equal(activityStatuses.at(-1), "w1", "real worker_run queueing raises the activity count");
     assert.equal((receipt as unknown as { provider: string }).provider, "openai-codex");
     assert.equal((receipt as unknown as { model: string }).model, "gpt-5.6-sol");
     assert.equal((receipt as unknown as { thinkingLevel: string }).thinkingLevel, "xhigh");
@@ -461,6 +626,7 @@ test("worker_run queues immediately, then forks the completed parent turn before
     await appendFile(parentSessionFile, `${JSON.stringify({ type: "custom", id: "after", parentId: "before", timestamp: "2026-09-10T19:30:00.500Z", customType: "worker-run-result", data: { jobId: receipt.jobId } })}\n`);
     await api.emit("turn_end", {}, context);
     assert.equal(launches.length, 1);
+    assert.equal(activityStatuses.at(-1), "w1", "queued to running keeps one active worker");
     assert.ok(launches[0].record.sessionFile);
     const forkText = await readFile(launches[0].record.sessionFile!, "utf8");
     assert.match(forkText, /worker-run-result/);
@@ -485,6 +651,7 @@ test("worker_run queues immediately, then forks the completed parent turn before
 
     const record = readWorkerRecord(workerPaths(roots, receipt.workerId).recordFile);
     assert.equal(record.status, "handed_off");
+    assert.equal(activityStatuses.at(-1), undefined, "handoff terminal transition clears worker activity");
     assert.equal(record.activeRun, undefined);
     assert.equal(record.lastRun?.runId, receipt.runId);
     assert.deepEqual(record.container, plannedContainer, "successful handoff preserves the exact worker container for resume");
@@ -508,6 +675,8 @@ test("worker_run queues immediately, then forks the completed parent turn before
 
     await api.emit("message_end", { message: { role: "custom", ...(api.messages[0].message as object) } }, context);
     assert.equal(readWorkerRecord(workerPaths(roots, receipt.workerId).recordFile).lastRun?.delivery, "delivered");
+    assert.equal(activityStatuses.at(-1), undefined, "result delivery does not make a terminal worker active");
+    await api.emit("session_shutdown", { reason: "quit" }, context);
   });
 });
 
@@ -737,6 +906,8 @@ test("worker_run resume reopens only the exact worker session and captures fresh
       JSON.stringify({ type: "custom", id: "parent-before", parentId: null, timestamp: "2026-09-10T19:29:01.000Z", customType: "parent-before", data: {} })
     ].join("\n") + "\n");
     const context = parentContext(parentCwd, parentSessionFile);
+    const activityStatuses: Array<string | undefined> = [];
+    enableWorkerActivityUI(context, activityStatuses);
     const api = fakeApi();
     const roots = { stateRoot: path.join(directory, "workers"), workspaceRoot: path.join(directory, "workspaces") };
     const workerId = "worker_20260910190000_resume01";
@@ -781,6 +952,7 @@ test("worker_run resume reopens only the exact worker session and captures fresh
         };
       }
     });
+    await api.emit("session_start", { reason: "startup" }, context);
     const tool = api.tools.find((candidate) => candidate.name === "worker_run");
     assert.ok(tool?.execute);
     const result = await tool.execute("call-resume", {
@@ -791,6 +963,7 @@ test("worker_run resume reopens only the exact worker session and captures fresh
     assert.equal(receipt.sessionFile, forked.sessionFile);
     assert.equal(receipt.taskIds.length, MAX_WORKER_TASK_IDS);
     assert.equal(receipt.taskIds.at(-1), "personal-added");
+    assert.equal(activityStatuses.at(-1), "w1", "resume queueing is counted");
 
     await appendFile(parentSessionFile, `${JSON.stringify({ type: "custom", id: "parent-fresh", parentId: "parent-before", timestamp: "2026-09-10T19:30:59.000Z", customType: "FRESH_PARENT_MARKER", data: {} })}\n`);
     await api.emit("turn_end", {}, context);
@@ -815,7 +988,9 @@ test("worker_run resume reopens only the exact worker session and captures fresh
     await new Promise((resolve) => setTimeout(resolve, 10));
     const completed = readWorkerRecord(paths.recordFile);
     assert.equal(completed.status, "handed_off");
+    assert.equal(activityStatuses.at(-1), undefined, "resumed handoff clears activity");
     assert.ok(completed.lastRun);
+    await api.emit("session_shutdown", { reason: "quit" }, context);
     writeWorkerRecord(paths.recordFile, {
       ...completed,
       lastRun: { ...completed.lastRun, delivery: "delivered" }
@@ -889,12 +1064,16 @@ test("resume rejects a poisoned artifacts symlink and removes the persistent con
       launch: () => { launched = true; throw new Error("must not launch"); }
     });
     const context = parentContext(parentCwd, parentSessionFile);
+    const activityStatuses: Array<string | undefined> = [];
+    enableWorkerActivityUI(context, activityStatuses);
+    await api.emit("session_start", { reason: "startup" }, context);
     const tool = api.tools.find((candidate) => candidate.name === "worker_run");
     assert.ok(tool?.execute);
     const result = await tool.execute("call-poison", {
       runs: [{ kind: "resume", workerId, message: "resume safely" }]
     } as never, undefined, undefined, context);
     const receipt = (result.details as { runs: Array<{ runId: string }> }).runs[0];
+    assert.equal(activityStatuses.at(-1), "w1", "a real resumed run is counted while queued");
     await api.emit("turn_end", {}, context);
 
     assert.equal(launched, false);
@@ -904,6 +1083,8 @@ test("resume rejects a poisoned artifacts symlink and removes the persistent con
     assert.equal(failed.status, "failed");
     assert.equal(failed.activeRun, undefined);
     assert.equal(failed.container, undefined);
+    assert.equal(activityStatuses.at(-1), undefined, "launch failure clears activity");
+    await api.emit("session_shutdown", { reason: "quit" }, context);
   });
 });
 
@@ -970,11 +1151,14 @@ test("restart rolls back an unlaunched queued integration resolution to its park
     acquireWorkerLease(paths.leaseFile, { version: 1, workerId, runId, parentPid: 2_147_483_000, acquiredAt: "2026-09-10T19:30:00.000Z" });
     let parks = 0; let removals = 0; const api = fakeApi();
     registerWorkerExtension(api, { roots, now: () => new Date("2026-09-10T19:32:00.000Z"), parkContainer: (value) => { parks += 1; assert.equal(value.containerId, container.containerId); }, removeContainer: () => { removals += 1; } });
-    await api.emit("session_start", {}, parentContext(parentCwd, parentSessionFile));
+    const activityStatuses: Array<string | undefined> = [];
+    const context = parentContext(parentCwd, parentSessionFile);
+    enableWorkerActivityUI(context, activityStatuses);
+    await api.emit("session_start", {}, context);
     const restored = readWorkerRecord(paths.recordFile);
     assert.equal(restored.status, "handed_off"); assert.equal(restored.activeRun, undefined); assert.equal(restored.integration?.phase, "analysis"); assert.equal(restored.container?.containerId, container.containerId);
     assert.equal(existsSync(decisionsFile), false); assert.equal(existsSync(workspaceDecisionsFile), false); assert.equal(existsSync(paths.leaseFile), false);
-    assert.equal(parks, 1); assert.equal(removals, 0); assert.equal(api.messages.length, 1); assert.match(JSON.stringify(api.messages[0]?.message), /rolled back.*parent restart/i);
+    assert.equal(parks, 1); assert.equal(removals, 0); assert.equal(api.messages.length, 1); assert.equal(activityStatuses.at(-1), undefined, "restart reconciliation clears rolled-back queued activity"); assert.match(JSON.stringify(api.messages[0]?.message), /rolled back.*parent restart/i);
   });
 });
 
@@ -1371,6 +1555,8 @@ test("worker_control cancels and settles an attached running host without duplic
     await mkdir(parentCwd);
     await writeFile(parentSessionFile, `${JSON.stringify({ type: "session", version: 3, id: "parent-session", timestamp: "2026-09-10T19:29:00.000Z", cwd: parentCwd })}\n`);
     const context = parentContext(parentCwd, parentSessionFile);
+    const activityStatuses: Array<string | undefined> = [];
+    enableWorkerActivityUI(context, activityStatuses);
     const api = fakeApi();
     const roots = { stateRoot: path.join(directory, "workers"), workspaceRoot: path.join(directory, "workspaces") };
     const randomValues = [
@@ -1393,6 +1579,7 @@ test("worker_control cancels and settles an attached running host without duplic
         notifyOnExit: false
       })
     });
+    await api.emit("session_start", { reason: "startup" }, context);
     const tool = api.tools.find((candidate) => candidate.name === "worker_run");
     assert.ok(tool?.execute);
     const result = await tool.execute("call-attached", { runs: [{ kind: "new", taskIds: ["personal-test"] }] } as never, undefined, undefined, context);
@@ -1402,6 +1589,7 @@ test("worker_control cancels and settles an attached running host without duplic
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     assert.ok(existsSync(attachedMarker));
+    assert.equal(activityStatuses.at(-1), "w1", "a launched running worker remains counted");
     const control = api.tools.find((candidate) => candidate.name === "worker_control");
     assert.ok(control?.execute);
     const cancellation = await control.execute("control-cancel-attached", { action: "cancel", workerId } as never, undefined, undefined, context);
@@ -1411,6 +1599,8 @@ test("worker_control cancels and settles an attached running host without duplic
     assert.equal(record.activeRun, undefined);
     assert.equal(record.lastRun?.delivery, "delivered");
     assert.equal(api.messages.length, 0, "the synchronous control result already observes cancellation");
+    assert.equal(activityStatuses.at(-1), undefined, "running cancellation clears activity");
+    await api.emit("session_shutdown", { reason: "quit" }, context);
   });
 });
 
@@ -1836,6 +2026,8 @@ test("worker_control cancels queued work and discards the settled worker", async
     await mkdir(parentCwd);
     await writeFile(parentSessionFile, `${JSON.stringify({ type: "session", version: 3, id: "parent-session", timestamp: "2026-09-10T19:29:00.000Z", cwd: parentCwd })}\n`);
     const context = parentContext(parentCwd, parentSessionFile);
+    const activityStatuses: Array<string | undefined> = [];
+    enableWorkerActivityUI(context, activityStatuses);
     const api = fakeApi();
     const roots = { stateRoot: path.join(directory, "workers"), workspaceRoot: path.join(directory, "workspaces") };
     let launches = 0;
@@ -1848,6 +2040,7 @@ test("worker_control cancels queued work and discards the settled worker", async
         throw new Error("cancelled queued run must not launch");
       }
     });
+    await api.emit("session_start", { reason: "startup" }, context);
     const run = api.tools.find((candidate) => candidate.name === "worker_run");
     const control = api.tools.find((candidate) => candidate.name === "worker_control");
     assert.ok(run?.execute);
@@ -1856,6 +2049,7 @@ test("worker_control cancels queued work and discards the settled worker", async
       runs: [{ kind: "new", taskIds: ["personal-control"], completionDelivery: "followUp" }]
     } as never, undefined, undefined, context);
     const workerId = (started.details as { runs: Array<{ workerId: string }> }).runs[0].workerId;
+    assert.equal(activityStatuses.at(-1), "w1");
 
     await assert.rejects(
       async () => control.execute("control-discard-active", { action: "discard", workerId, confirm: true } as never, undefined, undefined, context),
@@ -1867,17 +2061,22 @@ test("worker_control cancels queued work and discards the settled worker", async
     const cancelledRecord = readWorkerRecord(workerPaths(roots, workerId).recordFile);
     assert.equal(cancelledRecord.lastRun?.delivery, "delivered");
     assert.equal(cancelledRecord.lastRun?.completionDelivery, "followUp");
+    assert.equal(activityStatuses.at(-1), undefined, "queued cancellation clears activity");
     assert.equal(api.messages.length, 0, "the synchronous control result observes queued cancellation without another model message");
     await api.emit("turn_end", {}, context);
     assert.equal(launches, 0);
     assert.equal(api.messages.length, 0);
     assert.equal(readWorkerRecord(workerPaths(roots, workerId).recordFile).status, "cancelled");
 
+    const activityCallsBeforeDiscard = activityStatuses.length;
     const discarded = await control.execute("control-discard", { action: "discard", workerId, confirm: true } as never, undefined, undefined, context);
     assert.equal(Check(RetainedToolOutputSchemas.worker_control, discarded), true);
     assert.equal((discarded.details as { discarded: boolean }).discarded, true);
     assert.equal(existsSync(workerPaths(roots, workerId).workspaceRoot), false);
     assert.equal(existsSync(workerPaths(roots, workerId).stateDir), false);
+    assert.ok(activityStatuses.length > activityCallsBeforeDiscard, "discard removal notifies the live activity listener");
+    assert.equal(activityStatuses.at(-1), undefined, "discard removal leaves the zero status cleared");
+    await api.emit("session_shutdown", { reason: "quit" }, context);
   });
 });
 

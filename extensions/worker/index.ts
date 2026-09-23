@@ -320,6 +320,13 @@ type WorkerExtensionDependencies = {
   parkContainer?(container: WorkerContainerReference): void;
   removeContainer(container: WorkerContainerReference): void;
   launch(api: ExtensionAPI, context: ExtensionContext, request: WorkerLaunchRequest): ManagedWorkerHandle;
+  adoptRuns(
+    api: ExtensionAPI,
+    context: ExtensionContext,
+    dependencies: WorkerExtensionDependencies,
+    active: Map<string, { runId: string; handle: ManagedWorkerHandle }>,
+    monitors: Map<string, NodeJS.Timeout>
+  ): Promise<void>;
 };
 
 type PendingWorkerRun = {
@@ -353,17 +360,26 @@ export function registerWorkerExtension(
   const active = new Map<string, { runId: string; handle: ManagedWorkerHandle }>();
   const monitors = new Map<string, NodeJS.Timeout>();
   let unsubscribeActivity: (() => void) | undefined;
+  let activityGeneration = 0;
 
   api.on("session_start", async (_event, context) => {
+    const generation = ++activityGeneration;
     unsubscribeActivity?.();
     unsubscribeActivity = undefined;
     if (context.mode === "tui" && context.hasUI) {
       unsubscribeActivity = subscribeWorkerRecordChanges(() => updateWorkerActivityStatus(dependencies.roots, context));
     }
-    await adoptWorkerRuns(api, context, dependencies, active, monitors);
+    await dependencies.adoptRuns(api, context, dependencies, active, monitors);
+    if (generation !== activityGeneration) return;
+    updateWorkerActivityStatus(dependencies.roots, context);
+  });
+  api.on("input", (_event, context) => {
+    // Pi 0.84.4 has no extension theme-change event. Re-render from the current
+    // theme at the next submitted input as well as every worker record change.
     updateWorkerActivityStatus(dependencies.roots, context);
   });
   api.on("session_shutdown", (_event, context) => {
+    activityGeneration += 1;
     if (context.mode === "tui" && context.hasUI && typeof context.ui?.setStatus === "function") context.ui.setStatus(WORKER_ACTIVITY_STATUS_KEY, undefined);
     unsubscribeActivity?.();
     unsubscribeActivity = undefined;
@@ -751,14 +767,32 @@ export function registerWorkerExtension(
   });
 }
 
-const WORKER_ACTIVITY_STATUS_KEY = "pi-tools-worker-activity";
+export const WORKER_ACTIVITY_STATUS_KEY = "00-pi-tools-worker-activity";
 
 export function activeWorkerCountForContext(roots: WorkerRoots, context: ExtensionContext): number {
+  const parentSessionFile = context.sessionManager.getSessionFile();
+  if (!parentSessionFile) return 0;
+  let entries;
   try {
-    return listParentWorkerRecords(roots, context).filter(isActiveWorkerRecord).length;
+    entries = readdirSync(roots.stateRoot, { withFileTypes: true });
   } catch {
     return 0;
   }
+  let count = 0;
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !isWorkerId(entry.name)) continue;
+    try {
+      const record = readWorkerRecord(workerPaths(roots, entry.name).recordFile);
+      if (
+        path.resolve(record.parentSessionFile) === path.resolve(parentSessionFile) &&
+        isActiveWorkerRecord(record)
+      ) count += 1;
+    } catch {
+      // This footer is observational. A malformed or concurrently removed
+      // unrelated record must not hide independently readable active workers.
+    }
+  }
+  return count;
 }
 
 export function renderWorkerActivityStatus(
@@ -3333,6 +3367,7 @@ function defaultDependencies(): WorkerExtensionDependencies {
     }),
     parkContainer: (container) => parkWorkerContainer(resolveDockerPath(), container),
     removeContainer: (container) => settleWorkerContainer(resolveDockerPath(), container),
+    adoptRuns: adoptWorkerRuns,
     launch: (api, context, request) => {
       if (!request.container) throw new Error(`Worker ${request.record.workerId}/${request.record.activeRun?.runId ?? "unknown"} lost its planned Docker identity.`);
       const dockerPath = resolveDockerPath();

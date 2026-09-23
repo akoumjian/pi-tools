@@ -11,7 +11,36 @@ import { isRepositoryInventorySummary, type InitialRepositoryPin, type Repositor
 export const WORKER_RECORD_VERSION = 1;
 
 type WorkerRecordChangeListener = (recordFile: string) => void;
-const workerRecordChangeListeners = new Set<WorkerRecordChangeListener>();
+const WORKER_RECORD_RUNTIME_HOLDER_KEY = Symbol.for("@akoumjian/pi-tools/worker-record-runtime");
+const WORKER_RECORD_RUNTIME_HOLDER_VERSION = 1;
+
+type WorkerRecordRuntimeHolder = {
+  version: typeof WORKER_RECORD_RUNTIME_HOLDER_VERSION;
+  listeners: Set<WorkerRecordChangeListener>;
+};
+
+function workerRecordRuntimeHolder(): WorkerRecordRuntimeHolder {
+  const existing = Reflect.get(globalThis, WORKER_RECORD_RUNTIME_HOLDER_KEY) as Partial<WorkerRecordRuntimeHolder> | undefined;
+  if (existing !== undefined) {
+    if (
+      existing === null ||
+      typeof existing !== "object" ||
+      existing.version !== WORKER_RECORD_RUNTIME_HOLDER_VERSION ||
+      !(existing.listeners instanceof Set)
+    ) {
+      throw new Error(`Incompatible worker-record runtime holder for version ${WORKER_RECORD_RUNTIME_HOLDER_VERSION}.`);
+    }
+    return existing as WorkerRecordRuntimeHolder;
+  }
+  const created: WorkerRecordRuntimeHolder = {
+    version: WORKER_RECORD_RUNTIME_HOLDER_VERSION,
+    listeners: new Set<WorkerRecordChangeListener>()
+  };
+  Reflect.set(globalThis, WORKER_RECORD_RUNTIME_HOLDER_KEY, created);
+  return created;
+}
+
+const workerRecordChangeListeners = workerRecordRuntimeHolder().listeners;
 
 export function subscribeWorkerRecordChanges(listener: WorkerRecordChangeListener): () => void {
   workerRecordChangeListeners.add(listener);

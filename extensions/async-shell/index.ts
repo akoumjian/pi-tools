@@ -124,23 +124,7 @@ type CompletionDeliveryRuntime = {
 };
 
 type AsyncShellActivityListener = () => void;
-const asyncShellActivityListeners = new Set<AsyncShellActivityListener>();
-const ASYNC_SHELL_ACTIVITY_STATUS_KEY = "pi-tools-async-activity";
-
-function subscribeAsyncShellActivity(listener: AsyncShellActivityListener): () => void {
-  asyncShellActivityListeners.add(listener);
-  return () => asyncShellActivityListeners.delete(listener);
-}
-
-function notifyAsyncShellActivity(): void {
-  for (const listener of asyncShellActivityListeners) {
-    try {
-      listener();
-    } catch {
-      // Activity display is observational and must never affect job lifecycle.
-    }
-  }
-}
+export const ASYNC_SHELL_ACTIVITY_STATUS_KEY = "01-pi-tools-async-activity";
 
 type CompletionDeliveryBatch = {
   deliveryId: string;
@@ -326,7 +310,57 @@ type StatusInput = Static<typeof StatusParams>;
 type ReadInput = Static<typeof ReadParams>;
 type CancelInput = Static<typeof CancelParams>;
 
-const jobs = new Map<string, JobRuntime>();
+const ASYNC_SHELL_RUNTIME_HOLDER_KEY = Symbol.for("@akoumjian/pi-tools/async-shell-runtime");
+const ASYNC_SHELL_RUNTIME_HOLDER_VERSION = 1;
+
+type AsyncShellRuntimeHolder = {
+  version: typeof ASYNC_SHELL_RUNTIME_HOLDER_VERSION;
+  jobs: Map<string, JobRuntime>;
+  activityListeners: Set<AsyncShellActivityListener>;
+};
+
+function asyncShellRuntimeHolder(): AsyncShellRuntimeHolder {
+  const existing = Reflect.get(globalThis, ASYNC_SHELL_RUNTIME_HOLDER_KEY) as Partial<AsyncShellRuntimeHolder> | undefined;
+  if (existing !== undefined) {
+    if (
+      existing === null ||
+      typeof existing !== "object" ||
+      existing.version !== ASYNC_SHELL_RUNTIME_HOLDER_VERSION ||
+      !(existing.jobs instanceof Map) ||
+      !(existing.activityListeners instanceof Set)
+    ) {
+      throw new Error(`Incompatible async-shell runtime holder for version ${ASYNC_SHELL_RUNTIME_HOLDER_VERSION}.`);
+    }
+    return existing as AsyncShellRuntimeHolder;
+  }
+  const created: AsyncShellRuntimeHolder = {
+    version: ASYNC_SHELL_RUNTIME_HOLDER_VERSION,
+    jobs: new Map<string, JobRuntime>(),
+    activityListeners: new Set<AsyncShellActivityListener>()
+  };
+  Reflect.set(globalThis, ASYNC_SHELL_RUNTIME_HOLDER_KEY, created);
+  return created;
+}
+
+const asyncShellRuntime = asyncShellRuntimeHolder();
+const jobs = asyncShellRuntime.jobs;
+const asyncShellActivityListeners = asyncShellRuntime.activityListeners;
+
+function subscribeAsyncShellActivity(listener: AsyncShellActivityListener): () => void {
+  asyncShellActivityListeners.add(listener);
+  return () => asyncShellActivityListeners.delete(listener);
+}
+
+function notifyAsyncShellActivity(): void {
+  for (const listener of asyncShellActivityListeners) {
+    try {
+      listener();
+    } catch {
+      // Activity display is observational and must never affect job lifecycle.
+    }
+  }
+}
+
 const scheduledCompletionNotifications = new WeakSet<CompletionNotificationTarget>();
 const pendingCompletionNotifications = new Map<string, JobRuntime>();
 const completionDeliveryBatches = new Map<string, CompletionDeliveryBatch>();
@@ -367,6 +401,11 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     unsubscribeActivity = undefined;
     if (context.mode !== "tui" || !context.hasUI) return;
     unsubscribeActivity = subscribeAsyncShellActivity(() => updateAsyncShellActivityStatus(context));
+    updateAsyncShellActivityStatus(context);
+  });
+  api.on("input", (_event, context) => {
+    // Pi 0.84.4 has no extension theme-change event. Re-render from the current
+    // theme at the next submitted input as well as every shell lifecycle event.
     updateAsyncShellActivityStatus(context);
   });
 
