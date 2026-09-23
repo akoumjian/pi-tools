@@ -6,6 +6,7 @@ export const WORKER_CONFIG_FILE = "worker-settings.json";
 
 export type WorkerSettings = {
   defaultRoute: string;
+  reviewRoute?: string;
   configSource: string;
 };
 
@@ -26,7 +27,7 @@ export function normalizeWorkerSettings(value: unknown, configSource: string): W
   if (!isRecord(value)) {
     throw new Error(`${configSource} must contain a JSON object.`);
   }
-  const unsupported = Object.keys(value).filter((key) => key !== "defaultRoute");
+  const unsupported = Object.keys(value).filter((key) => key !== "defaultRoute" && key !== "reviewRoute");
   if (unsupported.length > 0) {
     throw new Error(`${configSource} contains unsupported worker setting${unsupported.length === 1 ? "" : "s"}: ${unsupported.join(", ")}.`);
   }
@@ -37,7 +38,17 @@ export function normalizeWorkerSettings(value: unknown, configSource: string): W
   if (defaultRoute.length > 512) {
     throw new Error(`${configSource} defaultRoute must be at most 512 characters.`);
   }
-  return { defaultRoute, configSource };
+  let reviewRoute: string | undefined;
+  if (value.reviewRoute !== undefined) {
+    if (typeof value.reviewRoute !== "string" || value.reviewRoute.trim() === "") {
+      throw new Error(`${configSource} reviewRoute must be a non-empty model:thinking string when provided.`);
+    }
+    reviewRoute = value.reviewRoute.trim();
+    if (reviewRoute.length > 512 || !/^[^\s/:]+\/[^\s]+:(?:off|minimal|low|medium|high|xhigh|max)$/.test(reviewRoute)) {
+      throw new Error(`${configSource} reviewRoute must be an exact provider/model:thinking route of at most 512 characters.`);
+    }
+  }
+  return { defaultRoute, ...(reviewRoute ? { reviewRoute } : {}), configSource };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

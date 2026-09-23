@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "license": "MIT",
   "type": "module",
-  "description": "Reusable Pi coding-agent extensions: async shell jobs, batch file tools, web research, tool safety, review workflows, and compact TUI rendering.",
+  "description": "Reusable Pi coding-agent extensions: async shell jobs, batch file tools, web research, tool safety, managed-worker review, and compact TUI rendering.",
   "engines": {
     "node": ">=22.19.0"
   },
@@ -40,7 +40,6 @@
       "extensions/web-fetch/index.ts",
       "extensions/file-open/index.ts",
       "extensions/theme-preview/index.ts",
-      "extensions/review-subagent/index.ts",
       "extensions/tool-display/index.ts"
     ],
     "skills": [

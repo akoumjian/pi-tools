@@ -11,7 +11,6 @@ Reusable extensions for the [Pi coding agent](https://pi.dev/). The package focu
 - provider-safe resend of the current context after any failure or cancellation via `/retry`, plus bounded automatic retry of outage-class errors Pi core does not classify
 - provider-free active-context clipboard snapshots via `/context:copy`
 - robust chunked context compaction via `/compacter`
-- a `/review` subagent workflow
 - durable Docker-confined managed workers with exact-session lifecycle and deterministic fold preparation
 - TUI niceties: tmux/scrollback compatibility, theme preview, compact tool renderers, file-reference picker
 
@@ -61,7 +60,7 @@ Tools (LLM-callable):
 - `shell_start`, `shell_status`, `shell_read`, `shell_cancel` — async shell jobs
 - `worker_run` — start or exactly resume durable private-workspace Pi workers
 - `worker_control` — list/status exact-session workers, retrieve and acknowledge typed results, cancel runs, or discard settled workers
-- `worker_review` — independently review one exact clean repository from a settled parked worker
+- `worker_review` — independently review one exact clean repository from a settled worker whose persistent container is already stopped
 - `worker_fold_prepare` — prepare exact merge/squash changesets and disposable views outside authoritative repositories
 - `read_many`, `search_many`, `write_many`, `edit_many` — batch-native file tools (`read_many` delivers UTF-8 text and supported filesystem images)
 - `apply_reviewed_mutation` — cheap re-apply of a previously-reviewed edit/write
@@ -85,7 +84,6 @@ Commands:
 - `/fetch:status`
 - `/file:open`
 - `/themes:preview [theme-name]`
-- `/review`, `/review:setup`, `/review:status`, `/review:cancel`, `/review:send-last`
 - `/docparser:doctor`
 
 The load order in `package.json#pi.extensions` is intentional: terminal patches first, safety before async shell, workers immediately after their shared async-shell runtime, completion-notifications after async shell so it can read completion barriers, native batch tools before manual-retry, manual-retry before context-export and compacter so both copied and summarized context use the same retry filtering, and optional display overrides last.
@@ -146,9 +144,9 @@ Each extension below documents what it does, what it provides, and how to set it
 
 **Provides.** `worker_run`; exact settled-result `worker_review`; model-facing `worker_control` actions `status`, `result`, `cancel`, and confirmed `discard`; deterministic `worker_fold_prepare` for exact external multi-repository preparation; explicit two-phase `worker_fold_resolve` for one prepared conflict; provider-free `/worker:list` for active current-chat workers (`/worker:list --all` includes settled workers); `/worker:status <worker-id>`; `/worker:view <worker-id> [...]`; `/worker:ack <worker-id>`; `/worker:cancel <worker-id>`; `/worker:discard <worker-id> --confirm`. `worker_control` is exact-parent-session scoped; `result` validates the typed handoff before acknowledging pending delivery, and every valid action bypasses model/human safety review while malformed calls remain reviewed. Worker RPC exposes only normal async-shell tools, bounded exact-route `worker_task_read` for searching or reading all central tasks with explicit assigned-ID markers, assigned-only `worker_task_update`, and typed `worker_handoff`, which requires the worker to wait for or cancel every owned shell job and verify settlement before acceptance. Exclusive run and lifecycle-operation locks, trusted process/settlement markers, cooperative command-group cancellation, exact Docker container cleanup, fail-closed survivor sweeps, and same-session completion receipts and explicit uncertain-delivery acknowledgment protect lifecycle recovery without automatic reload replay. Each worker identity gets one Linux container that is authoritatively stopped after successful handoff and restarted for resume, with all of `~/Code` read-only and only its private workspace read-write; provider credentials, host control sockets/state, sibling workspaces, and central Beads stay on the trusted macOS host. After settlement, trusted host code independently inventories bounded physical Git repositories under the private workspace and persists hash-bound repository-level candidates with reported/unreported, committed-base delta, aggregate dirty, lineage, policy, and exact OID facts. Worker-reported paths that are missing or not repositories remain explicit issues, and one scan-coverage record says whether bounded discovery was complete. Individual changed or dirty files and skipped symlinks are not enumerated. A verified committed delta with a pinned ancestor and supported callback-free Git policy is foldable even when separately dirty, independently discovered without a worker report, or nested below another repository; the parent uses the dirty flag to decide whether later inspection or worker correction is needed. Discovery never mutates source or authoritative repositories and does not authorize integration. After the parent selects candidate IDs and maps each to one existing local target repository/ref with a purpose, `merge` or `squash` method, and dependency edges, `worker_fold_prepare` revalidates exact candidate/target identities and clean target policy, derives a stable dependency order, and writes only owner-private external bundles, deterministic desired commits, disposable review views, and an immutable hash-bound manifest under `~/.local/share/agent/worker-folds/`. Conflicts become bounded `resolution_required` cases. Preparation never updates authoritative refs, indexes, worktrees, files, or remotes and performs no model call. For one such case, `worker_fold_resolve` provisions only the exact immutable target/candidate bundle and parent-curated context, requires a pristine analysis-only `checkpoint`/`needs_input`, and permits mutation only after exact-session resume with immutable settled decisions. A successful resolution yields exactly one committed lineage-bearing candidate based on the prepared target, with aggregate dirty evidence still surfaced by inventory; it does not mutate the prepared artifact, authoritative target, or promote anything. Review, validation, re-preparation, promotion, and publication remain separate parent-owned phases.
 
-**Setup.** macOS, Node, Pi, a running Docker Desktop/Engine plus CLI, the pinned worker image documented in the full guide, a correctly routed central `bd` executable, and `config/worker-settings.json` with `defaultRoute`. New workers use that configured provider/model/thinking route unless the caller supplies `route`; resume always retains the persisted route. The parent remains responsible for grounding, review, integration, promotion, and task closure.
+**Setup.** macOS, Node, Pi, a running Docker Desktop/Engine plus CLI, the pinned worker image documented in the full guide, a correctly routed central `bd` executable, and `config/worker-settings.json` with `defaultRoute`; `worker_review` additionally requires an exact `reviewRoute` (`provider/model:thinking`) and fails closed when the model or auth is unavailable. New workers use `defaultRoute` unless the caller supplies `route`; resume always retains the persisted implementation route. The parent remains responsible for grounding, review, integration, promotion, and task closure.
 
-The package ships progressively disclosed role skills for the managed-worker parent, implementation worker, independent reviewer, and integration worker. Normal parents discover all four from `skills/`; confined implementation/integration launches keep ambient skills disabled and receive only their trusted role skill. The existing general `/review` child keeps its ambient skill behavior; the review role resource is reserved for a dedicated settled-worker review path.
+The package ships progressively disclosed role skills for the managed-worker parent, implementation worker, independent reviewer, and integration worker. Normal parents discover all four from `skills/`; confined implementation/integration launches keep ambient skills disabled and receive only their trusted role skill. `worker_review` injects the verified review role text into a dedicated in-memory child with no ambient skills or project resources.
 
 ---
 
@@ -272,18 +270,6 @@ The package ships progressively disclosed role skills for the managed-worker par
 
 ---
 
-### review-subagent
-
-[Full docs](docs/extensions/review-subagent.md).
-
-**Purpose.** Tool-using review subagent over recent main-agent context. Runs in its own session with a read-only tool allowlist, produces a structured critique, optionally sends back to the main agent.
-
-**Provides.** `/review`, `/review:setup`, `/review:status`, `/review:cancel`, `/review:send-last`; reviewer guidance in [`config/review-subagent-guidance.md`](config/review-subagent-guidance.md); never modifies files.
-
-**Setup.** Run `/review:setup provider/model[:thinking]` once per machine (typical: a strong reasoning model). Run `/review focus...` to review.
-
----
-
 ### tool-display
 
 [Full docs](docs/extensions/tool-display.md).
@@ -302,7 +288,6 @@ Reusable defaults live under `config/`:
 
 - `tool-safety-settings.json` → `tool-safety-policy.md`
 - `mutation-review-settings.json` → `mutation-review-guidance.md`
-- `review-subagent-settings.json` → `review-subagent-guidance.md`
 - `tool-display-settings.json`
 - `file-open-settings.json`
 - `searxng.env.example`

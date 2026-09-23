@@ -156,6 +156,25 @@ export function parkWorkerContainer(dockerPath: string, reference: WorkerContain
   }
 }
 
+export type StoppedWorkerContainerIdentity = {
+  containerId: string;
+  exitCode?: number;
+};
+
+/** Read-only exact identity/state check. Never starts, stops, kills, or removes the container. */
+export function inspectStoppedWorkerContainer(
+  dockerPath: string,
+  reference: WorkerContainerReference
+): StoppedWorkerContainerIdentity {
+  assertWorkerContainerReference(reference);
+  assertExecutable(dockerPath, "Docker CLI");
+  if (!reference.containerId) throw new Error(`Docker worker container ${reference.name} has no persisted exact container id.`);
+  const inspected = inspectWorkerContainer(dockerPath, reference);
+  if (!inspected) throw new Error(`Docker worker container ${reference.name} is missing.`);
+  if (inspected.state.Running) throw new Error(`Docker worker container ${reference.name} is running; settled review requires it to remain stopped.`);
+  return { containerId: inspected.id, ...(inspected.state.ExitCode === undefined ? {} : { exitCode: inspected.state.ExitCode }) };
+}
+
 export function settleWorkerContainer(dockerPath: string, reference: WorkerContainerReference): void {
   assertWorkerContainerReference(reference);
   assertExecutable(dockerPath, "Docker CLI");

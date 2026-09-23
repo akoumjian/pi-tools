@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   buildWorkerContainerEnvironment,
   createWorkerContainer,
+  inspectStoppedWorkerContainer,
   parkWorkerContainer,
   planWorkerContainer,
   prepareWorkerContainerProcess,
@@ -112,7 +113,16 @@ process.stderr.write("unsupported fake docker call: " + JSON.stringify(args) + "
     const created = createWorkerContainer(fakeDocker, planned);
     assert.equal(created.containerId, "a".repeat(64));
     signalWorkerContainerJob(fakeDocker, created, "job_20260917140000_signalk1", "SIGKILL");
+    assert.throws(() => inspectStoppedWorkerContainer(fakeDocker, created), /is running/);
     parkWorkerContainer(fakeDocker, created);
+    const callsBeforeReadOnlyInspect = (await readFile(callsFile, "utf8")).trim().split("\n").length;
+    assert.deepEqual(inspectStoppedWorkerContainer(fakeDocker, created), { containerId: created.containerId, exitCode: 137 });
+    const inspectOnlyCalls = (await readFile(callsFile, "utf8")).trim().split("\n").slice(callsBeforeReadOnlyInspect).map((line) => JSON.parse(line) as string[]);
+    assert.deepEqual(inspectOnlyCalls.map((args) => args.slice(0, 2)), [["container", "inspect"]], "read-only stopped inspection must not stop, start, kill, wait, or remove");
+    const parkedState = JSON.parse(await readFile(stateFile, "utf8")) as { labels: Record<string, string>; running: boolean };
+    await writeFile(stateFile, JSON.stringify({ ...parkedState, labels: { ...parkedState.labels, "pi.nonce": "forged" } }));
+    assert.throws(() => inspectStoppedWorkerContainer(fakeDocker, created), /identity mismatch/);
+    await writeFile(stateFile, JSON.stringify(parkedState));
     const reused = createWorkerContainer(fakeDocker, created);
     assert.equal(reused.containerId, created.containerId);
     settleWorkerContainer(fakeDocker, reused);

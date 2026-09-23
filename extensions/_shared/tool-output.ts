@@ -457,19 +457,21 @@ const WorkerRunDetailsSchema = Type.Object({
 }, { additionalProperties: false });
 
 const WorkerReviewDetailsSchema = Type.Object({
-  workerId: Type.String({ minLength: 1 }),
-  runId: Type.String({ minLength: 1 }),
+  workerId: Type.String({ minLength: 1, maxLength: 128 }),
+  runId: Type.String({ minLength: 1, maxLength: 128 }),
   candidateId: Type.String({ pattern: "^candidate_[0-9a-f]{24}$" }),
   workspaceRepo: Type.String({ minLength: 1, maxLength: 1024 }),
   headCommit: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
   headTree: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
-  model: Type.String({ minLength: 1 }),
-  thinkingLevel: Type.String({ minLength: 1 }),
-  startedAt: Type.String({ minLength: 1 }),
-  completedAt: Type.String({ minLength: 1 }),
+  model: Type.String({ minLength: 1, maxLength: 512 }),
+  thinkingLevel: Type.String({ minLength: 1, maxLength: 16 }),
+  startedAt: Type.String({ minLength: 1, maxLength: 64 }),
+  completedAt: Type.String({ minLength: 1, maxLength: 64 }),
   durationMs: NonNegativeNumberSchema,
   toolCallCount: NonNegativeIntegerSchema,
-  critique: Type.String({ minLength: 1 })
+  verdict: Type.Union([Type.Literal("approve"), Type.Literal("request_changes"), Type.Literal("blocked")]),
+  findings: Type.String({ minLength: 1, maxLength: 24000 }),
+  checks: Type.String({ minLength: 1, maxLength: 8000 })
 }, { additionalProperties: false });
 
 const WorkerFoldResolveDetailsSchema = Type.Object({

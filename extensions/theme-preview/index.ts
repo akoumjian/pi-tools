@@ -447,7 +447,7 @@ function addMessagesSection(lines: string[], theme: PreviewTheme, width: number)
     lines,
     theme,
     width,
-    `${theme.fg("customMessageLabel", "extension ▸")} ${theme.fg("customMessageText", "review-subagent report ready")}`,
+    `${theme.fg("customMessageLabel", "extension ▸")} ${theme.fg("customMessageText", "managed-worker review report ready")}`,
     "border",
     "customMessageBg"
   );

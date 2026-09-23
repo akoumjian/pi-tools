@@ -221,7 +221,9 @@ const samples: Record<RetainedToolName, unknown> = {
       completedAt: "2026-09-10T19:00:01.000Z",
       durationMs: 1000,
       toolCallCount: 3,
-      critique: "independent critique"
+      verdict: "request_changes",
+      findings: "High: fix exact issue.",
+      checks: "Inspected exact files."
     }
   },
   worker_fold_prepare: {

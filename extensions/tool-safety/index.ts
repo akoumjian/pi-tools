@@ -756,7 +756,7 @@ export function evaluateWorkerReview(input: unknown): SafetyDecision {
   return {
     action: "allow",
     risk: "low",
-    reason: "Worker review inspects one exact clean parked worker repository with read-only tools.",
+    reason: "Worker review inspects one exact clean settled worker repository with an already-stopped container and read-only tools.",
     ruleId: "worker-review-read-only",
     tags: ["worker", "review", "read-only", "subagent"]
   };

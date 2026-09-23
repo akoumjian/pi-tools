@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, link, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -19,6 +19,7 @@ import {
   buildNewWorkerPrompt,
   buildResumeWorkerPrompt,
   registerWorkerExtension,
+  resolveWorkerReviewRoute,
   resolveWorkerRoute,
   WorkerFoldResolveParams
 } from "../extensions/worker/index.js";
@@ -388,6 +389,19 @@ test("worker settings select a configured default while explicit routes override
     defaultRoute: "openai-codex/gpt-5.6-sol:xhigh",
     configSource: "fixture"
   });
+  assert.deepEqual(normalizeWorkerSettings({
+    defaultRoute: "openai-codex/gpt-5.6-sol:xhigh",
+    reviewRoute: "anthropic/claude-opus-5-5:xhigh"
+  }, "fixture"), {
+    defaultRoute: "openai-codex/gpt-5.6-sol:xhigh",
+    reviewRoute: "anthropic/claude-opus-5-5:xhigh",
+    configSource: "fixture"
+  });
+  assert.throws(() => normalizeWorkerSettings({ defaultRoute: "openai-codex/gpt-5.6-sol:xhigh", reviewRoute: "opus" }, "fixture"), /exact provider\/model:thinking/);
+  assert.equal(normalizeWorkerSettings({
+    defaultRoute: "openai-codex/gpt-5.6-sol:xhigh",
+    reviewRoute: "openrouter/vendor/model:variant:xhigh"
+  }, "fixture").reviewRoute, "openrouter/vendor/model:variant:xhigh");
   assert.throws(() => normalizeWorkerSettings({}, "fixture"), /defaultRoute/);
   assert.throws(() => normalizeWorkerSettings({ defaultRoute: "openai-codex/gpt-5.6-sol:xhigh", extra: true }, "fixture"), /unsupported worker setting/);
   assert.deepEqual(resolveWorkerRoute(undefined, context), {
@@ -405,6 +419,29 @@ test("worker settings select a configured default while explicit routes override
   };
   unavailableContext.modelRegistry.getAll = () => [fakeModel()];
   assert.throws(() => resolveWorkerRoute(undefined, unavailableContext), /Worker model not found: openai-codex\/gpt-5\.6-sol/);
+  assert.throws(() => resolveWorkerReviewRoute(context, {
+    defaultRoute: "openai-codex/gpt-5.6-sol:xhigh",
+    configSource: "fixture"
+  }), /review route is not configured/);
+  assert.deepEqual(resolveWorkerReviewRoute(context, {
+    defaultRoute: "openai-codex/gpt-5.6-sol:xhigh",
+    reviewRoute: "openai-codex/gpt-test:xhigh",
+    configSource: "fixture"
+  }), { model: context.model, thinkingLevel: "xhigh" });
+  assert.throws(() => resolveWorkerReviewRoute(context, {
+    defaultRoute: "openai-codex/gpt-5.6-sol:xhigh",
+    reviewRoute: "openai-codex/missing:xhigh",
+    configSource: "fixture"
+  }), /Managed-worker review model not found/);
+  const authlessContext = parentContext("/tmp/parent", "/tmp/parent.jsonl") as ExtensionContext & {
+    modelRegistry: { hasConfiguredAuth(model: Model<Api>): boolean; getAll(): Model<Api>[] };
+  };
+  authlessContext.modelRegistry.hasConfiguredAuth = () => false;
+  assert.throws(() => resolveWorkerReviewRoute(authlessContext, {
+    defaultRoute: "openai-codex/gpt-5.6-sol:xhigh",
+    reviewRoute: "openai-codex/gpt-test:xhigh",
+    configSource: "fixture"
+  }), /has no configured auth/);
 });
 
 test("worker_run queues immediately, then forks the completed parent turn before launch", async () => {
@@ -1687,37 +1724,44 @@ test("worker:cancel removes a queued resume container and makes cleanup failure 
   });
 });
 
-test("worker_review returns ordinary critique for one exact clean parked worker result", async () => {
+test("worker_review is observational across resumed runs and returns bounded structured review", async () => {
   await withTempDir(async (directory) => {
     const parentCwd = path.join(directory, "parent");
     const parentSessionFile = path.join(directory, "parent.jsonl");
     await mkdir(parentCwd);
-    await writeFile(parentSessionFile, "parent\n");
+    await writeFile(parentSessionFile, "PARENT_TRANSCRIPT_POISON\n");
     const fixture = await provisionWorkerReviewFixture(directory, parentSessionFile, parentCwd);
-    let parks = 0;
-    let reviewInput: { cwd: string; focus?: string; context?: string; tools?: string[]; isolateWorkspaceResources?: boolean; gitContext?: { stagedDiff: string; stagedDiffLabel?: string; status: string } } | undefined;
+    const record = readWorkerRecord(fixture.paths.recordFile);
+    const persistentContainer = { ...fixture.container, runId: "run_20260910190000_creation1" };
+    writeWorkerRecord(fixture.paths.recordFile, { ...record, container: persistentContainer });
+    const recordBefore = await readFile(fixture.paths.recordFile);
+    let inspections = 0;
+    let reviewInput: { cwd: string; evidence: string; focus?: string } | undefined;
+    const reviewModel = fakeModel();
     const api = fakeApi();
     registerWorkerExtension(api, {
       roots: fixture.roots,
-      parkContainer(container) {
-        parks += 1;
-        assert.equal(container.containerId, fixture.container.containerId);
+      inspectContainer(container) {
+        inspections += 1;
+        assert.deepEqual(container, persistentContainer);
+        return { containerId: persistentContainer.containerId! , exitCode: 0 };
       },
-      reviewWorker: async (_reviewApi, _context, input) => {
+      parkContainer() { throw new Error("review must never park or mutate the container"); },
+      resolveReviewRoute: () => ({ model: reviewModel, thinkingLevel: "xhigh" }),
+      reviewWorker: async (_context, input) => {
         assert.equal(existsSync(fixture.paths.operationLockFile), true);
         reviewInput = input;
         return {
           status: "completed",
           cwd: input.cwd,
-          model: "anthropic/claude-opus-5-5",
+          model: "openai-codex/gpt-test",
           thinkingLevel: "xhigh",
-          focus: input.focus,
           startedAt: "2026-09-10T19:32:00.000Z",
           completedAt: "2026-09-10T19:32:01.000Z",
           durationMs: 1000,
-          critique: "APPROVE: implementation is correct and scoped.",
-          sentBack: false,
-          events: [],
+          verdict: "approve",
+          findings: "None.",
+          checks: "Inspected exact diff and files.",
           toolCallCount: 4
         };
       }
@@ -1731,32 +1775,27 @@ test("worker_review returns ordinary critique for one exact clean parked worker 
       focus: "Check lifecycle races."
     } as never, undefined, undefined, parentContext(parentCwd, parentSessionFile));
     assert.equal(Check(RetainedToolOutputSchemas.worker_review, result), true);
-    assert.equal(parks, 1);
+    assert.equal(inspections, 2, "stopped identity is inspected before and after review");
     assert.equal(reviewInput?.cwd, fixture.repository);
     assert.equal(reviewInput?.focus, "Check lifecycle races.");
-    assert.deepEqual(reviewInput?.tools, ["search_many", "read_many"]);
-    assert.equal(reviewInput?.isolateWorkspaceResources, true);
-    assert.equal(reviewInput?.gitContext?.stagedDiffLabel, "Exact committed candidate delta excerpt");
-    assert.match(reviewInput?.gitContext?.stagedDiff ?? "", /-base/);
-    assert.match(reviewInput?.gitContext?.stagedDiff ?? "", /\+review me/);
-    assert.match(reviewInput?.context ?? "", new RegExp(`${fixture.workerId}/${fixture.runId}`));
-    assert.match(reviewInput?.context ?? "", /Do not modify it/);
-    const details = result.details as { workerId: string; runId: string; headCommit: string; headTree: string; model: string; critique: string };
-    assert.equal(details.workerId, fixture.workerId);
-    assert.equal(details.runId, fixture.runId);
-    assert.equal(details.headCommit, fixture.headCommit);
-    assert.equal(details.headTree, fixture.headTree);
-    assert.equal(details.model, "anthropic/claude-opus-5-5");
-    assert.match(details.critique, /APPROVE/);
-    assert.match((result.content[0] as { text: string }).text, /1000 ms \(2026-09-10T19:32:00.000Z → 2026-09-10T19:32:01.000Z\)/);
-    assert.equal(readWorkerRecord(fixture.paths.recordFile).lastRun?.delivery, "delivered");
+    assert.match(reviewInput?.evidence ?? "", new RegExp(`${fixture.workerId}/${fixture.runId}`));
+    assert.match(reviewInput?.evidence ?? "", /-base/);
+    assert.match(reviewInput?.evidence ?? "", /\+review me/);
+    assert.doesNotMatch(reviewInput?.evidence ?? "", /implemented exact review target|npm test|PARENT_TRANSCRIPT_POISON/);
+    const details = result.details as { verdict: string; findings: string; checks: string; model: string };
+    assert.equal(details.verdict, "approve");
+    assert.equal(details.findings, "None.");
+    assert.equal(details.model, "openai-codex/gpt-test");
+    assert.match((result.content[0] as { text: string }).text, /Verdict: approve/);
+    assert.deepEqual(await readFile(fixture.paths.recordFile), recordBefore, "review must not acknowledge delivery or rewrite worker state");
+    assert.equal(readWorkerRecord(fixture.paths.recordFile).lastRun?.delivery, "pending");
     const reacquired = acquireWorkerOperationLock(fixture.paths.operationLockFile);
     releaseWorkerOperationLock(reacquired);
     assert.equal(gitFixture(fixture.repository, "status", "--porcelain=v1", "--untracked-files=all"), "");
   });
 });
 
-test("worker_review rejects wrong ownership, run identity, active workers, and unparked containers", async () => {
+test("worker_review rejects wrong ownership, run identity, active workers, and running containers", async () => {
   await withTempDir(async (directory) => {
     const parentCwd = path.join(directory, "parent");
     const parentSessionFile = path.join(directory, "parent.jsonl");
@@ -1764,50 +1803,36 @@ test("worker_review rejects wrong ownership, run identity, active workers, and u
     await writeFile(parentSessionFile, "parent\n");
     const fixture = await provisionWorkerReviewFixture(directory, parentSessionFile, parentCwd);
     let reviews = 0;
-    const reviewWorker = async () => {
-      reviews += 1;
-      throw new Error("review should not run");
-    };
     const api = fakeApi();
-    registerWorkerExtension(api, { roots: fixture.roots, parkContainer: () => {}, reviewWorker });
+    registerWorkerExtension(api, {
+      roots: fixture.roots,
+      inspectContainer: () => ({ containerId: fixture.container.containerId!, exitCode: 0 }),
+      resolveReviewRoute: () => ({ model: fakeModel(), thinkingLevel: "xhigh" }),
+      reviewWorker: async () => { reviews += 1; throw new Error("review should not run"); }
+    });
     const tool = api.tools.find((candidate) => candidate.name === "worker_review");
     assert.ok(tool?.execute);
     const input = { workerId: fixture.workerId, runId: fixture.runId, workspaceRepo: "repos/project" };
-    await assert.rejects(
-      () => tool.execute!("review-unowned", input as never, undefined, undefined, parentContext(parentCwd, path.join(directory, "other-parent.jsonl"))),
-      /different parent session/
-    );
-    await assert.rejects(
-      () => tool.execute!("review-wrong-run", { ...input, runId: "run_20260910193000_wrong001" } as never, undefined, undefined, parentContext(parentCwd, parentSessionFile)),
-      /requires exact handed-off run/
-    );
+    await assert.rejects(() => tool.execute!("review-unowned", input as never, undefined, undefined, parentContext(parentCwd, path.join(directory, "other.jsonl"))), /different parent session/);
+    await assert.rejects(() => tool.execute!("review-wrong-run", { ...input, runId: "run_20260910193000_wrong001" } as never, undefined, undefined, parentContext(parentCwd, parentSessionFile)), /requires exact handed-off run/);
     const settled = readWorkerRecord(fixture.paths.recordFile);
-    writeWorkerRecord(fixture.paths.recordFile, {
-      ...settled,
-      status: "running",
-      activeRun: { runId: "run_20260910193000_active01", jobId: "job_20260910193000_active01", status: "running" }
-    });
-    await assert.rejects(
-      () => tool.execute!("review-active", input as never, undefined, undefined, parentContext(parentCwd, parentSessionFile)),
-      /became active before review/
-    );
+    writeWorkerRecord(fixture.paths.recordFile, { ...settled, status: "running", activeRun: { runId: "run_20260910193000_active01", jobId: "job_20260910193000_active01", status: "running" } });
+    await assert.rejects(() => tool.execute!("review-active", input as never, undefined, undefined, parentContext(parentCwd, parentSessionFile)), /became active before review/);
     writeWorkerRecord(fixture.paths.recordFile, settled);
-    const unparkedApi = fakeApi();
-    registerWorkerExtension(unparkedApi, {
+    const runningApi = fakeApi();
+    registerWorkerExtension(runningApi, {
       roots: fixture.roots,
-      parkContainer: () => { throw new Error("worker container is still running"); },
-      reviewWorker
+      inspectContainer: () => { throw new Error("container is running"); },
+      resolveReviewRoute: () => ({ model: fakeModel(), thinkingLevel: "xhigh" }),
+      reviewWorker: async () => { reviews += 1; throw new Error("review should not run"); }
     });
-    const unparked = unparkedApi.tools.find((candidate) => candidate.name === "worker_review");
-    await assert.rejects(
-      () => unparked!.execute!("review-unparked", input as never, undefined, undefined, parentContext(parentCwd, parentSessionFile)),
-      /container is still running/
-    );
+    const running = runningApi.tools.find((candidate) => candidate.name === "worker_review");
+    await assert.rejects(() => running!.execute!("review-running", input as never, undefined, undefined, parentContext(parentCwd, parentSessionFile)), /container is running/);
     assert.equal(reviews, 0);
   });
 });
 
-test("worker_review fails closed for changed inventories and repository drift before or during review", async () => {
+test("worker_review fails closed for inventory, repository, lifecycle, container, and hardlink drift", async () => {
   await withTempDir(async (directory) => {
     const parentCwd = path.join(directory, "parent");
     const parentSessionFile = path.join(directory, "parent.jsonl");
@@ -1816,39 +1841,70 @@ test("worker_review fails closed for changed inventories and repository drift be
     const fixture = await provisionWorkerReviewFixture(directory, parentSessionFile, parentCwd);
     const context = parentContext(parentCwd, parentSessionFile);
     const input = { workerId: fixture.workerId, runId: fixture.runId, workspaceRepo: "repos/project" };
-    let reviews = 0;
-    const api = fakeApi();
-    registerWorkerExtension(api, {
+    const reviewModel = fakeModel();
+    const baseDependencies = {
       roots: fixture.roots,
-      parkContainer: () => {},
-      reviewWorker: async (_reviewApi, _context, reviewInput) => {
-        reviews += 1;
-        return { status: "completed", cwd: reviewInput.cwd, model: "reviewer", thinkingLevel: "high", startedAt: "2026-09-10T19:32:00.000Z", completedAt: "2026-09-10T19:32:01.000Z", durationMs: 1000, critique: "critique", sentBack: false, events: [], toolCallCount: 1 };
-      }
-    });
-    const tool = api.tools.find((candidate) => candidate.name === "worker_review");
-    assert.ok(tool?.execute);
+      inspectContainer: () => ({ containerId: fixture.container.containerId!, exitCode: 0 }),
+      resolveReviewRoute: () => ({ model: reviewModel, thinkingLevel: "xhigh" as const })
+    };
+    const completed = (cwd: string) => ({ status: "completed" as const, cwd, model: "openai-codex/gpt-test", thinkingLevel: "xhigh" as const, startedAt: "2026-09-10T19:32:00.000Z", completedAt: "2026-09-10T19:32:01.000Z", durationMs: 1000, verdict: "approve" as const, findings: "None.", checks: "Inspected.", toolCallCount: 1 });
     const inventoryFile = readWorkerRecord(fixture.paths.recordFile).lastRun!.repositoryInventory!.inventoryFile;
     const inventoryText = await readFile(inventoryFile, "utf8");
     await writeFile(inventoryFile, `${inventoryText} `);
-    await assert.rejects(() => tool.execute!("review-inventory-drift", input as never, undefined, undefined, context), /inventory hash mismatch/);
+    let api = fakeApi();
+    registerWorkerExtension(api, { ...baseDependencies, reviewWorker: async (_context, reviewInput) => completed(reviewInput.cwd) });
+    let tool = api.tools.find((candidate) => candidate.name === "worker_review")!;
+    await assert.rejects(() => tool.execute!("inventory", input as never, undefined, undefined, context), /inventory hash mismatch/);
     await writeFile(inventoryFile, inventoryText);
-    await writeFile(path.join(fixture.repository, "untracked.txt"), "drift\n");
-    await assert.rejects(() => tool.execute!("review-repo-drift", input as never, undefined, undefined, context), /repository changed or violated clean policy/);
-    await rm(path.join(fixture.repository, "untracked.txt"));
-    assert.equal(reviews, 0);
 
-    const mutationApi = fakeApi();
-    registerWorkerExtension(mutationApi, {
-      roots: fixture.roots,
-      parkContainer: () => {},
-      reviewWorker: async (_reviewApi, _context, reviewInput) => {
-        await writeFile(path.join(reviewInput.cwd, "reviewer-write.txt"), "forbidden\n");
-        return { status: "completed", cwd: reviewInput.cwd, model: "reviewer", thinkingLevel: "high", startedAt: "2026-09-10T19:32:00.000Z", completedAt: "2026-09-10T19:32:01.000Z", durationMs: 1000, critique: "critique", sentBack: false, events: [], toolCallCount: 1 };
+    await writeFile(path.join(fixture.repository, "untracked.txt"), "drift\n");
+    await assert.rejects(() => tool.execute!("dirty", input as never, undefined, undefined, context), /repository changed or violated clean policy/);
+    await rm(path.join(fixture.repository, "untracked.txt"));
+
+    const outside = path.join(directory, "outside-hardlink.txt");
+    await writeFile(outside, "review me\n");
+    await rm(path.join(fixture.repository, "value.txt"));
+    await link(outside, path.join(fixture.repository, "value.txt"));
+    await assert.rejects(() => tool.execute!("hardlink", input as never, undefined, undefined, context), /hardlinked worktree evidence/);
+    await rm(path.join(fixture.repository, "value.txt"));
+    await writeFile(path.join(fixture.repository, "value.txt"), "review me\n");
+
+    api = fakeApi();
+    registerWorkerExtension(api, {
+      ...baseDependencies,
+      reviewWorker: async (_context, reviewInput) => {
+        const current = readWorkerRecord(fixture.paths.recordFile);
+        writeWorkerRecord(fixture.paths.recordFile, { ...current, status: "running", activeRun: { runId: "run_20260910193000_race0001", jobId: "job_20260910193000_race0001", status: "running" } });
+        return completed(reviewInput.cwd);
       }
     });
-    const mutationTool = mutationApi.tools.find((candidate) => candidate.name === "worker_review");
-    await assert.rejects(() => mutationTool!.execute!("review-post-drift", input as never, undefined, undefined, context), /repository changed or violated clean policy/);
+    tool = api.tools.find((candidate) => candidate.name === "worker_review")!;
+    await assert.rejects(() => tool.execute!("lifecycle", input as never, undefined, undefined, context), /changed lifecycle state/);
+    const raced = readWorkerRecord(fixture.paths.recordFile);
+    writeWorkerRecord(fixture.paths.recordFile, { ...raced, status: "handed_off", activeRun: undefined });
+
+    let inspections = 0;
+    api = fakeApi();
+    registerWorkerExtension(api, {
+      ...baseDependencies,
+      inspectContainer: () => ({ containerId: fixture.container.containerId!, exitCode: inspections++ === 0 ? 0 : 9 }),
+      reviewWorker: async (_context, reviewInput) => completed(reviewInput.cwd)
+    });
+    tool = api.tools.find((candidate) => candidate.name === "worker_review")!;
+    await assert.rejects(() => tool.execute!("container-drift", input as never, undefined, undefined, context), /container identity changed/);
+
+    const beforeFailure = await readFile(fixture.paths.recordFile);
+    inspections = 0;
+    api = fakeApi();
+    registerWorkerExtension(api, {
+      ...baseDependencies,
+      inspectContainer: () => { inspections += 1; return { containerId: fixture.container.containerId!, exitCode: 0 }; },
+      reviewWorker: async () => { const error = new Error("review timed out"); error.name = "TimeoutError"; throw error; }
+    });
+    tool = api.tools.find((candidate) => candidate.name === "worker_review")!;
+    await assert.rejects(() => tool.execute!("review-timeout", input as never, undefined, undefined, context), { name: "TimeoutError" });
+    assert.equal(inspections, 2, "review failure still rechecks stopped container state");
+    assert.deepEqual(await readFile(fixture.paths.recordFile), beforeFailure, "review failure must not mutate delivery or lifecycle state");
   });
 });
 

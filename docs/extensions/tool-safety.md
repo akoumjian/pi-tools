@@ -52,7 +52,7 @@ For each `tool_call` event:
 1. **Initial classification.** A set of fast deterministic command/path rules produces a baseline decision:
    - Allow routine read-only inspection, local validation commands, and file mutations inside the trusted workspace.
    - Allow every valid exact-session `worker_control` action without model or human review. Discard still requires an exact worker ID plus literal `confirm:true`; malformed IDs, missing confirmation, and unsupported fields remain routed to `review`.
-   - Allow a schema-valid `worker_review` call because it can only inspect one exact clean parked worker repository with isolated read-only tools; malformed identities, paths, fields, or focus remain routed to `review`.
+   - Allow a schema-valid `worker_review` call because it can only inspect one exact clean settled worker repository with an already-stopped verified container and isolated read-only tools; malformed identities, paths, fields, or focus remain routed to `review`.
    - Route credential-like paths, history-rewrite git ops, deploys, package installs, network exfiltration, privilege escalation, and similar to `review`.
    - Deny clearly malicious or self-harming patterns.
    The classification surfaces rule id, risk level, tags, and confidence, used as inputs for both the approval judge and the human review prompt.

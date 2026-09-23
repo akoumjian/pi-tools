@@ -27,7 +27,7 @@ import {
   type EditManyInput,
   type WriteManyInput
 } from "../native-tools/index.js";
-import { serializeRecentMessages } from "../review-subagent/index.js";
+import { serializeRecentMessages } from "../_shared/transcript.js";
 import {
   formatModelName,
   normalizeThinkingLevel,
