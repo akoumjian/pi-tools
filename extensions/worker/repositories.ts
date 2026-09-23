@@ -12,6 +12,7 @@ import {
   writeFileSync
 } from "node:fs";
 import path from "node:path";
+import { TextDecoder } from "node:util";
 import { resolveExecutable } from "../_shared/executable.js";
 import type { AcceptedWorkerHandoff } from "../_shared/worker-contract.js";
 
@@ -342,9 +343,7 @@ function inspectRepository(
   }
 
   try {
-    const trackedStatus = gitBuffer(runner, repoPath, ["status", "--porcelain=v1", "-z", "--untracked-files=no", "--ignore-submodules=none"]);
-    const untrackedStatus = gitBuffer(runner, repoPath, ["ls-files", "--others", "--directory", "-z"]);
-    dirty = trackedStatus.byteLength > 0 || untrackedStatus.byteLength > 0;
+    dirty = repositoryDirty(repoPath, runner);
   } catch (error) {
     policyIssues.push(safeIssue(error));
   }
@@ -422,16 +421,34 @@ export function repositoryPolicyIssues(repoPath: string, runner: GitRunner): str
 }
 
 export function repositoryDirty(repoPath: string, runner: GitRunner): boolean {
-  return gitBuffer(runner, repoPath, ["status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching", "-z"]).byteLength > 0;
+  const trackedStatus = gitBuffer(runner, repoPath, ["status", "--porcelain=v1", "-z", "--untracked-files=no", "--ignore-submodules=none"]);
+  const untrackedStatus = gitBuffer(runner, repoPath, ["ls-files", "--others", "--directory", "-z"]);
+  return trackedStatus.byteLength > 0 || untrackedStatus.byteLength > 0;
 }
 
 export function repositoryTreePolicyIssues(repoPath: string, commit: string, runner: GitRunner): string[] {
   if (!OID_PATTERN.test(commit)) return ["invalid_tree_commit"];
   try {
-    const attributes = gitBuffer(runner, repoPath, ["ls-tree", "-r", "-z", commit, "--", ".gitattributes", "**/.gitattributes"]);
-    if (attributes.byteLength > 0) return ["repository_attributes"];
-    const tree = gitText(runner, repoPath, ["ls-tree", "-r", commit]);
-    if (tree.split("\n").some((line) => line.startsWith("160000 "))) return ["gitlinks_or_submodules"];
+    const output = gitBuffer(runner, repoPath, ["ls-tree", "-r", "-z", "--full-tree", commit]);
+    if (output.byteLength === 0) return [];
+    if (output.at(-1) !== 0) throw new Error("malformed_tree_listing");
+    let decoded: string;
+    try { decoded = new TextDecoder("utf-8", { fatal: true }).decode(output); }
+    catch { throw new Error("tree_listing_not_utf8"); }
+    for (const entry of decoded.slice(0, -1).split("\0")) {
+      const separator = entry.indexOf("\t");
+      if (separator <= 0) throw new Error("malformed_tree_entry");
+      const metadata = entry.slice(0, separator);
+      const repositoryPath = entry.slice(separator + 1);
+      const match = /^(\d{6}) (blob|tree|commit) ([0-9a-f]{40,64})$/.exec(metadata);
+      if (!match || !repositoryPath) throw new Error("malformed_tree_entry");
+      const [mode, type] = [match[1], match[2]];
+      const validEntry = (type === "blob" && (mode === "100644" || mode === "100755" || mode === "120000")) || (type === "commit" && mode === "160000") || (type === "tree" && mode === "040000");
+      if (!validEntry) throw new Error("malformed_tree_entry");
+      if (mode === "160000") return ["gitlinks_or_submodules"];
+      const basename = repositoryPath.slice(repositoryPath.lastIndexOf("/") + 1);
+      if (basename.toLowerCase() === ".gitattributes") return ["repository_attributes"];
+    }
     return [];
   } catch (error) {
     return [safeIssue(error)];
@@ -458,7 +475,11 @@ function gitMetadataIssues(gitDirectory: string): string[] {
       const metadata = lstatSync(child);
       if (entry.isDirectory()) queue.push(child);
       else if (!entry.isFile()) return ["git_metadata_special_file"];
-      else if (metadata.nlink !== 1) return ["git_metadata_hardlink"];
+      else {
+        const relative = path.relative(root, child);
+        const objectContent = relative.startsWith(`objects${path.sep}`);
+        if (!objectContent && metadata.nlink !== 1) return ["git_metadata_hardlink"];
+      }
     }
   }
   return [];

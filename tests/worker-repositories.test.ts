@@ -1,16 +1,20 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import type { AcceptedWorkerHandoff } from "../extensions/_shared/worker-contract.js";
 import {
+  createGitRunner,
   deriveRepositoryInventory,
   persistRepositoryInventory,
   pinInitialRepositories,
-  readRepositoryInventory
+  readRepositoryInventory,
+  repositoryDirty,
+  repositoryPolicyIssues,
+  repositoryTreePolicyIssues
 } from "../extensions/worker/repositories.js";
 
 const WORKER_ID = "worker_20260922170000_repocand";
@@ -426,5 +430,62 @@ test("records repository-level commit status without enumerating changed files",
     assert.equal(candidate.foldable, true);
     assert.equal("changedPaths" in candidate, false);
     assert.equal("changedPathCount" in candidate, false);
+  });
+});
+
+
+test("repository dirty state exactly matches inventory tracked and untracked commands", async () => {
+  await withTempDir(async (directory) => {
+    const repo = await createSource(directory, "dirty-semantics");
+    const runner = createGitRunner(execFileSync("which", ["git"], { encoding: "utf8" }).trim(), path.join(directory, "state"));
+    assert.equal(repositoryDirty(repo, runner), false);
+    await mkdir(path.join(repo, "empty-untracked"));
+    assert.equal(repositoryDirty(repo, runner), true);
+    await rm(path.join(repo, "empty-untracked"), { recursive: true });
+    assert.equal(repositoryDirty(repo, runner), false);
+    await mkdir(path.join(repo, "empty-untracked"));
+    await writeFile(path.join(repo, "empty-untracked", "file.txt"), "untracked\n");
+    assert.equal(repositoryDirty(repo, runner), true);
+    git(repo, "add", "empty-untracked/file.txt");
+    git(repo, "commit", "-qm", "tracked file");
+    await writeFile(path.join(repo, ".gitignore"), "ignored/\n");
+    git(repo, "add", ".gitignore");
+    git(repo, "commit", "-qm", "ignore directory");
+    await mkdir(path.join(repo, "ignored"));
+    await writeFile(path.join(repo, "ignored", "artifact.txt"), "ignored but inventoried dirty\n");
+    assert.equal(repositoryDirty(repo, runner), true);
+  });
+});
+
+test("exact tree policy parses one full tree and rejects nested case-insensitive attributes", async () => {
+  await withTempDir(async (directory) => {
+    const repo = await createSource(directory, "tree-policy");
+    const runner = createGitRunner(execFileSync("which", ["git"], { encoding: "utf8" }).trim(), path.join(directory, "state"));
+    await mkdir(path.join(repo, "sub"));
+    await writeFile(path.join(repo, "sub", ".GiTaTtRiBuTeS"), "* text\n");
+    git(repo, "add", "sub/.GiTaTtRiBuTeS");
+    git(repo, "commit", "-qm", "nested attributes");
+    assert.deepEqual(repositoryTreePolicyIssues(repo, git(repo, "rev-parse", "HEAD"), runner), ["repository_attributes"]);
+
+    const fakeGit = path.join(directory, "fake-git");
+    await writeFile(fakeGit, "#!/bin/sh\nprintf '\\377\\0'\n");
+    await chmod(fakeGit, 0o700);
+    const malformedRunner = createGitRunner(fakeGit, path.join(directory, "malformed-state"));
+    assert.deepEqual(repositoryTreePolicyIssues(repo, git(repo, "rev-parse", "HEAD"), malformedRunner), ["tree_listing_not_utf8"]);
+  });
+});
+
+test("local clone object hardlinks are allowed but mutable Git metadata hardlinks are rejected", async () => {
+  await withTempDir(async (directory) => {
+    const source = await createSource(directory, "hardlink-source");
+    const destination = path.join(directory, "hardlink-clone");
+    execFileSync("git", ["clone", "-q", source, destination], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_SYSTEM: "/dev/null", GIT_CONFIG_GLOBAL: "/dev/null" }
+    });
+    const runner = createGitRunner(execFileSync("which", ["git"], { encoding: "utf8" }).trim(), path.join(directory, "state"));
+    assert.doesNotMatch(repositoryPolicyIssues(destination, runner).join(","), /git_metadata_hardlink/);
+    await link(path.join(destination, ".git", "config"), path.join(destination, ".git", "config-hardlink"));
+    assert.deepEqual(repositoryPolicyIssues(destination, runner), ["git_metadata_hardlink"]);
   });
 });

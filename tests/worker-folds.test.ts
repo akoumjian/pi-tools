@@ -158,6 +158,27 @@ function prepare(root: string, resolved: ResolvedRepositoryCandidate[], reposito
   });
 }
 
+async function rewritePreparedManifest(
+  manifestFile: string,
+  mutate: (manifest: Record<string, any>) => void
+): Promise<{ preparedId: string; preparedRoot: string }> {
+  const oldRoot = path.dirname(manifestFile);
+  const manifest = JSON.parse(await readFile(manifestFile, "utf8")) as Record<string, any>;
+  mutate(manifest);
+  delete manifest.preparedId;
+  delete manifest.manifestSha256;
+  const manifestSha256 = createHash("sha256").update(Buffer.from(JSON.stringify(manifest))).digest("hex");
+  const preparedId = `prepared_${manifestSha256.slice(0, 24)}`;
+  manifest.preparedId = preparedId;
+  manifest.manifestSha256 = manifestSha256;
+  chmodSync(manifestFile, 0o600);
+  await writeFile(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
+  chmodSync(manifestFile, 0o400);
+  const preparedRoot = path.join(path.dirname(oldRoot), preparedId);
+  renameSync(oldRoot, preparedRoot);
+  return { preparedId, preparedRoot };
+}
+
 test("prepares exact merge and squash commits without changing authoritative targets", async () => {
   await withTempDir(async (root) => {
     const merge = await fixture(root, "a");
@@ -404,5 +425,88 @@ test("rejects two candidate mappings to one physical target identity", async () 
       first.selection,
       { ...first.selection, candidateId: secondId, purpose: "duplicate physical target" }
     ]), /one candidate per physical target/);
+  });
+});
+
+test("rejects nested exact-tree attributes hidden from a dirty candidate index before conflict preparation", async () => {
+  await withTempDir(async (root) => {
+    const item = await fixture(root, "n", { conflict: true });
+    const repo = path.join(item.resolved.workspaceRoot, item.resolved.candidate.workspaceRepo);
+    await mkdir(path.join(repo, "sub"));
+    await writeFile(path.join(repo, "sub", ".gitattributes"), "* text\n");
+    git(repo, "add", "sub/.gitattributes");
+    const headCommit = commit(repo, "nested attributes in conflict candidate");
+    const headTree = git(repo, "rev-parse", "HEAD^{tree}");
+    git(repo, "rm", "--cached", "sub/.gitattributes");
+    await rm(path.join(repo, "sub", ".gitattributes"));
+    const candidate = item.resolved.candidate;
+    candidate.headCommit = headCommit;
+    candidate.headTree = headTree;
+    candidate.dirty = true;
+    candidate.candidateId = repositoryCandidateId({ workerId: candidate.workerId, runId: candidate.runId, workspaceRepo: candidate.workspaceRepo, baseCommit: candidate.baseCommit!, headCommit, headTree });
+    item.selection.candidateId = candidate.candidateId;
+    await refreshInventory(item.resolved);
+    assert.equal(await readFile(path.join(item.target, "shared.txt"), "utf8"), "target\n");
+    await assert.rejects(async () => prepare(root, [item.resolved], [item.selection]), /repository_attributes/);
+  });
+});
+
+test("restart reader rejects nested case-insensitive attributes in an otherwise self-consistent conflict artifact", async () => {
+  await withTempDir(async (root) => {
+    const item = await fixture(root, "r", { conflict: true });
+    const result = prepare(root, [item.resolved], [item.selection]);
+    const oldRoot = path.dirname(result.summary.manifestFile);
+    const record = result.manifest.repositories[0]!;
+    const view = path.join(oldRoot, record.viewPath);
+    await mkdir(path.join(view, "nested"));
+    await writeFile(path.join(view, "nested", ".GITATTRIBUTES"), "* text\n");
+    git(view, "add", "nested/.GITATTRIBUTES");
+    const badTarget = commit(view, "nested target attributes");
+    const badTree = git(view, "rev-parse", `${badTarget}^{tree}`);
+    git(view, "update-ref", "refs/worker-fold/target", badTarget);
+    const replacement = path.join(oldRoot, `${record.artifact.file}.replacement`);
+    git(view, "bundle", "create", replacement, "refs/worker-fold/target", "refs/worker-fold/candidate");
+    const artifact = path.join(oldRoot, record.artifact.file);
+    chmodSync(artifact, 0o600);
+    renameSync(replacement, artifact);
+    chmodSync(artifact, 0o400);
+    const rewritten = await rewritePreparedManifest(result.summary.manifestFile, (manifest) => {
+      manifest.repositories[0].targetExpectedCommit = badTarget;
+      manifest.repositories[0].targetExpectedTree = badTree;
+      manifest.repositories[0].artifact.heads.target.oid = badTarget;
+      manifest.repositories[0].artifact.sha256 = createHash("sha256").update(readFileSync(artifact)).digest("hex");
+    });
+    assert.throws(() => readPreparedWorkerFold(path.join(root, "folds"), rewritten.preparedId), /unsupported exact-tree policy/);
+  });
+});
+
+test("restart manifest validation binds dependency order and resolution targets", async () => {
+  await withTempDir(async (root) => {
+    const dependencyRoot = path.join(root, "dependency");
+    await mkdir(dependencyRoot);
+    const first = await fixture(dependencyRoot, "u");
+    const second = await fixture(dependencyRoot, "v");
+    second.selection.dependsOn = [first.selection.candidateId];
+    const dependencyResult = prepare(dependencyRoot, [first.resolved, second.resolved], [first.selection, second.selection]);
+    const unknown = await rewritePreparedManifest(dependencyResult.summary.manifestFile, (manifest) => {
+      manifest.repositories.find((entry: Record<string, any>) => entry.candidateId === second.selection.candidateId).dependsOn = ["candidate_ffffffffffffffffffffffff"];
+    });
+    assert.throws(() => readPreparedWorkerFold(path.join(dependencyRoot, "folds"), unknown.preparedId), /manifest failed validation/);
+
+    const orderRoot = path.join(root, "order");
+    await mkdir(orderRoot);
+    const before = await fixture(orderRoot, "w");
+    const after = await fixture(orderRoot, "x");
+    after.selection.dependsOn = [before.selection.candidateId];
+    const orderResult = prepare(orderRoot, [before.resolved, after.resolved], [before.selection, after.selection]);
+    const reversed = await rewritePreparedManifest(orderResult.summary.manifestFile, (manifest) => { manifest.order.reverse(); });
+    assert.throws(() => readPreparedWorkerFold(path.join(orderRoot, "folds"), reversed.preparedId), /manifest failed validation/);
+
+    const conflictRoot = path.join(root, "resolution");
+    await mkdir(conflictRoot);
+    const conflict = await fixture(conflictRoot, "y", { conflict: true });
+    const conflictResult = prepare(conflictRoot, [conflict.resolved], [conflict.selection]);
+    const mismatched = await rewritePreparedManifest(conflictResult.summary.manifestFile, (manifest) => { manifest.resolutionCases[0].targetRef = "refs/heads/other"; });
+    assert.throws(() => readPreparedWorkerFold(path.join(conflictRoot, "folds"), mismatched.preparedId), /manifest failed validation/);
   });
 });

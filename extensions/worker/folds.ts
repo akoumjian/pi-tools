@@ -260,6 +260,7 @@ export function prepareRepositoryChangeSet(input: {
       rmSync(candidateSourceBundle, { force: true });
       assertObject(viewDirectory, candidate.headCommit, runner, `Exact candidate head did not import into prepared view: ${candidateId}`);
       assertObject(viewDirectory, candidate.baseCommit, runner, `Candidate base is unavailable in target history: ${candidateId}`);
+      gitBuffer(runner, viewDirectory, ["fsck", "--strict", "--connectivity-only", "--no-dangling", target.expectedCommit, candidate.headCommit]);
 
       const mergeBase = gitText(runner, viewDirectory, ["merge-base", target.expectedCommit, candidate.headCommit]).trim();
       if (mergeBase !== candidate.baseCommit) throw new Error(`Candidate base does not match the exact target merge base: ${candidateId}`);
@@ -426,6 +427,7 @@ export function readPreparedWorkerFold(foldsRoot: string, preparedId: string, ex
       verifyBundle(runner, verifyRepo, artifact, expectedHeads, repository.artifact.prerequisites);
       const refspecs = [...expectedHeads.keys()].sort().map((ref) => `${ref}:${ref}`);
       gitBuffer(runner, verifyRepo, ["fetch", "--no-write-fetch-head", "--no-tags", "--no-recurse-submodules", artifact, ...refspecs]);
+      gitBuffer(runner, verifyRepo, ["fsck", "--strict", "--connectivity-only", "--no-dangling", ...expectedHeads.values()]);
       verifyPreparedObjects(repository, verifyRepo, runner);
     } finally {
       rmSync(verifyDirectory, { recursive: true, force: true });
@@ -718,6 +720,19 @@ function isPreparedWorkerFoldManifest(value: unknown): value is PreparedWorkerFo
   if (new Set(preparedRepositories.map((item) => item.candidateId)).size !== preparedRepositories.length) return false;
   if (new Set(preparedRepositories.map((item) => `${item.targetGitDevice}:${item.targetGitInode}`)).size !== preparedRepositories.length) return false;
   if (preparedRepositories.some((item) => !order.includes(item.candidateId))) return false;
+  const orderIndex = new Map(order.map((candidateId, index) => [candidateId, index]));
+  for (const repository of preparedRepositories) {
+    const repositoryIndex = orderIndex.get(repository.candidateId);
+    if (repositoryIndex === undefined || repository.dependsOn.some((dependency) => {
+      const dependencyIndex = orderIndex.get(dependency);
+      return dependencyIndex === undefined || dependencyIndex >= repositoryIndex;
+    })) return false;
+  }
+  const repositoriesById = new Map(preparedRepositories.map((repository) => [repository.candidateId, repository]));
+  if (cases.some((resolutionCase) => {
+    const repository = repositoriesById.get(resolutionCase.candidateId);
+    return !repository || resolutionCase.targetRepo !== repository.targetRepo || resolutionCase.targetRef !== repository.targetRef;
+  })) return false;
   const requiredResolutionIds = preparedRepositories.filter((item) => item.status === "resolution_required").map((item) => item.candidateId).sort();
   if (JSON.stringify(requiredResolutionIds) !== JSON.stringify(cases.map((item) => item.candidateId).sort())) return false;
   return value.status === (cases.length === 0 ? "ready" : "resolution_required");

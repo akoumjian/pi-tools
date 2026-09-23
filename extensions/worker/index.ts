@@ -654,7 +654,7 @@ function withLockedParentFoldCandidates<T>(
   const locks: ReturnType<typeof acquireWorkerOperationLock>[] = [];
   try {
     for (const workerId of workerIds) locks.push(acquireWorkerOperationLock(workerPaths(dependencies.roots, workerId).operationLockFile));
-    return operation(resolveParentFoldCandidates(changeSet, context, dependencies));
+    return operation(resolveParentFoldCandidates(changeSet, context, dependencies, owners));
   } finally {
     for (const lock of locks.reverse()) releaseWorkerOperationLock(lock);
   }
@@ -663,7 +663,8 @@ function withLockedParentFoldCandidates<T>(
 function resolveParentFoldCandidates(
   changeSet: RepositoryChangeSet,
   context: ExtensionContext,
-  dependencies: WorkerExtensionDependencies
+  dependencies: WorkerExtensionDependencies,
+  expectedOwners: ReadonlyMap<string, string>
 ): Array<{ candidate: RepositoryInventory["candidates"][number]; workspaceRoot: string; inventory: { inventoryFile: string; inventorySha256: string; reportedIssues: RepositoryInventory["reportedIssues"]; scanCoverage: RepositoryInventory["scanCoverage"] } }> {
   const requested = new Set(changeSet.repositories.map((item) => item.candidateId));
   const resolved = new Map<string, { candidate: RepositoryInventory["candidates"][number]; workspaceRoot: string; inventory: { inventoryFile: string; inventorySha256: string; reportedIssues: RepositoryInventory["reportedIssues"]; scanCoverage: RepositoryInventory["scanCoverage"] } }>();
@@ -686,6 +687,8 @@ function resolveParentFoldCandidates(
     });
     for (const candidate of inventory.candidates) {
       if (!requested.has(candidate.candidateId)) continue;
+      const expectedOwner = expectedOwners.get(candidate.candidateId);
+      if (!expectedOwner || candidate.workerId !== expectedOwner || record.workerId !== expectedOwner) throw new Error(`Worker repository candidate owner mismatch: ${candidate.candidateId}`);
       if (resolved.has(candidate.candidateId)) throw new Error(`Worker repository candidate identity is ambiguous: ${candidate.candidateId}`);
       resolved.set(candidate.candidateId, {
         candidate,
