@@ -28,6 +28,8 @@ Worker-only RPC surface:
 
 `/worker:list` is provider-free and shows up to 100 active (`queued` or `running`) workers owned by the exact current chat. `/worker:list --all` also includes handed-off, failed, and cancelled workers. Both views report their exact selected count and any omitted rows instead of failing. `/worker:status <worker-id>` shows the full canonical record for one known worker.
 
+The built-in Pi footer uses the extension status surface for one compact theme-aware `wN` count while the exact current parent chat owns queued or running workers. It recomputes from canonical durable records after lifecycle writes and restart reconciliation, clears at zero and session shutdown, and never acknowledges a result, adds a transcript/provider message, or polls.
+
 The parent owns grounding, assignment acceptance, review, integration, promotion, and task closure.
 
 ## Tool schema

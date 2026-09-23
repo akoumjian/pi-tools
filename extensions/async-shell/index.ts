@@ -123,6 +123,25 @@ type CompletionDeliveryRuntime = {
   active: boolean;
 };
 
+type AsyncShellActivityListener = () => void;
+const asyncShellActivityListeners = new Set<AsyncShellActivityListener>();
+const ASYNC_SHELL_ACTIVITY_STATUS_KEY = "pi-tools-async-activity";
+
+function subscribeAsyncShellActivity(listener: AsyncShellActivityListener): () => void {
+  asyncShellActivityListeners.add(listener);
+  return () => asyncShellActivityListeners.delete(listener);
+}
+
+function notifyAsyncShellActivity(): void {
+  for (const listener of asyncShellActivityListeners) {
+    try {
+      listener();
+    } catch {
+      // Activity display is observational and must never affect job lifecycle.
+    }
+  }
+}
+
 type CompletionDeliveryBatch = {
   deliveryId: string;
   originSessionId: string;
@@ -145,6 +164,7 @@ type JobRuntime = JobMeta & {
   // the exact custom-message receipt for this job.
   completionFollowUpQueued: boolean;
   settleProcessGroup: boolean;
+  showInActivity: boolean;
   startupError?: string;
   cancellationEffect?: (signal: NodeJS.Signals) => void;
   groupMonitor?: NodeJS.Timeout;
@@ -340,6 +360,15 @@ export function isAsyncShellCompletionBarrierTarget(target: {
 
 export default function asyncShellExtension(api: ExtensionAPI): void {
   const completionRuntime: CompletionDeliveryRuntime = { active: true };
+  let unsubscribeActivity: (() => void) | undefined;
+
+  api.on("session_start", (_event, context) => {
+    unsubscribeActivity?.();
+    unsubscribeActivity = undefined;
+    if (context.mode !== "tui" || !context.hasUI) return;
+    unsubscribeActivity = subscribeAsyncShellActivity(() => updateAsyncShellActivityStatus(context));
+    updateAsyncShellActivityStatus(context);
+  });
 
   registerCommandWithAliases(
     api,
@@ -381,7 +410,10 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
   api.on("agent_end", (_event, context) => {
     scheduleCompletionBatchFlush(api, createCompletionDeliveryContext(context));
   });
-  api.on("session_shutdown", async () => {
+  api.on("session_shutdown", async (_event, context) => {
+    if (context.mode === "tui" && context.hasUI && typeof context.ui?.setStatus === "function") context.ui.setStatus(ASYNC_SHELL_ACTIVITY_STATUS_KEY, undefined);
+    unsubscribeActivity?.();
+    unsubscribeActivity = undefined;
     completionRuntime.active = false;
     abandonCompletionRuntime(completionRuntime);
     const owner = workerOwnerFromEnvironment();
@@ -556,6 +588,7 @@ function startJob(
     notifyOnExit: boolean;
     completionDelivery?: CompletionDelivery;
     completionRuntime?: CompletionDeliveryRuntime;
+    showInActivity?: boolean;
   }
 ): JobRuntime {
   const cwd = resolveCwd(context, input.cwd);
@@ -623,11 +656,13 @@ function startJob(
     completionRuntime: input.completionRuntime ?? { active: true },
     completionFollowUpQueued: false,
     settleProcessGroup: input.settleProcessGroup ?? false,
+    showInActivity: input.showInActivity ?? true,
     cancellationEffect: processInput.cancellationEffect,
     pid: child.pid
   };
 
   jobs.set(jobId, runtime);
+  notifyAsyncShellActivity();
   child.on("error", (error) => finalizeJob(api, runtime, "failed", undefined, undefined, error.message));
   child.on("close", (code, signal) => {
     finalizeJobAfterProcessGroupExit(api, runtime, code, signal);
@@ -654,7 +689,8 @@ export function startManagedAsyncJob(
 ): ManagedAsyncJobHandle {
   const runtime = startJob(api, context, {
     ...input,
-    notifyOnExit: input.notifyOnExit ?? false
+    notifyOnExit: input.notifyOnExit ?? false,
+    showInActivity: false
   });
   runtime.startResultPending = false;
   return {
@@ -670,6 +706,32 @@ function waitForManagedJobCompletion(job: JobRuntime): Promise<JobMeta> {
   return new Promise((resolve) => {
     job.waiters.push(() => resolve(publicJob(job)));
   });
+}
+
+export function activeAsyncShellJobCount(
+  context: Pick<ExtensionContext, "cwd" | "sessionManager">
+): number {
+  const sessionId = context.sessionManager.getSessionId();
+  if (!sessionId) return 0;
+  return Array.from(jobs.values()).filter((job) =>
+    job.showInActivity &&
+    !isTerminal(job.status) &&
+    job.originSessionId === sessionId &&
+    isJobInContext(context, job)
+  ).length;
+}
+
+export function renderAsyncShellActivityStatus(count: number, theme: Pick<Theme, "fg">): string | undefined {
+  if (count <= 0) return undefined;
+  return theme.fg("warning", `sh${count}`);
+}
+
+function updateAsyncShellActivityStatus(context: ExtensionContext): void {
+  if (context.mode !== "tui" || !context.hasUI || typeof context.ui?.setStatus !== "function" || !context.ui.theme) return;
+  context.ui.setStatus(
+    ASYNC_SHELL_ACTIVITY_STATUS_KEY,
+    renderAsyncShellActivityStatus(activeAsyncShellJobCount(context), context.ui.theme)
+  );
 }
 
 export function activeAsyncShellJobsForOwner(owner: AsyncShellJobOwner): JobMeta[] {
@@ -848,6 +910,7 @@ function finalizeJob(
   job.error = error;
   job.outputBytes = asyncJobOutputBytes(job.stdoutLog, job.stderrLog);
   writeMeta(job);
+  notifyAsyncShellActivity();
 
   for (const resolve of job.waiters.splice(0)) {
     resolve();

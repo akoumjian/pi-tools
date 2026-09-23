@@ -77,10 +77,12 @@ import {
   createWorkerRunId,
   defaultWorkerRoots,
   provisionWorkerPaths,
+  notifyWorkerRecordRemoved,
   readWorkerLease,
   readWorkerRecord,
   releaseWorkerLease,
   releaseWorkerOperationLock,
+  subscribeWorkerRecordChanges,
   workerPaths,
   writeWorkerRecord,
   type WorkerIntegrationRecord,
@@ -350,11 +352,21 @@ export function registerWorkerExtension(
   const pending = new Map<string, PendingWorkerRun>();
   const active = new Map<string, { runId: string; handle: ManagedWorkerHandle }>();
   const monitors = new Map<string, NodeJS.Timeout>();
+  let unsubscribeActivity: (() => void) | undefined;
 
   api.on("session_start", async (_event, context) => {
+    unsubscribeActivity?.();
+    unsubscribeActivity = undefined;
+    if (context.mode === "tui" && context.hasUI) {
+      unsubscribeActivity = subscribeWorkerRecordChanges(() => updateWorkerActivityStatus(dependencies.roots, context));
+    }
     await adoptWorkerRuns(api, context, dependencies, active, monitors);
+    updateWorkerActivityStatus(dependencies.roots, context);
   });
-  api.on("session_shutdown", () => {
+  api.on("session_shutdown", (_event, context) => {
+    if (context.mode === "tui" && context.hasUI && typeof context.ui?.setStatus === "function") context.ui.setStatus(WORKER_ACTIVITY_STATUS_KEY, undefined);
+    unsubscribeActivity?.();
+    unsubscribeActivity = undefined;
     for (const monitor of monitors.values()) clearInterval(monitor);
     monitors.clear();
   });
@@ -739,6 +751,32 @@ export function registerWorkerExtension(
   });
 }
 
+const WORKER_ACTIVITY_STATUS_KEY = "pi-tools-worker-activity";
+
+export function activeWorkerCountForContext(roots: WorkerRoots, context: ExtensionContext): number {
+  try {
+    return listParentWorkerRecords(roots, context).filter(isActiveWorkerRecord).length;
+  } catch {
+    return 0;
+  }
+}
+
+export function renderWorkerActivityStatus(
+  count: number,
+  theme: { fg(color: string, text: string): string }
+): string | undefined {
+  if (count <= 0) return undefined;
+  return theme.fg("accent", `w${count}`);
+}
+
+function updateWorkerActivityStatus(roots: WorkerRoots, context: ExtensionContext): void {
+  if (context.mode !== "tui" || !context.hasUI || typeof context.ui?.setStatus !== "function" || !context.ui.theme) return;
+  context.ui.setStatus(
+    WORKER_ACTIVITY_STATUS_KEY,
+    renderWorkerActivityStatus(activeWorkerCountForContext(roots, context), context.ui.theme)
+  );
+}
+
 function readParentWorkerRecord(
   roots: WorkerRoots,
   workerId: string,
@@ -897,6 +935,7 @@ function discardParentWorker(
     if (record.container) dependencies.removeContainer(record.container);
     rmSync(paths.workspaceRoot, { recursive: true, force: true });
     rmSync(paths.stateDir, { recursive: true, force: true });
+    notifyWorkerRecordRemoved(paths.recordFile);
     return true;
   });
 }
@@ -1098,6 +1137,7 @@ function prepareWorkerPlans(
       if (plan.kind === "new") {
         rmSync(paths.workspaceRoot, { recursive: true, force: true });
         rmSync(paths.stateDir, { recursive: true, force: true });
+        notifyWorkerRecordRemoved(paths.recordFile);
       }
     }
     throw error;
@@ -1221,6 +1261,7 @@ function prepareNewWorker(
     }
     rmSync(paths.workspaceRoot, { recursive: true, force: true });
     rmSync(paths.stateDir, { recursive: true, force: true });
+    notifyWorkerRecordRemoved(paths.recordFile);
     throw error;
   }
 }
@@ -2112,6 +2153,7 @@ function recoverOrphanedWorkerPreparation(paths: WorkerPaths): void {
     releaseWorkerLease(paths.leaseFile, lease.workerId, lease.runId);
     rmSync(paths.workspaceRoot, { recursive: true, force: true });
     rmSync(paths.stateDir, { recursive: true, force: true });
+    notifyWorkerRecordRemoved(paths.recordFile);
   });
 }
 

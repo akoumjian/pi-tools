@@ -91,6 +91,8 @@ Cancel implicitly suppresses the completion notice for that job (`notifyOnExit` 
 
 ## Behavior
 
+The built-in Pi footer uses the extension status surface for one compact theme-aware `shN` count while the exact current session has active user `shell_start` jobs. It derives the count from the canonical attached job registry on start and terminal transitions, excludes managed worker host processes, clears at zero and session shutdown, and never adds a transcript message, provider request, assistant turn, timer, or second job registry.
+
 1. Each command is spawned via `spawn(shell, ["-lc", command], { cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] })`. A durable `jobId` of the form `job_<yyyymmddhhmmss>_<random8>` is created, metadata is written to `meta.json`, and stdout/stderr are streamed to `stdout.log` and `stderr.log` under `.pi/async-shell/jobs/<jobId>/`.
 2. `shell_start` then waits up to a fixed **6-second** in-band grace period for all jobs in the call to finish. Jobs that finish in-band are reported as completed in the start result and never produce a completion notice; jobs still running at the end of the grace period continue in the background. If the parent agent is interrupted during this grace period, only the wait ends early: already-created jobs remain durable and their metadata is returned. `shell_cancel` remains the only tool that terminates a job.
 3. The in-band result groups one metadata entry per command:

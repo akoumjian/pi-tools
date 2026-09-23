@@ -14,11 +14,13 @@ import { managedWorkerRoleSkillText } from "../extensions/_shared/role-skills.js
 import { startManagedAsyncJob, type JobMeta } from "../extensions/async-shell/index.js";
 import type { WorkerContainerReference } from "../extensions/_shared/worker-container.js";
 import {
+  activeWorkerCountForContext,
   buildIntegrationAnalysisPrompt,
   buildIntegrationResolutionPrompt,
   buildNewWorkerPrompt,
   buildResumeWorkerPrompt,
   registerWorkerExtension,
+  renderWorkerActivityStatus,
   resolveWorkerRoute,
   WorkerFoldResolveParams
 } from "../extensions/worker/index.js";
@@ -296,6 +298,76 @@ test("worker settings select a configured default while explicit routes override
   };
   unavailableContext.modelRegistry.getAll = () => [fakeModel()];
   assert.throws(() => resolveWorkerRoute(undefined, unavailableContext), /Worker model not found: openai-codex\/gpt-5\.6-sol/);
+});
+
+test("worker activity status is compact, themed, exact-parent scoped, and record driven", async () => {
+  await withTempDir(async (directory) => {
+    const roots = { stateRoot: path.join(directory, "workers"), workspaceRoot: path.join(directory, "workspaces") };
+    const parentSessionFile = path.join(directory, "parent.jsonl");
+    const otherSessionFile = path.join(directory, "other.jsonl");
+    await writeFile(parentSessionFile, "\n");
+    await writeFile(otherSessionFile, "\n");
+    const statuses: Array<{ key: string; text: string | undefined }> = [];
+    const theme = {
+      fg(color: string, text: string): string { return `<${color}>${text}</${color}>`; },
+      bold(text: string): string { return text; }
+    };
+    const context = parentContext(directory, parentSessionFile) as ExtensionContext & {
+      ui: ExtensionContext["ui"];
+    };
+    Object.assign(context, { mode: "tui", hasUI: true });
+    context.ui = {
+      theme,
+      notify(): void {},
+      setStatus(key: string, text: string | undefined): void { statuses.push({ key, text }); }
+    } as unknown as ExtensionContext["ui"];
+    const api = fakeApi();
+    registerWorkerExtension(api, { roots });
+
+    assert.equal(renderWorkerActivityStatus(0, theme), undefined);
+    assert.equal(renderWorkerActivityStatus(2, theme), "<accent>w2</accent>");
+    await api.emit("session_start", { reason: "startup" }, context);
+    assert.deepEqual(statuses.at(-1), { key: "pi-tools-worker-activity", text: undefined });
+
+    const record = (workerId: string, sessionFile: string, status: WorkerRecord["status"]): WorkerRecord => ({
+      version: WORKER_RECORD_VERSION,
+      workerId,
+      sessionId: `${workerId}-session`,
+      parentSessionFile: sessionFile,
+      workspaceRoot: path.join(roots.workspaceRoot, workerId),
+      taskIds: ["personal-activity"],
+      route: { provider: "openai-codex", model: "gpt-test", thinkingLevel: "xhigh" },
+      status,
+      activeRun: status === "queued" || status === "running"
+        ? { runId: `run_${workerId.slice(-8)}`, jobId: `job_20260923170000_${workerId.slice(-8)}`, status }
+        : undefined,
+      updatedAt: "2026-09-23T17:00:00.000Z"
+    });
+    const first = workerPaths(roots, "worker_20260923170000_active01");
+    const second = workerPaths(roots, "worker_20260923170000_active02");
+    const unrelated = workerPaths(roots, "worker_20260923170000_other001");
+    writeWorkerRecord(first.recordFile, record("worker_20260923170000_active01", parentSessionFile, "queued"));
+    writeWorkerRecord(second.recordFile, record("worker_20260923170000_active02", parentSessionFile, "running"));
+    writeWorkerRecord(unrelated.recordFile, record("worker_20260923170000_other001", otherSessionFile, "running"));
+    assert.equal(activeWorkerCountForContext(roots, context), 2);
+    assert.deepEqual(statuses.at(-1), { key: "pi-tools-worker-activity", text: "<accent>w2</accent>" });
+
+    writeWorkerRecord(first.recordFile, record("worker_20260923170000_active01", parentSessionFile, "handed_off"));
+    assert.deepEqual(statuses.at(-1), { key: "pi-tools-worker-activity", text: "<accent>w1</accent>" });
+    writeWorkerRecord(second.recordFile, record("worker_20260923170000_active02", parentSessionFile, "cancelled"));
+    assert.equal(activeWorkerCountForContext(roots, context), 0);
+    assert.deepEqual(statuses.at(-1), { key: "pi-tools-worker-activity", text: undefined });
+    assert.equal(api.messages.length, 0, "activity status never sends a session/provider message");
+
+    await api.emit("session_shutdown", { reason: "reload" }, context);
+    const callsAfterShutdown = statuses.length;
+    writeWorkerRecord(first.recordFile, record("worker_20260923170000_active01", parentSessionFile, "queued"));
+    assert.equal(statuses.length, callsAfterShutdown, "shutdown unsubscribes from later record transitions");
+    const rpcContext = { ...context, mode: "rpc", hasUI: true } as ExtensionContext;
+    await api.emit("session_start", { reason: "resume" }, rpcContext);
+    await api.emit("session_shutdown", { reason: "reload" }, rpcContext);
+    assert.equal(statuses.length, callsAfterShutdown, "RPC/headless modes receive no activity UI requests");
+  });
 });
 
 test("worker_run queues immediately, then forks the completed parent turn before launch", async () => {

@@ -10,6 +10,28 @@ import { isRepositoryInventorySummary, type InitialRepositoryPin, type Repositor
 
 export const WORKER_RECORD_VERSION = 1;
 
+type WorkerRecordChangeListener = (recordFile: string) => void;
+const workerRecordChangeListeners = new Set<WorkerRecordChangeListener>();
+
+export function subscribeWorkerRecordChanges(listener: WorkerRecordChangeListener): () => void {
+  workerRecordChangeListeners.add(listener);
+  return () => workerRecordChangeListeners.delete(listener);
+}
+
+export function notifyWorkerRecordRemoved(recordFile: string): void {
+  notifyWorkerRecordChange(path.resolve(recordFile));
+}
+
+function notifyWorkerRecordChange(recordFile: string): void {
+  for (const listener of workerRecordChangeListeners) {
+    try {
+      listener(recordFile);
+    } catch {
+      // Activity display is observational and must never affect durable lifecycle writes.
+    }
+  }
+}
+
 export type WorkerRoute = {
   provider: string;
   model: string;
@@ -311,6 +333,7 @@ export function writeWorkerRecord(recordFile: string, record: WorkerRecord): voi
   const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
   writeFileSync(temporary, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
   renameSync(temporary, target);
+  notifyWorkerRecordChange(target);
 }
 
 export function readWorkerRecord(recordFile: string): WorkerRecord {

@@ -8,6 +8,7 @@ import test from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import asyncShellExtension, {
+  activeAsyncShellJobCount,
   activeAsyncShellJobsForOwner,
   buildAsyncShellStatusText,
   buildAsyncShellViewerFrame,
@@ -18,6 +19,7 @@ import asyncShellExtension, {
   loadAsyncShellViewerSnapshot,
   parseAsyncShellViewerArgs,
   sanitizeAsyncShellViewerText,
+  renderAsyncShellActivityStatus,
   startManagedAsyncJob,
   type AsyncShellViewerSnapshot
 } from "../extensions/async-shell/index.js";
@@ -170,6 +172,81 @@ async function writeJobMeta(contextDir: string, jobId: string, meta: Record<stri
     ...meta
   }, null, 2)}\n`);
 }
+
+test("async-shell activity status is compact, themed, exact-session scoped, and lifecycle driven", async () => {
+  await withTempDir(async (dir) => {
+    const api = createFakeApi();
+    asyncShellExtension(api);
+    const statuses: Array<{ key: string; text: string | undefined }> = [];
+    const theme = {
+      fg(color: string, text: string): string { return `<${color}>${text}</${color}>`; },
+      bold(text: string): string { return text; }
+    } as unknown as Theme;
+    const context = {
+      ...createContext(dir),
+      mode: "tui",
+      hasUI: true,
+      sessionManager: { getSessionId: () => "activity-session" },
+      ui: {
+        theme,
+        setStatus(key: string, text: string | undefined): void { statuses.push({ key, text }); }
+      }
+    } as unknown as ExtensionContext;
+
+    assert.equal(renderAsyncShellActivityStatus(0, theme), undefined);
+    assert.equal(renderAsyncShellActivityStatus(3, theme), "<warning>sh3</warning>");
+    assert.equal(visibleWidth(renderAsyncShellActivityStatus(123, plainTheme)!), 5, "the count stays narrow");
+    await api.emit("session_start", { reason: "startup" }, context);
+    assert.deepEqual(statuses.at(-1), { key: "pi-tools-async-activity", text: undefined });
+    await writeJobMeta(dir, "job_20260923165959_stale001", { status: "running", pid: 2_147_483_647 });
+    assert.equal(activeAsyncShellJobCount(context), 0, "detached stale metadata is not active UI state");
+
+    const internal = startManagedAsyncJob(api, context, {
+      command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("setTimeout(() => {}, 80)")}`,
+      cwd: dir,
+      notifyOnExit: false
+    });
+    assert.equal(activeAsyncShellJobCount(context), 0, "managed worker host jobs stay out of the shell count");
+    await delay(120);
+    await internal.completion;
+
+    const shellStart = required(api.registeredTools.find((candidate) => candidate.name === "shell_start"), "shell_start tool");
+    const run = shellStart.execute(
+      "activity-call",
+      {
+        commands: [
+          { command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("setTimeout(() => {}, 180)")}`, cwd: dir, notifyOnExit: false },
+          { command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("setTimeout(() => {}, 360)")}`, cwd: dir, notifyOnExit: false }
+        ]
+      } as never,
+      new AbortController().signal,
+      undefined,
+      context
+    );
+    await delay(40);
+    assert.equal(activeAsyncShellJobCount(context), 2);
+    assert.ok(statuses.some((status) => status.text === "<warning>sh2</warning>"));
+    const otherSession = {
+      ...context,
+      sessionManager: { getSessionId: () => "other-session" }
+    } as ExtensionContext;
+    assert.equal(activeAsyncShellJobCount(otherSession), 0, "activity never crosses session identity");
+
+    await run;
+    assert.equal(activeAsyncShellJobCount(context), 0);
+    assert.ok(statuses.some((status) => status.text === "<warning>sh1</warning>"), "concurrent completion decrements the canonical count");
+    assert.deepEqual(statuses.at(-1), { key: "pi-tools-async-activity", text: undefined });
+    assert.equal(api.sentMessages.length, 0, "activity status adds no provider-visible messages");
+
+    await api.emit("session_shutdown", { reason: "reload" }, context);
+    assert.deepEqual(statuses.at(-1), { key: "pi-tools-async-activity", text: undefined });
+    const tuiStatusCount = statuses.length;
+    const rpcContext = { ...context, mode: "rpc", hasUI: true } as ExtensionContext;
+    await api.emit("session_start", { reason: "resume" }, rpcContext);
+    await api.emit("session_shutdown", { reason: "reload" }, rpcContext);
+    assert.equal(statuses.length, tuiStatusCount, "RPC/headless modes receive no activity UI requests");
+  });
+});
 
 test("async-shell tools expose complete system-prompt contracts", () => {
   const api = createFakeApi();
