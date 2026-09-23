@@ -10,6 +10,7 @@ import { managedWorkerRoleSkillText } from "../extensions/_shared/role-skills.js
 import { searchMany } from "../extensions/native-tools/index.js";
 import {
   MAX_MANAGED_WORKER_REVIEW_CHECKS_CHARS,
+  ManagedReviewConfinementViolation,
   assertManagedReviewToolCallWithinRoot,
   buildManagedWorkerReviewTask,
   formatManagedWorkerReviewRoute,
@@ -134,7 +135,7 @@ test("managed review output parser requires bounded structured verdict, findings
   assert.throws(() => parseManagedWorkerReviewOutput(`VERDICT: BLOCKED\n## Findings\nBlocked.\n## Checks\n${"x".repeat(MAX_MANAGED_WORKER_REVIEW_CHECKS_CHARS + 1)}`), /checks exceed/);
 });
 
-test("managed review confinement handles lexical, canonical, cursor, glob, and malformed attacks", async () => {
+test("managed review confinement distinguishes fatal violations from recoverable tool errors", async () => {
   const fixture = await mkdtemp(path.join(tmpdir(), "pi-managed-review-confine-"));
   const root = path.join(fixture, "repo");
   const outside = path.join(fixture, "outside.txt");
@@ -159,13 +160,26 @@ test("managed review confinement handles lexical, canonical, cursor, glob, and m
       toolCall("read_many", { files: [{ path: "escape-link" }] }),
       toolCall("read_many", { files: [{ path: ".git/config" }] }),
       toolCall("read_many", { files: [{ path: "nested/.git/config" }] }),
-      toolCall("read_many", { files: [{ path: "inside.txt", cursor: "opaque", offset: 1 }] }),
       toolCall("search_many", { searches: [{ kind: "files", path: ".", glob: "../**" }] }),
-      toolCall("search_many", { searches: [{ kind: "content", path: "." }] }),
-      toolCall("search_many", { searches: "wrong" }),
       toolCall("write_many", { writes: [{ path: "inside.txt", content: "bad" }] })
     ]) {
-      await assert.rejects(() => assertManagedReviewToolCallWithinRoot(root, event));
+      await assert.rejects(
+        () => assertManagedReviewToolCallWithinRoot(root, event),
+        (error) => error instanceof ManagedReviewConfinementViolation,
+        `${event.toolName} must be classified as a fatal confinement violation`
+      );
+    }
+    for (const event of [
+      toolCall("read_many", { files: [{ path: "missing.txt" }] }),
+      toolCall("read_many", { files: [{ path: "inside.txt", cursor: "opaque", offset: 1 }] }),
+      toolCall("search_many", { searches: [{ kind: "content", path: "." }] }),
+      toolCall("search_many", { searches: "wrong" })
+    ]) {
+      await assert.rejects(
+        () => assertManagedReviewToolCallWithinRoot(root, event),
+        (error) => error instanceof Error && !(error instanceof ManagedReviewConfinementViolation),
+        `${event.toolName} malformed/ENOENT result must remain recoverable`
+      );
     }
   } finally {
     await rm(fixture, { recursive: true, force: true });
@@ -215,18 +229,24 @@ test("managed review treats inactive disallowed write_many and bash calls as fat
   }
 });
 
-test("managed review classifies symlink escapes and nested Git-admin reads as fatal confinement", async () => {
+test("managed review classifies path and search escapes as fatal confinement", async () => {
   const fixture = await mkdtemp(path.join(tmpdir(), "pi-managed-review-fatal-paths-"));
   const root = path.join(fixture, "repo");
   await mkdir(path.join(root, "nested", ".git"), { recursive: true });
   await writeFile(path.join(root, "nested", ".git", "config"), "secret\n");
   await writeFile(path.join(fixture, "outside.txt"), "outside\n");
   await symlink(path.join(fixture, "outside.txt"), path.join(root, "escape-link"));
+  const attacks = [
+    { label: "symlink", tool: "read_many", arguments: { files: [{ path: "escape-link" }] } },
+    { label: "nested-git-read", tool: "read_many", arguments: { files: [{ path: "nested/.git/config" }] } },
+    { label: "parent-glob", tool: "search_many", arguments: { searches: [{ kind: "files", path: ".", glob: "../**" }] } },
+    { label: "nested-git-search", tool: "search_many", arguments: { searches: [{ kind: "files", path: "nested/.git", glob: "*" }] } }
+  ];
   try {
-    for (const requestedPath of ["escape-link", "nested/.git/config"]) {
-      const faux = fauxProvider({ provider: "anthropic", api: `managed-review-fatal-${requestedPath.replaceAll("/", "-")}-api`, models: [{ id: "opus", reasoning: true }] });
+    for (const attack of attacks) {
+      const faux = fauxProvider({ provider: "anthropic", api: `managed-review-fatal-${attack.label}-api`, models: [{ id: "opus", reasoning: true }] });
       faux.setResponses([
-        fauxAssistantMessage([{ type: "toolCall", id: "fatal-read", name: "read_many", arguments: { files: [{ path: requestedPath }] } }] as never, { stopReason: "toolUse" }),
+        fauxAssistantMessage([{ type: "toolCall", id: `fatal-${attack.label}`, name: attack.tool, arguments: attack.arguments }] as never, { stopReason: "toolUse" }),
         fauxAssistantMessage("VERDICT: APPROVE\n## Findings\nNone.\n## Checks\nMust not be accepted.")
       ]);
       await assert.rejects(() => runManagedWorkerReviewWithRateLimitFallback(childContext(faux, []), {
@@ -238,6 +258,28 @@ test("managed review classifies symlink escapes and nested Git-admin reads as fa
     }
   } finally {
     await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test("managed review faux-provider search keeps ordinary dotfiles visible", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-managed-review-dotfile-"));
+  await writeFile(path.join(root, ".env"), "VISIBLE_DOTFILE\n");
+  const faux = fauxProvider({ provider: "anthropic", api: "managed-review-dotfile-api", models: [{ id: "opus", reasoning: true }] });
+  faux.setResponses([
+    fauxAssistantMessage([{ type: "toolCall", id: "dotfile-search", name: "search_many", arguments: { searches: [{ kind: "files", path: ".", glob: ".env" }] } }] as never, { stopReason: "toolUse" }),
+    fauxAssistantMessage("VERDICT: APPROVE\n## Findings\nNone.\n## Checks\nFound the ordinary dotfile.")
+  ]);
+  try {
+    const result = await runManagedWorkerReviewWithRateLimitFallback(childContext(faux, []), {
+      cwd: root,
+      primaryRoute: { model: faux.getModel("opus") as Model<Api>, thinkingLevel: "xhigh" },
+      evidence: "exact",
+      timeoutMs: 5_000
+    });
+    assert.equal(result.review.verdict, "approve");
+    assert.equal(faux.state.callCount, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 

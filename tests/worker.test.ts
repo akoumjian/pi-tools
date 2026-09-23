@@ -978,6 +978,20 @@ test("worker_run resume reopens only the exact worker session and captures fresh
     assert.equal(rejectedLegacyMax.activeRun, undefined);
     assert.equal(Boolean(launch), false);
     writeWorkerRecord(paths.recordFile, legacyMax);
+    const mutableRegistry = context.modelRegistry as { getAll(): Model<Api>[] };
+    const allowedModels = mutableRegistry.getAll();
+    mutableRegistry.getAll = () => allowedModels.map((model) => model.id === legacyMax.route.model
+      ? { ...model, name: "Anthropic Claude Fable 5" }
+      : model);
+    await assert.rejects(
+      tool.execute("call-resume-fable-name", { runs: [{ kind: "resume", workerId, message: "Do not launch renamed Fable." }] } as never, undefined, undefined, context),
+      /Persisted worker .*Claude Fable/
+    );
+    const rejectedRenamedFable = readWorkerRecord(paths.recordFile);
+    assert.deepEqual(rejectedRenamedFable.route, legacyMax.route, "persisted route rendering must remain truthful after current-name rejection");
+    assert.equal(rejectedRenamedFable.activeRun, undefined);
+    assert.equal(Boolean(launch), false);
+    mutableRegistry.getAll = () => allowedModels;
     const result = await tool.execute("call-resume", {
       runs: [{ kind: "resume", workerId, message: "Inspect the fresh parent context.", addTaskIds: ["personal-added"] }]
     } as never, undefined, undefined, context);
@@ -2004,7 +2018,7 @@ test("worker_review pre-fallback revalidation detects a stopped-container start/
   });
 });
 
-test("worker_review pre-fallback revalidation binds the complete accepted handoff payload", async () => {
+test("worker_review pre-fallback revalidation binds the complete accepted handoff envelope", async () => {
   await withTempDir(async (directory) => {
     const parentCwd = path.join(directory, "parent");
     const parentSessionFile = path.join(directory, "parent.jsonl");
@@ -2025,7 +2039,13 @@ test("worker_review pre-fallback revalidation binds the complete accepted handof
         rateLimitFallback: { model: fallbackModel, thinkingLevel: "xhigh" }
       }),
       reviewWorker: async (_context, input) => {
-        const parsed = JSON.parse(originalResult) as { handoff: Record<string, unknown> };
+        const parsed = JSON.parse(originalResult) as { acceptedAt: string; handoff: Record<string, unknown> };
+        await writeFile(resultFile, `${JSON.stringify({ ...parsed, acceptedAt: "2026-09-10T19:31:59.999Z" })}\n`);
+        try {
+          await assert.rejects(async () => { await input.beforeFallback!(new AbortController().signal); }, /exact handoff or repository inventory changed/);
+        } finally {
+          await writeFile(resultFile, originalResult);
+        }
         await writeFile(resultFile, `${JSON.stringify({
           ...parsed,
           handoff: {

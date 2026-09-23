@@ -626,7 +626,7 @@ export function registerWorkerExtension(
       "worker_review use: Call for the exact settled worker/run/repository after selecting its authoritative candidate; if review requests changes, resume the implementation worker and review the new settled run again.",
       inputJsonSchemaGuideline("worker_review", WorkerReviewParams),
       outputJsonSchemaGuideline("worker_review", RetainedToolOutputSchemas.worker_review),
-      "worker_review constraints: Requires an exact-parent-owned handed-off run, valid hash-bound inventory, already-stopped exact persistent container, and clean foldable candidate. Primary and fallback routes reject max thinking and every Claude Fable model. It never acknowledges delivery or mutates worker/container state. A bounded operation lock covers the primary and, only after a confirmed Anthropic 429 rate_limit_error plus renewed exact lifecycle/lease, complete accepted handoff payload, stopped-container timestamp fingerprint, repository/commit, and confinement prechecks, one fresh same-provider configured fallback child. Both use trusted in-memory settings with retries and compaction disabled, stripped provider fallback metadata, exact every-turn response-model/name verification, Unicode-safe nonce-delimited JSON candidate evidence, and only repository-confined read_many/search_many with unconditional Git-admin search exclusion; recoverable ENOENT/schema tool errors remain model-visible while true escapes and inactive disallowed-tool requests terminate; auth/model/config/transport/5xx/timeout/cancellation/output/policy failures never trigger fallback. Only actually started routes appear in ordered attempt history; safe route/config failures retain sanitized host guidance without raw provider errors. Lifecycle/container/HEAD/tree/dirty/policy are rechecked after the overall review; drift fails visibly. The structured verdict/findings/checks are advice only, not validation, attestation, promotion, push, or publication authority. Only result content is provider-visible; details are internal."
+      "worker_review constraints: Requires an exact-parent-owned handed-off run, valid hash-bound inventory, already-stopped exact persistent container, and clean foldable candidate. Primary and fallback routes reject max thinking and every Claude Fable model. It never acknowledges delivery or mutates worker/container state. A bounded operation lock covers the primary and, only after a confirmed Anthropic 429 rate_limit_error plus renewed exact lifecycle/lease, complete accepted handoff envelope including acceptedAt, stopped-container timestamp fingerprint, repository/commit, and confinement prechecks, one fresh same-provider configured fallback child. Both use trusted in-memory settings with retries and compaction disabled, stripped provider fallback metadata, exact every-turn response-model/name verification, Unicode-safe nonce-delimited JSON candidate evidence, and only repository-confined read_many/search_many with unconditional Git-admin search exclusion; recoverable ENOENT/schema tool errors remain model-visible while true escapes and inactive disallowed-tool requests terminate; auth/model/config/transport/5xx/timeout/cancellation/output/policy failures never trigger fallback. Only actually started routes appear in ordered attempt history; safe route/config failures retain sanitized host guidance without raw provider errors. Lifecycle/container/HEAD/tree/dirty/policy are rechecked after the overall review; drift fails visibly. The structured verdict/findings/checks are advice only, not validation, attestation, promotion, push, or publication authority. Only result content is provider-visible; details are internal."
     ],
     parameters: WorkerReviewParams,
     executionMode: "sequential",
@@ -736,7 +736,7 @@ export function registerWorkerExtension(
       } else {
         const paths = workerPaths(dependencies.roots, request.workerId);
         const existing = readWorkerRecord(paths.recordFile);
-        assertSubagentRouteAllowed(existing.route, `Persisted integration worker ${existing.workerId} route`);
+        assertPersistedWorkerRouteAllowed(existing.route, context, `Persisted integration worker ${existing.workerId} route`);
         assertWorkerParentSession(existing, context);
         if (!existing.integration || existing.integration.phase !== "analysis") throw new Error("worker_fold_resolve resume requires a settled analysis integration worker.");
         if (existing.status !== "handed_off" || existing.lastRun?.status !== "handed_off" || existing.lastRun.runId !== existing.integration.analysisRunId) throw new Error("worker_fold_resolve resume requires the exact successful analysis handoff.");
@@ -857,7 +857,7 @@ async function reviewSettledWorker(
     if (observed.handoff.handoff.state !== "ready_for_review" && observed.handoff.handoff.state !== "assignment_complete") {
       throw new Error(`worker_review requires a completed handoff, not ${observed.handoff.handoff.state}.`);
     }
-    const acceptedHandoffPayload = JSON.stringify(observed.handoff.handoff);
+    const acceptedHandoffEnvelope = JSON.stringify(observed.handoff);
     if (!record.container || record.container.workerId !== input.workerId) {
       throw new Error(`worker_review requires worker ${input.workerId}'s exact persisted container identity.`);
     }
@@ -895,7 +895,7 @@ async function reviewSettledWorker(
       if (
         currentObserved.record.lastRun?.runId !== input.runId || !currentObserved.handoff ||
         (currentHandoffState !== "ready_for_review" && currentHandoffState !== "assignment_complete") ||
-        JSON.stringify(currentObserved.handoff.handoff) !== acceptedHandoffPayload || !currentCandidate ||
+        JSON.stringify(currentObserved.handoff) !== acceptedHandoffEnvelope || !currentCandidate ||
         JSON.stringify(currentCandidate) !== JSON.stringify(candidate)
       ) {
         throw new Error("Managed-worker exact handoff or repository inventory changed during review.");
@@ -1378,6 +1378,30 @@ async function cancelParentWorker(
   return "detached";
 }
 
+function assertPersistedWorkerRouteAllowed(
+  route: WorkerRecord["route"],
+  context: ExtensionContext,
+  label: string
+): void {
+  assertSubagentRouteAllowed(route, label);
+  const exactThinking = parseModelThinkingPair(`${route.provider}/${route.model}:${route.thinkingLevel}`).thinkingLevel;
+  const resolved = resolveExtensionModel({
+    registry: context.modelRegistry,
+    requested: `${route.provider}/${route.model}:${route.thinkingLevel}`,
+    fallbackThinkingLevel: exactThinking,
+    label,
+    noModelMessage: `${label} is unavailable.`
+  });
+  assertChildAgentRouteAllowed(resolved.model, exactThinking, label);
+  if (
+    resolved.model.provider !== route.provider ||
+    resolved.model.id !== route.model ||
+    resolved.thinkingLevel !== exactThinking
+  ) {
+    throw new Error(`${label} cannot be honored exactly against the current trusted model registry.`);
+  }
+}
+
 function planWorkerRuns(
   inputs: WorkerRunInput["runs"],
   context: ExtensionContext,
@@ -1404,7 +1428,7 @@ function planWorkerRuns(
     resumed.add(input.workerId);
     const paths = workerPaths(dependencies.roots, input.workerId);
     const existing = readWorkerRecord(paths.recordFile);
-    assertSubagentRouteAllowed(existing.route, `Persisted worker ${existing.workerId} route`);
+    assertPersistedWorkerRouteAllowed(existing.route, context, `Persisted worker ${existing.workerId} route`);
     if (parentSessionFile !== path.resolve(existing.parentSessionFile)) {
       throw new Error(`Worker ${existing.workerId} can only resume from its exact parent session ${existing.parentSessionFile}.`);
     }
@@ -1589,7 +1613,7 @@ function prepareResumedWorker(
   const jobId = createAsyncJobId(now, dependencies.random());
   return withWorkerOperationLock(paths, () => {
     const existing = readWorkerRecord(paths.recordFile);
-    assertSubagentRouteAllowed(existing.route, `Persisted worker ${existing.workerId} route`);
+    assertPersistedWorkerRouteAllowed(existing.route, context, `Persisted worker ${existing.workerId} route`);
     if (existing.activeRun) throw new Error(`Worker ${existing.workerId} became active before resume preparation.`);
     if (existing.lastRun?.delivery === "pending") {
       throw new Error(`Worker ${existing.workerId} completion delivery became pending before resume preparation; inspect it with worker_control result or use /worker:ack.`);
@@ -1733,7 +1757,7 @@ async function startPendingWorker(
   let launchedHandle: ManagedWorkerHandle | undefined;
   let launchAttempted = false;
   try {
-    assertSubagentRouteAllowed(record.route, `Worker ${record.workerId} launch route`);
+    assertPersistedWorkerRouteAllowed(record.route, context, `Worker ${record.workerId} launch route`);
     const currentParentSessionFile = context.sessionManager.getSessionFile();
     if (!currentParentSessionFile || path.resolve(currentParentSessionFile) !== pending.parentSessionFile) {
       throw new Error(`Worker ${record.workerId} launch parent session changed before the queued run became durable.`);
@@ -3702,7 +3726,7 @@ function defaultDependencies(): WorkerExtensionDependencies {
     removeContainer: (container) => settleWorkerContainer(resolveDockerPath(), container),
     launch: (api, context, request) => {
       if (!request.container) throw new Error(`Worker ${request.record.workerId}/${request.record.activeRun?.runId ?? "unknown"} lost its planned Docker identity.`);
-      assertSubagentRouteAllowed(request.record.route, `Worker ${request.record.workerId} launch route`);
+      assertPersistedWorkerRouteAllowed(request.record.route, context, `Worker ${request.record.workerId} launch route`);
       const dockerPath = resolveDockerPath();
       let container = request.container;
       try {

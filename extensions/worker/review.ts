@@ -421,7 +421,7 @@ export function parseManagedWorkerReviewOutput(text: string): Pick<ManagedWorker
   };
 }
 
-class ManagedReviewConfinementViolation extends Error {
+export class ManagedReviewConfinementViolation extends Error {
   constructor(message: string) {
     super(message);
     this.name = "ManagedReviewConfinementViolation";
