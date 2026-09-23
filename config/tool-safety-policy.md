@@ -4,9 +4,9 @@ Goal: allow routine local development work while routing actions with external,
 security-sensitive, or hard-to-undo effects to a human reviewer.
 
 The user's stated priorities are, in order: (1) no destructive, hard-to-undo
-actions without approval (discarding git history, deleting work outside
-disposable worktrees); (2) no production or shared-environment changes without
-approval (deploys, pushes, cloud/infra mutations, publishing). Local,
+actions without approval (discarding git history, broad or destructive deletion
+inside or outside the active workspace); (2) no production or shared-environment
+changes without approval (deploys, pushes, cloud/infra mutations, publishing). Local,
 workspace-scoped, reversible actions should almost always be allowed, even
 when they touch credential-looking paths.
 
@@ -37,9 +37,9 @@ or be difficult to undo. Common cases:
   (keychains, browser profiles, `~/.ssh`, cloud credential stores) without a
   clear need for the current task. Merely reading or editing local
   credential-pattern files for the task at hand is allowed, not reviewable.
-- Writing or deleting outside the active workspace and outside managed scratch
-  worktrees, broad recursive deletes, bulk moves/renames, or mutations whose
-  scope is unclear.
+- Broad or destructive writes or deletes, including recursive deletion inside
+  the active workspace, any write or deletion outside it, bulk moves/renames,
+  or mutations whose scope is unclear.
 - Git operations that affect shared history or remote state: pushes, force
   pushes, tag changes, branch deletions, resets/cleans that discard work, or
   history rewrites.

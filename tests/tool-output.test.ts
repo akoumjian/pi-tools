@@ -273,6 +273,7 @@ test("authoritative output schemas accept representative runtime results and gen
     assert.equal(Check(schema, samples[name]), true, `${name} representative result matches its output schema`);
     assert.equal(Check(schema, { content: [text("Tool failed")], details: {} }), true, `${name} accepts Pi's generic runtime error result`);
     assert.equal(Check(schema, { ...(samples[name] as object), unexpected: true }), false, `${name} rejects unknown top-level fields`);
+    assert.equal(Check(schema, { ...(samples[name] as object), isError: true }), false, `${name} rejects raw execute isError`);
   }
   assert.equal(Check(RuntimeErrorResultSchema, { content: [text("Tool failed")], details: {} }), true);
 });

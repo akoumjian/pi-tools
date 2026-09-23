@@ -437,16 +437,6 @@ const DocumentParseDetailsSchema = Type.Object({
   warnings: Type.Optional(Type.Array(Type.String()))
 }, { additionalProperties: false });
 
-const ThinkingLevelSchema = Type.Union([
-  Type.Literal("off"),
-  Type.Literal("minimal"),
-  Type.Literal("low"),
-  Type.Literal("medium"),
-  Type.Literal("high"),
-  Type.Literal("xhigh"),
-  Type.Literal("max")
-]);
-
 const WorkerRunReceiptSchema = Type.Object({
   workerId: Type.String({ minLength: 1 }),
   runId: Type.String({ minLength: 1 }),
