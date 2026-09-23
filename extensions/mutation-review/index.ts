@@ -27,9 +27,13 @@ import {
   type EditManyInput,
   type WriteManyInput
 } from "../native-tools/index.js";
-import { serializeRecentMessages } from "../review-subagent/index.js";
+import { serializeRecentMessages } from "../_shared/transcript.js";
 import {
+  assertChildAgentRouteAllowed,
+  assertSubagentRouteSpecAllowed,
+  assertSubagentThinkingLevelAllowed,
   formatModelName,
+  parseOptionalModelThinkingPair,
   normalizeThinkingLevel,
   resolveExtensionModel,
   type ExtensionModelRegistry,
@@ -1689,11 +1693,20 @@ function readMutationReviewGuidanceConfig(configData: Record<string, unknown>, c
 }
 
 function normalizeMutationReviewSettings(settings: MutationReviewSettings): MutationReviewSettings {
+  const defaultModel = typeof settings.defaultModel === "string" && settings.defaultModel.trim() ? settings.defaultModel.trim() : undefined;
+  const thinkingLevel = normalizeThinkingLevel(settings.thinkingLevel, "low");
+  if (defaultModel) {
+    assertSubagentRouteSpecAllowed(defaultModel, "Mutation-review configured route");
+    assertSubagentRouteSpecAllowed(`${defaultModel}:${thinkingLevel}`, "Mutation-review configured route");
+  }
+  if (thinkingLevel === "max") {
+    throw new Error("Mutation-review configured thinking level max is not allowed: subagent thinking is capped at xhigh. Choose xhigh or a lower exact level.");
+  }
   return {
-    defaultModel: typeof settings.defaultModel === "string" && settings.defaultModel.trim() ? settings.defaultModel.trim() : undefined,
+    defaultModel,
     guidance: typeof settings.guidance === "string" && settings.guidance.trim() ? settings.guidance.trim() : undefined,
     guidanceFile: typeof settings.guidanceFile === "string" && settings.guidanceFile.trim() ? settings.guidanceFile.trim() : undefined,
-    thinkingLevel: normalizeThinkingLevel(settings.thinkingLevel, "low"),
+    thinkingLevel,
     maxRecentMessages: positiveInteger(settings.maxRecentMessages, 8),
     maxTranscriptChars: positiveInteger(settings.maxTranscriptChars, 8000),
     maxDiffChars: positiveInteger(settings.maxDiffChars, 24000),
@@ -1878,7 +1891,11 @@ export function selectMutationReviewModel(
   currentModel: Model<Api> | undefined,
   fallbackThinkingLevel: ThinkingLevel = "off"
 ): ResolvedExtensionModel {
-  return resolveExtensionModel({
+  if (requested) assertSubagentRouteSpecAllowed(requested, "Mutation-review route");
+  if (!requested || !parseOptionalModelThinkingPair(requested)) {
+    assertSubagentThinkingLevelAllowed(fallbackThinkingLevel, "Mutation-review inherited thinking level");
+  }
+  const resolved = resolveExtensionModel({
     registry,
     requested,
     currentModel,
@@ -1886,6 +1903,8 @@ export function selectMutationReviewModel(
     label: "Mutation review",
     noModelMessage: "No mutation review model configured. Run /mutation:setup provider/model[:thinking]."
   });
+  assertChildAgentRouteAllowed(resolved.model, resolved.thinkingLevel, "Mutation-review route");
+  return resolved;
 }
 
 function omitMutationReviewExtension(result: LoadExtensionsResult): LoadExtensionsResult {

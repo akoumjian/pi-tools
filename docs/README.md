@@ -19,8 +19,7 @@ Index (extensions load in this order; see `package.json#pi.extensions`):
 13. [web-fetch](extensions/web-fetch.md) — `web_fetch_many` for safe HTTP(S) fetch + cache + readability extraction.
 14. [file-open](extensions/file-open.md) — `/file:open` picker for recent transcript file references.
 15. [theme-preview](extensions/theme-preview.md) — `/themes:preview` live theme showcase.
-16. [review-subagent](extensions/review-subagent.md) — `/review` tool-using review subagent workflow.
-17. [tool-display](extensions/tool-display.md) — opt-in display wrapper for `document_parse`.
+16. [tool-display](extensions/tool-display.md) — opt-in display wrapper for `document_parse`.
 
 ## Conventions used in these docs
 

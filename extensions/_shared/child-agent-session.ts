@@ -5,6 +5,7 @@ import {
   createAgentSessionServices,
   getAgentDir,
   SessionManager,
+  SettingsManager,
   type AgentSessionEvent,
   type ExtensionContext,
   type ExtensionError,
@@ -14,8 +15,21 @@ import {
   type ToolDefinition
 } from "@earendil-works/pi-coding-agent";
 import { throwIfAborted } from "./cancellation.js";
+import { assertChildAgentRouteAllowed } from "./model-spec.js";
 
 export type ChildAgentSession = Awaited<ReturnType<typeof createAgentSessionFromServices>>["session"];
+
+export type IsolatedChildSettings = {
+  compaction: { enabled: false };
+  retry: { enabled: false; maxRetries: 0; provider: { maxRetries: 0 } };
+};
+
+export function createIsolatedChildSettings(): IsolatedChildSettings {
+  return {
+    compaction: { enabled: false },
+    retry: { enabled: false, maxRetries: 0, provider: { maxRetries: 0 } }
+  };
+}
 
 export type ChildAgentSessionOptions = {
   cwd: string;
@@ -30,6 +44,8 @@ export type ChildAgentSessionOptions = {
   onError?: (error: ExtensionError) => void;
   onWarning?: (message: string) => void;
   onInteractiveDenial?: (method: string, title: string) => void;
+  /** Exact trusted system prompt plus in-memory settings and empty ambient resources. */
+  isolatedSystemPrompt?: string;
   signal?: AbortSignal;
 };
 
@@ -39,19 +55,44 @@ export async function withChildAgentSession<T>(
   run: (session: ChildAgentSession) => Promise<T>
 ): Promise<T> {
   throwIfAborted(options.signal);
+  assertChildAgentRouteAllowed(options.model, options.thinkingLevel);
   const tools = uniqueStrings(options.tools);
+  const isolatedSystemPrompt = options.isolatedSystemPrompt?.trim();
+  if (options.isolatedSystemPrompt !== undefined && !isolatedSystemPrompt) {
+    throw new Error("An isolated child session requires a non-empty trusted system prompt.");
+  }
+  if (isolatedSystemPrompt && options.systemPrompts?.length) {
+    throw new Error("An isolated child session cannot also append ambient system prompts.");
+  }
   const services = await createAgentSessionServices({
     cwd: options.cwd,
     agentDir: getAgentDir(),
+    settingsManager: isolatedSystemPrompt ? SettingsManager.inMemory(createIsolatedChildSettings()) : undefined,
     resourceLoaderOptions: {
-      appendSystemPromptOverride: options.systemPrompts?.length
-        ? (base) => [...base, ...options.systemPrompts!.filter((prompt) => prompt.trim()).map((prompt) => prompt.trim())]
-        : undefined,
+      ...(isolatedSystemPrompt ? {
+        noExtensions: true,
+        noSkills: true,
+        noPromptTemplates: true,
+        noThemes: true,
+        noContextFiles: true,
+        systemPrompt: isolatedSystemPrompt,
+        appendSystemPrompt: [],
+        skillsOverride: () => ({ skills: [], diagnostics: [] }),
+        promptsOverride: () => ({ prompts: [], diagnostics: [] }),
+        themesOverride: () => ({ themes: [], diagnostics: [] }),
+        agentsFilesOverride: () => ({ agentsFiles: [] }),
+        systemPromptOverride: () => isolatedSystemPrompt,
+        appendSystemPromptOverride: () => []
+      } : {
+        appendSystemPromptOverride: options.systemPrompts?.length
+          ? (base: string[]) => [...base, ...options.systemPrompts!.filter((prompt) => prompt.trim()).map((prompt) => prompt.trim())]
+          : undefined,
+        extensionsOverride: options.extensionsOverride
+      }),
       extensionFactories: [
         createChildToolAllowlistExtension(tools),
         ...(options.extensionFactories ?? [])
-      ],
-      extensionsOverride: options.extensionsOverride
+      ]
     }
   });
 

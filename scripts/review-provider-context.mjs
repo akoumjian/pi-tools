@@ -183,6 +183,13 @@ const resultContracts = {
     details: "internal bounded worker summaries and validated handoff/control outcomes",
     content: "worker/run/job/session/workspace/task/route state, full typed handoff JSON, errors, canonical result/log paths, and cleanup outcome"
   },
+  worker_review: {
+    success: "content reports the exact reviewed worker/run/candidate/HEAD/tree, reviewer route, bounded verdict, findings, and checks",
+    progress: "not applicable: one foreground exact-candidate review settles before return",
+    error: "active, cross-session, changed, dirty, nonfoldable, unparked, or invalid worker results fail visibly",
+    details: "internal exact candidate identity and reviewer execution metadata",
+    content: "exact reviewed identity, reviewer route/tool count, and bounded structured verdict/findings/checks without attestation or promotion authority"
+  },
   worker_fold_prepare: {
     success: "content reports prepared id/hash/status, every candidate-to-target expected/desired identity, immutable artifact, disposable view, and manifest path",
     progress: "not applicable: one deterministic bounded preparation settles before return",
