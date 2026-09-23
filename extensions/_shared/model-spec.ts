@@ -29,6 +29,7 @@ export type ParsedModelThinkingPair = {
 export type SubagentRoute = {
   provider: string;
   model: string;
+  modelName?: string;
   thinkingLevel: string;
 };
 
@@ -50,7 +51,7 @@ export function formatModelName(model: Pick<Model<Api>, "provider" | "id">): str
 export function assertSubagentRouteAllowed(route: SubagentRoute, label = "Subagent route"): void {
   const rendered = `${route.provider}/${route.model}:${route.thinkingLevel}`;
   assertSubagentThinkingLevelAllowed(route.thinkingLevel, `${label} ${rendered}`);
-  if (isClaudeFableModelReference(`${route.provider}/${route.model}`)) {
+  if (isClaudeFableModelReference(`${route.provider}/${route.model}`) || (route.modelName !== undefined && isClaudeFableModelReference(route.modelName))) {
     throw new Error(`${label} ${rendered} is not allowed: Claude Fable models cannot be used for subagents. Choose a non-Fable model.`);
   }
 }
@@ -73,11 +74,11 @@ export function assertSubagentRouteSpecAllowed(spec: string, label = "Subagent r
 }
 
 export function assertChildAgentRouteAllowed(
-  model: Pick<Model<Api>, "provider" | "id">,
+  model: Pick<Model<Api>, "provider" | "id" | "name">,
   thinkingLevel: ThinkingLevel,
   label = "Child-agent route"
 ): void {
-  assertSubagentRouteAllowed({ provider: model.provider, model: model.id, thinkingLevel }, label);
+  assertSubagentRouteAllowed({ provider: model.provider, model: model.id, modelName: model.name, thinkingLevel }, label);
 }
 
 /**
@@ -86,7 +87,7 @@ export function assertChildAgentRouteAllowed(
  * `claude-fablet`, `fable`, or `notclaude-fable`.
  */
 export function isClaudeFableModelReference(reference: string): boolean {
-  return /(?:^|[\/.:])claude[-_.]fable(?=$|[-_./:])/i.test(reference.trim());
+  return /(?:^|[\/.:])claude(?:[-_.]|\s)+fable(?=$|[-_./:\s])/i.test(reference.trim());
 }
 
 export function resolveExtensionModel(options: ResolveExtensionModelOptions): ResolvedExtensionModel {

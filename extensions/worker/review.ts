@@ -45,6 +45,7 @@ export type ManagedWorkerReviewAttemptOutcome =
   | "output_failed"
   | "confinement_failed"
   | "route_mismatch"
+  | "route_config_failed"
   | "precondition_failed"
   | "timed_out"
   | "cancelled"
@@ -78,8 +79,8 @@ export class ManagedWorkerReviewExecutionError extends Error {
   readonly attempts: ManagedWorkerReviewAttempt[];
   readonly outcome: ManagedWorkerReviewAttemptOutcome;
 
-  constructor(attempts: ManagedWorkerReviewAttempt[], outcome: ManagedWorkerReviewAttemptOutcome) {
-    super(`Managed-worker review failed (${outcome}). Ordered route outcomes: ${formatManagedWorkerReviewAttempts(attempts)}.`);
+  constructor(attempts: ManagedWorkerReviewAttempt[], outcome: ManagedWorkerReviewAttemptOutcome, trustedDetail?: string) {
+    super(`Managed-worker review failed (${outcome}). Ordered route outcomes: ${formatManagedWorkerReviewAttempts(attempts)}.${trustedDetail ? ` Trusted host detail: ${trustedDetail}` : ""}`);
     this.name = "ManagedWorkerReviewExecutionError";
     this.attempts = attempts.map((attempt) => ({ ...attempt }));
     this.outcome = outcome;
@@ -90,6 +91,18 @@ export function formatManagedWorkerReviewAttempts(attempts: readonly ManagedWork
   return attempts.length > 0
     ? attempts.map((attempt, index) => `${index + 1}. ${attempt.route} — ${attempt.outcome}`).join("; ")
     : "none";
+}
+
+export function managedWorkerReviewRouteConfigError(error: unknown): ManagedWorkerReviewExecutionError {
+  const raw = error instanceof Error ? error.message : String(error);
+  const sanitized = raw
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ")
+    .replace(/\bbearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(/\b(?:api[-_ ]?key|token|secret|password|authorization)\b\s*[:=]\s*\S+/gi, "[redacted]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 512) || "Review route configuration is invalid.";
+  return new ManagedWorkerReviewExecutionError([], "route_config_failed", sanitized);
 }
 
 export class ConfirmedAnthropicRateLimitError extends Error {
@@ -106,7 +119,11 @@ export async function runManagedWorkerReview(
   context: Pick<ExtensionContext, "modelRegistry" | "ui">,
   input: ManagedWorkerReviewInput
 ): Promise<ManagedWorkerReviewResult> {
-  assertChildAgentRouteAllowed(input.model, input.thinkingLevel, "Managed-worker review route");
+  try {
+    assertChildAgentRouteAllowed(input.model, input.thinkingLevel, "Managed-worker review route");
+  } catch (error) {
+    throw managedWorkerReviewRouteConfigError(error);
+  }
   const route = formatManagedWorkerReviewRoute(input);
   try {
     return await runManagedWorkerReviewAttempt(context, input, input.timeoutMs ?? MANAGED_WORKER_REVIEW_TIMEOUT_MS);
@@ -123,12 +140,16 @@ export async function runManagedWorkerReviewWithRateLimitFallback(
   context: Pick<ExtensionContext, "modelRegistry" | "ui">,
   input: ManagedWorkerReviewPlanInput
 ): Promise<ManagedWorkerReviewExecutionResult> {
-  assertChildAgentRouteAllowed(input.primaryRoute.model, input.primaryRoute.thinkingLevel, "Managed-worker review primary route");
-  if (input.rateLimitFallbackRoute) {
-    assertChildAgentRouteAllowed(input.rateLimitFallbackRoute.model, input.rateLimitFallbackRoute.thinkingLevel, "Managed-worker review rate-limit fallback route");
-  }
-  if (input.rateLimitFallbackRoute && input.rateLimitFallbackRoute.model.provider !== input.primaryRoute.model.provider) {
-    throw new Error("Managed-worker review rate-limit fallback must use the same provider as the primary route.");
+  try {
+    assertChildAgentRouteAllowed(input.primaryRoute.model, input.primaryRoute.thinkingLevel, "Managed-worker review primary route");
+    if (input.rateLimitFallbackRoute) {
+      assertChildAgentRouteAllowed(input.rateLimitFallbackRoute.model, input.rateLimitFallbackRoute.thinkingLevel, "Managed-worker review rate-limit fallback route");
+    }
+    if (input.rateLimitFallbackRoute && input.rateLimitFallbackRoute.model.provider !== input.primaryRoute.model.provider) {
+      throw new Error("Managed-worker review rate-limit fallback must use the same provider as the primary route.");
+    }
+  } catch (error) {
+    throw managedWorkerReviewRouteConfigError(error);
   }
   const scope = createAbortScope(input.signal, input.timeoutMs ?? MANAGED_WORKER_REVIEW_TIMEOUT_MS);
   const primaryRoute = formatManagedWorkerReviewRoute(input.primaryRoute);
@@ -242,9 +263,12 @@ async function runManagedWorkerReviewAttempt(
       await session.prompt(buildManagedWorkerReviewTask(input.evidence, input.focus), { source: "extension" });
       throwIfAborted(scope.signal);
       if (confinementFailure) throw new Error("Managed-worker review confinement blocked a forbidden tool request.");
-      const assistant = getFinalAssistant(session.messages);
-      if (!assistant) throw new Error("Managed-worker reviewer finished without an assistant response.");
-      assertExactManagedReviewResponseRoute(assistant, exactModel);
+      const assistants = session.messages.filter((message): message is AssistantMessage => {
+        return !!message && typeof message === "object" && (message as { role?: unknown }).role === "assistant";
+      });
+      if (assistants.length === 0) throw new Error("Managed-worker reviewer finished without an assistant response.");
+      for (const message of assistants) assertExactManagedReviewResponseRoute(message, exactModel);
+      const assistant = assistants.at(-1)!;
       if (assistant.stopReason === "error" || assistant.stopReason === "aborted") {
         const message = assistant.errorMessage ?? `Managed-worker reviewer stopped with ${assistant.stopReason}.`;
         if (assistant.stopReason === "error" && isConfirmedAnthropicRateLimitMessage(exactModel, message)) {
@@ -315,12 +339,12 @@ export function formatManagedWorkerReviewRoute(route: Pick<ManagedWorkerReviewRo
 
 export function buildManagedWorkerReviewTask(evidence: string, focus?: string): string {
   const nonce = randomUUID().replaceAll("-", "");
-  const candidateEnvelope = JSON.stringify({
+  const candidateEnvelope = serializeManagedReviewEnvelope({
     type: "untrusted_candidate_evidence",
     boundaryNonce: nonce,
     text: evidence
   });
-  const focusEnvelope = focus?.trim() ? JSON.stringify({
+  const focusEnvelope = focus?.trim() ? serializeManagedReviewEnvelope({
     type: "parent_authored_focus",
     boundaryNonce: nonce,
     text: focus.trim()
@@ -353,6 +377,13 @@ export function buildManagedWorkerReviewTask(evidence: string, focus?: string): 
   ].filter((part): part is string => part !== undefined).join("\n");
 }
 
+function serializeManagedReviewEnvelope(value: Record<string, string>): string {
+  return JSON.stringify(value)
+    .replace(/\u0085/g, "\\u0085")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
+}
+
 export function parseManagedWorkerReviewOutput(text: string): Pick<ManagedWorkerReviewResult, "verdict" | "findings" | "checks"> {
   const trimmed = text.trim();
   if (!trimmed) throw new Error("Managed-worker reviewer returned empty output.");
@@ -377,6 +408,13 @@ export function parseManagedWorkerReviewOutput(text: string): Pick<ManagedWorker
   };
 }
 
+class ManagedReviewConfinementViolation extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ManagedReviewConfinementViolation";
+  }
+}
+
 export function createConfinedManagedReviewToolsExtension(root: string, onViolation?: (reason: string) => void): ExtensionFactory {
   return (api) => {
     nativeToolsExtension(api);
@@ -386,7 +424,7 @@ export function createConfinedManagedReviewToolsExtension(root: string, onViolat
         return undefined;
       } catch (error) {
         const reason = `Managed-worker review confinement blocked ${event.toolName}: ${error instanceof Error ? error.message : String(error)}`;
-        onViolation?.(reason);
+        if (error instanceof ManagedReviewConfinementViolation) onViolation?.(reason);
         return {
           block: true,
           reason
@@ -423,12 +461,12 @@ export async function assertManagedReviewToolCallWithinRoot(root: string, event:
       if (item.kind === "content") nonEmptyString(item.pattern, "search_many content pattern");
       if (item.glob !== undefined) {
         const glob = nonEmptyString(item.glob, "search_many glob");
-        if (path.isAbsolute(glob) || glob.split(/[\\/]/).includes("..") || glob.includes("\0")) throw new Error("search_many glob must stay repository-relative.");
+        if (path.isAbsolute(glob) || glob.split(/[\\/]/).includes("..") || glob.includes("\0")) throw new ManagedReviewConfinementViolation("search_many glob must stay repository-relative.");
       }
       return item.path === undefined ? "." : nonEmptyString(item.path, "search_many path");
     });
   } else {
-    throw new Error(`tool ${event.toolName} is not permitted.`);
+    throw new ManagedReviewConfinementViolation(`tool ${event.toolName} is not permitted.`);
   }
   for (const rawPath of rawPaths) {
     const requested = resolveNativeToolPath(rootPath, rawPath);
@@ -450,12 +488,12 @@ function assertExactManagedReviewTools(names: string[]): void {
 
 function assertInsideOrEqual(candidate: string, root: string, message: string): void {
   const relative = path.relative(root, candidate);
-  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error(message);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new ManagedReviewConfinementViolation(message);
 }
 
 function assertNotGitAdminPath(candidate: string, root: string): void {
   const relative = path.relative(root, candidate);
-  if (relative.split(path.sep).includes(".git")) throw new Error("Git administrative paths are outside review evidence.");
+  if (relative.split(path.sep).includes(".git")) throw new ManagedReviewConfinementViolation("Git administrative paths are outside review evidence.");
 }
 
 function boundedArray(value: unknown, label: string): unknown[] {
@@ -477,12 +515,6 @@ function nonEmptyString(value: unknown, label: string): string {
   if (typeof value !== "string" || !value.trim()) throw new Error(`${label} must be a non-empty string.`);
   if (value.length > 4096 || value.includes("\0")) throw new Error(`${label} is malformed or too long.`);
   return value;
-}
-
-function getFinalAssistant(messages: readonly unknown[]): AssistantMessage | undefined {
-  return [...messages].reverse().find((message): message is AssistantMessage => {
-    return !!message && typeof message === "object" && (message as { role?: unknown }).role === "assistant";
-  });
 }
 
 function assistantText(message: AssistantMessage): string {

@@ -1963,8 +1963,10 @@ test("worker_review pre-fallback revalidation detects a stopped-container start/
       }),
       reviewWorker: async (_context, input) => {
         startedAt = "2026-09-10T19:25:00.000000000Z";
-        await assert.rejects(async () => { await input.beforeFallback!(new AbortController().signal); }, /stopped container identity changed/);
-        fallbackStarted = false;
+        await assert.rejects(async () => {
+          await input.beforeFallback!(new AbortController().signal);
+          fallbackStarted = true;
+        }, /stopped container identity changed/);
         startedAt = originalStartedAt;
         throw new ManagedWorkerReviewExecutionError(
           [{ route: "anthropic/opus:xhigh", outcome: "rate_limited" }],
@@ -1980,6 +1982,49 @@ test("worker_review pre-fallback revalidation detects a stopped-container start/
     } as never, undefined, undefined, parentContext(parentCwd, parentSessionFile)), /precondition_failed.*anthropic\/opus:xhigh — rate_limited/i);
     assert.equal(fallbackStarted, false);
     assert.equal(inspections, 3, "initial, before-fallback, and post-failure inspections all run");
+  });
+});
+
+test("worker_review pre-fallback revalidation requires the exact accepted handoff state", async () => {
+  await withTempDir(async (directory) => {
+    const parentCwd = path.join(directory, "parent");
+    const parentSessionFile = path.join(directory, "parent.jsonl");
+    await mkdir(parentCwd);
+    await writeFile(parentSessionFile, "parent\n");
+    const fixture = await provisionWorkerReviewFixture(directory, parentSessionFile, parentCwd);
+    const record = readWorkerRecord(fixture.paths.recordFile);
+    const resultFile = record.lastRun!.resultFile!;
+    const originalResult = await readFile(resultFile, "utf8");
+    const primaryModel = { ...fakeModel("opus"), provider: "anthropic" } as Model<Api>;
+    const fallbackModel = { ...fakeModel("secondary"), provider: "anthropic" } as Model<Api>;
+    const api = fakeApi();
+    registerWorkerExtension(api, {
+      roots: fixture.roots,
+      inspectContainer: () => stoppedContainerIdentity(fixture.container.containerId!),
+      resolveReviewRoutes: () => ({
+        primary: { model: primaryModel, thinkingLevel: "xhigh" },
+        rateLimitFallback: { model: fallbackModel, thinkingLevel: "xhigh" }
+      }),
+      reviewWorker: async (_context, input) => {
+        const parsed = JSON.parse(originalResult) as { handoff: Record<string, unknown> };
+        await writeFile(resultFile, `${JSON.stringify({ ...parsed, handoff: { ...parsed.handoff, state: "blocked" } })}\n`);
+        try {
+          await assert.rejects(async () => { await input.beforeFallback!(new AbortController().signal); }, /exact handoff or repository inventory changed/);
+        } finally {
+          await writeFile(resultFile, originalResult);
+        }
+        throw new ManagedWorkerReviewExecutionError(
+          [{ route: "anthropic/opus:xhigh", outcome: "rate_limited" }],
+          "precondition_failed"
+        );
+      }
+    });
+    const tool = api.tools.find((candidate) => candidate.name === "worker_review")!;
+    await assert.rejects(() => tool.execute!("fallback-handoff-state", {
+      workerId: fixture.workerId,
+      runId: fixture.runId,
+      workspaceRepo: "repos/project"
+    } as never, undefined, undefined, parentContext(parentCwd, parentSessionFile)), /precondition_failed.*anthropic\/opus:xhigh — rate_limited/i);
   });
 });
 
@@ -2090,7 +2135,7 @@ test("worker_review fails closed for inventory, repository, lifecycle, container
       reviewWorker: async () => { const error = new Error("review timed out"); error.name = "TimeoutError"; throw error; }
     });
     tool = api.tools.find((candidate) => candidate.name === "worker_review")!;
-    await assert.rejects(() => tool.execute!("review-timeout", input as never, undefined, undefined, context), /timed_out.*openai-codex\/gpt-test:xhigh — timed_out/i);
+    await assert.rejects(() => tool.execute!("review-timeout", input as never, undefined, undefined, context), /timed_out.*route outcomes: none/i);
     assert.equal(inspections, 2, "review failure still rechecks stopped container state");
     assert.deepEqual(await readFile(fixture.paths.recordFile), beforeFailure, "review failure must not mutate delivery or lifecycle state");
 
@@ -2099,11 +2144,16 @@ test("worker_review fails closed for inventory, repository, lifecycle, container
     registerWorkerExtension(api, {
       ...baseDependencies,
       inspectContainer: () => { inspections += 1; return stoppedContainerIdentity(fixture.container.containerId!); },
-      resolveReviewRoutes: () => { throw new Error("fallback model is not authenticated"); },
+      resolveReviewRoutes: () => { throw new Error("fallback model is not authenticated; Bearer sk-host-secret"); },
       reviewWorker: async () => { throw new Error("review should not start"); }
     });
     tool = api.tools.find((candidate) => candidate.name === "worker_review")!;
-    await assert.rejects(() => tool.execute!("review-route-failure", input as never, undefined, undefined, context), /precondition_failed.*route outcomes: none/i);
+    await assert.rejects(() => tool.execute!("review-route-failure", input as never, undefined, undefined, context), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /route_config_failed.*route outcomes: none.*fallback model is not authenticated/i);
+      assert.doesNotMatch(error.message, /sk-host-secret/);
+      return true;
+    });
     assert.equal(inspections, 2, "route validation failure still rechecks stopped container state");
   });
 });
