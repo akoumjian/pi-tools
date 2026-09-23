@@ -720,13 +720,13 @@ export function registerWorkerExtension(
   api.registerTool(defineTool({
     name: "worker_fold_promote",
     label: "Worker Fold Promote",
-    description: "Advance explicit local refs from one ready prepared fold with journaled exact compare-and-swap. Use only after the parent accepts the current prepared result and validation; retry the exact request for forward recovery. Do not use for review, testing, conflict resolution, rebasing, remote push, or release.",
-    promptSnippet: "Promote one accepted ready fold to explicit local refs with journaled exact CAS and forward recovery; never reviews, resolves, validates, or pushes.",
+    description: "Advance explicit local refs from one ready prepared fold with journaled exact compare-and-swap. Use only after parent review and validation; retry an exact partial/interrupted request for forward recovery, but stop on quarantine. Do not use for review, testing, conflict resolution, rebasing, remote push, or release.",
+    promptSnippet: "Promote one parent-accepted ready fold with durable exact local-ref CAS; retry partial state forward, stop and inspect quarantine, and never review, resolve, validate, or push.",
     promptGuidelines: [
-      "worker_fold_promote use: Call only with every exact repository identity returned by one ready worker_fold_prepare result after parent acceptance and validation; retry the identical request to recover an interrupted promotion.",
+      "worker_fold_promote use: Call only with every exact repository identity returned by one ready worker_fold_prepare result after parent review and validation. Retry the identical request for partial/interrupted forward recovery; a quarantined result is terminal and requires parent inspection plus fresh preparation from the accepted current state.",
       inputJsonSchemaGuideline("worker_fold_promote", WorkerFoldPromoteParams),
       outputJsonSchemaGuideline("worker_fold_promote", RetainedToolOutputSchemas.worker_fold_promote),
-      "worker_fold_promote constraints: Promotion is deterministic and model-free. It revalidates exact prepared/target identities, locks and preflights all targets, imports prepared objects, journals each transition, CAS-updates only explicit local refs, synchronizes eligible clean checked-out worktrees, reports partial state, and recovers forward or quarantines ambiguity. It never reviews, validates, resolves conflicts, rebases, fetches, pushes, publishes, closes tasks, or writes grounding. Only result content is provider-visible; details are internal, and thrown errors use the host's out-of-band error result."
+      "worker_fold_promote constraints: Promotion is deterministic and model-free. It revalidates exact prepared/target identities, locks and preflights all targets, imports prepared objects, journals each transition, CAS-updates only explicit local refs, synchronizes eligible clean checked-out worktrees, reports partial state, observes cancellation at safe pre-CAS boundaries, and recovers forward or quarantines ambiguity. It never reviews, validates, resolves conflicts, rebases, fetches, pushes, publishes, closes tasks, or writes grounding. Only result content is provider-visible; details are internal, and thrown errors use the host's out-of-band error result."
     ],
     parameters: WorkerFoldPromoteParams,
     renderCall(args, theme) { return renderWorkerFoldPromoteCall(args as WorkerFoldPromoteInput, theme); },
@@ -741,7 +741,7 @@ export function registerWorkerExtension(
         manifestSha256: params.manifestSha256,
         repositories: params.repositories.map((repository) => ({ ...repository }))
       };
-      const { summary } = dependencies.promoteFold({
+      const { summary } = await dependencies.promoteFold({
         request,
         parentSessionFile,
         foldsRoot: dependencies.foldsRoot,
@@ -2945,7 +2945,7 @@ function renderWorkerFoldPromoteResult(result: AgentToolResult<WorkerFoldPromoti
   const details = result.details;
   if (!details) return new Text(workerToolResult("promotion complete", "muted", theme), 0, 0);
   const lines = [workerToolResult(`${details.status} · ${shortWorkerId(details.promotionId)} · ${details.completedCount}/${details.repositoryCount} repositories`, details.status === "completed" ? "success" : details.status === "quarantined" ? "error" : "warning", theme)];
-  if (options.expanded) appendBoundedWorkerRows(lines, details.repositories.map((item) => `${shortWorkerId(item.candidateId)} · ${item.status} · ${truncateOneLine(item.targetRef, 80)}${item.error ? ` · ${truncateOneLine(item.error, 100)}` : ""}`));
+  if (options.expanded) appendBoundedWorkerRows(lines, [...(details.error ? [`error · ${truncateOneLine(details.error, 120)}`] : []), ...details.repositories.map((item) => `${shortWorkerId(item.candidateId)} · ${item.status} · ${truncateOneLine(item.targetRef, 80)}${item.error ? ` · ${truncateOneLine(item.error, 100)}` : ""}`)]);
   return new Text(lines.join("\n"), 0, 0);
 }
 
@@ -3246,10 +3246,11 @@ function formatWorkerFoldPromotionSummary(summary: WorkerFoldPromotionSummary): 
     `status: ${summary.status}`,
     `prepared_fold: ${summary.preparedId}`,
     `repositories: ${summary.completedCount}/${summary.repositoryCount} completed`,
-    ...summary.repositories.map((item) => `repository: ${item.candidateId} · ${item.status} · ${item.targetRepo}#${item.targetRef} · expected ${item.expectedCommit} · desired ${item.desiredCommit}${item.checkedOut ? " · worktree synchronized" : ""}${item.error ? ` · ${item.error}` : ""}`),
+    summary.error ? `error: ${summary.error}` : undefined,
+    ...summary.repositories.map((item) => `repository: ${item.candidateId} · ${item.status} · ${item.targetRepo}#${item.targetRef} · expected ${item.expectedCommit} · desired ${item.desiredCommit}${summary.status === "completed" && item.checkedOut && item.status === "completed" && !item.error ? " · worktree synchronized" : ""}${item.error ? ` · ${item.error}` : ""}`),
     `journal: ${summary.journalFile}`,
     `manifest_sha256: ${summary.manifestSha256}`
-  ].join("\n");
+  ].filter((line): line is string => line !== undefined).join("\n");
 }
 
 function formatRepositoryInventorySummary(summary: RepositoryInventorySummary | undefined): string[] {

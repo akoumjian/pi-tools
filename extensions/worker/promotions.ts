@@ -21,10 +21,13 @@ import {
   createGitRunner,
   gitBuffer,
   gitText,
+  repositoryChangedPaths,
   repositoryCommitParents,
+  repositoryIgnoredWorktreePaths,
   repositoryPolicyIssues,
   repositoryTreePolicyIssues,
   runGit,
+  withRepositoryBinaryPatch,
   type GitRunner
 } from "./repositories.js";
 import { readPreparedWorkerFold, type PreparedRepositoryFold, type PreparedWorkerFoldManifest } from "./folds.js";
@@ -38,6 +41,7 @@ const PREPARED_ID_PATTERN = /^prepared_[0-9a-f]{24}$/;
 const PROMOTION_ID_PATTERN = /^promotion_[0-9a-f]{24}$/;
 const CANDIDATE_ID_PATTERN = /^candidate_[0-9a-f]{24}$/;
 const TARGET_REF_PATTERN = /^refs\/heads\/[A-Za-z0-9][A-Za-z0-9._\/-]{0,239}$/;
+const DURABLE_GIT_CONFIG = ["-c", "core.fsync=objects,reference,index", "-c", "core.fsyncMethod=fsync"] as const;
 
 export type WorkerFoldPromotionSelection = {
   candidateId: string;
@@ -90,6 +94,7 @@ export type WorkerFoldPromotionSummary = {
   manifestSha256: string;
   repositoryCount: number;
   completedCount: number;
+  error?: string;
   repositories: Array<{
     candidateId: string;
     targetRepo: string;
@@ -115,6 +120,7 @@ export type PromotionTestHooks = {
   afterObjectsImported?(index: number, repository: PromotionRepositoryRecord): void;
   afterRefUpdated?(index: number, repository: PromotionRepositoryRecord): void;
   beforeWorktreeSync?(index: number, repository: PromotionRepositoryRecord): void;
+  afterWorktreeSynchronized?(index: number, repository: PromotionRepositoryRecord): void;
   afterRepositoryCompleted?(index: number, repository: PromotionRepositoryRecord): void;
 };
 
@@ -122,7 +128,7 @@ export function defaultWorkerPromotionsRoot(stateRoot: string): string {
   return path.join(path.dirname(path.resolve(stateRoot)), "worker-promotions");
 }
 
-export function promotePreparedWorkerFold(input: {
+export async function promotePreparedWorkerFold(input: {
   request: WorkerFoldPromotionRequest;
   parentSessionFile: string;
   foldsRoot: string;
@@ -132,7 +138,7 @@ export function promotePreparedWorkerFold(input: {
   gitPath?: string;
   signal?: AbortSignal;
   testHooks?: PromotionTestHooks;
-}): { journal: WorkerFoldPromotionJournal; summary: WorkerFoldPromotionSummary } {
+}): Promise<{ journal: WorkerFoldPromotionJournal; summary: WorkerFoldPromotionSummary }> {
   throwIfAborted(input.signal);
   const request = validatePromotionRequest(input.request);
   const manifest = readPreparedWorkerFold(input.foldsRoot, request.preparedId, input.parentSessionFile);
@@ -158,18 +164,6 @@ export function promotePreparedWorkerFold(input: {
       journal = readPromotionJournal(journalFile, request, input.parentSessionFile);
       validateJournalManifestBinding(journal, manifest, input.foldsRoot);
       if (journal.status === "quarantined") return { journal, summary: summarizePromotion(journal, journalFile) };
-      if (journal.status === "completed") {
-        for (let index = 0; index < journal.repositories.length; index += 1) {
-          try {
-            verifyCompletedRef(journal.repositories[index]!, runner, targetRoot);
-          } catch (error) {
-            const message = `Completed promotion no longer has its exact target identity/ref: ${boundError(error)}`;
-            markQuarantined(journal, journalFile, index, message, input.now);
-            return { journal, summary: summarizePromotion(journal, journalFile) };
-          }
-        }
-        return { journal, summary: summarizePromotion(journal, journalFile) };
-      }
     } else {
       const repositories = manifest.order.map((candidateId) => {
         const repository = manifest.repositories.find((item) => item.candidateId === candidateId)!;
@@ -198,26 +192,20 @@ export function promotePreparedWorkerFold(input: {
     }
 
     try {
+      preflightPersistedPromotion(journal, journalFile, runner, targetRoot, input.now);
+      if (journal.status === "completed" && journal.repositories.every((repository) => repository.status === "completed")) {
+        return { journal, summary: summarizePromotion(journal, journalFile) };
+      }
       for (let index = 0; index < journal.repositories.length; index += 1) {
         const repository = journal.repositories[index]!;
-        if (repository.status === "completed") {
-          try {
-            verifyCompletedRef(repository, runner, targetRoot);
-          } catch (error) {
-            quarantine(journal, journalFile, index, `Completed repository target identity/ref changed: ${boundError(error)}`, input.now);
-          }
-          continue;
-        }
-        if (repository.status === "quarantined") throw new Error(`Promotion repository is quarantined: ${repository.targetRepo}`);
-        throwIfAborted(input.signal);
+        if (repository.status === "completed") continue;
+        if (repository.status === "quarantined") quarantine(journal, journalFile, index, `Promotion repository is quarantined: ${repository.targetRepo}`, input.now);
+        await cancellationBoundary(input.signal);
         input.testHooks?.beforeRepository?.(index, { ...repository });
         try {
-          promoteOneRepository(journal, journalFile, index, runner, targetRoot, input.now, input.signal, input.testHooks);
+          await promoteOneRepository(journal, journalFile, index, runner, targetRoot, input.now, input.signal, input.testHooks);
         } catch (error) {
           if (error instanceof PromotionTestCrash) throw error;
-          if (repository.status === "ref_updated") {
-            quarantine(journal, journalFile, index, `Promotion became ambiguous after CAS: ${boundError(error)}`, input.now);
-          }
           repository.error ??= boundError(error);
           throw error;
         }
@@ -229,11 +217,13 @@ export function promotePreparedWorkerFold(input: {
       return { journal, summary: summarizePromotion(journal, journalFile) };
     } catch (error) {
       if (error instanceof PromotionTestCrash) throw error;
-      journal.status = journal.repositories.some((repository) => repository.status === "quarantined") ? "quarantined" : "partial";
-      journal.error = boundError(error);
-      journal.updatedAt = input.now().toISOString();
-      persistPromotionJournal(journalFile, journal);
-      if (input.signal?.aborted) {
+      if (journal.status !== "quarantined") {
+        journal.status = "partial";
+        journal.error = boundError(error);
+        journal.updatedAt = input.now().toISOString();
+        persistPromotionJournal(journalFile, journal);
+      }
+      if (input.signal?.aborted && journal.status !== "quarantined") {
         const completion = journal.repositories.filter((repository) => repository.status === "completed").length;
         throw new Error(`Worker fold promotion cancelled after ${completion}/${journal.repositories.length} repositories; recover with promotion ${journal.promotionId} at ${journalFile}.`);
       }
@@ -251,7 +241,52 @@ export function readWorkerFoldPromotion(promotionsRoot: string, promotionId: str
   return readPromotionJournalFile(file);
 }
 
-function promoteOneRepository(
+function preflightPersistedPromotion(
+  journal: WorkerFoldPromotionJournal,
+  journalFile: string,
+  runner: GitRunner,
+  targetRoot: string,
+  now: () => Date
+): void {
+  for (let index = 0; index < journal.repositories.length; index += 1) {
+    const repository = journal.repositories[index]!;
+    if (repository.status === "completed") {
+      try {
+        validateStableRepository(repository, runner, targetRoot);
+        verifyCompletedRepository(repository, runner, targetRoot);
+      } catch (error) {
+        quarantinePreservingCompletion(journal, journalFile, index, `Completed repository changed after durable completion: ${boundError(error)}`, now);
+      }
+      continue;
+    }
+    validateOrQuarantineStableRepository(journal, journalFile, index, runner, targetRoot, now);
+    const current = targetRefCommit(repository, runner);
+    if (repository.status === "pending") {
+      if (current !== repository.expectedCommit) quarantine(journal, journalFile, index, `Pending promotion target ref moved independently: ${repository.targetRef}`, now);
+      assertRepositoryPreCasClean(repository, runner);
+      continue;
+    }
+    if (repository.status === "objects_imported") {
+      if (current === repository.expectedCommit) {
+        if (repository.checkedOut && checkedOutWorktreeState(repository, runner) !== "expected") {
+          quarantine(journal, journalFile, index, "Objects-imported crash window has expected ref but non-expected worktree state.", now);
+        }
+        assertRepositoryPreCasClean(repository, runner);
+      } else if (current === repository.desiredCommit) {
+        assertRecoverablePostCasState(journal, journalFile, index, runner, now);
+      } else {
+        quarantine(journal, journalFile, index, `Target ref is ambiguous in the objects-imported crash window: ${repository.targetRef}`, now);
+      }
+      continue;
+    }
+    if (repository.status === "ref_updated") {
+      if (current !== repository.desiredCommit) quarantine(journal, journalFile, index, `Target ref moved after promotion CAS: ${repository.targetRef}`, now);
+      assertRecoverablePostCasState(journal, journalFile, index, runner, now);
+    }
+  }
+}
+
+async function promoteOneRepository(
   journal: WorkerFoldPromotionJournal,
   journalFile: string,
   index: number,
@@ -260,64 +295,135 @@ function promoteOneRepository(
   now: () => Date,
   signal?: AbortSignal,
   hooks?: PromotionTestHooks
-): void {
+): Promise<void> {
   const repository = journal.repositories[index]!;
-  const targetRepo = validateTargetIdentity(repository, runner, targetRoot);
-  assertRepositoryPolicy(repository, runner);
-  assertWorktreeTopology(repository, runner);
+  const targetRepo = validateOrQuarantineStableRepository(journal, journalFile, index, runner, targetRoot, now);
   let current = targetRefCommit(repository, runner);
   if (current !== repository.expectedCommit && current !== repository.desiredCommit) {
-    if (repository.status === "ref_updated" || repository.status === "objects_imported") quarantine(journal, journalFile, index, `Target ref is ambiguous after promotion progress: ${repository.targetRef}`, now);
-    repository.error = `Target ref moved before promotion: expected ${repository.expectedCommit}, found ${current}`;
-    throw new Error(repository.error);
+    quarantine(journal, journalFile, index, `Target ref moved independently during promotion: ${repository.targetRef}`, now);
   }
 
   if (current === repository.expectedCommit) {
     if (repository.status === "ref_updated") quarantine(journal, journalFile, index, "Promotion journal says ref_updated but target ref returned to expected.", now);
+    if (repository.status === "objects_imported" && repository.checkedOut && checkedOutWorktreeState(repository, runner) !== "expected") {
+      quarantine(journal, journalFile, index, "Objects-imported state changed before a recoverable CAS.", now);
+    }
     assertRepositoryPreCasClean(repository, runner);
     importAndVerifyObjects(repository, runner);
+    if (repository.checkedOut) assertNoIgnoredWorktreeCollisions(repository, runner);
     repository.status = "objects_imported";
     repository.error = undefined;
     journal.updatedAt = now().toISOString();
     persistPromotionJournal(journalFile, journal);
     hooks?.afterObjectsImported?.(index, { ...repository });
-    throwIfAborted(signal);
-    assertRepositoryPolicy(repository, runner);
+    await cancellationBoundary(signal);
+    validateOrQuarantineStableRepository(journal, journalFile, index, runner, targetRoot, now);
     assertRepositoryPreCasClean(repository, runner);
-    gitBuffer(runner, targetRepo, ["update-ref", repository.targetRef, repository.desiredCommit, repository.expectedCommit]);
+    durableGitBuffer(runner, targetRepo, ["update-ref", "--no-deref", repository.targetRef, repository.desiredCommit, repository.expectedCommit]);
     current = targetRefCommit(repository, runner);
-    if (current !== repository.desiredCommit) throw new Error(`Target ref CAS did not install the desired commit: ${repository.targetRef}`);
+    if (current !== repository.desiredCommit) quarantine(journal, journalFile, index, `Target ref CAS did not install the desired commit: ${repository.targetRef}`, now);
     hooks?.afterRefUpdated?.(index, { ...repository });
     repository.status = "ref_updated";
     journal.updatedAt = now().toISOString();
     persistPromotionJournal(journalFile, journal);
   } else {
+    if (repository.status === "pending") quarantine(journal, journalFile, index, `Pending target moved independently to the desired ref: ${repository.targetRef}`, now);
     importAndVerifyObjects(repository, runner);
-    if (repository.status === "pending" || repository.status === "objects_imported") {
+    if (repository.status === "objects_imported") {
       repository.status = "ref_updated";
       journal.updatedAt = now().toISOString();
       persistPromotionJournal(journalFile, journal);
     }
   }
 
-  if (repository.checkedOut) {
-    const state = checkedOutWorktreeState(repository, runner);
-    if (state === "expected") {
-      hooks?.beforeWorktreeSync?.(index, { ...repository });
-      if (checkedOutWorktreeState(repository, runner) !== "expected") {
-        quarantine(journal, journalFile, index, "Checked-out target changed before worktree synchronization.", now);
-      }
-      gitBuffer(runner, targetRepo, ["reset", "--hard", repository.desiredCommit]);
-    } else if (state !== "desired") {
-      quarantine(journal, journalFile, index, "Checked-out target worktree/index is neither the exact expected nor desired state.", now);
-    }
-  }
+  synchronizeCheckedOutWorktree(journal, journalFile, index, runner, targetRoot, now, hooks);
   verifyCompletedRepository(repository, runner, targetRoot);
   repository.status = "completed";
   repository.error = undefined;
   journal.updatedAt = now().toISOString();
   persistPromotionJournal(journalFile, journal);
   hooks?.afterRepositoryCompleted?.(index, { ...repository });
+}
+
+function synchronizeCheckedOutWorktree(
+  journal: WorkerFoldPromotionJournal,
+  journalFile: string,
+  index: number,
+  runner: GitRunner,
+  targetRoot: string,
+  now: () => Date,
+  hooks?: PromotionTestHooks
+): void {
+  const repository = journal.repositories[index]!;
+  if (!repository.checkedOut) return;
+  let state = checkedOutWorktreeState(repository, runner);
+  if (state === "desired") return;
+  if (state !== "expected") quarantine(journal, journalFile, index, "Checked-out target is neither the exact expected nor desired state after CAS.", now);
+  assertNoIgnoredWorktreeCollisions(repository, runner);
+  hooks?.beforeWorktreeSync?.(index, { ...repository });
+  validateOrQuarantineStableRepository(journal, journalFile, index, runner, targetRoot, now);
+  if (targetRefCommit(repository, runner) !== repository.desiredCommit) quarantine(journal, journalFile, index, "Target ref changed before worktree synchronization.", now);
+  state = checkedOutWorktreeState(repository, runner);
+  if (state !== "expected") quarantine(journal, journalFile, index, "Checked-out target changed before worktree synchronization.", now);
+  assertNoIgnoredWorktreeCollisions(repository, runner);
+  try {
+    withRepositoryBinaryPatch(repository.targetRepo, repository.expectedCommit, repository.desiredCommit, runner, (patchFile, size) => {
+      if (size > 0) durableGitBuffer(runner, repository.targetRepo, ["apply", "--index", "--whitespace=nowarn", patchFile]);
+    });
+  } catch (error) {
+    const current = targetRefCommit(repository, runner);
+    const after = checkedOutWorktreeState(repository, runner);
+    if (current !== repository.desiredCommit || (after !== "expected" && after !== "desired")) {
+      quarantine(journal, journalFile, index, `Worktree synchronization failed with ambiguous state: ${boundError(error)}`, now);
+    }
+    throw error;
+  }
+  hooks?.afterWorktreeSynchronized?.(index, { ...repository });
+  validateOrQuarantineStableRepository(journal, journalFile, index, runner, targetRoot, now);
+  if (targetRefCommit(repository, runner) !== repository.desiredCommit || checkedOutWorktreeState(repository, runner) !== "desired") {
+    quarantine(journal, journalFile, index, "Worktree synchronization did not produce the exact desired state.", now);
+  }
+}
+
+function validateOrQuarantineStableRepository(
+  journal: WorkerFoldPromotionJournal,
+  journalFile: string,
+  index: number,
+  runner: GitRunner,
+  targetRoot: string,
+  now: () => Date
+): string {
+  try {
+    return validateStableRepository(journal.repositories[index]!, runner, targetRoot);
+  } catch (error) {
+    quarantine(journal, journalFile, index, `Promotion target identity, policy, ref kind, or topology changed: ${boundError(error)}`, now);
+  }
+}
+
+function validateStableRepository(repository: PromotionRepositoryRecord, runner: GitRunner, targetRoot: string): string {
+  const targetRepo = validateTargetIdentity(repository, runner, targetRoot);
+  assertRepositoryPolicy(repository, runner);
+  assertDirectTargetRef(repository, runner);
+  assertNoRepositoryOperation(targetRepo);
+  assertWorktreeTopology(repository, runner);
+  return targetRepo;
+}
+
+function assertRecoverablePostCasState(
+  journal: WorkerFoldPromotionJournal,
+  journalFile: string,
+  index: number,
+  runner: GitRunner,
+  now: () => Date
+): void {
+  const repository = journal.repositories[index]!;
+  if (repository.checkedOut) {
+    const state = checkedOutWorktreeState(repository, runner);
+    if (state !== "expected" && state !== "desired") quarantine(journal, journalFile, index, "Post-CAS checked-out worktree state is ambiguous.", now);
+    if (state === "expected") assertNoIgnoredWorktreeCollisions(repository, runner);
+  } else if (!repositoryStatusClean(repository.targetRepo, runner)) {
+    throw new Error(`Post-CAS detached target worktree is dirty: ${repository.targetRepo}`);
+  }
 }
 
 function preflightNewRepository(
@@ -347,6 +453,8 @@ function preflightNewRepository(
   const targetRepo = validateTargetIdentity(record, runner, targetRoot);
   if (targetRefCommit(record, runner) !== record.expectedCommit) throw new Error(`Target ref moved before promotion: ${record.targetRef}`);
   assertRepositoryPolicy(record, runner);
+  assertDirectTargetRef(record, runner);
+  assertNoRepositoryOperation(targetRepo);
   record.checkedOut = targetRefCheckedOutHere(record, runner);
   if (!repositoryStatusClean(targetRepo, runner)) throw new Error(`Target repository is dirty before promotion: ${targetRepo}`);
   if (record.checkedOut && checkedOutWorktreeState(record, runner) !== "expected") throw new Error(`Checked-out target is not at its exact expected state: ${targetRepo}`);
@@ -429,6 +537,18 @@ function validateTargetIdentity(repository: PromotionRepositoryRecord, runner: G
   return targetRepo;
 }
 
+function assertDirectTargetRef(repository: PromotionRepositoryRecord, runner: GitRunner): void {
+  const symbolic = runGit(runner, repository.targetRepo, ["symbolic-ref", "-q", repository.targetRef], { allowedStatuses: [0, 1] });
+  if (symbolic.status === 0) throw new Error(`Promotion target ref is symbolic: ${repository.targetRef}`);
+}
+
+function assertNoRepositoryOperation(targetRepo: string): void {
+  const gitDirectory = path.join(targetRepo, ".git");
+  for (const marker of ["rebase-apply", "rebase-merge", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG", "BISECT_START"]) {
+    if (existsSync(path.join(gitDirectory, marker))) throw new Error(`Promotion target has an in-progress Git operation: ${marker}`);
+  }
+}
+
 function targetRefCommit(repository: PromotionRepositoryRecord, runner: GitRunner): string {
   const current = gitText(runner, repository.targetRepo, ["show-ref", "--verify", "--hash", repository.targetRef]).trim();
   if (!OID_PATTERN.test(current)) throw new Error(`Promotion target ref is not an exact commit: ${repository.targetRef}`);
@@ -495,7 +615,29 @@ function checkedOutWorktreeState(repository: PromotionRepositoryRecord, runner: 
   return "other";
 }
 
+function assertNoIgnoredWorktreeCollisions(repository: PromotionRepositoryRecord, runner: GitRunner): void {
+  const changed = new Set(repositoryChangedPaths(repository.targetRepo, repository.expectedCommit, repository.desiredCommit, runner));
+  const ignored = new Set(repositoryIgnoredWorktreePaths(repository.targetRepo, runner));
+  for (const ignoredPath of ignored) {
+    if (changed.has(ignoredPath) || pathHasAncestorIn(ignoredPath, changed)) throw new Error(`Ignored worktree path collides with promotion: ${ignoredPath}`);
+  }
+  for (const changedPath of changed) {
+    if (pathHasAncestorIn(changedPath, ignored)) throw new Error(`Ignored worktree path collides with promotion: ${changedPath}`);
+  }
+}
+
+function pathHasAncestorIn(repositoryPath: string, candidates: ReadonlySet<string>): boolean {
+  let separator = repositoryPath.lastIndexOf("/");
+  while (separator > 0) {
+    if (candidates.has(repositoryPath.slice(0, separator))) return true;
+    separator = repositoryPath.lastIndexOf("/", separator - 1);
+  }
+  return false;
+}
+
 function assertRepositoryPreCasClean(repository: PromotionRepositoryRecord, runner: GitRunner): void {
+  assertDirectTargetRef(repository, runner);
+  assertNoRepositoryOperation(repository.targetRepo);
   assertWorktreeTopology(repository, runner);
   if (targetRefCommit(repository, runner) !== repository.expectedCommit) throw new Error(`Promotion target ref moved before CAS: ${repository.targetRef}`);
   if (repository.checkedOut) {
@@ -506,7 +648,7 @@ function assertRepositoryPreCasClean(repository: PromotionRepositoryRecord, runn
 }
 
 function importAndVerifyObjects(repository: PromotionRepositoryRecord, runner: GitRunner): void {
-  gitBuffer(runner, repository.targetRepo, ["bundle", "unbundle", repository.artifactFile]);
+  durableGitBuffer(runner, repository.targetRepo, ["bundle", "unbundle", repository.artifactFile]);
   gitBuffer(runner, repository.targetRepo, ["cat-file", "-e", `${repository.desiredCommit}^{commit}`]);
   const desiredTree = gitText(runner, repository.targetRepo, ["rev-parse", `${repository.desiredCommit}^{tree}`]).trim();
   if (desiredTree !== repository.desiredTree) throw new Error(`Imported promotion desired tree mismatch: ${repository.targetRepo}`);
@@ -519,6 +661,8 @@ function importAndVerifyObjects(repository: PromotionRepositoryRecord, runner: G
 
 function verifyCompletedRef(repository: PromotionRepositoryRecord, runner: GitRunner, targetRoot: string): void {
   validateTargetIdentity(repository, runner, targetRoot);
+  assertDirectTargetRef(repository, runner);
+  assertNoRepositoryOperation(repository.targetRepo);
   if (targetRefCommit(repository, runner) !== repository.desiredCommit) throw new Error(`Completed promotion target ref no longer matches desired commit: ${repository.targetRef}`);
 }
 
@@ -532,6 +676,16 @@ function verifyCompletedRepository(repository: PromotionRepositoryRecord, runner
   }
 }
 
+
+function quarantinePreservingCompletion(journal: WorkerFoldPromotionJournal, journalFile: string, index: number, message: string, now: () => Date): never {
+  const repository = journal.repositories[index]!;
+  repository.error = message;
+  journal.status = "quarantined";
+  journal.error = message;
+  journal.updatedAt = now().toISOString();
+  persistPromotionJournal(journalFile, journal);
+  throw new Error(message);
+}
 
 function markQuarantined(journal: WorkerFoldPromotionJournal, journalFile: string, index: number, message: string, now: () => Date): void {
   const repository = journal.repositories[index]!;
@@ -633,8 +787,9 @@ function isPromotionJournal(value: unknown): value is WorkerFoldPromotionJournal
     ) return false;
     candidateIds.add(repository.candidateId);
   }
-  if (journal.status === "completed" && journal.repositories.some((repository) => repository.status !== "completed")) return false;
-  if (journal.status === "quarantined" && journal.repositories.every((repository) => repository.status !== "quarantined")) return false;
+  if (journal.status === "completed" && (journal.error !== undefined || journal.repositories.some((repository) => repository.status !== "completed" || repository.error !== undefined))) return false;
+  if (journal.status !== "quarantined" && journal.repositories.some((repository) => repository.status === "quarantined")) return false;
+  if (journal.status === "quarantined" && (journal.error === undefined || journal.repositories.every((repository) => repository.status !== "quarantined" && repository.error === undefined))) return false;
   return true;
 }
 
@@ -655,6 +810,7 @@ function summarizePromotion(journal: WorkerFoldPromotionJournal, journalFile: st
     manifestSha256: journal.manifestSha256,
     repositoryCount: journal.repositories.length,
     completedCount: journal.repositories.filter((repository) => repository.status === "completed").length,
+    ...(journal.error === undefined ? {} : { error: journal.error }),
     repositories: journal.repositories.map(({ candidateId, targetRepo, targetRef, expectedCommit, desiredCommit, checkedOut, status, error }) => ({
       candidateId,
       targetRepo,
@@ -702,6 +858,15 @@ function fsyncPath(file: string): void {
 function fsyncDirectory(directory: string): void {
   const descriptor = openSync(directory, "r");
   try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
+}
+
+function durableGitBuffer(runner: GitRunner, cwd: string, args: string[]): Buffer {
+  return gitBuffer(runner, cwd, [...DURABLE_GIT_CONFIG, ...args]);
+}
+
+async function cancellationBoundary(signal: AbortSignal | undefined): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  throwIfAborted(signal);
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

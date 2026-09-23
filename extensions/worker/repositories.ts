@@ -28,6 +28,9 @@ const MAX_SCAN_ENTRIES = 20_000;
 const MAX_SCAN_DEPTH = 12;
 const MAX_GIT_OUTPUT_BYTES = 1024 * 1024;
 const MAX_TREE_LISTING_BYTES = 64 * 1024 * 1024;
+const MAX_WORKTREE_PATCH_BYTES = 512 * 1024 * 1024;
+const MAX_PATH_LISTING_ENTRIES = 200_000;
+const MAX_REPOSITORY_PATH_BYTES = 4096;
 const MAX_COMMIT_OBJECT_BYTES = 64 * 1024 * 1024;
 const MAX_PATH_BYTES = 1024;
 const OID_PATTERN = /^[0-9a-f]{40,64}$/;
@@ -454,6 +457,78 @@ export function repositoryDirty(repoPath: string, runner: GitRunner): boolean {
   return trackedStatus.byteLength > 0 || untrackedStatus.byteLength > 0;
 }
 
+export function repositoryChangedPaths(repoPath: string, expectedCommit: string, desiredCommit: string, runner: GitRunner): string[] {
+  if (!OID_PATTERN.test(expectedCommit) || !OID_PATTERN.test(desiredCommit)) throw new Error("invalid_changed_path_commits");
+  return withBoundedRepositoryGitOutput(
+    runner,
+    repoPath,
+    ["diff", "--no-ext-diff", "--name-only", "--no-renames", "-z", expectedCommit, desiredCommit, "--"],
+    MAX_TREE_LISTING_BYTES,
+    "changed_paths",
+    (descriptor, size) => parseBoundedNulPathOutput(descriptor, size, "changed_paths")
+  );
+}
+
+export function repositoryIgnoredWorktreePaths(repoPath: string, runner: GitRunner): string[] {
+  return withBoundedRepositoryGitOutput(
+    runner,
+    repoPath,
+    ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+    MAX_TREE_LISTING_BYTES,
+    "ignored_paths",
+    (descriptor, size) => parseBoundedNulPathOutput(descriptor, size, "ignored_paths")
+  );
+}
+
+export function withRepositoryBinaryPatch<T>(
+  repoPath: string,
+  expectedCommit: string,
+  desiredCommit: string,
+  runner: GitRunner,
+  consume: (patchFile: string, size: number) => T
+): T {
+  if (!OID_PATTERN.test(expectedCommit) || !OID_PATTERN.test(desiredCommit)) throw new Error("invalid_patch_commit");
+  return withBoundedRepositoryGitOutput(
+    runner,
+    repoPath,
+    ["diff", "--binary", "--full-index", "--no-ext-diff", "--no-renames", expectedCommit, desiredCommit, "--"],
+    MAX_WORKTREE_PATCH_BYTES,
+    "worktree_patch",
+    (_descriptor, size, outputFile) => consume(outputFile, size),
+    120_000
+  );
+}
+
+function parseBoundedNulPathOutput(descriptor: number, size: number, label: string): string[] {
+  const paths: string[] = [];
+  const buffer = Buffer.alloc(64 * 1024);
+  let remainder = Buffer.alloc(0);
+  let position = 0;
+  while (position < size) {
+    const count = readSync(descriptor, buffer, 0, Math.min(buffer.byteLength, size - position), position);
+    if (count <= 0) throw new Error(`${label}_short_read`);
+    const chunk = remainder.byteLength > 0 ? Buffer.concat([remainder, buffer.subarray(0, count)]) : buffer.subarray(0, count);
+    let start = 0;
+    for (let index = 0; index < chunk.byteLength; index += 1) {
+      if (chunk[index] !== 0) continue;
+      const raw = chunk.subarray(start, index);
+      if (raw.byteLength < 1 || raw.byteLength > MAX_REPOSITORY_PATH_BYTES || paths.length >= MAX_PATH_LISTING_ENTRIES) throw new Error(`${label}_entry_limit`);
+      let repositoryPath: string;
+      try { repositoryPath = new TextDecoder("utf-8", { fatal: true }).decode(raw); }
+      catch { throw new Error(`${label}_not_utf8`); }
+      const normalizedPath = repositoryPath.endsWith("/") ? repositoryPath.slice(0, -1) : repositoryPath;
+      if (!normalizedPath || path.posix.isAbsolute(normalizedPath) || normalizedPath.split("/").some((part) => part === "" || part === "." || part === "..")) throw new Error(`${label}_invalid_path`);
+      paths.push(normalizedPath);
+      start = index + 1;
+    }
+    remainder = Buffer.from(chunk.subarray(start));
+    if (remainder.byteLength > MAX_REPOSITORY_PATH_BYTES) throw new Error(`${label}_entry_limit`);
+    position += count;
+  }
+  if (remainder.byteLength > 0) throw new Error(`${label}_malformed_output`);
+  return paths;
+}
+
 export function repositoryTreePolicyIssues(repoPath: string, commit: string, runner: GitRunner): string[] {
   if (!OID_PATTERN.test(commit)) return ["invalid_tree_commit"];
   try {
@@ -779,7 +854,8 @@ function withBoundedRepositoryGitOutput<T>(
   args: readonly string[],
   maxBytes: number,
   label: string,
-  consume: (descriptor: number, size: number) => T
+  consume: (descriptor: number, size: number, outputFile: string) => T,
+  timeoutMs = 10_000
 ): T {
   const outputFile = path.join(String(runner.env.HOME), `${label}-${randomUUID()}.bin`);
   const output = openSync(outputFile, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
@@ -789,7 +865,7 @@ function withBoundedRepositoryGitOutput<T>(
       env: { ...runner.env, GIT_CEILING_DIRECTORIES: cwd },
       shell: false,
       stdio: ["ignore", output, "pipe"],
-      timeout: 10_000,
+      timeout: timeoutMs,
       killSignal: "SIGKILL",
       maxBuffer: MAX_GIT_OUTPUT_BYTES
     });
@@ -801,7 +877,7 @@ function withBoundedRepositoryGitOutput<T>(
     if (before.size > maxBytes) throw new Error(`${label}_output_limit`);
     let value: T | undefined;
     let consumeError: unknown;
-    try { value = consume(output, before.size); } catch (error) { consumeError = error; }
+    try { value = consume(output, before.size, outputFile); } catch (error) { consumeError = error; }
     const after = fstatSync(output);
     if (after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size || after.mode !== before.mode || after.nlink !== before.nlink || after.uid !== before.uid || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) throw new Error(`${label}_output_changed`);
     if (consumeError) throw consumeError;

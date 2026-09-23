@@ -2197,6 +2197,7 @@ test("worker_fold_promote forwards exact parent authorization and returns strict
       manifestSha256: "b".repeat(64),
       repositoryCount: 1,
       completedCount: 0,
+      error: "target changed before CAS",
       repositories: [{ ...params.repositories[0]!, checkedOut: true, status: "objects_imported" as const, error: "target changed before CAS" }]
     };
     const api = fakeApi();
@@ -2215,6 +2216,8 @@ test("worker_fold_promote forwards exact parent authorization and returns strict
     assert.equal(captured?.parentSessionFile, parentSessionFile);
     assert.equal(Check(RetainedToolOutputSchemas.worker_fold_promote, result), true);
     assert.match(JSON.stringify(result.content), /0\/1 completed/);
+    assert.match(JSON.stringify(result.content), /target changed before CAS/);
+    assert.doesNotMatch(JSON.stringify(result.content), /worktree synchronized/);
     assert.match(renderWorkerToolCall(tool, params), /Worker Promote\(1 repository\)/);
     assert.match(renderWorkerToolResult(tool, result), /partial · promotion_…ccccccc · 0\/1 repositories/);
   });
