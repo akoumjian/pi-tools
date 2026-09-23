@@ -30,6 +30,7 @@ export type ChildAgentSessionOptions = {
   onError?: (error: ExtensionError) => void;
   onWarning?: (message: string) => void;
   onInteractiveDenial?: (method: string, title: string) => void;
+  isolateWorkspaceResources?: boolean;
   signal?: AbortSignal;
 };
 
@@ -44,6 +45,13 @@ export async function withChildAgentSession<T>(
     cwd: options.cwd,
     agentDir: getAgentDir(),
     resourceLoaderOptions: {
+      ...(options.isolateWorkspaceResources ? {
+        noExtensions: true,
+        noSkills: true,
+        noPromptTemplates: true,
+        noThemes: true,
+        noContextFiles: true
+      } : {}),
       appendSystemPromptOverride: options.systemPrompts?.length
         ? (base) => [...base, ...options.systemPrompts!.filter((prompt) => prompt.trim()).map((prompt) => prompt.trim())]
         : undefined,

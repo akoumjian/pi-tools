@@ -32,6 +32,7 @@ import {
   provisionWorkerPaths,
   readWorkerRecord,
   releaseWorkerLease,
+  releaseWorkerOperationLock,
   workerPaths,
   writeWorkerRecord,
   type WorkerRecord
@@ -171,6 +172,114 @@ function gitFixture(cwd: string, ...args: string[]): string {
       GIT_COMMITTER_EMAIL: "worker@example.invalid"
     }
   }).trim();
+}
+
+type WorkerReviewFixture = {
+  roots: { stateRoot: string; workspaceRoot: string };
+  paths: ReturnType<typeof workerPaths>;
+  workerId: string;
+  runId: string;
+  repository: string;
+  resultFile: string;
+  headCommit: string;
+  headTree: string;
+  container: WorkerContainerReference;
+};
+
+async function provisionWorkerReviewFixture(directory: string, parentSessionFile: string, parentCwd: string): Promise<WorkerReviewFixture> {
+  const roots = { stateRoot: path.join(directory, "workers"), workspaceRoot: path.join(directory, "workspaces") };
+  const workerId = "worker_20260910190000_review01";
+  const runId = "run_20260910193000_review01";
+  const paths = workerPaths(roots, workerId);
+  provisionWorkerPaths(paths);
+  const repository = path.join(paths.workspaceRoot, "repos", "project");
+  await mkdir(repository, { recursive: true });
+  gitFixture(repository, "init", "-q");
+  await writeFile(path.join(repository, "value.txt"), "base\n");
+  gitFixture(repository, "add", "value.txt");
+  gitFixture(repository, "commit", "-q", "-m", "base");
+  const baseCommit = gitFixture(repository, "rev-parse", "HEAD");
+  const baseTree = gitFixture(repository, "rev-parse", "HEAD^{tree}");
+  await writeFile(path.join(repository, "value.txt"), "review me\n");
+  gitFixture(repository, "add", "value.txt");
+  gitFixture(repository, "commit", "-q", "-m", "candidate");
+  const headCommit = gitFixture(repository, "rev-parse", "HEAD");
+  const headTree = gitFixture(repository, "rev-parse", "HEAD^{tree}");
+  const runDir = path.join(paths.stateDir, "runs", runId);
+  await mkdir(runDir, { recursive: true });
+  const resultFile = path.join(runDir, "result.json");
+  await writeFile(resultFile, `${JSON.stringify({
+    version: 1,
+    workerId,
+    runId,
+    acceptedAt: "2026-09-10T19:31:00.000Z",
+    handoff: {
+      state: "ready_for_review",
+      summary: "implemented exact review target",
+      taskUpdates: [{ taskId: "personal-review", update: "ready" }],
+      repositories: [{ workspaceRepo: "repos/project", purpose: "review target" }],
+      checks: [{ cwd: repository, command: "npm test", outcome: "passed" }]
+    }
+  })}\n`);
+  const repositoryInventory = persistRepositoryInventory(path.join(runDir, "repository-candidates.json"), {
+    version: 2,
+    workerId,
+    runId,
+    workspaceRoot: paths.workspaceRoot,
+    generatedAt: "2026-09-10T19:31:00.500Z",
+    candidates: [{
+      candidateId: "candidate_bbbbbbbbbbbbbbbbbbbbbbbb",
+      workerId,
+      runId,
+      workspaceRepo: "repos/project",
+      reported: true,
+      purpose: "review target",
+      dependsOn: [],
+      baseCommit,
+      baseTree,
+      headCommit,
+      headTree,
+      dirty: false,
+      committedChanged: true,
+      foldable: true,
+      policyIssues: []
+    }],
+    reportedIssues: [],
+    scanCoverage: { complete: true, limitations: [] }
+  });
+  const container: WorkerContainerReference = {
+    version: 1,
+    workerId,
+    runId,
+    name: "pi-worker-review-fixture",
+    nonce: "review-fixture-container",
+    image: "alpine@test",
+    codeRoot: parentCwd,
+    workspaceRoot: paths.workspaceRoot,
+    containerId: "e".repeat(64)
+  };
+  writeWorkerRecord(paths.recordFile, {
+    version: WORKER_RECORD_VERSION,
+    workerId,
+    sessionId: "worker-session-review",
+    parentSessionFile,
+    workspaceRoot: paths.workspaceRoot,
+    taskIds: ["personal-review"],
+    route: { provider: "openai-codex", model: "gpt-test", thinkingLevel: "xhigh" },
+    status: "handed_off",
+    container,
+    lastRun: {
+      runId,
+      jobId: "job_20260910193000_review01",
+      status: "handed_off",
+      resultFile,
+      delivery: "pending",
+      completionDelivery: "steer",
+      repositoryInventory
+    },
+    updatedAt: "2026-09-10T19:31:01.000Z"
+  });
+  return { roots, paths, workerId, runId, repository, resultFile, headCommit, headTree, container };
 }
 
 function completedJob(jobId: string, cwd: string): JobMeta {
@@ -1575,6 +1684,171 @@ test("worker:cancel removes a queued resume container and makes cleanup failure 
     assert.equal(cancelled.container, undefined);
     assert.equal(existsSync(paths.leaseFile), false);
     assert.equal(removals, 2);
+  });
+});
+
+test("worker_review returns ordinary critique for one exact clean parked worker result", async () => {
+  await withTempDir(async (directory) => {
+    const parentCwd = path.join(directory, "parent");
+    const parentSessionFile = path.join(directory, "parent.jsonl");
+    await mkdir(parentCwd);
+    await writeFile(parentSessionFile, "parent\n");
+    const fixture = await provisionWorkerReviewFixture(directory, parentSessionFile, parentCwd);
+    let parks = 0;
+    let reviewInput: { cwd: string; focus?: string; context?: string; tools?: string[]; isolateWorkspaceResources?: boolean; gitContext?: { stagedDiff: string; stagedDiffLabel?: string; status: string } } | undefined;
+    const api = fakeApi();
+    registerWorkerExtension(api, {
+      roots: fixture.roots,
+      parkContainer(container) {
+        parks += 1;
+        assert.equal(container.containerId, fixture.container.containerId);
+      },
+      reviewWorker: async (_reviewApi, _context, input) => {
+        assert.equal(existsSync(fixture.paths.operationLockFile), true);
+        reviewInput = input;
+        return {
+          status: "completed",
+          cwd: input.cwd,
+          model: "anthropic/claude-opus-5-5",
+          thinkingLevel: "xhigh",
+          focus: input.focus,
+          startedAt: "2026-09-10T19:32:00.000Z",
+          completedAt: "2026-09-10T19:32:01.000Z",
+          durationMs: 1000,
+          critique: "APPROVE: implementation is correct and scoped.",
+          sentBack: false,
+          events: [],
+          toolCallCount: 4
+        };
+      }
+    });
+    const tool = api.tools.find((candidate) => candidate.name === "worker_review");
+    assert.ok(tool?.execute);
+    const result = await tool.execute("review-success", {
+      workerId: fixture.workerId,
+      runId: fixture.runId,
+      workspaceRepo: "repos/project",
+      focus: "Check lifecycle races."
+    } as never, undefined, undefined, parentContext(parentCwd, parentSessionFile));
+    assert.equal(Check(RetainedToolOutputSchemas.worker_review, result), true);
+    assert.equal(parks, 1);
+    assert.equal(reviewInput?.cwd, fixture.repository);
+    assert.equal(reviewInput?.focus, "Check lifecycle races.");
+    assert.deepEqual(reviewInput?.tools, ["search_many", "read_many"]);
+    assert.equal(reviewInput?.isolateWorkspaceResources, true);
+    assert.equal(reviewInput?.gitContext?.stagedDiffLabel, "Exact committed candidate delta excerpt");
+    assert.match(reviewInput?.gitContext?.stagedDiff ?? "", /-base/);
+    assert.match(reviewInput?.gitContext?.stagedDiff ?? "", /\+review me/);
+    assert.match(reviewInput?.context ?? "", new RegExp(`${fixture.workerId}/${fixture.runId}`));
+    assert.match(reviewInput?.context ?? "", /Do not modify it/);
+    const details = result.details as { workerId: string; runId: string; headCommit: string; headTree: string; model: string; critique: string };
+    assert.equal(details.workerId, fixture.workerId);
+    assert.equal(details.runId, fixture.runId);
+    assert.equal(details.headCommit, fixture.headCommit);
+    assert.equal(details.headTree, fixture.headTree);
+    assert.equal(details.model, "anthropic/claude-opus-5-5");
+    assert.match(details.critique, /APPROVE/);
+    assert.match((result.content[0] as { text: string }).text, /1000 ms \(2026-09-10T19:32:00.000Z → 2026-09-10T19:32:01.000Z\)/);
+    assert.equal(readWorkerRecord(fixture.paths.recordFile).lastRun?.delivery, "delivered");
+    const reacquired = acquireWorkerOperationLock(fixture.paths.operationLockFile);
+    releaseWorkerOperationLock(reacquired);
+    assert.equal(gitFixture(fixture.repository, "status", "--porcelain=v1", "--untracked-files=all"), "");
+  });
+});
+
+test("worker_review rejects wrong ownership, run identity, active workers, and unparked containers", async () => {
+  await withTempDir(async (directory) => {
+    const parentCwd = path.join(directory, "parent");
+    const parentSessionFile = path.join(directory, "parent.jsonl");
+    await mkdir(parentCwd);
+    await writeFile(parentSessionFile, "parent\n");
+    const fixture = await provisionWorkerReviewFixture(directory, parentSessionFile, parentCwd);
+    let reviews = 0;
+    const reviewWorker = async () => {
+      reviews += 1;
+      throw new Error("review should not run");
+    };
+    const api = fakeApi();
+    registerWorkerExtension(api, { roots: fixture.roots, parkContainer: () => {}, reviewWorker });
+    const tool = api.tools.find((candidate) => candidate.name === "worker_review");
+    assert.ok(tool?.execute);
+    const input = { workerId: fixture.workerId, runId: fixture.runId, workspaceRepo: "repos/project" };
+    await assert.rejects(
+      () => tool.execute!("review-unowned", input as never, undefined, undefined, parentContext(parentCwd, path.join(directory, "other-parent.jsonl"))),
+      /different parent session/
+    );
+    await assert.rejects(
+      () => tool.execute!("review-wrong-run", { ...input, runId: "run_20260910193000_wrong001" } as never, undefined, undefined, parentContext(parentCwd, parentSessionFile)),
+      /requires exact handed-off run/
+    );
+    const settled = readWorkerRecord(fixture.paths.recordFile);
+    writeWorkerRecord(fixture.paths.recordFile, {
+      ...settled,
+      status: "running",
+      activeRun: { runId: "run_20260910193000_active01", jobId: "job_20260910193000_active01", status: "running" }
+    });
+    await assert.rejects(
+      () => tool.execute!("review-active", input as never, undefined, undefined, parentContext(parentCwd, parentSessionFile)),
+      /became active before review/
+    );
+    writeWorkerRecord(fixture.paths.recordFile, settled);
+    const unparkedApi = fakeApi();
+    registerWorkerExtension(unparkedApi, {
+      roots: fixture.roots,
+      parkContainer: () => { throw new Error("worker container is still running"); },
+      reviewWorker
+    });
+    const unparked = unparkedApi.tools.find((candidate) => candidate.name === "worker_review");
+    await assert.rejects(
+      () => unparked!.execute!("review-unparked", input as never, undefined, undefined, parentContext(parentCwd, parentSessionFile)),
+      /container is still running/
+    );
+    assert.equal(reviews, 0);
+  });
+});
+
+test("worker_review fails closed for changed inventories and repository drift before or during review", async () => {
+  await withTempDir(async (directory) => {
+    const parentCwd = path.join(directory, "parent");
+    const parentSessionFile = path.join(directory, "parent.jsonl");
+    await mkdir(parentCwd);
+    await writeFile(parentSessionFile, "parent\n");
+    const fixture = await provisionWorkerReviewFixture(directory, parentSessionFile, parentCwd);
+    const context = parentContext(parentCwd, parentSessionFile);
+    const input = { workerId: fixture.workerId, runId: fixture.runId, workspaceRepo: "repos/project" };
+    let reviews = 0;
+    const api = fakeApi();
+    registerWorkerExtension(api, {
+      roots: fixture.roots,
+      parkContainer: () => {},
+      reviewWorker: async (_reviewApi, _context, reviewInput) => {
+        reviews += 1;
+        return { status: "completed", cwd: reviewInput.cwd, model: "reviewer", thinkingLevel: "high", startedAt: "2026-09-10T19:32:00.000Z", completedAt: "2026-09-10T19:32:01.000Z", durationMs: 1000, critique: "critique", sentBack: false, events: [], toolCallCount: 1 };
+      }
+    });
+    const tool = api.tools.find((candidate) => candidate.name === "worker_review");
+    assert.ok(tool?.execute);
+    const inventoryFile = readWorkerRecord(fixture.paths.recordFile).lastRun!.repositoryInventory!.inventoryFile;
+    const inventoryText = await readFile(inventoryFile, "utf8");
+    await writeFile(inventoryFile, `${inventoryText} `);
+    await assert.rejects(() => tool.execute!("review-inventory-drift", input as never, undefined, undefined, context), /inventory hash mismatch/);
+    await writeFile(inventoryFile, inventoryText);
+    await writeFile(path.join(fixture.repository, "untracked.txt"), "drift\n");
+    await assert.rejects(() => tool.execute!("review-repo-drift", input as never, undefined, undefined, context), /repository changed or violated clean policy/);
+    await rm(path.join(fixture.repository, "untracked.txt"));
+    assert.equal(reviews, 0);
+
+    const mutationApi = fakeApi();
+    registerWorkerExtension(mutationApi, {
+      roots: fixture.roots,
+      parkContainer: () => {},
+      reviewWorker: async (_reviewApi, _context, reviewInput) => {
+        await writeFile(path.join(reviewInput.cwd, "reviewer-write.txt"), "forbidden\n");
+        return { status: "completed", cwd: reviewInput.cwd, model: "reviewer", thinkingLevel: "high", startedAt: "2026-09-10T19:32:00.000Z", completedAt: "2026-09-10T19:32:01.000Z", durationMs: 1000, critique: "critique", sentBack: false, events: [], toolCallCount: 1 };
+      }
+    });
+    const mutationTool = mutationApi.tools.find((candidate) => candidate.name === "worker_review");
+    await assert.rejects(() => mutationTool!.execute!("review-post-drift", input as never, undefined, undefined, context), /repository changed or violated clean policy/);
   });
 });
 

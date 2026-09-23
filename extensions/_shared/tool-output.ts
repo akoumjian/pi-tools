@@ -456,6 +456,22 @@ const WorkerRunDetailsSchema = Type.Object({
   runs: Type.Array(WorkerRunReceiptSchema, { minItems: 1, maxItems: 8 })
 }, { additionalProperties: false });
 
+const WorkerReviewDetailsSchema = Type.Object({
+  workerId: Type.String({ minLength: 1 }),
+  runId: Type.String({ minLength: 1 }),
+  candidateId: Type.String({ pattern: "^candidate_[0-9a-f]{24}$" }),
+  workspaceRepo: Type.String({ minLength: 1, maxLength: 1024 }),
+  headCommit: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
+  headTree: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
+  model: Type.String({ minLength: 1 }),
+  thinkingLevel: Type.String({ minLength: 1 }),
+  startedAt: Type.String({ minLength: 1 }),
+  completedAt: Type.String({ minLength: 1 }),
+  durationMs: NonNegativeNumberSchema,
+  toolCallCount: NonNegativeIntegerSchema,
+  critique: Type.String({ minLength: 1 })
+}, { additionalProperties: false });
+
 const WorkerFoldResolveDetailsSchema = Type.Object({
   workerId: Type.String({ minLength: 1 }), runId: Type.String({ minLength: 1 }), jobId: Type.String({ minLength: 1 }), sessionId: Type.String({ minLength: 1 }),
   sessionFile: Type.Optional(Type.String({ minLength: 1 })), workspaceRoot: Type.String({ minLength: 1 }), taskIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: MAX_WORKER_TASK_IDS }),
@@ -703,6 +719,7 @@ export const RetainedToolOutputSchemas = {
   web_fetch_many: finalResultSchema(WebFetchManyDetailsSchema),
   document_parse: finalResultSchema(DocumentParseDetailsSchema),
   worker_run: finalResultSchema(WorkerRunDetailsSchema),
+  worker_review: finalResultSchema(WorkerReviewDetailsSchema),
   worker_control: finalResultSchema(WorkerControlDetailsSchema),
   worker_fold_prepare: finalResultSchema(WorkerFoldPrepareDetailsSchema),
   worker_fold_resolve: finalResultSchema(WorkerFoldResolveDetailsSchema)

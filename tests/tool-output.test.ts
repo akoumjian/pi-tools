@@ -206,6 +206,24 @@ const samples: Record<RetainedToolName, unknown> = {
       }]
     }
   },
+  worker_review: {
+    content: [text("independent critique")],
+    details: {
+      workerId: "worker_20260910190000_12345678",
+      runId: "run_20260910190000_87654321",
+      candidateId: "candidate_bbbbbbbbbbbbbbbbbbbbbbbb",
+      workspaceRepo: "repos/project",
+      headCommit: "c".repeat(40),
+      headTree: "d".repeat(40),
+      model: "anthropic/claude-opus-test",
+      thinkingLevel: "xhigh",
+      startedAt: "2026-09-10T19:00:00.000Z",
+      completedAt: "2026-09-10T19:00:01.000Z",
+      durationMs: 1000,
+      toolCallCount: 3,
+      critique: "independent critique"
+    }
+  },
   worker_fold_prepare: {
     content: [text("prepared fold")],
     details: {

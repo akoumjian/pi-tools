@@ -26,10 +26,12 @@ import {
   CompletionDeliverySchema,
   resolveCompletionDelivery
 } from "../_shared/completion-delivery.js";
+import { resolveExecutable } from "../_shared/executable.js";
 import { formatModelName, resolveExtensionModel } from "../_shared/model-spec.js";
 import { MAX_WORKER_TASK_IDS } from "../_shared/worker-contract.js";
 import { isWorkerId, WORKER_ID_PATTERN } from "../_shared/worker-id.js";
 import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
+import { runIndependentReview, type IndependentReviewInput, type ReviewDetails, type ReviewGitContext } from "../review-subagent/index.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 import { managedWorkerRoleSkillText } from "../_shared/role-skills.js";
 import { cancelPersistedAsyncShellJobsForOwner, handleAsyncShellViewerCommand, type JobMeta, type ManagedAsyncJobHandle } from "../async-shell/index.js";
@@ -58,10 +60,14 @@ import {
 import { launchWorkerHost, readWorkerHostProcess, readWorkerHostSettlement } from "./runner.js";
 import { readWorkerRuntimeHandoff, type AcceptedWorkerHandoff } from "./runtime.js";
 import {
+  createGitRunner,
   deriveRepositoryInventory,
+  gitText,
   persistRepositoryInventory,
   pinInitialRepositories,
   readRepositoryInventory,
+  repositoryDirty,
+  repositoryPolicyIssues,
   type InitialRepositoryPin,
   type RepositoryIntegrationLineage,
   type RepositoryInventory,
@@ -156,6 +162,13 @@ export const WorkerControlParams = Type.Object({
   confirm: Type.Optional(Type.Literal(true))
 }, { additionalProperties: false });
 
+export const WorkerReviewParams = Type.Object({
+  workerId: WorkerIdSchema,
+  runId: Type.String({ minLength: 1, maxLength: 128, pattern: "^run_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$" }),
+  workspaceRepo: Type.String({ minLength: 7, maxLength: 1024, pattern: "^repos/[A-Za-z0-9._/-]+$" }),
+  focus: Type.Optional(Type.String({ minLength: 1, maxLength: 4000 }))
+}, { additionalProperties: false });
+
 const RepositoryChangeSetEntrySchema = Type.Object({
   candidateId: Type.String({ minLength: 34, maxLength: 34, pattern: "^candidate_[0-9a-f]{24}$" }),
   targetRepo: Type.String({ minLength: 1, maxLength: 1024, description: "Absolute existing local target repository below the accepted local target root (~/Code by default)." }),
@@ -171,6 +184,7 @@ export const WorkerFoldPrepareParams = Type.Object({
 
 export type WorkerRunInput = Static<typeof WorkerRunParams>;
 export type WorkerControlInput = Static<typeof WorkerControlParams>;
+export type WorkerReviewInput = Static<typeof WorkerReviewParams>;
 export type WorkerFoldPrepareInput = Static<typeof WorkerFoldPrepareParams>;
 export type WorkerFoldResolveRequest =
   | { kind: "start"; preparedId: string; manifestSha256: string; candidateId: string; taskIds: string[]; context: IntegrationContextBundle; route?: string; completionDelivery?: "steer" | "followUp" }
@@ -192,6 +206,21 @@ export type WorkerRunReceipt = {
 };
 
 type WorkerRunDetails = { runs: WorkerRunReceipt[] };
+type WorkerReviewDetails = {
+  workerId: string;
+  runId: string;
+  candidateId: string;
+  workspaceRepo: string;
+  headCommit: string;
+  headTree: string;
+  model: string;
+  thinkingLevel: ThinkingLevel;
+  startedAt: string;
+  completedAt: string;
+  durationMs: number;
+  toolCallCount: number;
+  critique: string;
+};
 type WorkerFoldResolveDetails = WorkerRunReceipt & {
   phase: "analysis" | "resolution";
   method: "merge" | "squash";
@@ -314,6 +343,7 @@ type WorkerExtensionDependencies = {
   foldsRoot: string;
   targetRoot: string;
   prepareFold: typeof prepareRepositoryChangeSet;
+  reviewWorker(api: Pick<ExtensionAPI, "exec" | "getAllTools">, context: ExtensionContext, input: IndependentReviewInput): Promise<ReviewDetails>;
   planContainer?(record: WorkerRecord, runId: string, nonce: string): WorkerContainerReference;
   parkContainer?(container: WorkerContainerReference): void;
   removeContainer(container: WorkerContainerReference): void;
@@ -562,6 +592,29 @@ export function registerWorkerExtension(
 
 
   api.registerTool(defineTool({
+    name: "worker_review",
+    label: "Worker Review",
+    description: "Review one clean, settled managed-worker repository in its exact parked workspace with an independent read-only agent. Use after an implementation or correction handoff. Do not use while the worker is active, to change code, or as promotion authority.",
+    promptSnippet: "Independently review one exact clean repository from a settled managed worker; never modifies or promotes it.",
+    promptGuidelines: [
+      "worker_review use: Call after worker_control result for the exact worker/run/repository; if review requests changes, resume the implementation worker and review the new settled run again.",
+      inputJsonSchemaGuideline("worker_review", WorkerReviewParams),
+      outputJsonSchemaGuideline("worker_review", RetainedToolOutputSchemas.worker_review),
+      "worker_review constraints: Requires an exact-parent-owned handed-off run, valid handoff/inventory, parked container, and clean foldable candidate. The worker operation lock stays held throughout review. The reviewer has read-only tools and no human prompt, implementation, attestation, validation authority, promotion, or push capability. Repository HEAD/tree/clean policy are rechecked after review; drift fails visibly. Only result content is provider-visible; details are internal."
+    ],
+    parameters: WorkerReviewParams,
+    executionMode: "sequential",
+    async execute(_toolCallId, params, signal, _onUpdate, context): Promise<AgentToolResult<WorkerReviewDetails>> {
+      throwIfAborted(signal);
+      const details = await reviewSettledWorker(api, context, params as WorkerReviewInput, signal, dependencies);
+      return {
+        content: [{ type: "text", text: formatWorkerReviewResult(details) }],
+        details
+      };
+    }
+  }));
+
+  api.registerTool(defineTool({
     name: "worker_fold_prepare",
     label: "Worker Fold Prepare",
     description: "Prepare an exact multi-repository worker changeset outside authoritative repositories. Select durable repository candidate IDs and map each to one explicit existing local target repository/ref, purpose, merge or squash method, and candidate dependencies. The trusted host locks selected workers, revalidates exact candidate and target identities, computes deterministic desired commits or bounded resolution cases, materializes disposable views plus immutable exact-object artifacts, and persists one hash-bound manifest without updating authoritative refs, indexes, worktrees, or files.",
@@ -749,6 +802,193 @@ function readParentWorkerRecord(
   return record;
 }
 
+async function reviewSettledWorker(
+  api: ExtensionAPI,
+  context: ExtensionContext,
+  input: WorkerReviewInput,
+  signal: AbortSignal | undefined,
+  dependencies: WorkerExtensionDependencies
+): Promise<WorkerReviewDetails> {
+  const paths = workerPaths(dependencies.roots, input.workerId);
+  const lock = acquireWorkerOperationLock(paths.operationLockFile);
+  try {
+    throwIfAborted(signal);
+    const record = readWorkerRecord(paths.recordFile);
+    assertWorkerParentSession(record, context);
+    if (record.activeRun || readWorkerLease(paths.leaseFile)) throw new Error(`Worker ${input.workerId} became active before review.`);
+    const lastRun = record.lastRun;
+    if (record.status !== "handed_off" || !lastRun || lastRun.status !== "handed_off" || lastRun.runId !== input.runId) {
+      throw new Error(`worker_review requires exact handed-off run ${input.runId} for worker ${input.workerId}.`);
+    }
+    const observed = readParentWorkerResult(input.workerId, context, dependencies, true);
+    if (observed.record.lastRun?.runId !== input.runId || !observed.handoff || !observed.repositories) {
+      throw new Error("worker_review requires a validated typed handoff and repository inventory for the exact run.");
+    }
+    if (observed.handoff.handoff.state !== "ready_for_review" && observed.handoff.handoff.state !== "assignment_complete") {
+      throw new Error(`worker_review requires a completed handoff, not ${observed.handoff.handoff.state}.`);
+    }
+    if (!record.container || record.container.runId !== input.runId || !dependencies.parkContainer) {
+      throw new Error(`worker_review requires worker ${input.workerId}/${input.runId}'s exact verified parked container.`);
+    }
+    dependencies.parkContainer(record.container);
+    const candidate = observed.repositories.candidates.find((item) => item.workspaceRepo === input.workspaceRepo);
+    if (!candidate || candidate.runId !== input.runId || candidate.workerId !== input.workerId) {
+      throw new Error(`worker_review repository is not an exact candidate from ${input.workerId}/${input.runId}: ${input.workspaceRepo}`);
+    }
+    if (!candidate.foldable || candidate.dirty || !candidate.baseCommit || !candidate.headCommit || !candidate.headTree || candidate.policyIssues.length > 0) {
+      throw new Error("worker_review requires a clean foldable committed repository candidate; resume the implementation worker to clean or commit it first.");
+    }
+    const repository = canonicalWorkerReviewRepository(paths.workspaceRoot, candidate.workspaceRepo);
+    verifyWorkerReviewRepository(repository, candidate, paths.stateDir);
+    const reviewContext = formatWorkerReviewContext(record, observed.handoff, candidate);
+    const review = await dependencies.reviewWorker(api, context, {
+      cwd: repository,
+      context: reviewContext,
+      focus: input.focus,
+      tools: ["search_many", "read_many"],
+      gitContext: buildWorkerReviewGitContext(repository, candidate, paths.stateDir),
+      isolateWorkspaceResources: true,
+      signal
+    });
+    throwIfAborted(signal);
+    const current = readWorkerRecord(paths.recordFile);
+    assertWorkerParentSession(current, context);
+    if (current.activeRun || readWorkerLease(paths.leaseFile) || current.status !== "handed_off" || current.lastRun?.runId !== input.runId) {
+      throw new Error("Managed worker changed lifecycle state during review.");
+    }
+    verifyWorkerReviewRepository(repository, candidate, paths.stateDir);
+    if (review.status !== "completed" || !review.critique.trim()) {
+      throw new Error(`Managed-worker review did not complete: ${review.error ?? review.status}`);
+    }
+    if (path.resolve(review.cwd) !== repository) {
+      throw new Error("Managed-worker reviewer returned a different repository identity.");
+    }
+    return {
+      workerId: input.workerId,
+      runId: input.runId,
+      candidateId: candidate.candidateId,
+      workspaceRepo: candidate.workspaceRepo,
+      headCommit: candidate.headCommit,
+      headTree: candidate.headTree,
+      model: review.model,
+      thinkingLevel: review.thinkingLevel,
+      startedAt: review.startedAt,
+      completedAt: review.completedAt,
+      durationMs: review.durationMs,
+      toolCallCount: review.toolCallCount,
+      critique: review.critique
+    };
+  } finally {
+    releaseWorkerOperationLock(lock);
+  }
+}
+
+function canonicalWorkerReviewRepository(workspaceRootValue: string, workspaceRepo: string): string {
+  const workspaceRoot = realpathSync(workspaceRootValue);
+  const requested = path.resolve(workspaceRoot, workspaceRepo);
+  const relative = path.relative(workspaceRoot, requested);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative) || !workspaceRepo.startsWith("repos/")) {
+    throw new Error("worker_review repository path escapes the managed workspace.");
+  }
+  const repository = realpathSync(requested);
+  const canonicalRelative = path.relative(workspaceRoot, repository);
+  if (!canonicalRelative || canonicalRelative.startsWith("..") || path.isAbsolute(canonicalRelative) || canonicalRelative !== workspaceRepo) {
+    throw new Error("worker_review repository path is not the exact canonical workspace repository.");
+  }
+  return repository;
+}
+
+function verifyWorkerReviewRepository(
+  repository: string,
+  candidate: RepositoryInventory["candidates"][number],
+  trustedStateRoot: string
+): void {
+  const runner = createGitRunner(resolveExecutable("git"), path.join(trustedStateRoot, "review-git"));
+  const headCommit = gitText(runner, repository, ["rev-parse", "--verify", "HEAD^{commit}"]).trim();
+  const headTree = gitText(runner, repository, ["rev-parse", "--verify", `${headCommit}^{tree}`]).trim();
+  const issues = repositoryPolicyIssues(repository, runner, headCommit);
+  if (headCommit !== candidate.headCommit || headTree !== candidate.headTree || repositoryDirty(repository, runner) || issues.length > 0) {
+    throw new Error("Managed-worker repository changed or violated clean policy before review completed; resume and review the new settled result.");
+  }
+}
+
+function buildWorkerReviewGitContext(
+  repository: string,
+  candidate: RepositoryInventory["candidates"][number],
+  trustedStateRoot: string
+): ReviewGitContext {
+  const runner = createGitRunner(resolveExecutable("git"), path.join(trustedStateRoot, "review-context-git"));
+  const errors: string[] = [];
+  let diffStat = "Exact committed candidate delta: unavailable.";
+  let committedDiff = "(unavailable; inspect the exact current files with read-only tools)";
+  try {
+    diffStat = gitText(runner, repository, ["diff", "--no-ext-diff", "--stat", candidate.baseCommit!, candidate.headCommit!, "--"]).trim()
+      || "Exact committed candidate delta: (no stat output)";
+  } catch (error) {
+    errors.push(`exact committed diff stat: ${reviewContextError(error)}`);
+  }
+  try {
+    const output = gitText(runner, repository, ["diff", "--no-ext-diff", "--minimal", "--unified=40", candidate.baseCommit!, candidate.headCommit!, "--"]).trim();
+    committedDiff = boundReviewContext(output || "(none)", 50_000);
+  } catch (error) {
+    errors.push(`exact committed diff: ${reviewContextError(error)}`);
+  }
+  return {
+    isRepository: true,
+    root: repository,
+    status: `(clean; exact candidate HEAD ${candidate.headCommit})`,
+    diffStat: boundReviewContext(diffStat, 20_000),
+    stagedDiff: committedDiff,
+    stagedDiffLabel: "Exact committed candidate delta excerpt",
+    unstagedDiff: "(none)",
+    unstagedDiffLabel: "Unstaged diff excerpt (must remain empty)",
+    untrackedFiles: "(none)",
+    errors
+  };
+}
+
+function boundReviewContext(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, maxChars)}\n... [truncated ${value.length - maxChars} characters; inspect exact files with read-only tools]`;
+}
+
+function reviewContextError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return boundReviewContext(message.replace(/\s+/g, " ").trim() || "unknown error", 500);
+}
+
+function formatWorkerReviewContext(
+  record: WorkerRecord,
+  handoff: AcceptedWorkerHandoff,
+  candidate: RepositoryInventory["candidates"][number]
+): string {
+  return [
+    `Review exact managed-worker result ${record.workerId}/${candidate.runId}.`,
+    `Assigned tasks: ${record.taskIds.join(", ")}.`,
+    `Repository: ${candidate.workspaceRepo}.`,
+    `Candidate: ${candidate.candidateId}.`,
+    `Exact base..HEAD: ${candidate.baseCommit}..${candidate.headCommit}.`,
+    `Exact HEAD tree: ${candidate.headTree}.`,
+    `Worker handoff (${handoff.handoff.state}): ${handoff.handoff.summary}`,
+    handoff.handoff.checks?.length
+      ? `Worker-reported checks:
+${handoff.handoff.checks.map((check) => `- ${check.outcome}: ${check.command} (${check.cwd})`).join("\n")}`
+      : "Worker-reported checks: none.",
+    "Review this implementation independently. Do not modify it. Return actionable findings; this critique is advice to the parent, not promotion authority."
+  ].join("\n");
+}
+
+function formatWorkerReviewResult(details: WorkerReviewDetails): string {
+  return [
+    `Managed-worker review completed for ${details.workerId}/${details.runId}.`,
+    `Repository: ${details.workspaceRepo} (${details.candidateId})`,
+    `Exact HEAD/tree: ${details.headCommit}/${details.headTree}`,
+    `Reviewer: ${details.model}:${details.thinkingLevel} · ${details.toolCallCount} tool call${details.toolCallCount === 1 ? "" : "s"} · ${details.durationMs} ms (${details.startedAt} → ${details.completedAt})`,
+    "",
+    details.critique
+  ].join("\n");
+}
+
 function listParentWorkerRecords(roots: WorkerRoots, context: ExtensionContext): WorkerRecord[] {
   const parentSessionFile = context.sessionManager.getSessionFile();
   if (!parentSessionFile) throw new Error("worker_control requires a persisted parent session.");
@@ -843,7 +1083,8 @@ function resolveParentFoldCandidates(
 function readParentWorkerResult(
   workerId: string,
   context: ExtensionContext,
-  dependencies: WorkerExtensionDependencies
+  dependencies: WorkerExtensionDependencies,
+  operationLocked = false
 ): { record: WorkerRecord; handoff?: AcceptedWorkerHandoff; repositories?: RepositoryInventory; acknowledgedDelivery: boolean } {
   const paths = workerPaths(dependencies.roots, workerId);
   const record = readWorkerRecord(paths.recordFile);
@@ -866,7 +1107,7 @@ function readParentWorkerResult(
       })
     : undefined;
 
-  const observed = withWorkerOperationLock(paths, () => {
+  const observe = () => {
     const current = readWorkerRecord(paths.recordFile);
     assertWorkerParentSession(current, context);
     if (current.activeRun || current.lastRun?.runId !== lastRun.runId) {
@@ -880,7 +1121,8 @@ function readParentWorkerResult(
     };
     writeWorkerRecord(paths.recordFile, next);
     return { record: next, acknowledgedDelivery: true };
-  });
+  };
+  const observed = operationLocked ? observe() : withWorkerOperationLock(paths, observe);
   return { record: observed.record, handoff, repositories, acknowledgedDelivery: observed.acknowledgedDelivery };
 }
 
@@ -3283,6 +3525,7 @@ function defaultDependencies(): WorkerExtensionDependencies {
     foldsRoot: defaultWorkerFoldsRoot(roots.stateRoot),
     targetRoot: path.join(homedir(), "Code"),
     prepareFold: prepareRepositoryChangeSet,
+    reviewWorker: runIndependentReview,
     planContainer: (record, runId, nonce) => planWorkerContainer({
       workerId: record.workerId,
       runId,

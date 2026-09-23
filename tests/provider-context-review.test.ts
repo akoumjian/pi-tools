@@ -21,6 +21,7 @@ const retainedToolNames = [
   "document_parse",
   "worker_run",
   "worker_control",
+  "worker_review",
   "worker_fold_prepare",
   "worker_fold_resolve"
 ] as const;
@@ -105,6 +106,7 @@ test("provider context review command renders sanitized prompt, tool declaration
     assert.match(artifact.systemPrompt, /read_many use:/);
     assert.match(artifact.systemPrompt, /worker_run constraints:/);
     assert.match(artifact.systemPrompt, /worker_control constraints:/);
+    assert.match(artifact.systemPrompt, /worker_review constraints:/);
     assert.match(artifact.systemPrompt, /worker_fold_prepare constraints:/);
     assert.match(artifact.systemPrompt, /worker_fold_resolve constraints:/);
     assert.doesNotMatch(artifact.systemPrompt, /Batch-native tool usage:/);

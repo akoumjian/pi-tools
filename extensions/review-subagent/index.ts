@@ -1,3 +1,5 @@
+import { realpath } from "node:fs/promises";
+import path from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, AssistantMessage, ImageContent, Message, Model, TextContent, ToolResultMessage } from "@earendil-works/pi-ai";
 import {
@@ -9,7 +11,8 @@ import {
   type ExtensionCommandContext,
   type ExtensionContext,
   type ExtensionFactory,
-  type LoadExtensionsResult
+  type LoadExtensionsResult,
+  type ToolCallEvent
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import {
@@ -27,6 +30,7 @@ import {
 import { formatConfigPath, readPiToolsJsonConfigSource, readPiToolsReferencedTextConfig, writeAgentExtensionConfig, type PiToolsJsonConfig } from "../_shared/config.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 import { guidedModelSetupUsage, parseGuidedModelSetupArgs, readSetupGuidance } from "../_shared/setup-command.js";
+import nativeToolsExtension, { resolveNativeToolPath } from "../native-tools/index.js";
 
 const REVIEW_MESSAGE_TYPE = "review-subagent";
 const REVIEW_STATUS_KEY = "review-subagent";
@@ -99,13 +103,15 @@ export type ReviewCommandArgs = {
   help: boolean;
 };
 
-type GitContext = {
+export type ReviewGitContext = {
   isRepository: boolean;
   root?: string;
   status: string;
   diffStat: string;
   unstagedDiff: string;
   stagedDiff: string;
+  unstagedDiffLabel?: string;
+  stagedDiffLabel?: string;
   untrackedFiles: string;
   errors: string[];
 };
@@ -314,7 +320,7 @@ async function runReviewWorkInBackground(
   try {
     const parentContext = buildParentContext(context, settings);
     const gitContext = await collectGitContext(api, cwd, settings);
-    const result = await runReviewSubagent(context, activeRun, commandArgs, settings, parentContext, gitContext);
+    const result = await runReviewSubagent(context, activeRun, commandArgs, settings, parentContext, gitContext, cwd);
     details = activeRun.cancelRequested
       ? buildCancelledReviewDetails(cwd, commandArgs.focus, "Review subagent cancelled before publishing the critique.", result.details)
       : result.details;
@@ -459,12 +465,15 @@ function notifyReview(context: Pick<ExtensionContext, "hasUI" | "ui">, message: 
 }
 
 async function runReviewSubagent(
-  context: ExtensionCommandContext,
+  context: ExtensionContext,
   activeRun: ReviewActiveRun,
   commandArgs: ReviewCommandArgs,
   settings: ReviewSettings,
   parentContext: string,
-  gitContext: GitContext
+  gitContext: ReviewGitContext,
+  cwd = context.cwd,
+  signal?: AbortSignal,
+  isolateWorkspaceResources = false
 ): Promise<ReviewRunResult> {
   const startedAt = new Date();
   const events: ReviewEventRecord[] = [];
@@ -475,12 +484,15 @@ async function runReviewSubagent(
   activeRun.thinkingLevel = thinkingLevel;
 
   return withChildAgentSession(context, {
-    cwd: context.cwd,
+    cwd,
     model,
     thinkingLevel,
     tools: settings.tools,
+    isolateWorkspaceResources,
+    extensionFactories: isolateWorkspaceResources ? [createConfinedReviewToolsExtension(cwd)] : undefined,
     systemPrompts: [reviewerSystemPrompt],
-    extensionsOverride: omitReviewSubagentExtension,
+    extensionsOverride: isolateWorkspaceResources ? undefined : omitReviewSubagentExtension,
+    signal,
     onWarning: (message) => context.ui.notify(`Review child session warning: ${message}`, "warning"),
     onError: (error) => {
       events.push({
@@ -520,7 +532,7 @@ async function runReviewSubagent(
         finalMessages,
         details: {
           status: "completed" as const,
-          cwd: context.cwd,
+          cwd,
           model: formatModelName(model),
           thinkingLevel,
           focus: commandArgs.focus,
@@ -711,6 +723,109 @@ export function createReviewToolAllowlistExtension(toolNames: string[]): Extensi
 
 export function validateReviewToolAllowlist(api: Pick<ExtensionAPI, "getAllTools">, toolNames: string[], configSource = "review-subagent settings"): void {
   validateChildToolAllowlist(api.getAllTools(), toolNames, "Review-subagent", configSource);
+}
+
+export function createConfinedReviewToolsExtension(root: string): ExtensionFactory {
+  return (api) => {
+    nativeToolsExtension(api);
+    api.on("tool_call", async (event) => {
+      try {
+        await assertReviewToolCallWithinRoot(root, event);
+        return undefined;
+      } catch (error) {
+        return {
+          block: true,
+          reason: `Managed-worker review confinement blocked ${event.toolName}: ${error instanceof Error ? error.message : String(error)}`
+        };
+      }
+    });
+  };
+}
+
+export async function assertReviewToolCallWithinRoot(root: string, event: ToolCallEvent): Promise<void> {
+  const rootPath = path.resolve(root);
+  const rootReal = await realpath(rootPath);
+  const rawInput: unknown = event.input;
+  const input: Record<string, unknown> = isReviewRecord(rawInput) ? rawInput : {};
+  let rawPaths: string[];
+  if (event.toolName === "read_many") {
+    rawPaths = reviewToolItemPaths(input.files, "read_many files");
+  } else if (event.toolName === "search_many") {
+    if (!Array.isArray(input.searches)) throw new Error("search_many searches must be an array.");
+    rawPaths = input.searches.map((item) => {
+      if (!isReviewRecord(item)) throw new Error("search_many item must be an object.");
+      return typeof item.path === "string" && item.path.trim() ? item.path : ".";
+    });
+  } else {
+    throw new Error(`tool ${event.toolName} is not permitted.`);
+  }
+  for (const rawPath of rawPaths) {
+    const requested = resolveNativeToolPath(rootPath, rawPath);
+    assertPathInsideReviewRoot(requested, rootPath, `path escapes review root: ${requested}`);
+    const canonical = await realpath(requested);
+    assertPathInsideReviewRoot(canonical, rootReal, `resolved path escapes review root: ${canonical}`);
+  }
+}
+
+function reviewToolItemPaths(value: unknown, label: string): string[] {
+  if (!Array.isArray(value)) throw new Error(`${label} must be an array.`);
+  return value.map((item) => {
+    if (!isReviewRecord(item) || typeof item.path !== "string" || !item.path.trim()) {
+      throw new Error(`${label} items require a non-empty path.`);
+    }
+    return item.path;
+  });
+}
+
+function isReviewRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function assertPathInsideReviewRoot(candidate: string, root: string, message: string): void {
+  const relative = path.relative(root, candidate);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) throw new Error(message);
+}
+
+export type IndependentReviewInput = {
+  cwd: string;
+  focus?: string;
+  context?: string;
+  tools?: string[];
+  gitContext?: ReviewGitContext;
+  isolateWorkspaceResources?: boolean;
+  signal?: AbortSignal;
+};
+
+/** Run one foreground independent review without creating command/UI review state. */
+export async function runIndependentReview(
+  api: Pick<ExtensionAPI, "exec" | "getAllTools">,
+  context: ExtensionContext,
+  input: IndependentReviewInput
+): Promise<ReviewDetails> {
+  const settings = readReviewSettings();
+  const tools = input.tools ?? settings.tools;
+  validateReviewToolAllowlist(api, tools, input.tools ? "independent-review caller" : settings.configSource);
+  if (!settings.defaultModel) {
+    throw new Error("Review subagent is not configured. Run /review:setup provider/model[:thinking] before using managed-worker review.");
+  }
+  const focus = [input.context?.trim(), input.focus?.trim()].filter(Boolean).join("\n\n") || undefined;
+  const commandArgs: ReviewCommandArgs = { focus, send: false, noSend: true, help: false };
+  const runSettings: ReviewSettings = { ...settings, tools };
+  const activeRun = createReviewActiveRun(input.cwd, focus);
+  const parentContext = buildParentContext(context, settings);
+  const gitContext = input.gitContext ?? await collectGitContext(api, input.cwd, settings);
+  const result = await runReviewSubagent(
+    context,
+    activeRun,
+    commandArgs,
+    runSettings,
+    parentContext,
+    gitContext,
+    input.cwd,
+    input.signal,
+    input.isolateWorkspaceResources === true
+  );
+  return result.details;
 }
 
 function omitReviewSubagentExtension(result: LoadExtensionsResult): LoadExtensionsResult {
@@ -1082,7 +1197,7 @@ function contentToText(content: string | (TextContent | ImageContent)[]): string
   return content.map((item) => item.type === "text" ? item.text : `[image: ${item.mimeType}]`).join("\n");
 }
 
-async function collectGitContext(api: ExecCapableApi, cwd: string, settings: ReviewSettings): Promise<GitContext> {
+async function collectGitContext(api: ExecCapableApi, cwd: string, settings: ReviewSettings): Promise<ReviewGitContext> {
   const errors: string[] = [];
   const rootResult = await execGit(api, cwd, ["rev-parse", "--show-toplevel"], settings.commandTimeoutMs);
   if (rootResult.code !== 0) {
@@ -1145,14 +1260,18 @@ async function execGit(api: ExecCapableApi, cwd: string, args: string[], timeout
   }
 }
 
-export function buildReviewTask(parentContext: string, gitContext: GitContext, focus: string | undefined, settings: ReviewSettings): string {
+export function buildReviewTask(parentContext: string, gitContext: ReviewGitContext, focus: string | undefined, settings: ReviewSettings): string {
   return [
     "Review the recent work from the parent Pi session.",
     focus ? `\nUser-requested review focus:\n${focus}` : undefined,
     ...formatReviewGuidance(settings.guidance),
-    "\nYou have your own tool access. Inspect the repository and run safe validation commands when useful before writing the final critique.",
+    settings.tools.includes("shell_start")
+      ? "\nYou have your own tool access. Inspect the repository and run safe validation commands when useful before writing the final critique."
+      : "\nUse the available read-only tools to inspect the repository before writing the final critique. Do not modify files or run validation commands.",
     "\nImportant live-worktree note: the parent conversation may continue while you review. Treat the transcript and git diff below as launch-time context, verify current files before citing them, and call out any apparent drift if it affects confidence.",
-    "\nImportant shell_start instruction: keep validation commands bounded, use command objects that include cwd and notifyOnExit:false, and do not leave long-running background jobs from the review subagent.",
+    settings.tools.includes("shell_start")
+      ? "\nImportant shell_start instruction: keep validation commands bounded, use command objects that include cwd and notifyOnExit:false, and do not leave long-running background jobs from the review subagent."
+      : "\nThis review is inspection-only; return critique rather than implementation or validation claims.",
     `\nMaximum final answer target: ${settings.maxOutputTokens} tokens. Be thorough but prioritize actionable findings.`,
     "\n## Current working directory",
     gitContext.root ? `${gitContext.root}` : "Unknown / not a git repository",
@@ -1164,9 +1283,9 @@ export function buildReviewTask(parentContext: string, gitContext: GitContext, f
     gitContext.diffStat || "(none)",
     "\n## Untracked files",
     gitContext.untrackedFiles,
-    "\n## Staged diff excerpt",
+    `\n## ${gitContext.stagedDiffLabel ?? "Staged diff excerpt"}`,
     fenced(gitContext.stagedDiff, "diff"),
-    "\n## Unstaged diff excerpt",
+    `\n## ${gitContext.unstagedDiffLabel ?? "Unstaged diff excerpt"}`,
     fenced(gitContext.unstagedDiff, "diff"),
     gitContext.errors.length > 0 ? `\n## Git context collection errors\n${gitContext.errors.map((error) => `- ${error}`).join("\n")}` : undefined,
     "\nNow perform your independent review. Use tools first if more evidence is needed, then provide the final answer in the required review format."

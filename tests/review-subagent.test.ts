@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -10,6 +10,7 @@ import reviewSubagentExtension, {
   buildCancelledReviewDetails,
   buildReviewMessageContent,
   buildReviewStatusText,
+  assertReviewToolCallWithinRoot,
   buildReviewTask,
   cancelReviewState,
   clearReviewState,
@@ -22,6 +23,7 @@ import reviewSubagentExtension, {
   publishReviewDetails,
   readReviewSettings,
   renderReviewMessage,
+  runIndependentReview,
   selectReviewModel,
   serializeRecentMessages,
   settleReviewWorkLaunch,
@@ -322,6 +324,54 @@ test("review tool allowlist validation fails loudly for missing configured tools
   assert.throws(
     () => validateReviewToolAllowlist(api, ["read_many", "web_fetch_many"], "profile:/config/review-subagent-settings.json"),
     /Review-subagent configured tools are unavailable: web_fetch_many.*profile:\/config\/review-subagent-settings\.json/
+  );
+});
+
+test("managed-worker review read tools cannot escape the exact repository through paths or symlinks", async () => {
+  const fixture = await mkdtemp(path.join(tmpdir(), "pi-review-confined-"));
+  const repository = path.join(fixture, "repository");
+  const outside = path.join(fixture, "outside.txt");
+  await mkdir(repository);
+  await writeFile(path.join(repository, "inside.txt"), "inside\n");
+  await writeFile(outside, "outside\n");
+  await symlink(outside, path.join(repository, "escape-link"));
+  try {
+    await assertReviewToolCallWithinRoot(repository, {
+      type: "tool_call",
+      toolName: "read_many",
+      input: { files: [{ path: "inside.txt" }] }
+    } as never);
+    await assertReviewToolCallWithinRoot(repository, {
+      type: "tool_call",
+      toolName: "search_many",
+      input: { searches: [{ kind: "files" }] }
+    } as never);
+    await assert.rejects(
+      () => assertReviewToolCallWithinRoot(repository, {
+        type: "tool_call",
+        toolName: "read_many",
+        input: { files: [{ path: "../outside.txt" }] }
+      } as never),
+      /escapes review root/
+    );
+    await assert.rejects(
+      () => assertReviewToolCallWithinRoot(repository, {
+        type: "tool_call",
+        toolName: "read_many",
+        input: { files: [{ path: "escape-link" }] }
+      } as never),
+      /resolved path escapes review root/
+    );
+  } finally {
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test("independent review fails closed without a configured reviewer route", async () => {
+  const api = createToolListApi([], ["read_many", "search_many"]);
+  await assert.rejects(
+    () => runIndependentReview(api as never, {} as never, { cwd: "/repo", tools: ["search_many", "read_many"] }),
+    /Review subagent is not configured/
   );
 });
 
@@ -628,6 +678,9 @@ test("buildReviewTask injects configured reviewer guidance", () => {
 
   assert.match(task, /## Reviewer guidance/);
   assert.match(task, /Prioritize package\/profile boundary regressions\./);
+  assert.match(task, /available read-only tools/);
+  assert.match(task, /inspection-only/);
+  assert.doesNotMatch(task, /Important shell_start instruction/);
 });
 
 test("review publish skips stale display after deferred-display cancellation", async () => {
