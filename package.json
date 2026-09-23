@@ -15,7 +15,7 @@
   "scripts": {
     "check": "tsc --noEmit",
     "pretest": "rm -rf .pi/test-build",
-    "test": "PI_TOOLS_CONFIG_DIR=config tsc -p tsconfig.test.json && PI_TOOLS_CONFIG_DIR=config node --test .pi/test-build/tests/*.test.js",
+    "test": "PI_TOOLS_CONFIG_DIR=config tsc -p tsconfig.test.json && cp -R skills .pi/test-build/skills && PI_TOOLS_CONFIG_DIR=config node --test .pi/test-build/tests/*.test.js",
     "validate": "npm run check && npm test && git diff --check",
     "pi": "pi -e .",
     "dev:pi": "node scripts/dev-pi.mjs",
@@ -43,6 +43,9 @@
       "extensions/review-subagent/index.ts",
       "extensions/tool-display/index.ts",
       "extensions/orchestrator/index.ts"
+    ],
+    "skills": [
+      "skills"
     ]
   },
   "dependencies": {

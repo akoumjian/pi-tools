@@ -141,9 +141,12 @@ test("pi-tools package defaults do not own personal profile model or trust choic
   assert.doesNotMatch(reviewGuidance, personalHomePattern);
 });
 
-test("pi-tools package does not register removed Hunk resources", () => {
+test("pi-tools package ships managed-worker role skills without removed Hunk resources", () => {
   const manifest = packageJson();
-  assert.equal(manifest.pi?.skills, undefined);
+  assert.deepEqual(manifest.pi?.skills, ["skills"]);
+  for (const role of ["parent", "implementation", "review", "integration"]) {
+    assert.ok(existsSync(path.join(packageRoot, "skills", `managed-worker-${role}`, "SKILL.md")), role);
+  }
   assert.equal(manifest.pi?.extensions?.some((entry: string) => entry.includes("hunk-review")), false);
   assert.equal(existsSync(path.join(packageRoot, "extensions", "hunk-review")), false);
   assert.equal(existsSync(path.join(packageRoot, "skills", "hunk-review")), false);

@@ -31,6 +31,7 @@ import { MAX_WORKER_TASK_IDS } from "../_shared/worker-contract.js";
 import { isWorkerId, WORKER_ID_PATTERN } from "../_shared/worker-id.js";
 import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
+import { managedWorkerRoleSkillText } from "../_shared/role-skills.js";
 import { cancelPersistedAsyncShellJobsForOwner, handleAsyncShellViewerCommand, type JobMeta, type ManagedAsyncJobHandle } from "../async-shell/index.js";
 import {
   defaultWorkerFoldsRoot,
@@ -2734,6 +2735,8 @@ function buildNewWorkerPrompt(
     `You are managed worker ${record.workerId} in workspace ${record.workspaceRoot}.`,
     `Assigned Beads: ${record.taskIds.join(", ")}.`,
     "The parent session was forked into this exact worker session. Work only on the assigned scope.",
+    `Trusted implementation role skill:
+${managedWorkerRoleSkillText("implementation")}`,
     WORKER_OPERATIONAL_GUIDANCE,
     initialRepos?.length ? `Initial repositories requested:\n${initialRepos.map((repo) => `- ${repo.source}${repo.revision ? ` @ ${repo.revision}` : ""}`).join("\n")}` : undefined,
     guidance?.trim() ? `Parent guidance:\n${guidance.trim()}` : undefined
@@ -2747,6 +2750,7 @@ function buildIntegrationAnalysisPrompt(record: WorkerRecord): string {
     `Read the immutable parent-curated context at ${integration.workspaceContextFile}.`,
     `Inspect ${integration.workspaceRepo} for prepared ${integration.method} integration at exact target ${integration.targetExpectedCommit} and exact candidate ref refs/heads/integration-candidate (${integration.candidateHeadCommit}).`,
     "Do not modify repository HEAD, refs, index, worktree, ignored/untracked files, or config. Unreferenced Git objects are benign, but experiments and clones belong only below workspace scratch, never below repos/. Analyze the conflict, report no repositories, propose an exact plan, identify questions and assumptions, and finish resumably only with worker_handoff state checkpoint or needs_input; use blocked or failed only for an honest terminal failure. Any repository mutation or completion claim is rejected.",
+    `Trusted integration role skill:\n${managedWorkerRoleSkillText("integration")}`,
     WORKER_OPERATIONAL_GUIDANCE
   ].join("\n\n");
 }
@@ -2759,6 +2763,7 @@ function buildIntegrationResolutionPrompt(record: WorkerRecord, message: string,
     `Resolve only ${integration.workspaceRepo} using prepared method ${integration.method}. Start from exact target ${integration.targetExpectedCommit}; integrate exact candidate ${integration.candidateHeadCommit} from refs/heads/integration-candidate according to settled decisions. Commit the result locally, do not push, and report ${integration.workspaceRepo} in worker_handoff.`,
     `Fresh parent context snapshot: ${parentContextSnapshot}`,
     `Parent resume message: ${message}`,
+    `Trusted integration role skill:\n${managedWorkerRoleSkillText("integration")}`,
     WORKER_OPERATIONAL_GUIDANCE
   ].join("\n\n");
 }
@@ -2786,6 +2791,7 @@ function buildResumeWorkerPrompt(record: WorkerRecord, message: string, parentCo
     `Resume managed worker ${record.workerId} in the exact existing session and workspace.`,
     `Assigned Beads: ${record.taskIds.join(", ")}.`,
     `A fresh mode-0400 snapshot of the completed parent session for this resume is available at ${parentContextSnapshot}.`,
+    `Trusted implementation role skill:\n${managedWorkerRoleSkillText("implementation")}`,
     WORKER_OPERATIONAL_GUIDANCE,
     `Parent update:\n${message.trim()}`
   ].join("\n\n");

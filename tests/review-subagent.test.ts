@@ -22,6 +22,7 @@ import reviewSubagentExtension, {
   publishReviewDetails,
   readReviewSettings,
   renderReviewMessage,
+  reviewRoleSkillSessionOptions,
   selectReviewModel,
   serializeRecentMessages,
   settleReviewWorkLaunch,
@@ -290,6 +291,13 @@ test("selectReviewModel uses the current model when no default is requested", ()
   const current = fakeModel("openai-codex", "gpt-5.3-codex");
   const registry = fakeRegistry([current]);
   assert.deepEqual(selectReviewModel(registry, undefined, current, "xhigh"), { model: current, thinkingLevel: "xhigh" });
+});
+
+test("review child receives only the trusted reviewer role skill", () => {
+  const options = reviewRoleSkillSessionOptions();
+  assert.equal(options.exclusiveSkills, true);
+  assert.equal(options.skillPaths.length, 1);
+  assert.match(options.skillPaths[0], /skills[/\\]managed-worker-review[/\\]SKILL\.md$/);
 });
 
 test("review tool allowlist stays restricted after native default tools are re-added", async () => {

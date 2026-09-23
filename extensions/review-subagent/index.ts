@@ -12,6 +12,7 @@ import {
   type LoadExtensionsResult
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
+import { exclusiveManagedWorkerRoleSkillOptions } from "../_shared/role-skills.js";
 import {
   formatModelName,
   normalizeThinkingLevel,
@@ -32,6 +33,11 @@ const REVIEW_MESSAGE_TYPE = "review-subagent";
 const REVIEW_STATUS_KEY = "review-subagent";
 const REVIEW_EXTENSION_PATH_PATTERN = /(?:^|[/\\])extensions[/\\]review-subagent[/\\]index\.(?:ts|js)$/;
 const REVIEW_CONFIG_FILE = "review-subagent-settings.json";
+
+export function reviewRoleSkillSessionOptions(): { skillPaths: string[]; exclusiveSkills: true } {
+  const roleSkill = exclusiveManagedWorkerRoleSkillOptions("review");
+  return { skillPaths: roleSkill.additionalSkillPaths, exclusiveSkills: true };
+}
 
 const DEFAULT_REVIEW_TOOLS = [
   "search_many",
@@ -479,6 +485,7 @@ async function runReviewSubagent(
     model,
     thinkingLevel,
     tools: settings.tools,
+    ...reviewRoleSkillSessionOptions(),
     systemPrompts: [reviewerSystemPrompt],
     extensionsOverride: omitReviewSubagentExtension,
     onWarning: (message) => context.ui.notify(`Review child session warning: ${message}`, "warning"),

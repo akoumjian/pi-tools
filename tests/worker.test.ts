@@ -641,6 +641,8 @@ test("worker_run resume reopens only the exact worker session and captures fresh
     assert.equal(launch.sessionFile, forked.sessionFile);
     assert.match(launch.prompt, /fresh mode-0400 snapshot/);
     assert.match(launch.prompt, /Inspect the fresh parent context/);
+    assert.match(launch.prompt, /Trusted implementation role skill/);
+    assert.match(launch.prompt, /Never push, publish, promote/);
     const snapshot = path.join(paths.artifactsDir, `parent-context-${receipt.runId}.jsonl`);
     assert.match(await readFile(snapshot, "utf8"), /FRESH_PARENT_MARKER/);
 

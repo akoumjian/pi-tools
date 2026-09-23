@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { startManagedAsyncJob, type ManagedAsyncJobHandle } from "../async-shell/index.js";
 import { resolveExecutable } from "../_shared/executable.js";
+import { managedWorkerRoleSkillPath, type ManagedWorkerRoleSkill } from "../_shared/role-skills.js";
 import type { WorkerContainerReference } from "../_shared/worker-container.js";
 import type { WorkerIntegrationRecord, WorkerRecord } from "./state.js";
 
@@ -30,6 +31,7 @@ export type WorkerHostConfig = {
   asyncJobRoot: string;
   parentContextSnapshot?: string;
   taskIds: string[];
+  roleSkill: Extract<ManagedWorkerRoleSkill, "implementation" | "integration">;
   integration?: WorkerIntegrationRecord;
   resultFile: string;
   settledFile: string;
@@ -112,6 +114,7 @@ export function launchWorkerHost(
     asyncJobRoot: path.join(stateRoot, "async-shell"),
     parentContextSnapshot: input.parentContextSnapshot,
     taskIds: [...input.record.taskIds],
+    roleSkill: input.record.integration ? "integration" : "implementation",
     integration: input.record.integration,
     resultFile: input.resultFile,
     settledFile: path.join(input.runDir, "settled.json"),
@@ -212,6 +215,7 @@ export function buildWorkerRpcArgs(config: WorkerHostConfig): string[] {
     "--no-approve",
     "--no-context-files",
     "--no-skills",
+    "--skill", managedWorkerRoleSkillPath(config.roleSkill),
     "--no-prompt-templates",
     "--no-themes",
     "--no-extensions",

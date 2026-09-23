@@ -752,6 +752,7 @@ test("worker RPC argv pins exact session resources and only the worker tool surf
     stateRoot: "/tmp/worker-state",
     asyncJobRoot: "/tmp/worker-state/async-shell",
     taskIds: ["personal-test"],
+    roleSkill: "implementation",
     resultFile: "/tmp/result.json",
     settledFile: "/tmp/settled.json",
     processFile: "/tmp/host-process.json",
@@ -783,6 +784,10 @@ test("worker RPC argv pins exact session resources and only the worker tool surf
   }
   assert.match(args[args.indexOf("--tools") + 1], /worker_handoff/);
   assert.match(args[args.indexOf("--tools") + 1], /worker_task_read/);
+  assert.ok(args.includes("--no-skills"));
+  assert.match(args[args.indexOf("--skill") + 1], /skills[/\\]managed-worker-implementation[/\\]SKILL\.md$/);
+  const integrationArgs = buildWorkerRpcArgs({ ...config, roleSkill: "integration" });
+  assert.match(integrationArgs[integrationArgs.indexOf("--skill") + 1], /skills[/\\]managed-worker-integration[/\\]SKILL\.md$/);
   assert.ok(resolvePiCliPath().endsWith("/dist/cli.js"));
   assert.equal(defaultWorkerExtensionPaths().length, 2);
 });
