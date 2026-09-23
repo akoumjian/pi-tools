@@ -92,7 +92,7 @@ Result details include:
 
 ## Setup
 
-1. Run `/mutation:setup provider/model[:thinking]` to pick a fast, cheap, reasoning-friendly reviewer model.
+1. Run `/mutation:setup provider/model[:thinking]` to pick a fast, cheap, reasoning-friendly reviewer model. Mutation-review is a child agent, so `max` thinking and Claude Fable models are rejected rather than clamped or substituted; `xhigh` is the ceiling.
 2. `/mutation:status` confirms the active reviewer model, guidance source, tool allowlist, reviewed tools, and any runtime overrides.
 3. To temporarily disable: `/mutation:toggle off`.
 4. To change reviewer mid-session without persisting: `/mutation:model provider/model[:thinking]`. `/mutation:model reset` clears the runtime override.

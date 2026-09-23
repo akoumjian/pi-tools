@@ -29,7 +29,16 @@ import {
   resolveCompletionDelivery
 } from "../_shared/completion-delivery.js";
 import { resolveExecutable } from "../_shared/executable.js";
-import { formatModelName, parseModelThinkingPair, resolveExtensionModel } from "../_shared/model-spec.js";
+import {
+  assertChildAgentRouteAllowed,
+  assertSubagentRouteAllowed,
+  assertSubagentRouteSpecAllowed,
+  assertSubagentThinkingLevelAllowed,
+  formatModelName,
+  parseModelThinkingPair,
+  parseOptionalModelThinkingPair,
+  resolveExtensionModel
+} from "../_shared/model-spec.js";
 import { MAX_WORKER_TASK_IDS } from "../_shared/worker-contract.js";
 import { isWorkerId, WORKER_ID_PATTERN } from "../_shared/worker-id.js";
 import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
@@ -120,7 +129,7 @@ const NewWorkerRunSchema = Type.Object({
   route: Type.Optional(Type.String({
     minLength: 1,
     maxLength: 512,
-    description: "Override the configured default provider/model/thinking route for this new worker."
+    description: "Override the configured default provider/model/thinking route for this new worker; max and Claude Fable routes are rejected."
   })),
   completionDelivery: Type.Optional(CompletionDeliverySchema),
   initialRepos: Type.Optional(Type.Array(InitialRepoSchema, { maxItems: 16 }))
@@ -152,7 +161,7 @@ const IntegrationContextSchema = Type.Object({ ...Object.fromEntries(INTEGRATION
 const WorkerFoldResolveStartSchema = Type.Object({
   kind: Type.Literal("start"), preparedId: Type.String({ pattern: "^prepared_[0-9a-f]{24}$" }), manifestSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }), candidateId: Type.String({ pattern: "^candidate_[0-9a-f]{24}$" }),
   taskIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { minItems: 1, maxItems: MAX_WORKER_TASK_IDS }), context: IntegrationContextSchema,
-  route: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })), completionDelivery: Type.Optional(CompletionDeliverySchema)
+  route: Type.Optional(Type.String({ minLength: 1, maxLength: 512, description: "Override the integration subagent route; max and Claude Fable routes are rejected." })), completionDelivery: Type.Optional(CompletionDeliverySchema)
 }, { additionalProperties: false });
 const WorkerFoldResolveResumeSchema = Type.Object({
   kind: Type.Literal("resume"), workerId: WorkerIdSchema, message: Type.String({ minLength: 1, maxLength: 12000 }),
@@ -614,7 +623,7 @@ export function registerWorkerExtension(
       "worker_review use: Call for the exact settled worker/run/repository after selecting its authoritative candidate; if review requests changes, resume the implementation worker and review the new settled run again.",
       inputJsonSchemaGuideline("worker_review", WorkerReviewParams),
       outputJsonSchemaGuideline("worker_review", RetainedToolOutputSchemas.worker_review),
-      "worker_review constraints: Requires an exact-parent-owned handed-off run, valid hash-bound inventory, already-stopped exact persistent container, and clean foldable candidate. It never acknowledges delivery or mutates worker/container state. A bounded operation lock covers the primary and, only after a confirmed Anthropic 429 rate_limit_error, one fresh same-provider configured fallback child. Both use trusted in-memory settings, verified review-role text, and only repository-confined read_many/search_many; auth/model/config/transport/5xx/timeout/cancellation/output/policy failures never trigger fallback. Exact attempt routes are visible. Lifecycle/container/HEAD/tree/dirty/policy are rechecked after the overall review; drift fails visibly. The structured verdict/findings/checks are advice only, not validation, attestation, promotion, push, or publication authority. Only result content is provider-visible; details are internal."
+      "worker_review constraints: Requires an exact-parent-owned handed-off run, valid hash-bound inventory, already-stopped exact persistent container, and clean foldable candidate. Primary and fallback routes reject max thinking and every Claude Fable model. It never acknowledges delivery or mutates worker/container state. A bounded operation lock covers the primary and, only after a confirmed Anthropic 429 rate_limit_error, one fresh same-provider configured fallback child. Both use trusted in-memory settings, verified review-role text, and only repository-confined read_many/search_many; auth/model/config/transport/5xx/timeout/cancellation/output/policy failures never trigger fallback. Exact attempt routes are visible. Lifecycle/container/HEAD/tree/dirty/policy are rechecked after the overall review; drift fails visibly. The structured verdict/findings/checks are advice only, not validation, attestation, promotion, push, or publication authority. Only result content is provider-visible; details are internal."
     ],
     parameters: WorkerReviewParams,
     executionMode: "sequential",
@@ -688,7 +697,7 @@ export function registerWorkerExtension(
       "worker_fold_resolve use: start binds preparedId/hash/candidateId, assigned task IDs, route, and a complete bounded parent-curated context; resume the returned worker only after reading its checkpoint or needs_input handoff and settling decisions.",
       inputJsonSchemaGuideline("worker_fold_resolve", WorkerFoldResolveParams),
       outputJsonSchemaGuideline("worker_fold_resolve", RetainedToolOutputSchemas.worker_fold_resolve),
-      "worker_fold_resolve constraints: Analysis is immutable and may hand off only checkpoint or needs_input. Resolution is an exact-session resume with immutable decisions and may hand off only completed states. Moved targets, tampered prepared/context state, repository mutation during analysis, generic resume, credentials, push, implicit rebase, review, validation, and promotion fail closed. Only result content is provider-visible; details are internal."
+      "worker_fold_resolve constraints: Integration routes reject max thinking and every Claude Fable model. Analysis is immutable and may hand off only checkpoint or needs_input. Resolution is an exact-session resume with immutable decisions and may hand off only completed states. Moved targets, tampered prepared/context state, repository mutation during analysis, generic resume, credentials, push, implicit rebase, review, validation, and promotion fail closed. Only result content is provider-visible; details are internal."
     ],
     parameters: WorkerFoldResolveParams,
     renderCall(args, theme) { return renderWorkerFoldResolveCall(args as WorkerFoldResolveInput, theme); },
@@ -724,6 +733,7 @@ export function registerWorkerExtension(
       } else {
         const paths = workerPaths(dependencies.roots, request.workerId);
         const existing = readWorkerRecord(paths.recordFile);
+        assertSubagentRouteAllowed(existing.route, `Persisted integration worker ${existing.workerId} route`);
         assertWorkerParentSession(existing, context);
         if (!existing.integration || existing.integration.phase !== "analysis") throw new Error("worker_fold_resolve resume requires a settled analysis integration worker.");
         if (existing.status !== "handed_off" || existing.lastRun?.status !== "handed_off" || existing.lastRun.runId !== existing.integration.analysisRunId) throw new Error("worker_fold_resolve resume requires the exact successful analysis handoff.");
@@ -769,7 +779,7 @@ export function registerWorkerExtension(
       "worker_run use: Use worker_run for substantive engineering that benefits from an independent durable agent session and private workspace; use kind=new with assigned Beads and kind=resume for the exact same worker after feedback or a checkpoint. New workers use the worker-settings.json default route unless route explicitly overrides it.",
       inputJsonSchemaGuideline("worker_run", WorkerRunParams),
       outputJsonSchemaGuideline("worker_run", RetainedToolOutputSchemas.worker_run),
-      "worker_run constraints: The parent owns grounding, task acceptance, integration, and promotion. A new worker forks the completed current parent turn; a resume cannot change session/workspace/provider/model. Receipts are immediate, process exit is not semantic completion, and cancellation must settle all shell jobs owned by the worker. Only result content is provider-visible; details are internal."
+      "worker_run constraints: New, explicit, and persisted resume routes reject max thinking and every Claude Fable model; legacy records remain unchanged when resume fails. The parent owns grounding, task acceptance, integration, and promotion. A new worker forks the completed current parent turn; a resume cannot change session/workspace/provider/model. Receipts are immediate, process exit is not semantic completion, and cancellation must settle all shell jobs owned by the worker. Only result content is provider-visible; details are internal."
     ],
     parameters: WorkerRunParams,
     renderCall(args, theme) {
@@ -1338,6 +1348,7 @@ function planWorkerRuns(
     resumed.add(input.workerId);
     const paths = workerPaths(dependencies.roots, input.workerId);
     const existing = readWorkerRecord(paths.recordFile);
+    assertSubagentRouteAllowed(existing.route, `Persisted worker ${existing.workerId} route`);
     if (parentSessionFile !== path.resolve(existing.parentSessionFile)) {
       throw new Error(`Worker ${existing.workerId} can only resume from its exact parent session ${existing.parentSessionFile}.`);
     }
@@ -1522,6 +1533,7 @@ function prepareResumedWorker(
   const jobId = createAsyncJobId(now, dependencies.random());
   return withWorkerOperationLock(paths, () => {
     const existing = readWorkerRecord(paths.recordFile);
+    assertSubagentRouteAllowed(existing.route, `Persisted worker ${existing.workerId} route`);
     if (existing.activeRun) throw new Error(`Worker ${existing.workerId} became active before resume preparation.`);
     if (existing.lastRun?.delivery === "pending") {
       throw new Error(`Worker ${existing.workerId} completion delivery became pending before resume preparation; inspect it with worker_control result or use /worker:ack.`);
@@ -1665,6 +1677,7 @@ async function startPendingWorker(
   let launchedHandle: ManagedWorkerHandle | undefined;
   let launchAttempted = false;
   try {
+    assertSubagentRouteAllowed(record.route, `Worker ${record.workerId} launch route`);
     const currentParentSessionFile = context.sessionManager.getSessionFile();
     if (!currentParentSessionFile || path.resolve(currentParentSessionFile) !== pending.parentSessionFile) {
       throw new Error(`Worker ${record.workerId} launch parent session changed before the queued run became durable.`);
@@ -2978,6 +2991,10 @@ function assertWorkerParentSession(record: WorkerRecord, context: ExtensionConte
 export function resolveWorkerRoute(requested: string | undefined, context: ExtensionContext): WorkerRoute {
   const fallbackThinkingLevel = (context.thinkingLevel ?? "xhigh") as ThinkingLevel;
   const route = requested?.trim() || readWorkerSettings().defaultRoute;
+  assertSubagentRouteSpecAllowed(route, "Worker route");
+  if (!parseOptionalModelThinkingPair(route)) {
+    assertSubagentThinkingLevelAllowed(fallbackThinkingLevel, "Worker inherited thinking level");
+  }
   const resolved = resolveExtensionModel({
     registry: context.modelRegistry,
     requested: route,
@@ -2985,11 +3002,13 @@ export function resolveWorkerRoute(requested: string | undefined, context: Exten
     label: "Worker",
     noModelMessage: "No worker route is configured. Set worker-settings.json defaultRoute or pass route."
   });
-  return {
+  const workerRoute = {
     provider: resolved.model.provider,
     model: resolved.model.id,
     thinkingLevel: resolved.thinkingLevel
   };
+  assertSubagentRouteAllowed(workerRoute, "Worker route");
+  return workerRoute;
 }
 
 export function resolveWorkerReviewRoutes(
@@ -3022,6 +3041,7 @@ function resolveExactWorkerReviewRoute(
   route: string,
   role: "primary" | "rate-limit fallback"
 ): ManagedWorkerReviewRoute {
+  assertSubagentRouteSpecAllowed(route, `Managed-worker review ${role} route`);
   const configured = parseModelThinkingPair(route);
   const resolved = resolveExtensionModel({
     registry: context.modelRegistry,
@@ -3033,6 +3053,7 @@ function resolveExactWorkerReviewRoute(
   if (formatModelName(resolved.model) !== configured.model || resolved.thinkingLevel !== configured.thinkingLevel) {
     throw new Error(`Managed-worker review ${role} route cannot be honored exactly: ${route}.`);
   }
+  assertChildAgentRouteAllowed(resolved.model, resolved.thinkingLevel, `Managed-worker review ${role} route`);
   return resolved;
 }
 
@@ -3624,6 +3645,7 @@ function defaultDependencies(): WorkerExtensionDependencies {
     removeContainer: (container) => settleWorkerContainer(resolveDockerPath(), container),
     launch: (api, context, request) => {
       if (!request.container) throw new Error(`Worker ${request.record.workerId}/${request.record.activeRun?.runId ?? "unknown"} lost its planned Docker identity.`);
+      assertSubagentRouteAllowed(request.record.route, `Worker ${request.record.workerId} launch route`);
       const dockerPath = resolveDockerPath();
       let container = request.container;
       try {

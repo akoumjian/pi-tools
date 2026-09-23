@@ -806,6 +806,10 @@ test("selectMutationReviewModel resolves configured models and auth", () => {
   const registry = fakeRegistry([gpt, spark], new Set(["openai-codex/gpt-5.3-codex"]));
 
   assert.deepEqual(selectMutationReviewModel(registry, "openai-codex/gpt-5.3-codex", spark, "low"), { model: gpt, thinkingLevel: "low" });
+  assert.throws(() => selectMutationReviewModel(registry, "openai-codex/gpt-5.3-codex:max", spark, "low"), /capped at xhigh/);
+  assert.throws(() => selectMutationReviewModel(registry, "openai-codex/gpt-5.3-codex", spark, "max"), /inherited thinking level.*capped at xhigh/);
+  const fable = fakeModel("anthropic", "claude-fable-5");
+  assert.throws(() => selectMutationReviewModel(fakeRegistry([fable]), "anthropic/claude-fable-5:xhigh", undefined, "low"), /Claude Fable/);
   assert.throws(() => selectMutationReviewModel(registry, "openai-codex/gpt-5.3-codex-spark", gpt), /no configured auth/);
   assert.throws(() => selectMutationReviewModel(registry, "missing-format", gpt), /not found/);
 });

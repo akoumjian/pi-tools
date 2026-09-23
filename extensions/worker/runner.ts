@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { startManagedAsyncJob, type ManagedAsyncJobHandle } from "../async-shell/index.js";
 import { resolveExecutable } from "../_shared/executable.js";
+import { assertSubagentRouteAllowed } from "../_shared/model-spec.js";
 import { managedWorkerRoleSkillPath, type ManagedWorkerRoleSkill } from "../_shared/role-skills.js";
 import type { WorkerContainerReference } from "../_shared/worker-container.js";
 import type { WorkerIntegrationRecord, WorkerRecord } from "./state.js";
@@ -94,6 +95,7 @@ export function launchWorkerHost(
   context: ExtensionContext,
   input: LaunchWorkerHostInput
 ): { handle: ManagedAsyncJobHandle; config: WorkerHostConfig; configFile: string } {
+  assertSubagentRouteAllowed(input.record.route, `Worker ${input.record.workerId} host route`);
   if (!input.record.sessionFile) throw new Error(`Worker ${input.record.workerId} has no forked session file.`);
   if (!input.record.activeRun) throw new Error(`Worker ${input.record.workerId} has no active run to launch.`);
   const activeRun = input.record.activeRun;

@@ -10,6 +10,7 @@ import {
   MAX_MANAGED_WORKER_REVIEW_CHECKS_CHARS,
   assertManagedReviewToolCallWithinRoot,
   buildManagedWorkerReviewTask,
+  formatManagedWorkerReviewRoute,
   isConfirmedAnthropicRateLimitMessage,
   parseManagedWorkerReviewOutput,
   runManagedWorkerReview,
@@ -203,6 +204,39 @@ test("managed review plan rejects a cross-provider fallback before starting a ch
     }), /fallback must use the same provider/);
     assert.equal(anthropic.state.callCount, 0);
     assert.equal(openai.state.callCount, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("managed review rejects max and Claude Fable routes before starting either child", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-managed-review-route-policy-"));
+  const faux = fauxProvider({
+    provider: "anthropic",
+    api: "managed-review-route-policy-api",
+    models: [{ id: "opus", reasoning: true }, { id: "secondary", reasoning: true }, { id: "claude-fable-5", reasoning: true }]
+  });
+  try {
+    assert.equal(formatManagedWorkerReviewRoute({ model: faux.getModel("opus") as Model<Api>, thinkingLevel: "max" }), "anthropic/opus:max", "forbidden routes remain truthfully rendered");
+    await assert.rejects(() => runManagedWorkerReviewWithRateLimitFallback(childContext(faux, []), {
+      cwd: root,
+      primaryRoute: { model: faux.getModel("opus") as Model<Api>, thinkingLevel: "max" },
+      rateLimitFallbackRoute: { model: faux.getModel("secondary") as Model<Api>, thinkingLevel: "xhigh" },
+      evidence: "exact"
+    }), /primary route .*capped at xhigh/);
+    await assert.rejects(() => runManagedWorkerReviewWithRateLimitFallback(childContext(faux, []), {
+      cwd: root,
+      primaryRoute: { model: faux.getModel("opus") as Model<Api>, thinkingLevel: "xhigh" },
+      rateLimitFallbackRoute: { model: faux.getModel("secondary") as Model<Api>, thinkingLevel: "max" },
+      evidence: "exact"
+    }), /fallback route .*capped at xhigh/);
+    await assert.rejects(() => runManagedWorkerReview(childContext(faux, []), {
+      cwd: root,
+      model: faux.getModel("claude-fable-5") as Model<Api>,
+      thinkingLevel: "xhigh",
+      evidence: "exact"
+    }), /Claude Fable models cannot be used for subagents/);
+    assert.equal(faux.state.callCount, 0);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

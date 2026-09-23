@@ -448,6 +448,11 @@ test("worker settings select a configured default while explicit routes override
     reviewRateLimitFallbackRoute: "openai-codex/gpt-test:xhigh"
   }, "fixture"), /same exact provider/);
   assert.throws(() => normalizeWorkerSettings({}, "fixture"), /defaultRoute/);
+  assert.throws(() => normalizeWorkerSettings({ defaultRoute: "openai-codex/gpt-5.6-sol:max" }, "fixture"), /capped at xhigh/);
+  assert.throws(() => normalizeWorkerSettings({ defaultRoute: "anthropic/claude-fable-5:xhigh" }, "fixture"), /Claude Fable/);
+  assert.throws(() => normalizeWorkerSettings({ defaultRoute: "openai-codex/gpt-5.6-sol:xhigh", reviewRoute: "anthropic/claude-opus-5-5:max" }, "fixture"), /capped at xhigh/);
+  assert.throws(() => normalizeWorkerSettings({ defaultRoute: "openai-codex/gpt-5.6-sol:xhigh", reviewRoute: "anthropic/claude-fable-5:xhigh" }, "fixture"), /Claude Fable/);
+  assert.throws(() => normalizeWorkerSettings({ defaultRoute: "openai-codex/gpt-5.6-sol:xhigh", reviewRoute: "anthropic/claude-opus-5-5:xhigh", reviewRateLimitFallbackRoute: "anthropic/claude-opus-5:max" }, "fixture"), /capped at xhigh/);
   assert.throws(() => normalizeWorkerSettings({ defaultRoute: "openai-codex/gpt-5.6-sol:xhigh", extra: true }, "fixture"), /unsupported worker setting/);
   assert.deepEqual(resolveWorkerRoute(undefined, context), {
     provider: "openai-codex",
@@ -459,6 +464,9 @@ test("worker settings select a configured default while explicit routes override
     model: "gpt-test",
     thinkingLevel: "xhigh"
   });
+  assert.throws(() => resolveWorkerRoute("openai-codex/gpt-test:max", context), /capped at xhigh/);
+  const maxParentContext = { ...context, thinkingLevel: "max" } as ExtensionContext;
+  assert.throws(() => resolveWorkerRoute("openai-codex/gpt-test", maxParentContext), /inherited thinking level.*capped at xhigh/);
   const unavailableContext = parentContext("/tmp/parent", "/tmp/parent.jsonl") as ExtensionContext & {
     modelRegistry: { hasConfiguredAuth(model: Model<Api>): boolean; getAll(): Model<Api>[] };
   };
@@ -482,6 +490,17 @@ test("worker settings select a configured default while explicit routes override
     primary: { model: context.model, thinkingLevel: "xhigh" },
     rateLimitFallback: { model: context.modelRegistry.getAll().find((model) => model.id === "gpt-5.6-sol"), thinkingLevel: "xhigh" }
   });
+  assert.throws(() => resolveWorkerReviewRoute(context, {
+    defaultRoute: "openai-codex/gpt-5.6-sol:xhigh",
+    reviewRoute: "openai-codex/gpt-test:max",
+    configSource: "fixture"
+  }), /capped at xhigh/);
+  assert.throws(() => resolveWorkerReviewRoutes(context, {
+    defaultRoute: "openai-codex/gpt-5.6-sol:xhigh",
+    reviewRoute: "openai-codex/gpt-test:xhigh",
+    reviewRateLimitFallbackRoute: "openai-codex/gpt-5.6-sol:max",
+    configSource: "fixture"
+  }), /capped at xhigh/);
   assert.throws(() => resolveWorkerReviewRoute(context, {
     defaultRoute: "openai-codex/gpt-5.6-sol:xhigh",
     reviewRoute: "openai-codex/missing:xhigh",
@@ -911,6 +930,17 @@ test("worker_run resume reopens only the exact worker session and captures fresh
     });
     const tool = api.tools.find((candidate) => candidate.name === "worker_run");
     assert.ok(tool?.execute);
+    const legacyMax = readWorkerRecord(paths.recordFile);
+    writeWorkerRecord(paths.recordFile, { ...legacyMax, route: { ...legacyMax.route, thinkingLevel: "max" } });
+    await assert.rejects(
+      tool.execute("call-resume-max", { runs: [{ kind: "resume", workerId, message: "Do not launch max." }] } as never, undefined, undefined, context),
+      /Persisted worker .*capped at xhigh/
+    );
+    const rejectedLegacyMax = readWorkerRecord(paths.recordFile);
+    assert.equal(rejectedLegacyMax.route.thinkingLevel, "max", "legacy persisted route must remain truthful");
+    assert.equal(rejectedLegacyMax.activeRun, undefined);
+    assert.equal(Boolean(launch), false);
+    writeWorkerRecord(paths.recordFile, legacyMax);
     const result = await tool.execute("call-resume", {
       runs: [{ kind: "resume", workerId, message: "Inspect the fresh parent context.", addTaskIds: ["personal-added"] }]
     } as never, undefined, undefined, context);
@@ -2639,6 +2669,7 @@ test("worker_fold_resolve dispatches one exact immutable analysis worker", async
     assert.equal(preparedDetails.status, "resolution_required"); assert.equal(preparedDetails.resolutionCaseCount, 1);
     await assert.rejects(() => executeResolve("mixed-phase", { kind: "start", preparedId: preparedDetails.preparedId, manifestSha256: preparedDetails.manifestSha256, candidateId, taskIds: ["personal-resolve"], context: Object.fromEntries(["decisions","projectRules","acceptanceCriteria","dependencies","candidateRationale","candidateChecks","reviewFindings","invariants","nonGoals","priorities","openQuestions","authorResponses"].map((key) => [key, key === "acceptanceCriteria" ? ["Produce an exact conflict resolution."] : []])), workerId: sourceWorkerId }), /start requires only/);
     await assert.rejects(() => executeResolve("wrong-hash", { kind: "start", preparedId: preparedDetails.preparedId, manifestSha256: "0".repeat(64), candidateId, taskIds: ["personal-resolve"], context: Object.fromEntries(["decisions","projectRules","acceptanceCriteria","dependencies","candidateRationale","candidateChecks","reviewFindings","invariants","nonGoals","priorities","openQuestions","authorResponses"].map((key) => [key, key === "acceptanceCriteria" ? ["Produce an exact conflict resolution."] : []])) }), /hash mismatch/);
+    await assert.rejects(() => executeResolve("max-route", { kind: "start", preparedId: preparedDetails.preparedId, manifestSha256: preparedDetails.manifestSha256, candidateId, taskIds: ["personal-resolve"], route: "openai-codex/gpt-test:max", context: Object.fromEntries(["decisions","projectRules","acceptanceCriteria","dependencies","candidateRationale","candidateChecks","reviewFindings","invariants","nonGoals","priorities","openQuestions","authorResponses"].map((key) => [key, key === "acceptanceCriteria" ? ["Produce an exact conflict resolution."] : []])) }), /capped at xhigh/);
     const started = await executeResolve("resolve-start", { kind: "start", preparedId: preparedDetails.preparedId, manifestSha256: preparedDetails.manifestSha256, candidateId, taskIds: ["personal-resolve"], context: Object.fromEntries(["decisions","projectRules","acceptanceCriteria","dependencies","candidateRationale","candidateChecks","reviewFindings","invariants","nonGoals","priorities","openQuestions","authorResponses"].map((key) => [key, key === "acceptanceCriteria" ? ["Produce an exact conflict resolution."] : []])) });
     assert.equal(Check(RetainedToolOutputSchemas.worker_fold_resolve, started), true);
     const details = started.details as { workerId: string; phase: string; contextSha256: string; preparedId: string };

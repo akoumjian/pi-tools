@@ -5,7 +5,7 @@ import type { Api, AssistantMessage, Model, TextContent } from "@earendil-works/
 import type { AgentSessionEvent, ExtensionContext, ExtensionFactory, ToolCallEvent } from "@earendil-works/pi-coding-agent";
 import { createAbortScope, throwIfAborted } from "../_shared/cancellation.js";
 import { withChildAgentSession } from "../_shared/child-agent-session.js";
-import { formatModelName } from "../_shared/model-spec.js";
+import { assertChildAgentRouteAllowed, formatModelName } from "../_shared/model-spec.js";
 import { managedWorkerRoleSkillText } from "../_shared/role-skills.js";
 import nativeToolsExtension, { resolveNativeToolPath } from "../native-tools/index.js";
 
@@ -73,6 +73,7 @@ export async function runManagedWorkerReview(
   context: Pick<ExtensionContext, "modelRegistry" | "ui">,
   input: ManagedWorkerReviewInput
 ): Promise<ManagedWorkerReviewResult> {
+  assertChildAgentRouteAllowed(input.model, input.thinkingLevel, "Managed-worker review route");
   return runManagedWorkerReviewAttempt(context, input, input.timeoutMs ?? MANAGED_WORKER_REVIEW_TIMEOUT_MS);
 }
 
@@ -81,6 +82,10 @@ export async function runManagedWorkerReviewWithRateLimitFallback(
   context: Pick<ExtensionContext, "modelRegistry" | "ui">,
   input: ManagedWorkerReviewPlanInput
 ): Promise<ManagedWorkerReviewExecutionResult> {
+  assertChildAgentRouteAllowed(input.primaryRoute.model, input.primaryRoute.thinkingLevel, "Managed-worker review primary route");
+  if (input.rateLimitFallbackRoute) {
+    assertChildAgentRouteAllowed(input.rateLimitFallbackRoute.model, input.rateLimitFallbackRoute.thinkingLevel, "Managed-worker review rate-limit fallback route");
+  }
   if (input.rateLimitFallbackRoute && input.rateLimitFallbackRoute.model.provider !== input.primaryRoute.model.provider) {
     throw new Error("Managed-worker review rate-limit fallback must use the same provider as the primary route.");
   }

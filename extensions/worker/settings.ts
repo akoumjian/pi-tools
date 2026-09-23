@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import type { ConfigPath } from "../_shared/config.js";
 import { formatConfigPath, readPiToolsJsonConfigSource } from "../_shared/config.js";
+import { assertSubagentRouteSpecAllowed } from "../_shared/model-spec.js";
 
 export const WORKER_CONFIG_FILE = "worker-settings.json";
 
@@ -40,6 +41,7 @@ export function normalizeWorkerSettings(value: unknown, configSource: string): W
   if (defaultRoute.length > 512) {
     throw new Error(`${configSource} defaultRoute must be at most 512 characters.`);
   }
+  assertSubagentRouteSpecAllowed(defaultRoute, `${configSource} defaultRoute`);
 
   const reviewRoute = optionalExactReviewRoute(value.reviewRoute, "reviewRoute", configSource);
   const reviewRateLimitFallbackRoute = optionalExactReviewRoute(
@@ -78,6 +80,7 @@ function optionalExactReviewRoute(value: unknown, field: string, configSource: s
   if (route.length > 512 || !/^[^\s/:]+\/[^\s]+:(?:off|minimal|low|medium|high|xhigh|max)$/.test(route)) {
     throw new Error(`${configSource} ${field} must be an exact provider/model:thinking route of at most 512 characters.`);
   }
+  assertSubagentRouteSpecAllowed(route, `${configSource} ${field}`);
   return route;
 }
 

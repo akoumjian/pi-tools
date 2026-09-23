@@ -15,6 +15,7 @@ import {
   type ToolDefinition
 } from "@earendil-works/pi-coding-agent";
 import { throwIfAborted } from "./cancellation.js";
+import { assertChildAgentRouteAllowed } from "./model-spec.js";
 
 export type ChildAgentSession = Awaited<ReturnType<typeof createAgentSessionFromServices>>["session"];
 
@@ -42,6 +43,7 @@ export async function withChildAgentSession<T>(
   run: (session: ChildAgentSession) => Promise<T>
 ): Promise<T> {
   throwIfAborted(options.signal);
+  assertChildAgentRouteAllowed(options.model, options.thinkingLevel);
   const tools = uniqueStrings(options.tools);
   const isolatedSystemPrompt = options.isolatedSystemPrompt?.trim();
   if (options.isolatedSystemPrompt !== undefined && !isolatedSystemPrompt) {

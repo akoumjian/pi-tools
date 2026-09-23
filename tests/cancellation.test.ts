@@ -106,3 +106,22 @@ test("child sessions fail before loading resources when the parent is already ab
   );
   assert.equal(ran, false);
 });
+
+
+test("shared child sessions reject max before loading any child resources", async () => {
+  let ran = false;
+  await assert.rejects(
+    withChildAgentSession(
+      {} as Pick<ExtensionContext, "modelRegistry" | "ui">,
+      {
+        cwd: "/repo",
+        model: { provider: "openai-codex", id: "gpt-test" } as never,
+        thinkingLevel: "max",
+        tools: []
+      },
+      async () => { ran = true; }
+    ),
+    /subagent thinking is capped at xhigh/
+  );
+  assert.equal(ran, false);
+});

@@ -26,6 +26,12 @@ export type ParsedModelThinkingPair = {
   thinkingLevel: ThinkingLevel;
 };
 
+export type SubagentRoute = {
+  provider: string;
+  model: string;
+  thinkingLevel: string;
+};
+
 const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 export function isValidThinkingLevel(value: unknown): value is ThinkingLevel {
@@ -38,6 +44,43 @@ export function normalizeThinkingLevel(value: unknown, fallback: ThinkingLevel):
 
 export function formatModelName(model: Pick<Model<Api>, "provider" | "id">): string {
   return `${model.provider}/${model.id}`;
+}
+
+/** Fail closed for every delegated child while leaving the parent model untouched. */
+export function assertSubagentRouteAllowed(route: SubagentRoute, label = "Subagent route"): void {
+  const rendered = `${route.provider}/${route.model}:${route.thinkingLevel}`;
+  assertSubagentThinkingLevelAllowed(route.thinkingLevel, `${label} ${rendered}`);
+  if (isClaudeFableModelId(route.model)) {
+    throw new Error(`${label} ${rendered} is not allowed: Claude Fable models cannot be used for subagents. Choose a non-Fable model.`);
+  }
+}
+
+export function assertSubagentThinkingLevelAllowed(thinkingLevel: string, label = "Subagent thinking level"): void {
+  if (thinkingLevel === "max") {
+    throw new Error(`${label} is not allowed: subagent thinking is capped at xhigh. Choose xhigh or a lower exact level; max is never clamped or substituted.`);
+  }
+}
+
+/** Reject forbidden explicit suffixes/models before resolution can clamp or substitute them. */
+export function assertSubagentRouteSpecAllowed(spec: string, label = "Subagent route"): void {
+  const parsed = parseOptionalModelThinkingPair(spec);
+  if (!parsed) return;
+  const slash = parsed.model.indexOf("/");
+  const provider = slash > 0 ? parsed.model.slice(0, slash) : "configured";
+  const model = slash > 0 ? parsed.model.slice(slash + 1) : parsed.model;
+  assertSubagentRouteAllowed({ provider, model, thinkingLevel: parsed.thinkingLevel }, label);
+}
+
+export function assertChildAgentRouteAllowed(
+  model: Pick<Model<Api>, "provider" | "id">,
+  thinkingLevel: ThinkingLevel,
+  label = "Child-agent route"
+): void {
+  assertSubagentRouteAllowed({ provider: model.provider, model: model.id, thinkingLevel }, label);
+}
+
+function isClaudeFableModelId(modelId: string): boolean {
+  return /^claude-fable(?:-|$)/i.test(modelId.trim());
 }
 
 export function resolveExtensionModel(options: ResolveExtensionModelOptions): ResolvedExtensionModel {
