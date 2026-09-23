@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { Type, validateToolArguments, type Static, type Tool, type ToolCall } from "@earendil-works/pi-ai";
 import { defineTool, type AgentToolResult, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { unsettledAsyncShellJobsForOwner, unsettledPersistedAsyncShellJobsForOwner, type AsyncShellJobOwner } from "../async-shell/index.js";
-import { assertIntegrationRecordLayout, validateIntegrationHandoff } from "./integration.js";
+import { validateIntegrationHandoffShape } from "./integration.js";
 import type { WorkerIntegrationRecord } from "./state.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 import {
@@ -247,10 +247,7 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
     async execute(_toolCallId, params): Promise<AgentToolResult<WorkerHandoffDetails>> {
       const identity = workerRuntimeIdentity();
       validateWorkerHandoff(params, identity.workerId, identity.workspaceRoot, assignedTaskIds());
-      if (identity.integration) {
-        assertIntegrationRecordLayout(identity.integration, identity.workspaceRoot, identity.stateDir);
-        validateIntegrationHandoff(params, identity.integration, identity.workspaceRoot, identity.integrationStateRoot);
-      }
+      if (identity.integration) validateIntegrationHandoffShape(params, identity.integration);
       if (existsSync(identity.resultFile)) {
         throw new Error(`Worker handoff was already accepted for ${identity.workerId}/${identity.runId}.`);
       }
@@ -541,8 +538,6 @@ function workerRuntimeIdentity(): {
   asyncJobRoot: string;
   owner: AsyncShellJobOwner;
   integration?: WorkerIntegrationRecord;
-  stateDir: string;
-  integrationStateRoot: string;
 } {
   const workerId = requiredEnvironment("PI_WORKER_ID");
   const runId = requiredEnvironment("PI_WORKER_RUN_ID");
@@ -555,8 +550,6 @@ function workerRuntimeIdentity(): {
     workspaceRoot: path.resolve(requiredEnvironment("PI_WORKER_WORKSPACE_ROOT")),
     asyncJobRoot: path.resolve(requiredEnvironment("PI_WORKER_ASYNC_JOB_ROOT")),
     integration,
-    stateDir: path.resolve(requiredEnvironment("PI_WORKER_STATE_ROOT")),
-    integrationStateRoot: path.join(path.resolve(requiredEnvironment("PI_WORKER_STATE_ROOT")), "integration-runtime"),
     owner: { kind: "worker-run", workerId, runId }
   };
 }

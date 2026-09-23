@@ -787,7 +787,7 @@ test("worker RPC argv pins exact session resources and only the worker tool surf
   assert.equal(defaultWorkerExtensionPaths().length, 2);
 });
 
-test("integration handoff admission rejects forged immutable artifact layout", async () => {
+test("integration handoff admission performs only phase and shape checks while the container may be live", async () => {
   await withTempDir(async (directory) => {
     await withWorkerEnv(directory, async () => {
       const integration = {
@@ -800,8 +800,9 @@ test("integration handoff admission rejects forged immutable artifact layout", a
       process.env.PI_WORKER_INTEGRATION = JSON.stringify(integration);
       const api = fakeApi(); workerRuntimeExtension(api);
       const tool = api.tools.find((item) => item.name === "worker_handoff"); assert.ok(tool?.execute);
-      await assert.rejects(() => tool.execute!("integration-forged", { state: "checkpoint", summary: "analysis", taskUpdates: [] } as never, undefined, undefined, context(directory)), /context artifact identity is invalid/);
-      assert.equal(existsSync(path.join(directory, "run", "result.json")), false);
+      const accepted = await tool.execute!("integration-shape-only", { state: "checkpoint", summary: "analysis", taskUpdates: [] } as never, undefined, undefined, context(directory));
+      assert.equal((accepted.details as { accepted: boolean }).accepted, true);
+      assert.equal(existsSync(path.join(directory, "run", "result.json")), true);
     }, { PI_WORKER_INTEGRATION: "" });
   });
 });

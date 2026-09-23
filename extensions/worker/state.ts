@@ -32,7 +32,6 @@ export type WorkerIntegrationSnapshot = {
   refsSha256: string;
   configSha256: string;
   metadataSha256: string;
-  objectsSha256: string;
 };
 
 export type WorkerIntegrationRecord = {
@@ -49,6 +48,9 @@ export type WorkerIntegrationRecord = {
   candidateHeadCommit: string;
   candidateHeadTree: string;
   preparedArtifactFile: string;
+  analysisIndexFile: string;
+  analysisIndexSha256: string;
+  evidence: Array<{ path: string; size: number; sha256: string }>;
   workspaceRepo: string;
   contextFile: string;
   workspaceContextFile: string;
@@ -341,12 +343,14 @@ function assertValidWorkerRecord(value: unknown, target: string): asserts value 
 function validIntegrationRecord(value: unknown): boolean {
   if (value === undefined) return true;
   if (!isRecord(value) || (value.phase !== "analysis" && value.phase !== "resolution") || (value.method !== "merge" && value.method !== "squash")) return false;
-  const bounded = ["preparedId", "manifestSha256", "candidateId", "targetRepo", "targetRef", "preparedArtifactFile", "workspaceRepo", "contextFile", "workspaceContextFile", "contextSha256", "analysisRunId"];
+  const bounded = ["preparedId", "manifestSha256", "candidateId", "targetRepo", "targetRef", "preparedArtifactFile", "analysisIndexFile", "analysisIndexSha256", "workspaceRepo", "contextFile", "workspaceContextFile", "contextSha256", "analysisRunId"];
   if (bounded.some((key) => typeof value[key] !== "string" || !(value[key] as string) || Buffer.byteLength(value[key] as string, "utf8") > 4096)) return false;
-  if (!path.isAbsolute(String(value.targetRepo)) || !path.isAbsolute(String(value.preparedArtifactFile)) || !path.isAbsolute(String(value.contextFile)) || !path.isAbsolute(String(value.workspaceContextFile))) return false;
+  if (!path.isAbsolute(String(value.targetRepo)) || !path.isAbsolute(String(value.preparedArtifactFile)) || !path.isAbsolute(String(value.analysisIndexFile)) || !path.isAbsolute(String(value.contextFile)) || !path.isAbsolute(String(value.workspaceContextFile))) return false;
   if (!/^refs\/heads\/[A-Za-z0-9._/-]+$/.test(String(value.targetRef)) || !/^repos\/integration-[0-9a-f]{24}$/.test(String(value.workspaceRepo))) return false;
-  if (!/^prepared_[0-9a-f]{24}$/.test(String(value.preparedId)) || !/^candidate_[0-9a-f]{24}$/.test(String(value.candidateId)) || !/^[0-9a-f]{64}$/.test(String(value.manifestSha256)) || !/^[0-9a-f]{64}$/.test(String(value.contextSha256)) || !/^run_[A-Za-z0-9_-]{1,120}$/.test(String(value.analysisRunId))) return false;
+  if (!/^[0-9a-f]{64}$/.test(String(value.analysisIndexSha256)) || !/^prepared_[0-9a-f]{24}$/.test(String(value.preparedId)) || !/^candidate_[0-9a-f]{24}$/.test(String(value.candidateId)) || !/^[0-9a-f]{64}$/.test(String(value.manifestSha256)) || !/^[0-9a-f]{64}$/.test(String(value.contextSha256)) || !/^run_[A-Za-z0-9_-]{1,120}$/.test(String(value.analysisRunId))) return false;
   if (!Array.isArray(value.sourceCandidateIds) || value.sourceCandidateIds.length !== 1 || value.sourceCandidateIds[0] !== value.candidateId) return false;
+  if (!Array.isArray(value.evidence) || value.evidence.length > 32 || value.evidence.some((item) => !isRecord(item) || Object.keys(item).sort().join(",") !== "path,sha256,size" || typeof item.path !== "string" || !path.isAbsolute(item.path) || typeof item.size !== "number" || !Number.isSafeInteger(item.size) || item.size < 0 || item.size > 2 * 1024 * 1024 || typeof item.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(item.sha256))) return false;
+  if ((value.evidence as Array<{ size: number }>).reduce((total, item) => total + item.size, 0) > 8 * 1024 * 1024) return false;
   for (const key of ["targetExpectedCommit", "targetExpectedTree", "candidateHeadCommit", "candidateHeadTree"]) if (typeof value[key] !== "string" || !/^[0-9a-f]{40,64}$/.test(value[key] as string)) return false;
   if (!validIntegrationSnapshot(value.analysisSnapshot)) return false;
   const decisions = [value.decisionsFile, value.workspaceDecisionsFile, value.decisionsSha256, value.resolutionRunId];
@@ -357,7 +361,7 @@ function validIntegrationRecord(value: unknown): boolean {
 function validIntegrationSnapshot(value: unknown): boolean {
   if (!isRecord(value)) return false;
   for (const key of ["headCommit", "headTree"]) if (typeof value[key] !== "string" || !/^[0-9a-f]{40,64}$/.test(value[key] as string)) return false;
-  for (const key of ["statusSha256", "indexSha256", "refsSha256", "configSha256", "metadataSha256", "objectsSha256"]) if (typeof value[key] !== "string" || !/^[0-9a-f]{64}$/.test(value[key] as string)) return false;
+  for (const key of ["statusSha256", "indexSha256", "refsSha256", "configSha256", "metadataSha256"]) if (typeof value[key] !== "string" || !/^[0-9a-f]{64}$/.test(value[key] as string)) return false;
   return true;
 }
 

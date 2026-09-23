@@ -600,7 +600,9 @@ const RepositoryIntegrationLineageSchema = Type.Object({
   contextSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }),
   decisionsSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }),
   analysisRunId: Type.String({ minLength: 1 }),
+  resolutionWorkerId: Type.String({ minLength: 1 }),
   resolutionRunId: Type.String({ minLength: 1 }),
+  workspaceRepo: Type.String({ minLength: 1, maxLength: 1024 }),
   targetExpectedCommit: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
   targetExpectedTree: Type.String({ pattern: "^[0-9a-f]{40,64}$" })
 }, { additionalProperties: false });
@@ -611,6 +613,12 @@ const WorkerIntegrationSummarySchema = Type.Object({
   preparedId: Type.String({ pattern: "^prepared_[0-9a-f]{24}$" }),
   manifestSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }),
   candidateId: Type.String({ pattern: "^candidate_[0-9a-f]{24}$" }),
+  sourceCandidateIds: Type.Array(Type.String({ pattern: "^candidate_[0-9a-f]{24}$" }), { minItems: 1, maxItems: 16 }),
+  workspaceRepo: Type.String({ minLength: 1, maxLength: 1024 }),
+  targetRepo: Type.String({ minLength: 1 }),
+  targetRef: Type.String({ minLength: 1 }),
+  targetExpectedCommit: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
+  candidateHeadCommit: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
   contextSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }),
   analysisRunId: Type.String({ minLength: 1 }),
   decisionsSha256: Type.Optional(Type.String({ pattern: "^[0-9a-f]{64}$" })),

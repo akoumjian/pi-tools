@@ -42,7 +42,9 @@ export type RepositoryIntegrationLineage = {
   contextSha256: string;
   decisionsSha256: string;
   analysisRunId: string;
+  resolutionWorkerId: string;
   resolutionRunId: string;
+  workspaceRepo: string;
   targetExpectedCommit: string;
   targetExpectedTree: string;
 };
@@ -984,16 +986,17 @@ function isRepositoryCandidate(value: unknown): value is RepositoryCandidate {
     typeof value.reported === "boolean" && Array.isArray(value.dependsOn) && value.dependsOn.length <= 16 && value.dependsOn.every((item) => typeof item === "string" && item.length > 0 && item.length <= 1024) &&
     typeof value.dirty === "boolean" && typeof value.committedChanged === "boolean" && typeof value.foldable === "boolean" &&
     Array.isArray(value.policyIssues) && value.policyIssues.length <= 64 && value.policyIssues.every((item) => typeof item === "string" && item.length <= 160) &&
-    optionalString(value.purpose) && optionalString(value.source) && validIntegrationLineage(value.lineage) && optionalOid(value.baseCommit) && optionalOid(value.baseTree) && optionalOid(value.headCommit) && optionalOid(value.headTree) &&
+    optionalString(value.purpose) && optionalString(value.source) && validIntegrationLineage(value.lineage) && (!value.lineage || (((value.lineage as RepositoryIntegrationLineage).resolutionWorkerId === value.workerId) && ((value.lineage as RepositoryIntegrationLineage).resolutionRunId === value.runId) && ((value.lineage as RepositoryIntegrationLineage).workspaceRepo === value.workspaceRepo))) && optionalOid(value.baseCommit) && optionalOid(value.baseTree) && optionalOid(value.headCommit) && optionalOid(value.headTree) &&
     ((value.baseCommit === undefined) === (value.baseTree === undefined)) && ((value.headCommit === undefined) === (value.headTree === undefined));
 }
 
 
 function validIntegrationLineage(value: unknown): boolean {
   if (value === undefined) return true;
-  if (!isRecord(value) || value.kind !== "integration_resolution" || typeof value.preparedId !== "string" || !/^prepared_[0-9a-f]{24}$/.test(value.preparedId) || typeof value.manifestSha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.manifestSha256)) return false;
+  if (!isRecord(value) || Object.keys(value).sort().join(",") !== "analysisRunId,contextSha256,decisionsSha256,kind,manifestSha256,preparedId,resolutionRunId,resolutionWorkerId,sourceCandidateIds,targetExpectedCommit,targetExpectedTree,workspaceRepo" || value.kind !== "integration_resolution" || typeof value.preparedId !== "string" || !/^prepared_[0-9a-f]{24}$/.test(value.preparedId) || typeof value.manifestSha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.manifestSha256)) return false;
   if (!Array.isArray(value.sourceCandidateIds) || value.sourceCandidateIds.length < 1 || value.sourceCandidateIds.length > 16 || value.sourceCandidateIds.some((item) => typeof item !== "string" || !/^candidate_[0-9a-f]{24}$/.test(item)) || new Set(value.sourceCandidateIds).size !== value.sourceCandidateIds.length) return false;
   for (const key of ["contextSha256", "decisionsSha256"] as const) if (typeof value[key] !== "string" || !/^[0-9a-f]{64}$/.test(value[key])) return false;
+  if (typeof value.resolutionWorkerId !== "string" || !/^worker_[A-Za-z0-9_-]{1,120}$/.test(value.resolutionWorkerId) || typeof value.workspaceRepo !== "string" || !/^repos\/[A-Za-z0-9._/-]+$/.test(value.workspaceRepo)) return false;
   for (const key of ["analysisRunId", "resolutionRunId"] as const) if (typeof value[key] !== "string" || !/^run_[A-Za-z0-9_-]{1,120}$/.test(value[key])) return false;
   if (value.analysisRunId === value.resolutionRunId) return false;
   for (const key of ["targetExpectedCommit", "targetExpectedTree"] as const) if (typeof value[key] !== "string" || !OID_PATTERN.test(value[key])) return false;
