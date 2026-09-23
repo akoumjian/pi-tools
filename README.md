@@ -150,7 +150,7 @@ Each extension below documents what it does, what it provides, and how to set it
 
 **Setup.** macOS, Node, Pi, a running Docker Desktop/Engine plus CLI, the pinned worker image documented in the full guide, a correctly routed central `bd` executable, and `config/worker-settings.json` with `defaultRoute`. New workers use that configured provider/model/thinking route unless the caller supplies `route`; resume always retains the persisted route. The parent remains responsible for grounding, review, integration, promotion, and task closure.
 
-The package ships progressively disclosed role skills for the managed-worker parent, implementation worker, independent reviewer, and integration worker. Normal parents discover all four from `skills/`; confined implementation/integration launches keep ambient skills disabled and receive only their trusted role skill, while review children load only the reviewer skill.
+The package ships progressively disclosed role skills for the managed-worker parent, implementation worker, independent reviewer, and integration worker. Normal parents discover all four from `skills/`; confined implementation/integration launches keep ambient skills disabled and receive only their trusted role skill. The existing general `/review` child keeps its ambient skill behavior; the review role resource is reserved for a dedicated settled-worker review path.
 
 ---
 

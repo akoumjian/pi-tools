@@ -10,9 +10,18 @@ import { Check } from "typebox/value";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { RetainedToolOutputSchemas } from "../extensions/_shared/tool-output.js";
 import { MAX_WORKER_TASK_IDS } from "../extensions/_shared/worker-contract.js";
+import { managedWorkerRoleSkillText } from "../extensions/_shared/role-skills.js";
 import { startManagedAsyncJob, type JobMeta } from "../extensions/async-shell/index.js";
 import type { WorkerContainerReference } from "../extensions/_shared/worker-container.js";
-import { registerWorkerExtension, resolveWorkerRoute, WorkerFoldResolveParams } from "../extensions/worker/index.js";
+import {
+  buildIntegrationAnalysisPrompt,
+  buildIntegrationResolutionPrompt,
+  buildNewWorkerPrompt,
+  buildResumeWorkerPrompt,
+  registerWorkerExtension,
+  resolveWorkerRoute,
+  WorkerFoldResolveParams
+} from "../extensions/worker/index.js";
 import { persistRepositoryInventory, repositoryCandidateId } from "../extensions/worker/repositories.js";
 import { forkWorkerSession } from "../extensions/worker/session.js";
 import { normalizeWorkerSettings } from "../extensions/worker/settings.js";
@@ -187,6 +196,82 @@ function completedJob(jobId: string, cwd: string): JobMeta {
     outputBytes: { stdout: 0, stderr: 0 }
   };
 }
+
+test("managed-worker assignments inline the exact verified role contract in every phase", () => {
+  const baseRecord: WorkerRecord = {
+    version: WORKER_RECORD_VERSION,
+    workerId: "worker_20260910190000_prompts1",
+    sessionId: "session-prompts",
+    parentSessionFile: "/parent/session.jsonl",
+    workspaceRoot: "/workspace",
+    taskIds: ["personal-prompts"],
+    route: { provider: "openai-codex", model: "gpt-test", thinkingLevel: "xhigh" },
+    status: "queued",
+    updatedAt: "2026-09-10T19:00:00.000Z"
+  };
+  const implementationText = managedWorkerRoleSkillText("implementation");
+  const implementationPrompts = [
+    buildNewWorkerPrompt(baseRecord, "Implement exactly.", undefined),
+    buildResumeWorkerPrompt(baseRecord, "Correct exactly.", "/workspace/artifacts/parent-context.jsonl")
+  ];
+  for (const prompt of implementationPrompts) {
+    assert.equal(prompt.split(implementationText).length - 1, 1);
+    assert.match(prompt, /Trusted implementation role skill:/);
+  }
+
+  const integrationRecord: WorkerRecord = {
+    ...baseRecord,
+    integration: {
+      phase: "analysis",
+      preparedId: "prepared_aaaaaaaaaaaaaaaaaaaaaaaa",
+      manifestSha256: "a".repeat(64),
+      candidateId: "candidate_bbbbbbbbbbbbbbbbbbbbbbbb",
+      method: "merge",
+      sourceCandidateIds: ["candidate_bbbbbbbbbbbbbbbbbbbbbbbb"],
+      targetRepo: "/target",
+      targetRef: "refs/heads/main",
+      targetExpectedCommit: "c".repeat(40),
+      targetExpectedTree: "d".repeat(40),
+      candidateHeadCommit: "e".repeat(40),
+      candidateHeadTree: "f".repeat(40),
+      preparedArtifactFile: "/prepared.bundle",
+      analysisIndexFile: "/state/analysis-index",
+      analysisIndexSha256: "1".repeat(64),
+      evidence: [],
+      workspaceRepo: "repos/integration-bbbbbbbbbbbbbbbbbbbbbbbb",
+      contextFile: "/state/context.json",
+      workspaceContextFile: "/workspace/artifacts/integration-context.json",
+      contextSha256: "2".repeat(64),
+      analysisRunId: "run-analysis",
+      analysisSnapshot: {
+        headCommit: "c".repeat(40),
+        headTree: "d".repeat(40),
+        statusSha256: "3".repeat(64),
+        indexSha256: "4".repeat(64),
+        refsSha256: "5".repeat(64),
+        configSha256: "6".repeat(64),
+        metadataSha256: "7".repeat(64)
+      }
+    }
+  };
+  const resolutionRecord: WorkerRecord = {
+    ...integrationRecord,
+    integration: {
+      ...integrationRecord.integration!,
+      phase: "resolution",
+      workspaceDecisionsFile: "/workspace/artifacts/integration-decisions.json"
+    }
+  };
+  const integrationText = managedWorkerRoleSkillText("integration");
+  const integrationPrompts = [
+    buildIntegrationAnalysisPrompt(integrationRecord),
+    buildIntegrationResolutionPrompt(resolutionRecord, "Resolve exactly.", "/workspace/artifacts/parent-context.jsonl")
+  ];
+  for (const prompt of integrationPrompts) {
+    assert.equal(prompt.split(integrationText).length - 1, 1);
+    assert.match(prompt, /Trusted integration role skill:/);
+  }
+});
 
 test("worker settings select a configured default while explicit routes override it", () => {
   const context = parentContext("/tmp/parent", "/tmp/parent.jsonl");

@@ -9,6 +9,7 @@ import { validateToolArguments, type Tool, type ToolCall } from "@earendil-works
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import asyncShellExtension, { cancelAsyncShellJobsForOwner, startManagedAsyncJob } from "../extensions/async-shell/index.js";
 import { workerHandoffAdmissionPath } from "../extensions/_shared/worker-contract.js";
+import { managedWorkerRoleSkillPath } from "../extensions/_shared/role-skills.js";
 import workerRuntimeExtension, { readWorkerRuntimeHandoff } from "../extensions/worker/runtime.js";
 import { buildWorkerRpcArgs, defaultWorkerExtensionPaths, resolvePiCliPath, type WorkerHostConfig } from "../extensions/worker/runner.js";
 
@@ -784,10 +785,16 @@ test("worker RPC argv pins exact session resources and only the worker tool surf
   }
   assert.match(args[args.indexOf("--tools") + 1], /worker_handoff/);
   assert.match(args[args.indexOf("--tools") + 1], /worker_task_read/);
-  assert.ok(args.includes("--no-skills"));
-  assert.match(args[args.indexOf("--skill") + 1], /skills[/\\]managed-worker-implementation[/\\]SKILL\.md$/);
+  const assertExclusiveRoleSkill = (actual: string[], role: "implementation" | "integration"): void => {
+    assert.equal(actual.filter((item) => item === "--no-skills").length, 1);
+    assert.equal(actual.filter((item) => item === "--skill").length, 1);
+    const skillIndex = actual.indexOf("--skill");
+    assert.ok(actual.indexOf("--no-skills") < skillIndex);
+    assert.equal(actual[skillIndex + 1], managedWorkerRoleSkillPath(role));
+  };
+  assertExclusiveRoleSkill(args, "implementation");
   const integrationArgs = buildWorkerRpcArgs({ ...config, roleSkill: "integration" });
-  assert.match(integrationArgs[integrationArgs.indexOf("--skill") + 1], /skills[/\\]managed-worker-integration[/\\]SKILL\.md$/);
+  assertExclusiveRoleSkill(integrationArgs, "integration");
   assert.ok(resolvePiCliPath().endsWith("/dist/cli.js"));
   assert.equal(defaultWorkerExtensionPaths().length, 2);
 });

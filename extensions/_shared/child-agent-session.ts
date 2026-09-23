@@ -23,8 +23,6 @@ export type ChildAgentSessionOptions = {
   thinkingLevel: ThinkingLevel;
   tools: string[];
   systemPrompts?: string[];
-  skillPaths?: string[];
-  exclusiveSkills?: boolean;
   customTools?: ToolDefinition[];
   extensionFactories?: ExtensionFactory[];
   extensionsOverride?: (result: LoadExtensionsResult) => LoadExtensionsResult;
@@ -46,7 +44,6 @@ export async function withChildAgentSession<T>(
     cwd: options.cwd,
     agentDir: getAgentDir(),
     resourceLoaderOptions: {
-      ...(options.skillPaths?.length ? { additionalSkillPaths: options.skillPaths, noSkills: options.exclusiveSkills === true } : {}),
       appendSystemPromptOverride: options.systemPrompts?.length
         ? (base) => [...base, ...options.systemPrompts!.filter((prompt) => prompt.trim()).map((prompt) => prompt.trim())]
         : undefined,

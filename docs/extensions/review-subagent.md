@@ -52,7 +52,6 @@ Side effects:
 3. Launch a child Pi session via `createAgentSessionFromServices` with:
    - The configured reviewer model and thinking level (default `xhigh`).
    - The configured tool allowlist. Defaults include `search_many`, `read_many`, search/fetch/parse, and async-shell read-only commands.
-   - Only the trusted `managed-worker-review` role skill; ambient and project skills are excluded from the child.
    - The same tool-safety extension wired into the parent (so reviewer shell calls go through the same policy).
 4. Stream the child session in the background. The phase becomes `running`, with a transient bottom-status indicator `review subagent running`.
 5. When the child finishes:

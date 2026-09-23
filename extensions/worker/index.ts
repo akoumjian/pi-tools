@@ -2726,7 +2726,7 @@ function receipt(record: WorkerRecord): WorkerRunReceipt {
   };
 }
 
-function buildNewWorkerPrompt(
+export function buildNewWorkerPrompt(
   record: WorkerRecord,
   guidance: string | undefined,
   initialRepos: Array<{ source: string; revision?: string }> | undefined
@@ -2743,7 +2743,7 @@ ${managedWorkerRoleSkillText("implementation")}`,
   ].filter((part): part is string => part !== undefined).join("\n\n");
 }
 
-function buildIntegrationAnalysisPrompt(record: WorkerRecord): string {
+export function buildIntegrationAnalysisPrompt(record: WorkerRecord): string {
   const integration = record.integration!;
   return [
     `You are integration worker ${record.workerId} in ANALYSIS-ONLY phase for prepared fold ${integration.preparedId}.`,
@@ -2755,7 +2755,7 @@ function buildIntegrationAnalysisPrompt(record: WorkerRecord): string {
   ].join("\n\n");
 }
 
-function buildIntegrationResolutionPrompt(record: WorkerRecord, message: string, parentContextSnapshot: string): string {
+export function buildIntegrationResolutionPrompt(record: WorkerRecord, message: string, parentContextSnapshot: string): string {
   const integration = record.integration!;
   return [
     `Resume integration worker ${record.workerId} in RESOLUTION phase for prepared fold ${integration.preparedId}.`,
@@ -2786,7 +2786,7 @@ function formatWorkerFoldResolveReceipt(details: WorkerFoldResolveDetails): stri
   ].filter((line): line is string => line !== undefined).join("\n");
 }
 
-function buildResumeWorkerPrompt(record: WorkerRecord, message: string, parentContextSnapshot: string): string {
+export function buildResumeWorkerPrompt(record: WorkerRecord, message: string, parentContextSnapshot: string): string {
   return [
     `Resume managed worker ${record.workerId} in the exact existing session and workspace.`,
     `Assigned Beads: ${record.taskIds.join(", ")}.`,
