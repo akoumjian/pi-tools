@@ -28,6 +28,7 @@ const MAX_SCAN_ENTRIES = 20_000;
 const MAX_SCAN_DEPTH = 12;
 const MAX_GIT_OUTPUT_BYTES = 1024 * 1024;
 const MAX_TREE_LISTING_BYTES = 64 * 1024 * 1024;
+const MAX_COMMIT_OBJECT_BYTES = 64 * 1024 * 1024;
 const MAX_PATH_BYTES = 1024;
 const OID_PATTERN = /^[0-9a-f]{40,64}$/;
 
@@ -428,6 +429,7 @@ export function repositoryPolicyIssues(repoPath: string, runner: GitRunner, exac
     const hooks = path.join(gitDir, "hooks");
     if (existsSync(hooks) && readdirSync(hooks).some((entry) => !entry.endsWith(".sample"))) issues.push("repository_hooks");
     if (existsSync(path.join(gitDir, "info", "attributes"))) issues.push("repository_attributes");
+    if (existsSync(path.join(gitDir, "info", "grafts"))) issues.push("grafts_file");
     if (existsSync(path.join(gitDir, "shallow"))) issues.push("shallow_repository");
   }
   if (issues.length > 0) return boundedPolicyIssues(issues);
@@ -507,6 +509,53 @@ function parseTreePolicyEntry(raw: Buffer, issues: Set<string>): void {
   const basename = repositoryPath.slice(repositoryPath.lastIndexOf("/") + 1);
   if (basename.toLowerCase() === ".gitattributes") issues.add("repository_attributes");
 }
+export function repositoryCommitParents(repoPath: string, commit: string, runner: GitRunner): string[] {
+  if (!OID_PATTERN.test(commit)) throw new Error("invalid_commit_identity");
+  return withBoundedRepositoryGitOutput(
+    runner,
+    repoPath,
+    ["cat-file", "commit", commit],
+    MAX_COMMIT_OBJECT_BYTES,
+    "commit_object",
+    (descriptor, size) => parseRawCommitParents(descriptor, size)
+  );
+}
+
+function parseRawCommitParents(descriptor: number, size: number): string[] {
+  const parents: string[] = [];
+  const buffer = Buffer.alloc(64 * 1024);
+  let remainder = Buffer.alloc(0);
+  let position = 0;
+  let lineNumber = 0;
+  let acceptingParents = true;
+  while (position < size) {
+    const count = readSync(descriptor, buffer, 0, Math.min(buffer.byteLength, size - position), position);
+    if (count <= 0) throw new Error("commit_object_short_read");
+    const chunk = remainder.byteLength > 0 ? Buffer.concat([remainder, buffer.subarray(0, count)]) : buffer.subarray(0, count);
+    let start = 0;
+    for (let index = 0; index < chunk.byteLength; index += 1) {
+      if (chunk[index] !== 10) continue;
+      const line = chunk.subarray(start, index);
+      if (line.byteLength === 0) return parents;
+      if (lineNumber === 0) {
+        const tree = line.toString("ascii");
+        if (!/^tree [0-9a-f]{40,64}$/.test(tree)) throw new Error("malformed_commit_object");
+      } else if (acceptingParents && line.subarray(0, 7).equals(Buffer.from("parent "))) {
+        const parent = line.subarray(7).toString("ascii");
+        if (!OID_PATTERN.test(parent)) throw new Error("malformed_commit_parent");
+        parents.push(parent);
+      } else {
+        acceptingParents = false;
+      }
+      lineNumber += 1;
+      start = index + 1;
+    }
+    remainder = Buffer.from(chunk.subarray(start));
+    position += count;
+  }
+  throw new Error("malformed_commit_object");
+}
+
 function gitMetadataIssues(gitDirectory: string): string[] {
   const root = path.resolve(gitDirectory);
   if (realpathSync(root) !== root) return ["git_metadata_alias"];
@@ -646,6 +695,7 @@ export function createGitRunner(gitPath: string, trustedStateRoot: string): GitR
       SSH_ASKPASS: "/usr/bin/false",
       GIT_OPTIONAL_LOCKS: "0",
       GIT_NO_REPLACE_OBJECTS: "1",
+      GIT_GRAFT_FILE: "/dev/null",
       GIT_NO_LAZY_FETCH: "1",
       GIT_ATTR_NOSYSTEM: "1",
       GIT_PAGER: "cat",
@@ -700,6 +750,7 @@ function repositoryGitArgs(cwd: string, gitDirectory: string, args: readonly str
     "--no-optional-locks",
     "-c", "core.hooksPath=/dev/null",
     "-c", "core.fsmonitor=false",
+    "-c", "core.commitGraph=false",
     "-c", "core.ignoreStat=false",
     "-c", "core.fileMode=true",
     "-c", "core.autocrlf=false",
@@ -783,6 +834,7 @@ export function runStandaloneGit(runner: GitRunner, cwd: string, args: string[])
     "--no-optional-locks",
     "-c", "core.hooksPath=/dev/null",
     "-c", "core.fsmonitor=false",
+    "-c", "core.commitGraph=false",
     "-c", "core.ignoreStat=false",
     "-c", "core.fileMode=true",
     "-c", "core.autocrlf=false",

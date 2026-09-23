@@ -22,6 +22,7 @@ import {
   gitText,
   isRepositoryInventory,
   repositoryCandidateId,
+  repositoryCommitParents,
   repositoryDirty,
   repositoryPolicyIssues,
   repositoryTreePolicyIssues,
@@ -521,7 +522,7 @@ function verifyPreparedObjects(repository: PreparedRepositoryFold, repoPath: str
   if (repository.status === "ready") {
     if (!repository.desiredCommit || !repository.desiredTree) throw new Error("Prepared ready repository is missing desired identity.");
     const desiredTree = gitText(runner, repoPath, ["rev-parse", `${repository.desiredCommit}^{tree}`]).trim();
-    const parents = gitText(runner, repoPath, ["rev-list", "--parents", "-n", "1", repository.desiredCommit]).trim().split(/\s+/).slice(1);
+    const parents = repositoryCommitParents(repoPath, repository.desiredCommit, runner);
     const expectedParents = repository.method === "merge" ? [repository.targetExpectedCommit, repository.candidateHeadCommit] : [repository.targetExpectedCommit];
     if (desiredTree !== repository.desiredTree || JSON.stringify(parents) !== JSON.stringify(expectedParents)) throw new Error("Prepared desired commit tree or parent shape mismatch.");
     if (repositoryTreePolicyIssues(repoPath, repository.desiredCommit, runner).length) throw new Error("Prepared desired commit has unsupported exact-tree policy.");

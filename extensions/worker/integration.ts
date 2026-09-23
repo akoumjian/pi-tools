@@ -8,6 +8,7 @@ import {
   createGitRunner,
   gitBuffer,
   gitText,
+  repositoryCommitParents,
   repositoryPolicyIssues,
   runStandaloneGit,
   type GitRunner,
@@ -262,7 +263,7 @@ function validateResolutionRepository(integration: WorkerIntegrationRecord, work
   const candidateRef = gitText(runner, repository, ["rev-parse", "refs/heads/integration-candidate^{commit}"]).trim();
   if (targetRef !== integration.targetExpectedCommit || candidateRef !== integration.candidateHeadCommit) throw new Error("Integration exact input refs changed during resolution.");
   if (!OID_PATTERN.test(head) || !OID_PATTERN.test(tree) || head === integration.targetExpectedCommit || tree === integration.targetExpectedTree) throw new Error("Integration resolution must produce a new committed tree.");
-  const parents = gitText(runner, repository, ["rev-list", "--parents", "-n", "1", head]).trim().split(/\s+/).slice(1);
+  const parents = repositoryCommitParents(repository, head, runner);
   const expectedParents = integration.method === "merge"
     ? [integration.targetExpectedCommit, integration.candidateHeadCommit]
     : [integration.targetExpectedCommit];

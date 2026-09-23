@@ -18,7 +18,7 @@ import {
 } from "../extensions/worker/integration.js";
 import type { PreparedRepositoryFold, PreparedWorkerFoldManifest } from "../extensions/worker/folds.js";
 import type { WorkerIntegrationRecord } from "../extensions/worker/state.js";
-import { deriveRepositoryInventory } from "../extensions/worker/repositories.js";
+import { createGitRunner, deriveRepositoryInventory, repositoryCommitParents } from "../extensions/worker/repositories.js";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0" }, stdio: ["ignore", "pipe", "pipe"] }).trim();
@@ -185,6 +185,17 @@ test("accepts only a clean committed resolution and emits exact integration line
   });
   assert.equal(inventory.candidates.length, 1); assert.equal(inventory.candidates[0]?.foldable, true);
   assert.deepEqual(inventory.candidates[0]?.lineage, { kind: "integration_resolution", preparedId: integration.preparedId, manifestSha256: integration.manifestSha256, sourceCandidateIds: integration.sourceCandidateIds, contextSha256: integration.contextSha256, decisionsSha256: integration.decisionsSha256, analysisRunId: integration.analysisRunId, resolutionWorkerId: "worker_20260923000000_aaaaaaaa", resolutionRunId: integration.resolutionRunId, workspaceRepo: integration.workspaceRepo, targetExpectedCommit: integration.targetExpectedCommit, targetExpectedTree: integration.targetExpectedTree });
+
+  git(repositoryPath, "reset", "--hard", integration.targetExpectedCommit);
+  await writeFile(path.join(repositoryPath, "shared.txt"), "linear graft attack\n"); git(repositoryPath, "add", "shared.txt"); const linearHead = commit(repositoryPath, "linear resolution disguised by graft");
+  const graftFile = path.join(repositoryPath, ".git", "info", "grafts"); await mkdir(path.dirname(graftFile), { recursive: true });
+  await writeFile(graftFile, `${linearHead} ${integration.targetExpectedCommit} ${integration.candidateHeadCommit}\n`);
+  assert.deepEqual(git(repositoryPath, "rev-list", "--parents", "-n", "1", linearHead).split(/\s+/).slice(1), [integration.targetExpectedCommit, integration.candidateHeadCommit]);
+  const rawRunner = createGitRunner(execFileSync("which", ["git"], { encoding: "utf8" }).trim(), path.join(state, "raw-parent-git"));
+  assert.deepEqual(repositoryCommitParents(repositoryPath, linearHead, rawRunner), [integration.targetExpectedCommit]);
+  assert.throws(() => validateStoppedIntegrationHandoff(handoff, integration, workspace, path.join(state, "git")), /grafts_file|policy is unsupported/);
+  await rm(graftFile); git(repositoryPath, "reset", "--hard", exactMergeHead);
+
   git(repositoryPath, "update-ref", "refs/heads/integration-candidate", integration.targetExpectedCommit);
   assert.throws(() => validateStoppedIntegrationHandoff(handoff, integration, workspace, path.join(state, "git")), /input refs changed/);
   assert.throws(() => validateStoppedIntegrationHandoff({ ...handoff, repositories: [...handoff.repositories, { workspaceRepo: "repos/extra", purpose: "unexpected" }] }, integration, workspace, path.join(state, "git")), /report exactly/);

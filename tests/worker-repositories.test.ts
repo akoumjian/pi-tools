@@ -14,7 +14,8 @@ import {
   readRepositoryInventory,
   repositoryDirty,
   repositoryPolicyIssues,
-  repositoryTreePolicyIssues
+  repositoryTreePolicyIssues,
+  runStandaloneGit
 } from "../extensions/worker/repositories.js";
 
 const WORKER_ID = "worker_20260922170000_repocand";
@@ -506,6 +507,25 @@ test("repository policy reuses exact streamed tree parsing for gitlinks", async 
     git(repo, "update-index", "--add", "--cacheinfo", `160000,${head},nested-module`); git(repo, "commit", "-qm", "gitlink");
     const runner = createGitRunner(execFileSync("which", ["git"], { encoding: "utf8" }).trim(), path.join(directory, "state"));
     assert.deepEqual(repositoryPolicyIssues(repo, runner), ["gitlinks_or_submodules"]);
+  });
+});
+
+test("trusted Git disables history overlays and policy rejects repository grafts", async () => {
+  await withTempDir(async (directory) => {
+    const repo = await createSource(directory, "overlay-policy"); const head = git(repo, "rev-parse", "HEAD");
+    const runner = createGitRunner(execFileSync("which", ["git"], { encoding: "utf8" }).trim(), path.join(directory, "state"));
+    assert.equal(runner.env.GIT_GRAFT_FILE, "/dev/null"); assert.equal(runner.env.GIT_NO_REPLACE_OBJECTS, "1");
+    await mkdir(path.join(repo, ".git", "info"), { recursive: true }); await writeFile(path.join(repo, ".git", "info", "grafts"), `${head}\n`);
+    assert.deepEqual(repositoryPolicyIssues(repo, runner), ["grafts_file"]);
+
+    const fakeGit = path.join(directory, "capture-git");
+    await writeFile(fakeGit, `#!/bin/sh\nprintf '%s\n' "$@" > "$HOME/invocation-args"\n`); await chmod(fakeGit, 0o700);
+    const captureRunner = createGitRunner(fakeGit, path.join(directory, "capture-state"));
+    assert.deepEqual(repositoryTreePolicyIssues(repo, head, captureRunner), []);
+    const argsFile = path.join(String(captureRunner.env.HOME), "invocation-args");
+    const args = (await readFile(argsFile, "utf8")).split("\n"); assert.ok(args.includes("core.commitGraph=false"));
+    runStandaloneGit(captureRunner, repo, ["version"]);
+    const standaloneArgs = (await readFile(argsFile, "utf8")).split("\n"); assert.ok(standaloneArgs.includes("core.commitGraph=false"));
   });
 });
 
