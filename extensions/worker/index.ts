@@ -423,6 +423,13 @@ export function registerWorkerExtension(
   let unsubscribeActivity: (() => void) | undefined;
   let activityGeneration = 0;
 
+  api.registerMessageRenderer("worker-run", (message, options, theme) => {
+    return renderWorkerCompletionMessage(message.details, options, theme);
+  });
+  api.registerMessageRenderer("worker-run-recovery", (message, options, theme) => {
+    return renderWorkerRecoveryMessage(message.details, options, theme);
+  });
+
   api.on("session_start", async (_event, context) => {
     const generation = ++activityGeneration;
     unsubscribeActivity?.();
@@ -3328,6 +3335,75 @@ type WorkerRenderOptions = {
 type WorkerRenderContext = {
   isError?: boolean;
 };
+
+function renderWorkerCompletionMessage(
+  details: unknown,
+  _options: WorkerRenderOptions,
+  theme: WorkerRenderTheme
+): Text {
+  try {
+    if (!isRecord(details)) return new Text(workerToolResult("worker completed", "muted", theme), 0, 0);
+    const record = isRecord(details.record) ? details.record : undefined;
+    const workerId = typeof details.workerId === "string"
+      ? details.workerId
+      : record && typeof record.workerId === "string"
+        ? record.workerId
+        : undefined;
+    const identity = workerId ? shortWorkerId(workerId) : "worker";
+
+    if (typeof details.reason === "string") {
+      return new Text(workerToolResult(`resolution rolled back · ${identity} · analysis restored`, "warning", theme), 0, 0);
+    }
+
+    const status = record && typeof record.status === "string" ? record.status : undefined;
+    const label = status === "handed_off"
+      ? "handed off"
+      : status === "failed"
+        ? "failed"
+        : status === "cancelled"
+          ? "cancelled"
+          : "completed";
+    const color = status === "failed" ? "error" : status === "cancelled" ? "warning" : status === "handed_off" ? "success" : "muted";
+    const parts = [label, identity];
+
+    const acceptedHandoff = isRecord(details.handoff) ? details.handoff : undefined;
+    const handoff = acceptedHandoff && isRecord(acceptedHandoff.handoff) ? acceptedHandoff.handoff : undefined;
+    if (handoff && typeof handoff.state === "string") parts.push(truncateOneLine(handoff.state, 32));
+
+    const lastRun = record && isRecord(record.lastRun) ? record.lastRun : undefined;
+    const inventory = lastRun && isRecord(lastRun.repositoryInventory) ? lastRun.repositoryInventory : undefined;
+    if (inventory && typeof inventory.candidateCount === "number" && inventory.candidateCount > 0) {
+      parts.push(`${inventory.candidateCount} ${inventory.candidateCount === 1 ? "candidate" : "candidates"}`);
+    }
+    if (lastRun && typeof lastRun.repositoryError === "string") parts.push("repository warning");
+
+    const error = typeof details.error === "string"
+      ? details.error
+      : lastRun && typeof lastRun.error === "string"
+        ? lastRun.error
+        : undefined;
+    if (error && status !== "handed_off") parts.push(truncateOneLine(error, 120));
+
+    return new Text(workerToolResult(parts.join(" · "), color, theme), 0, 0);
+  } catch {
+    return new Text(workerToolResult("worker completed", "muted", theme), 0, 0);
+  }
+}
+
+function renderWorkerRecoveryMessage(
+  details: unknown,
+  _options: WorkerRenderOptions,
+  theme: WorkerRenderTheme
+): Text {
+  try {
+    const value = isRecord(details) ? details : undefined;
+    const workerId = value && typeof value.workerId === "string" ? shortWorkerId(value.workerId) : "worker";
+    const error = value && typeof value.error === "string" ? ` · ${truncateOneLine(value.error, 120)}` : "";
+    return new Text(workerToolResult(`recovery required · ${workerId}${error}`, "error", theme), 0, 0);
+  } catch {
+    return new Text(workerToolResult("worker recovery required", "error", theme), 0, 0);
+  }
+}
 
 function renderWorkerRunCall(args: WorkerRunInput, theme: WorkerRenderTheme): Text {
   const runs = isRecord(args) && Array.isArray(args.runs) ? args.runs.filter(isRecord) : [];

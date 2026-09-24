@@ -50,6 +50,7 @@ type FakeApi = ExtensionAPI & {
   tools: ToolDefinition[];
   commands: Map<string, { handler: (args: string, context: ExtensionContext) => Promise<void> | void }>;
   handlers: Map<string, Function[]>;
+  messageRenderers: Map<string, Function>;
   messages: Array<{ message: unknown; options: unknown }>;
   emit(name: string, event: unknown, context: ExtensionContext): Promise<void>;
 };
@@ -58,14 +59,17 @@ function fakeApi(): FakeApi {
   const tools: ToolDefinition[] = [];
   const commands = new Map<string, { handler: (args: string, context: ExtensionContext) => Promise<void> | void }>();
   const handlers = new Map<string, Function[]>();
+  const messageRenderers = new Map<string, Function>();
   const messages: Array<{ message: unknown; options: unknown }> = [];
   return {
     tools,
     commands,
     handlers,
+    messageRenderers,
     messages,
     registerTool(tool: ToolDefinition): void { tools.push(tool); },
     registerCommand(name: string, command: { handler: (args: string, context: ExtensionContext) => Promise<void> | void }): void { commands.set(name, command); },
+    registerMessageRenderer(customType: string, renderer: Function): void { messageRenderers.set(customType, renderer); },
     on(name: string, handler: Function): void { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
     sendMessage(message: unknown, options: unknown): void { messages.push({ message, options }); },
     async emit(name: string, event: unknown, context: ExtensionContext): Promise<void> {
@@ -183,6 +187,12 @@ function renderWorkerToolCall(tool: ToolDefinition, args: unknown): string {
 function renderWorkerToolResult(tool: ToolDefinition, result: unknown, options: { expanded?: boolean; isPartial?: boolean } = {}, context: unknown = {}): string {
   assert.ok(tool.renderResult, `${tool.name} should define renderResult`);
   return tool.renderResult(result as never, { expanded: options.expanded ?? false, isPartial: options.isPartial ?? false }, workerRenderTheme as never, context as never).render(200).join("\n");
+}
+
+function renderWorkerMessage(api: FakeApi, customType: string, message: unknown): string {
+  const renderer = api.messageRenderers.get(customType);
+  assert.ok(renderer, `${customType} should define a message renderer`);
+  return renderer(message, { expanded: false, outputPad: 0 }, workerRenderTheme).render(200).join("\n").trimEnd();
 }
 
 function isProcessAliveForTest(pid: number): boolean {
@@ -931,6 +941,10 @@ test("worker_run queues immediately, then forks the completed parent turn before
     assert.equal(record.lastRun?.repositoryInventory?.foldableCount, 1);
     assert.equal(record.lastRun?.repositoryInventory?.candidates[0]?.workspaceRepo, "repos/project");
     assert.match(JSON.stringify(api.messages[0].message), /candidate_[0-9a-f]{24}/);
+    const renderedCompletion = renderWorkerMessage(api, "worker-run", api.messages[0].message);
+    assert.match(renderedCompletion, /^⎿ handed off · worker_202…1111111 · assignment_complete · 1 candidate$/);
+    assert.equal(renderedCompletion.split("\n").length, 1);
+    assert.doesNotMatch(renderedCompletion, /handoff_json|workspace|session|stdout|stderr|done/);
 
     await api.emit(
       "message_end",
@@ -1038,6 +1052,10 @@ test("worker cleanup uncertainty retains the active run and lease for explicit r
     assert.match(record.activeRun?.recoveryError ?? "", /JSON|position|property/i);
     assert.equal(existsSync(paths.leaseFile), true);
     assert.match(JSON.stringify(api.messages.at(-1)?.message), /cleanup requires recovery/);
+    const renderedRecovery = renderWorkerMessage(api, "worker-run-recovery", api.messages.at(-1)?.message);
+    assert.match(renderedRecovery, /^⎿ recovery required · worker_202…1111111 · /);
+    assert.equal(renderedRecovery.split("\n").length, 1);
+    assert.doesNotMatch(renderedRecovery, /Use \/worker:status|workspace|lease/);
 
     await rm(malformedJobDir, { recursive: true, force: true });
     const cancel = api.commands.get("worker:cancel");
@@ -1450,6 +1468,9 @@ test("restart rolls back an unlaunched queued integration resolution to its park
     assert.equal(restored.status, "handed_off"); assert.equal(restored.activeRun, undefined); assert.equal(restored.integration?.phase, "analysis"); assert.equal(restored.container?.containerId, container.containerId);
     assert.equal(existsSync(decisionsFile), false); assert.equal(existsSync(workspaceDecisionsFile), false); assert.equal(existsSync(paths.leaseFile), false);
     assert.equal(parks, 1); assert.equal(removals, 0); assert.equal(api.messages.length, 1); assert.equal(activityStatuses.at(-1), undefined, "restart reconciliation clears rolled-back queued activity"); assert.match(JSON.stringify(api.messages[0]?.message), /rolled back.*parent restart/i);
+    const renderedRollback = renderWorkerMessage(api, "worker-run", api.messages[0]?.message);
+    assert.match(renderedRollback, /^⎿ resolution rolled back · worker_202…ollback · analysis restored$/);
+    assert.equal(renderedRollback.split("\n").length, 1);
   });
 });
 
@@ -2052,6 +2073,9 @@ test("worker:cancel verifies and finalizes a detached host with durable delivery
     assert.equal(record.activeRun, undefined);
     assert.equal(record.lastRun?.delivery, "pending");
     assert.match(JSON.stringify(api.messages.at(-1)?.message), /semantic: cancelled/);
+    const renderedCancellation = renderWorkerMessage(api, "worker-run", api.messages.at(-1)?.message);
+    assert.match(renderedCancellation, /^⎿ cancelled · worker_202…etach01$/);
+    assert.equal(renderedCancellation.split("\n").length, 1);
     assert.equal(existsSync(paths.leaseFile), false);
   });
 });
