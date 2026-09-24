@@ -437,6 +437,11 @@ const DocumentParseDetailsSchema = Type.Object({
   warnings: Type.Optional(Type.Array(Type.String()))
 }, { additionalProperties: false });
 
+const WorkerCacheLineageSummarySchema = Type.Object({
+  mode: Type.Union([Type.Literal("eligible"), Type.Literal("adopted"), Type.Literal("fresh")]),
+  reason: Type.Optional(Type.String({ minLength: 1, maxLength: 512 }))
+}, { additionalProperties: false });
+
 const WorkerRunReceiptSchema = Type.Object({
   workerId: Type.String({ minLength: 1 }),
   runId: Type.String({ minLength: 1 }),
@@ -449,7 +454,8 @@ const WorkerRunReceiptSchema = Type.Object({
   model: Type.String({ minLength: 1 }),
   thinkingLevel: Type.String({ minLength: 1 }),
   completionDelivery: CompletionDeliverySchema,
-  state: Type.Union([Type.Literal("queued"), Type.Literal("running")])
+  state: Type.Union([Type.Literal("queued"), Type.Literal("running")]),
+  cacheLineage: Type.Optional(WorkerCacheLineageSummarySchema)
 }, { additionalProperties: false });
 
 const WorkerRunDetailsSchema = Type.Object({
@@ -484,7 +490,7 @@ const WorkerFoldResolveDetailsSchema = Type.Object({
   workerId: Type.String({ minLength: 1 }), runId: Type.String({ minLength: 1 }), jobId: Type.String({ minLength: 1 }), sessionId: Type.String({ minLength: 1 }),
   sessionFile: Type.Optional(Type.String({ minLength: 1 })), workspaceRoot: Type.String({ minLength: 1 }), taskIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: MAX_WORKER_TASK_IDS }),
   provider: Type.String({ minLength: 1 }), model: Type.String({ minLength: 1 }), thinkingLevel: Type.String({ minLength: 1 }), completionDelivery: CompletionDeliverySchema,
-  state: Type.Union([Type.Literal("queued"), Type.Literal("running")]), phase: Type.Union([Type.Literal("analysis"), Type.Literal("resolution")]), method: Type.Union([Type.Literal("merge"), Type.Literal("squash")]),
+  state: Type.Union([Type.Literal("queued"), Type.Literal("running")]), cacheLineage: Type.Optional(WorkerCacheLineageSummarySchema), phase: Type.Union([Type.Literal("analysis"), Type.Literal("resolution")]), method: Type.Union([Type.Literal("merge"), Type.Literal("squash")]),
   preparedId: Type.String({ pattern: "^prepared_[0-9a-f]{24}$" }), manifestSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }), candidateId: Type.String({ pattern: "^candidate_[0-9a-f]{24}$" }),
   contextSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }), decisionsSha256: Type.Optional(Type.String({ pattern: "^[0-9a-f]{64}$" }))
 }, { additionalProperties: false });
@@ -617,6 +623,7 @@ const WorkerControlSummarySchema = Type.Object({
   workspaceRoot: Type.String({ minLength: 1 }),
   taskIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: MAX_WORKER_TASK_IDS }),
   route: WorkerRouteSchema,
+  cacheLineage: Type.Optional(WorkerCacheLineageSummarySchema),
   integration: Type.Optional(WorkerIntegrationSummarySchema),
   container: Type.Optional(Type.Object({
     name: Type.String({ minLength: 1 }),
@@ -665,6 +672,7 @@ const WorkerControlDetailsSchema = Type.Union([
     workspaceRoot: Type.String({ minLength: 1 }),
     taskIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: MAX_WORKER_TASK_IDS }),
     route: WorkerRouteSchema,
+    cacheLineage: Type.Optional(WorkerCacheLineageSummarySchema),
     integration: Type.Optional(WorkerIntegrationSummarySchema),
     resultFile: Type.Optional(Type.String({ minLength: 1 })),
     stdoutLog: Type.Optional(Type.String({ minLength: 1 })),

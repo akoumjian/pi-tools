@@ -5,6 +5,11 @@ import { randomUUID } from "node:crypto";
 import { Type, validateToolArguments, type Static, type Tool, type ToolCall } from "@earendil-works/pi-ai";
 import { defineTool, type AgentToolResult, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { unsettledAsyncShellJobsForOwner, unsettledPersistedAsyncShellJobsForOwner, type AsyncShellJobOwner } from "../async-shell/index.js";
+import {
+  createWorkerCacheLineageRuntime,
+  validateWorkerCacheLineageRecord,
+  type WorkerCacheLineageRecord
+} from "./cache-lineage.js";
 import { validateIntegrationHandoffShape } from "./integration.js";
 import type { WorkerIntegrationRecord } from "./state.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
@@ -108,7 +113,29 @@ type WorkerHandoffDetails =
   | { accepted: true; resultFile: string }
   | { accepted: false; activeJobIds: string[] };
 
+export function readCacheLineageEnvironment(
+  raw: string | undefined = process.env.PI_WORKER_CACHE_LINEAGE
+): WorkerCacheLineageRecord | undefined {
+  if (raw === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`Invalid PI_WORKER_CACHE_LINEAGE JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!validateWorkerCacheLineageRecord(parsed)) {
+    throw new Error("Invalid PI_WORKER_CACHE_LINEAGE state.");
+  }
+  return parsed;
+}
+
 export default function workerRuntimeExtension(api: ExtensionAPI): void {
+  const cacheLineage = createWorkerCacheLineageRuntime(readCacheLineageEnvironment());
+  api.on("before_provider_request", (event, context) => cacheLineage.transformPayload(event.payload, context));
+  api.on("before_provider_headers", (event, context) => cacheLineage.transformHeaders(event.headers, context));
+  api.on("tool_call", (event) => cacheLineage.guardTool(event.toolName));
+  api.on("session_shutdown", () => cacheLineage.restoreNetwork());
+
   api.registerTool(defineTool({
     name: "worker_task_read",
     label: "Worker Task Read",
