@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import path from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Api, AssistantMessage, Model, TextContent } from "@earendil-works/pi-ai";
+import type { Api, AssistantMessage, Context, Model, Provider, ProviderResponse, StreamOptions, TextContent } from "@earendil-works/pi-ai";
 import type { AgentSessionEvent, ExtensionContext, ExtensionFactory, ToolCallEvent } from "@earendil-works/pi-coding-agent";
 import { createAbortScope, throwIfAborted } from "../_shared/cancellation.js";
 import { withChildAgentSession } from "../_shared/child-agent-session.js";
@@ -102,12 +102,44 @@ export function formatManagedWorkerReviewAttempts(attempts: readonly ManagedWork
     : "none";
 }
 
+export type TrustedManagedWorkerReviewRouteGuidance =
+  | "configure_exact_route"
+  | "same_provider"
+  | "child_route_policy"
+  | "exact_route_format"
+  | "exact_route_unavailable";
+
+const TRUSTED_ROUTE_GUIDANCE: Record<TrustedManagedWorkerReviewRouteGuidance, string> = {
+  configure_exact_route: "Managed-worker review route is not configured. Set worker-settings.json reviewRoute to an exact provider/model:thinking route.",
+  same_provider: "Managed-worker review primary and rate-limit fallback routes must use the same provider.",
+  child_route_policy: "Managed-worker review child-agent routes must use a non-Fable model; subagent thinking is capped at xhigh.",
+  exact_route_format: "Managed-worker review routes must use an exact provider/model:thinking value.",
+  exact_route_unavailable: "Managed-worker review route cannot be honored exactly; configure an exact registered provider/model:thinking route."
+};
+
+export class TrustedManagedWorkerReviewRouteError extends Error {
+  readonly outcome: "auth_failed" | "route_config_failed";
+  readonly trustedDetail?: string;
+
+  constructor(outcome: "auth_failed" | "route_config_failed", guidance?: TrustedManagedWorkerReviewRouteGuidance) {
+    const trustedDetail = outcome === "route_config_failed" && guidance ? TRUSTED_ROUTE_GUIDANCE[guidance] : undefined;
+    super(trustedDetail ?? managedWorkerReviewFailureDetail(outcome));
+    this.name = "TrustedManagedWorkerReviewRouteError";
+    this.outcome = outcome;
+    this.trustedDetail = trustedDetail;
+  }
+}
+
 export function managedWorkerReviewRouteConfigError(error: unknown): ManagedWorkerReviewExecutionError {
-  const message = error instanceof Error ? error.message : String(error ?? "");
-  const outcome: ManagedWorkerReviewAttemptOutcome = /no configured auth|authenticat|credentials?/i.test(message)
-    ? "auth_failed"
-    : "route_config_failed";
-  return new ManagedWorkerReviewExecutionError([], outcome, managedWorkerReviewFailureDetail(outcome));
+  if (error instanceof TrustedManagedWorkerReviewRouteError) {
+    const detail = error.outcome === "route_config_failed"
+      ? error.trustedDetail ?? managedWorkerReviewFailureDetail(error.outcome)
+      : managedWorkerReviewFailureDetail(error.outcome);
+    return new ManagedWorkerReviewExecutionError([], error.outcome, detail);
+  }
+  // Arbitrary registry/provider errors are not trusted configuration prose.
+  // Never infer auth or replay actionable detail from keyword-like text.
+  return new ManagedWorkerReviewExecutionError([], "route_config_failed", managedWorkerReviewFailureDetail("route_config_failed"));
 }
 
 export class ConfirmedAnthropicRateLimitError extends Error {
@@ -241,6 +273,20 @@ export async function runManagedWorkerReviewWithRateLimitFallback(
   }
 }
 
+function contextualProviderHttpStatus(message: string): string | undefined {
+  const patterns = [
+    /\bHTTP(?:\/\d(?:\.\d)?)?\s+(500|501|502|503|504|505|506|507|508|510|511|529)\b/i,
+    /\bHTTP\/status\s*[:=]?\s*(500|501|502|503|504|505|506|507|508|510|511|529)\b/i,
+    /\b(?:HTTP\s+)?status(?:\s*code)?\s*[:=]\s*(500|501|502|503|504|505|506|507|508|510|511|529)\b/i,
+    /\bresponse[-_\s]+status\s*[:=]\s*(500|501|502|503|504|505|506|507|508|510|511|529)\b/i
+  ];
+  for (const pattern of patterns) {
+    const status = pattern.exec(message)?.[1];
+    if (status) return status;
+  }
+  return undefined;
+}
+
 export function classifyManagedWorkerReviewFailure(error: unknown, signal?: AbortSignal): ManagedWorkerReviewAttemptOutcome {
   const name = error instanceof Error ? error.name : "";
   const message = error instanceof Error ? error.message : String(error ?? "");
@@ -253,9 +299,11 @@ export function classifyManagedWorkerReviewFailure(error: unknown, signal?: Abor
   if (/different route identity|invalid route attempt|different repository identity|model substitution|response model|provider\/model/i.test(message)) return "route_mismatch";
   if (/without an assistant response|required VERDICT|empty output|output exceeds|findings exceed|checks exceed|findings and checks/i.test(message)) return "output_failed";
   if (/usage policy|safety policy|violative|content policy|policy[^.]{0,80}blocked|blocked under .*policy/i.test(message)) return "policy_failed";
-  if (/\b(?:401|403)\b|unauthori[sz]ed|forbidden|authentication|credentials?[^.]{0,40}(?:missing|invalid|expired)|oauth[^.]{0,40}(?:invalid|expired|failed)/i.test(message)) return "auth_failed";
-  if (/\b(?:HTTP(?:\/\d+(?:\.\d+)?)?\s*)?(?:500|502|503|504|529)\b|overloaded_error|internal[_ ]server[_ ]error/i.test(message)) return "provider_5xx";
-  if (/fetch failed|network|socket|econn|enotfound|tls|transport|connection (?:reset|refused|closed)|stream disconnected/i.test(message)) return "transport_failed";
+  if (/unauthori[sz]ed|forbidden|authentication|credentials?[^.]{0,40}(?:missing|invalid|expired)|oauth[^.]{0,40}(?:invalid|expired|failed)/i.test(message)
+    || /\bHTTP(?:\/\d(?:\.\d)?)?\s+(?:401|403)\b/i.test(message)
+    || /\b(?:HTTP\s+)?status(?:\s*code)?\s*[:=]\s*(?:401|403)\b/i.test(message)) return "auth_failed";
+  if (contextualProviderHttpStatus(message) || /overloaded_error|internal[_ ]server[_ ]error/i.test(message)) return "provider_5xx";
+  if (/fetch failed|network (?:error|request failed|connection failed)|socket (?:hang up|error|closed)|\b(?:ECONNRESET|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EHOSTUNREACH|EAI_AGAIN|UND_ERR_[A-Z_]+)\b|TLS (?:error|handshake failed)|certificate (?:error|verification failed|expired)|connection (?:reset|refused|closed|aborted|failed)|stream disconnected|transport (?:error|failure)/i.test(message)) return "transport_failed";
   if (/unknown (?:provider|model)|model .* unavailable|provider .* not configured|child session failed to load resources/i.test(message)) return "route_config_failed";
   if (error instanceof ManagedWorkerReviewProviderError) return "provider_failed";
   return "failed";
@@ -269,7 +317,7 @@ export function managedWorkerReviewFailureDetail(outcome: ManagedWorkerReviewAtt
     case "transport_failed": return "Managed-review provider transport failed; no further fallback is permitted.";
     case "provider_5xx": {
       const message = error instanceof Error ? error.message : String(error ?? "");
-      const status = /(?:^|\b)(500|502|503|504|529)(?:\b|$)/.exec(message)?.[1];
+      const status = contextualProviderHttpStatus(message);
       return status ? `Managed-review provider returned HTTP ${status}; no further fallback is permitted.` : "Managed-review provider returned a 5xx or 529 service failure; no further fallback is permitted.";
     }
     case "provider_failed": return "Managed-review provider request failed; no further fallback is permitted.";
@@ -315,6 +363,7 @@ async function runManagedWorkerReviewAttempt(
   const scope = createAbortScope(input.signal, timeoutMs);
   let toolCallCount = 0;
   let confinementFailure: string | undefined;
+  const providerHttp: ManagedReviewProviderHttpObservation = {};
   const systemPrompt = managedWorkerRoleSkillText("review");
   const exactModel = exactManagedWorkerReviewModel(input.model);
   try {
@@ -325,6 +374,9 @@ async function runManagedWorkerReviewAttempt(
       tools: [...MANAGED_WORKER_REVIEW_TOOLS],
       isolatedSystemPrompt: systemPrompt,
       extensionFactories: [createConfinedManagedReviewToolsExtension(input.cwd, (reason) => { confinementFailure ??= reason; })],
+      transformProvider: (provider) => provider.id === "anthropic"
+        ? observeManagedReviewProviderHttp(provider, providerHttp)
+        : provider,
       signal: scope.signal,
       onEvent: (event: AgentSessionEvent) => {
         if (event.type === "tool_execution_start") {
@@ -359,7 +411,8 @@ async function runManagedWorkerReviewAttempt(
       const assistant = assistants.at(-1)!;
       if (assistant.stopReason === "error" || assistant.stopReason === "aborted") {
         const message = assistant.errorMessage ?? `Managed-worker reviewer stopped with ${assistant.stopReason}.`;
-        if (assistant.stopReason === "error" && isConfirmedAnthropicRateLimitMessage(exactModel, message)) {
+        if (assistant.stopReason === "error"
+          && isConfirmedAnthropicRateLimitMessage(exactModel, message, providerHttp.lastStatus)) {
           throw new ConfirmedAnthropicRateLimitError(formatManagedWorkerReviewRoute({ model: exactModel, thinkingLevel: input.thinkingLevel }), message);
         }
         throw new ManagedWorkerReviewProviderError(message);
@@ -387,6 +440,41 @@ async function runManagedWorkerReviewAttempt(
   }
 }
 
+type ManagedReviewProviderHttpObservation = {
+  lastStatus?: number;
+};
+
+/** Capture the actual final HTTP status without retaining response headers or bodies. */
+function observeManagedReviewProviderHttp(
+  provider: Provider,
+  observation: ManagedReviewProviderHttpObservation
+): Provider {
+  const observeOptions = <T extends StreamOptions>(options: T | undefined): T => {
+    const upstreamFetch = options?.fetch ?? globalThis.fetch;
+    const upstreamOnResponse = options?.onResponse;
+    return {
+      ...(options ?? {}),
+      fetch: async (...args: Parameters<typeof globalThis.fetch>) => {
+        const response = await upstreamFetch(...args);
+        observation.lastStatus = response.status;
+        return response;
+      },
+      onResponse: async (response: ProviderResponse, model: Model<Api>) => {
+        observation.lastStatus = response.status;
+        await upstreamOnResponse?.(response, model);
+      }
+    } as T;
+  };
+  return {
+    ...provider,
+    getModels: () => provider.getModels(),
+    stream: ((model: Model<Api>, context: Context, options?: StreamOptions) =>
+      provider.stream(model, context, observeOptions(options) as never)) as Provider["stream"],
+    streamSimple: ((model: Model<Api>, context: Context, options?: StreamOptions) =>
+      provider.streamSimple(model, context, observeOptions(options) as never)) as Provider["streamSimple"]
+  };
+}
+
 function exactManagedWorkerReviewModel(model: Model<Api>): Model<Api> {
   const compat = model.compat as Record<string, unknown> | undefined;
   if (!compat) return { ...model };
@@ -410,8 +498,12 @@ function safeRouteValue(value: string): string {
   return /^[a-zA-Z0-9._:/-]+$/.test(bounded) && bounded.length === value.length ? bounded : "(redacted invalid route value)";
 }
 
-export function isConfirmedAnthropicRateLimitMessage(model: Pick<Model<Api>, "provider">, message: string): boolean {
-  if (model.provider !== "anthropic" || /overloaded_error/i.test(message)) return false;
+export function isConfirmedAnthropicRateLimitMessage(
+  model: Pick<Model<Api>, "provider">,
+  message: string,
+  observedHttpStatus: number | undefined
+): boolean {
+  if (model.provider !== "anthropic" || observedHttpStatus !== 429 || /overloaded_error/i.test(message)) return false;
   const statusCodes = [
     ...Array.from(message.matchAll(/\bHTTP(?:\/\d+(?:\.\d+)?)?\s*(?:status\s*)?[:=]?\s*(\d{3})\b/gi), (match) => Number(match[1])),
     ...Array.from(message.matchAll(/\b(?:status(?:Code)?|httpStatus)\s*["']?\s*[:=]?\s*(\d{3})\b/gi), (match) => Number(match[1]))

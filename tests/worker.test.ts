@@ -553,9 +553,14 @@ test("worker settings select a configured default while explicit routes override
   }), /capped at xhigh/);
   assert.throws(() => resolveWorkerReviewRoute(context, {
     defaultRoute: "openai-codex/gpt-5.6-sol:xhigh",
-    reviewRoute: "openai-codex/missing:xhigh",
+    reviewRoute: "openai-codex/missing-CANDIDATE_TEXT:xhigh",
     configSource: "fixture"
-  }), /Managed-worker review primary model not found/);
+  }), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.match(error.message, /could not be honored exactly/);
+    assert.doesNotMatch(error.message, /missing-CANDIDATE_TEXT|model not found/);
+    return true;
+  });
   const authlessContext = parentContext("/tmp/parent", "/tmp/parent.jsonl") as ExtensionContext & {
     modelRegistry: { hasConfiguredAuth(model: Model<Api>): boolean; getAll(): Model<Api>[] };
   };
@@ -564,7 +569,12 @@ test("worker settings select a configured default while explicit routes override
     defaultRoute: "openai-codex/gpt-5.6-sol:xhigh",
     reviewRoute: "openai-codex/gpt-test:xhigh",
     configSource: "fixture"
-  }), /has no configured auth/);
+  }), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.match(error.message, /authentication or authorization failed/);
+    assert.doesNotMatch(error.message, /has no configured auth|gpt-test/);
+    return true;
+  });
 });
 
 test("worker activity status is compact, themed, exact-parent scoped, and record driven", async () => {
@@ -2502,8 +2512,8 @@ test("worker_review fails closed for inventory, repository, lifecycle, container
     tool = api.tools.find((candidate) => candidate.name === "worker_review")!;
     await assert.rejects(() => tool.execute!("review-route-failure", input as never, undefined, undefined, context), (error: unknown) => {
       assert.ok(error instanceof Error);
-      assert.match(error.message, /auth_failed.*route outcomes: none.*authentication or authorization failed/i);
-      assert.doesNotMatch(error.message, /sk-host-secret/);
+      assert.match(error.message, /route_config_failed.*route outcomes: none.*could not be honored exactly/i);
+      assert.doesNotMatch(error.message, /sk-host-secret|not authenticated/);
       return true;
     });
     assert.equal(inspections, 2, "route validation failure still rechecks stopped container state");

@@ -91,6 +91,7 @@ import {
   managedWorkerReviewFailureDetail,
   managedWorkerReviewRouteConfigError,
   ManagedWorkerReviewExecutionError,
+  TrustedManagedWorkerReviewRouteError,
   runManagedWorkerReviewWithRateLimitFallback,
   type ManagedWorkerReviewAttempt,
   type ManagedWorkerReviewExecutionResult,
@@ -652,13 +653,13 @@ export function registerWorkerExtension(
   api.registerTool(defineTool({
     name: "worker_review",
     label: "Worker Review",
-    description: "Review one exact clean repository from a settled managed worker with a dedicated independently routed read-only agent. The configured primary route may use one visible fresh same-provider fallback only after a confirmed Anthropic HTTP 429 rate_limit_error. Use after an implementation or correction handoff when the persistent worker container is already stopped. Do not use while active, to validate by execution, change code, acknowledge delivery, or authorize promotion.",
+    description: "Review one exact clean repository from a settled managed worker with a dedicated independently routed read-only agent. The configured primary route may use one visible fresh same-provider fallback only after an actually observed Anthropic HTTP 429 response plus rate_limit_error. Use after an implementation or correction handoff when the persistent worker container is already stopped. Do not use while active, to validate by execution, change code, acknowledge delivery, or authorize promotion.",
     promptSnippet: "Independently review one exact clean repository from a settled managed worker; never modifies or promotes it.",
     promptGuidelines: [
       "worker_review use: Call for the exact settled worker/run/repository after selecting its authoritative candidate; if review requests changes, resume the implementation worker and review the new settled run again.",
       inputJsonSchemaGuideline("worker_review", WorkerReviewParams),
       outputJsonSchemaGuideline("worker_review", RetainedToolOutputSchemas.worker_review),
-      "worker_review constraints: Requires an exact-parent-owned handed-off run, valid hash-bound inventory, already-stopped exact persistent container, and clean foldable candidate. Primary and fallback routes reject max thinking and every Claude Fable model. It never acknowledges delivery or mutates worker/container state. A bounded operation lock covers the primary and, only after a confirmed Anthropic 429 rate_limit_error plus renewed exact lifecycle/lease, complete accepted handoff envelope including acceptedAt, stopped-container timestamp fingerprint, repository/commit, and confinement prechecks, one fresh same-provider configured fallback child. Both use trusted in-memory settings with retries and compaction disabled, stripped provider fallback metadata, exact every-turn response-model/name verification, Unicode-safe nonce-delimited JSON candidate evidence, and only repository-confined read_many/search_many with unconditional Git-admin search exclusion; recoverable ENOENT/schema tool errors remain model-visible while true escapes and inactive disallowed-tool requests terminate; auth/model/config/transport/5xx/timeout/cancellation/output/policy failures never trigger fallback. Only actually started routes appear in ordered attempt history; safe route/config failures retain sanitized host guidance without raw provider errors. Lifecycle/container/HEAD/tree/dirty/policy are rechecked after the overall review; drift fails visibly. The structured verdict/findings/checks are advice only, not validation, attestation, promotion, push, or publication authority. Only result content is provider-visible; details are internal."
+      "worker_review constraints: Requires an exact-parent-owned handed-off run, valid hash-bound inventory, already-stopped exact persistent container, and clean foldable candidate. Primary and fallback routes reject max thinking and every Claude Fable model. It never acknowledges delivery or mutates worker/container state. Before route resolution or provider startup, trusted Git builds Unicode-safe nonce-delimited JSON evidence with exact worker/run/tasks/repository/candidate/base/base-tree/HEAD/HEAD-tree identity plus bounded no-color shortstat, at most 200 quoted changed-path/status stat entries, and an independently Git-limited rename overview; raw patches, blobs, candidate purpose, and handoff prose are excluded, and deleted content is unavailable through HEAD-confined tools. A bounded operation lock covers the primary and, only after an actually observed Anthropic HTTP 429 response plus rate_limit_error and renewed exact lifecycle/lease, complete accepted handoff envelope including acceptedAt, stopped-container timestamp fingerprint, repository/commit, and confinement prechecks, one fresh same-provider configured fallback child. Both use trusted in-memory settings with retries and compaction disabled, stripped provider fallback metadata, exact every-turn response-model/name verification, and only repository-confined read_many/search_many with unconditional Git-admin search exclusion; recoverable ENOENT/schema tool errors remain model-visible while true escapes and inactive disallowed-tool requests terminate. Evidence, auth, unavailable/unknown route, transport, 5xx/529, timeout, cancellation, output, confinement, and policy failures never trigger fallback. Only actually started routes appear in ordered attempt history; evidence failure has attempts:none. Fixed failure categories are evidence_failed, policy_failed, auth_failed, transport_failed, provider_5xx, provider_failed, output_failed, confinement_failed, route_mismatch, route_config_failed, precondition_failed, timed_out, cancelled, postcondition_failed, rate_limited, and failed. Raw provider/configuration text never replays; only typed recognized host route-policy/configuration failures may add bounded sanitized actionable guidance, while auth and unavailable/unknown provider or model failures stay fixed-category. Lifecycle/container/HEAD/tree/dirty/policy are rechecked after the overall review; drift fails visibly. The structured verdict/findings/checks are advice only, not validation, attestation, promotion, push, or publication authority. Only result content is provider-visible; details are internal."
     ],
     parameters: WorkerReviewParams,
     executionMode: "sequential",
@@ -3159,14 +3160,14 @@ export function resolveWorkerReviewRoutes(
   settings: WorkerSettings = readWorkerSettings()
 ): { primary: ManagedWorkerReviewRoute; rateLimitFallback?: ManagedWorkerReviewRoute } {
   if (!settings.reviewRoute) {
-    throw new Error("Managed-worker review route is not configured. Set worker-settings.json reviewRoute to an exact provider/model:thinking route.");
+    throw new TrustedManagedWorkerReviewRouteError("route_config_failed", "configure_exact_route");
   }
   const primary = resolveExactWorkerReviewRoute(context, settings.reviewRoute, "primary");
   const rateLimitFallback = settings.reviewRateLimitFallbackRoute
     ? resolveExactWorkerReviewRoute(context, settings.reviewRateLimitFallbackRoute, "rate-limit fallback")
     : undefined;
   if (rateLimitFallback && rateLimitFallback.model.provider !== primary.model.provider) {
-    throw new Error("Managed-worker review primary and rate-limit fallback routes must resolve to the same exact provider.");
+    throw new TrustedManagedWorkerReviewRouteError("route_config_failed", "same_provider");
   }
   return { primary, ...(rateLimitFallback ? { rateLimitFallback } : {}) };
 }
@@ -3184,19 +3185,44 @@ function resolveExactWorkerReviewRoute(
   route: string,
   role: "primary" | "rate-limit fallback"
 ): ManagedWorkerReviewRoute {
-  assertSubagentRouteSpecAllowed(route, `Managed-worker review ${role} route`);
-  const configured = parseModelThinkingPair(route);
-  const resolved = resolveExtensionModel({
-    registry: context.modelRegistry,
-    requested: route,
-    fallbackThinkingLevel: configured.thinkingLevel,
-    label: `Managed-worker review ${role}`,
-    noModelMessage: `Managed-worker review ${role} route is not configured.`
-  });
-  if (formatModelName(resolved.model) !== configured.model || resolved.thinkingLevel !== configured.thinkingLevel) {
-    throw new Error(`Managed-worker review ${role} route cannot be honored exactly: ${route}.`);
+  try {
+    assertSubagentRouteSpecAllowed(route, `Managed-worker review ${role} route`);
+  } catch {
+    throw new TrustedManagedWorkerReviewRouteError("route_config_failed", "child_route_policy");
   }
-  assertChildAgentRouteAllowed(resolved.model, resolved.thinkingLevel, `Managed-worker review ${role} route`);
+  let configured: ReturnType<typeof parseModelThinkingPair>;
+  try {
+    configured = parseModelThinkingPair(route);
+  } catch {
+    throw new TrustedManagedWorkerReviewRouteError("route_config_failed", "exact_route_format");
+  }
+  let resolved: ManagedWorkerReviewRoute;
+  try {
+    resolved = resolveExtensionModel({
+      registry: context.modelRegistry,
+      requested: route,
+      fallbackThinkingLevel: configured.thinkingLevel,
+      label: `Managed-worker review ${role}`,
+      noModelMessage: `Managed-worker review ${role} route is not configured.`
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    if (/^Managed-worker review (?:primary|rate-limit fallback) model has no configured auth:/.test(message)) {
+      throw new TrustedManagedWorkerReviewRouteError("auth_failed");
+    }
+    if (/^Managed-worker review (?:primary|rate-limit fallback) model not found:/.test(message)) {
+      throw new TrustedManagedWorkerReviewRouteError("route_config_failed");
+    }
+    throw new TrustedManagedWorkerReviewRouteError("route_config_failed");
+  }
+  if (formatModelName(resolved.model) !== configured.model || resolved.thinkingLevel !== configured.thinkingLevel) {
+    throw new TrustedManagedWorkerReviewRouteError("route_config_failed", "exact_route_unavailable");
+  }
+  try {
+    assertChildAgentRouteAllowed(resolved.model, resolved.thinkingLevel, `Managed-worker review ${role} route`);
+  } catch {
+    throw new TrustedManagedWorkerReviewRouteError("route_config_failed", "child_route_policy");
+  }
   return resolved;
 }
 
