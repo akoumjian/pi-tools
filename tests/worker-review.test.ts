@@ -367,7 +367,7 @@ test("managed review timeout aborts only the dedicated child", async () => {
       thinkingLevel: "xhigh",
       evidence: "exact",
       timeoutMs: 20
-    }), /timed_out.*managed-review-timeout\/timeout:xhigh — timed_out/i);
+    }), /timed_out.*managed-review-timeout\/timeout:xhigh — timed_out.*20ms bounded timeout after 0 tool calls/i);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -792,7 +792,7 @@ test("non-rate-limit, malformed-output, timeout, and cancellation failures never
       evidence: "exact",
       beforeFallback: () => { timeoutPrechecks += 1; },
       timeoutMs: 20
-    }), /timed_out.*anthropic\/opus:xhigh — timed_out/i);
+    }), /timed_out.*anthropic\/opus:xhigh — timed_out.*20ms bounded timeout after 0 tool calls/i);
     assert.ok(timeoutFaux.state.callCount <= 1);
     assert.equal(timeoutPrechecks, 0);
   } finally {
