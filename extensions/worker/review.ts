@@ -11,7 +11,6 @@ import { managedWorkerRoleSkillText } from "../_shared/role-skills.js";
 import nativeToolsExtension, { resolveNativeToolPath } from "../native-tools/index.js";
 
 export const MANAGED_WORKER_REVIEW_TOOLS = ["search_many", "read_many"] as const;
-export const MANAGED_WORKER_REVIEW_TIMEOUT_MS = 12 * 60_000;
 export const MAX_MANAGED_WORKER_REVIEW_FINDINGS_CHARS = 24_000;
 export const MAX_MANAGED_WORKER_REVIEW_CHECKS_CHARS = 8_000;
 export const MAX_MANAGED_WORKER_REVIEW_TOTAL_CHARS = 32_768;
@@ -160,11 +159,11 @@ class ManagedWorkerReviewProviderError extends Error {
 }
 
 class ManagedWorkerReviewTimeoutError extends Error {
-  readonly timeoutMs: number;
+  readonly timeoutMs: number | undefined;
   readonly toolCallCount: number;
 
-  constructor(timeoutMs: number, toolCallCount: number) {
-    super(`Managed-worker review reached its ${timeoutMs}ms deadline after ${toolCallCount} tool calls.`);
+  constructor(timeoutMs: number | undefined, toolCallCount: number) {
+    super(`Managed-worker review was timed out${timeoutMs === undefined ? "" : ` after ${timeoutMs}ms`} with ${toolCallCount} tool calls.`);
     this.name = "TimeoutError";
     this.timeoutMs = timeoutMs;
     this.toolCallCount = toolCallCount;
@@ -189,7 +188,7 @@ export async function runManagedWorkerReview(
   }
   const route = formatManagedWorkerReviewRoute(input);
   try {
-    return await runManagedWorkerReviewAttempt(context, input, input.timeoutMs ?? MANAGED_WORKER_REVIEW_TIMEOUT_MS);
+    return await runManagedWorkerReviewAttempt(context, input, input.timeoutMs);
   } catch (error) {
     const outcome = error instanceof ConfirmedAnthropicRateLimitError
       ? "rate_limited"
@@ -198,7 +197,7 @@ export async function runManagedWorkerReview(
   }
 }
 
-/** One overall timeout and at most one fresh same-provider fallback after a confirmed primary Anthropic 429. */
+/** One optional caller deadline and at most one fresh same-provider fallback after a confirmed primary Anthropic 429. */
 export async function runManagedWorkerReviewWithRateLimitFallback(
   context: Pick<ExtensionContext, "modelRegistry" | "ui">,
   input: ManagedWorkerReviewPlanInput
@@ -214,7 +213,7 @@ export async function runManagedWorkerReviewWithRateLimitFallback(
   } catch (error) {
     throw managedWorkerReviewRouteConfigError(error);
   }
-  const scope = createAbortScope(input.signal, input.timeoutMs ?? MANAGED_WORKER_REVIEW_TIMEOUT_MS);
+  const scope = createAbortScope(input.signal, input.timeoutMs);
   const primaryRoute = formatManagedWorkerReviewRoute(input.primaryRoute);
   const fallbackRoute = input.rateLimitFallbackRoute ? formatManagedWorkerReviewRoute(input.rateLimitFallbackRoute) : undefined;
   try {
@@ -340,9 +339,12 @@ export function managedWorkerReviewFailureDetail(outcome: ManagedWorkerReviewAtt
     case "precondition_failed": return "Trusted fallback precondition revalidation failed.";
     case "timed_out": {
       const progress = error instanceof ManagedWorkerReviewTimeoutError
-        ? ` after ${error.toolCallCount} tool ${error.toolCallCount === 1 ? "call" : "calls"}`
+        ? ` with ${error.toolCallCount} tool ${error.toolCallCount === 1 ? "call" : "calls"}`
         : "";
-      return `Managed review exceeded its ${error instanceof ManagedWorkerReviewTimeoutError ? error.timeoutMs : MANAGED_WORKER_REVIEW_TIMEOUT_MS}ms bounded timeout${progress}; no further fallback is permitted.`;
+      const timeout = error instanceof ManagedWorkerReviewTimeoutError && error.timeoutMs !== undefined
+        ? ` after ${error.timeoutMs}ms`
+        : "";
+      return `Managed review was timed out${timeout}${progress}; no further fallback is permitted.`;
     }
     case "cancelled": return "Managed review was cancelled; no further fallback is permitted.";
     case "postcondition_failed": return "Trusted managed-review lifecycle or repository postcondition changed during review.";
@@ -718,10 +720,10 @@ function nonEmptyString(value: unknown, label: string): string {
   return value;
 }
 
-function timeoutFromAbortReason(reason: Error): number {
+function timeoutFromAbortReason(reason: Error): number | undefined {
   const timeout = /^Operation timed out after (\d+)ms$/.exec(reason.message)?.[1];
   const parsed = timeout === undefined ? Number.NaN : Number(timeout);
-  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : MANAGED_WORKER_REVIEW_TIMEOUT_MS;
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
 function assistantText(message: AssistantMessage): string {
