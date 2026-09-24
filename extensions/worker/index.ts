@@ -83,11 +83,15 @@ import {
   type RepositoryInventory,
   type RepositoryInventorySummary
 } from "./repositories.js";
+import { buildWorkerReviewEvidence } from "./review-evidence.js";
 import {
   classifyManagedWorkerReviewFailure,
   formatManagedWorkerReviewRoute,
+  managedWorkerReviewEvidenceError,
+  managedWorkerReviewFailureDetail,
   managedWorkerReviewRouteConfigError,
   ManagedWorkerReviewExecutionError,
+  TrustedManagedWorkerReviewRouteError,
   runManagedWorkerReviewWithRateLimitFallback,
   type ManagedWorkerReviewAttempt,
   type ManagedWorkerReviewExecutionResult,
@@ -369,6 +373,7 @@ type WorkerExtensionDependencies = {
   foldsRoot: string;
   targetRoot: string;
   prepareFold: typeof prepareRepositoryChangeSet;
+  buildReviewEvidence: typeof buildWorkerReviewEvidence;
   reviewWorker(context: Pick<ExtensionContext, "modelRegistry" | "ui">, input: ManagedWorkerReviewPlanInput): Promise<ManagedWorkerReviewExecutionResult>;
   resolveReviewRoutes(context: ExtensionContext): { primary: ManagedWorkerReviewRoute; rateLimitFallback?: ManagedWorkerReviewRoute };
   inspectContainer(container: WorkerContainerReference): StoppedWorkerContainerIdentity;
@@ -648,13 +653,13 @@ export function registerWorkerExtension(
   api.registerTool(defineTool({
     name: "worker_review",
     label: "Worker Review",
-    description: "Review one exact clean repository from a settled managed worker with a dedicated independently routed read-only agent. The configured primary route may use one visible fresh same-provider fallback only after a confirmed Anthropic HTTP 429 rate_limit_error. Use after an implementation or correction handoff when the persistent worker container is already stopped. Do not use while active, to validate by execution, change code, acknowledge delivery, or authorize promotion.",
+    description: "Review one exact clean repository from a settled managed worker with a dedicated independently routed read-only agent. The configured primary route may use one visible fresh same-provider fallback only after an actually observed Anthropic HTTP 429 response plus rate_limit_error. Use after an implementation or correction handoff when the persistent worker container is already stopped. Do not use while active, to validate by execution, change code, acknowledge delivery, or authorize promotion.",
     promptSnippet: "Independently review one exact clean repository from a settled managed worker; never modifies or promotes it.",
     promptGuidelines: [
       "worker_review use: Call for the exact settled worker/run/repository after selecting its authoritative candidate; if review requests changes, resume the implementation worker and review the new settled run again.",
       inputJsonSchemaGuideline("worker_review", WorkerReviewParams),
       outputJsonSchemaGuideline("worker_review", RetainedToolOutputSchemas.worker_review),
-      "worker_review constraints: Requires an exact-parent-owned handed-off run, valid hash-bound inventory, already-stopped exact persistent container, and clean foldable candidate. Primary and fallback routes reject max thinking and every Claude Fable model. It never acknowledges delivery or mutates worker/container state. A bounded operation lock covers the primary and, only after a confirmed Anthropic 429 rate_limit_error plus renewed exact lifecycle/lease, complete accepted handoff envelope including acceptedAt, stopped-container timestamp fingerprint, repository/commit, and confinement prechecks, one fresh same-provider configured fallback child. Both use trusted in-memory settings with retries and compaction disabled, stripped provider fallback metadata, exact every-turn response-model/name verification, Unicode-safe nonce-delimited JSON candidate evidence, and only repository-confined read_many/search_many with unconditional Git-admin search exclusion; recoverable ENOENT/schema tool errors remain model-visible while true escapes and inactive disallowed-tool requests terminate; auth/model/config/transport/5xx/timeout/cancellation/output/policy failures never trigger fallback. Only actually started routes appear in ordered attempt history; safe route/config failures retain sanitized host guidance without raw provider errors. Lifecycle/container/HEAD/tree/dirty/policy are rechecked after the overall review; drift fails visibly. The structured verdict/findings/checks are advice only, not validation, attestation, promotion, push, or publication authority. Only result content is provider-visible; details are internal."
+      "worker_review constraints: Requires an exact-parent-owned handed-off run, valid hash-bound inventory, already-stopped exact persistent container, and clean foldable candidate. Primary and fallback routes reject max thinking and every Claude Fable model. It never acknowledges delivery or mutates worker/container state. Before route resolution or provider startup, trusted Git builds Unicode-safe nonce-delimited JSON evidence with exact worker/run/tasks/repository/candidate/base/base-tree/HEAD/HEAD-tree identity plus bounded no-color shortstat, at most 200 quoted changed-path/status stat entries, and an independently Git-limited rename overview; raw patches, blobs, candidate purpose, and handoff prose are excluded, and deleted content is unavailable through HEAD-confined tools. A bounded operation lock covers the primary and, only after an actually observed Anthropic HTTP 429 response plus rate_limit_error and renewed exact lifecycle/lease, complete accepted handoff envelope including acceptedAt, stopped-container timestamp fingerprint, repository/commit, and confinement prechecks, one fresh same-provider configured fallback child. Both use trusted in-memory settings with retries and compaction disabled, stripped provider fallback metadata, exact every-turn response-model/name verification, and only repository-confined read_many/search_many with unconditional Git-admin search exclusion; recoverable ENOENT/schema tool errors remain model-visible while true escapes and inactive disallowed-tool requests terminate. Evidence, auth, unavailable/unknown route, transport, 5xx/529, timeout, cancellation, output, confinement, and policy failures never trigger fallback. Only actually started routes appear in ordered attempt history; evidence failure has attempts:none. Fixed failure categories are evidence_failed, policy_failed, auth_failed, transport_failed, provider_5xx, provider_failed, output_failed, confinement_failed, route_mismatch, route_config_failed, precondition_failed, timed_out, cancelled, postcondition_failed, rate_limited, and failed. Raw provider/configuration text never replays; only typed recognized host route-policy/configuration failures may add bounded sanitized actionable guidance, while auth and unavailable/unknown provider or model failures stay fixed-category. Lifecycle/container/HEAD/tree/dirty/policy are rechecked after the overall review; drift fails visibly. The structured verdict/findings/checks are advice only, not validation, attestation, promotion, push, or publication authority. Only result content is provider-visible; details are internal."
     ],
     parameters: WorkerReviewParams,
     executionMode: "sequential",
@@ -981,18 +986,33 @@ async function reviewSettledWorker(
     let reviewRoutes: ReturnType<WorkerExtensionDependencies["resolveReviewRoutes"]> | undefined;
     let execution: ManagedWorkerReviewExecutionResult | undefined;
     let reviewFailure: unknown;
+    let evidence: string | undefined;
     try {
-      reviewRoutes = dependencies.resolveReviewRoutes(context);
+      evidence = dependencies.buildReviewEvidence({
+        workerId: record.workerId,
+        runId: candidate.runId,
+        taskIds: record.taskIds,
+        candidate,
+        repository,
+        trustedStateRoot: paths.stateDir
+      });
     } catch (error) {
-      reviewFailure = managedWorkerReviewRouteConfigError(error);
+      reviewFailure = managedWorkerReviewEvidenceError(error);
     }
-    if (reviewRoutes) {
+    if (reviewFailure === undefined) {
+      try {
+        reviewRoutes = dependencies.resolveReviewRoutes(context);
+      } catch (error) {
+        reviewFailure = managedWorkerReviewRouteConfigError(error);
+      }
+    }
+    if (reviewRoutes && evidence !== undefined && reviewFailure === undefined) {
       try {
         execution = await dependencies.reviewWorker(context, {
           cwd: repository,
           primaryRoute: reviewRoutes.primary,
           rateLimitFallbackRoute: reviewRoutes.rateLimitFallback,
-          evidence: buildWorkerReviewEvidence(record, candidate, repository, paths.stateDir),
+          evidence,
           focus: input.focus,
           signal,
           beforeFallback: async (fallbackSignal) => {
@@ -1011,23 +1031,24 @@ async function reviewSettledWorker(
     } catch {
       const attempts = execution?.attempts
         ?? (reviewFailure instanceof ManagedWorkerReviewExecutionError ? reviewFailure.attempts : []);
-      throw new ManagedWorkerReviewExecutionError(attempts, "postcondition_failed");
+      throw new ManagedWorkerReviewExecutionError(attempts, "postcondition_failed", managedWorkerReviewFailureDetail("postcondition_failed"));
     }
     if (reviewFailure !== undefined) {
       if (reviewFailure instanceof ManagedWorkerReviewExecutionError) throw reviewFailure;
       const outcome = classifyManagedWorkerReviewFailure(reviewFailure, signal);
-      throw new ManagedWorkerReviewExecutionError([], outcome);
+      throw new ManagedWorkerReviewExecutionError([], outcome, managedWorkerReviewFailureDetail(outcome, reviewFailure));
     }
-    if (signal?.aborted) throw new ManagedWorkerReviewExecutionError(execution?.attempts ?? [], "cancelled");
-    if (!reviewRoutes || !execution) throw new ManagedWorkerReviewExecutionError([], "failed");
+    if (signal?.aborted) throw new ManagedWorkerReviewExecutionError(execution?.attempts ?? [], "cancelled", managedWorkerReviewFailureDetail("cancelled", signal.reason));
+    if (!reviewRoutes || !execution) throw new ManagedWorkerReviewExecutionError([], "failed", managedWorkerReviewFailureDetail("failed"));
     let review: ManagedWorkerReviewExecutionResult["review"];
     try {
       review = verifyManagedWorkerReviewExecution(execution, reviewRoutes);
     } catch (error) {
-      throw new ManagedWorkerReviewExecutionError(execution.attempts, classifyManagedWorkerReviewFailure(error, signal));
+      const outcome = classifyManagedWorkerReviewFailure(error, signal);
+      throw new ManagedWorkerReviewExecutionError(execution.attempts, outcome, managedWorkerReviewFailureDetail(outcome, error));
     }
     if (path.resolve(review.cwd) !== repository) {
-      throw new ManagedWorkerReviewExecutionError(execution.attempts, "route_mismatch");
+      throw new ManagedWorkerReviewExecutionError(execution.attempts, "route_mismatch", managedWorkerReviewFailureDetail("route_mismatch"));
     }
     return {
       workerId: input.workerId,
@@ -1115,40 +1136,6 @@ function verifyWorkerReviewRepository(
       throw new Error(`Managed-worker review rejects hardlinked worktree evidence: ${relative}`);
     }
   }
-}
-
-function buildWorkerReviewEvidence(
-  record: WorkerRecord,
-  candidate: RepositoryInventory["candidates"][number],
-  repository: string,
-  trustedStateRoot: string
-): string {
-  const runner = createGitRunner(resolveExecutable("git"), path.join(trustedStateRoot, "review-context-git"));
-  const diffStat = boundReviewContext(gitText(runner, repository, ["diff", "--no-ext-diff", "--stat", candidate.baseCommit!, candidate.headCommit!, "--"]).trim() || "(none)", 20_000);
-  const committedDiff = boundReviewContext(gitText(runner, repository, ["diff", "--no-ext-diff", "--minimal", "--unified=40", candidate.baseCommit!, candidate.headCommit!, "--"]).trim() || "(none)", 50_000);
-  return [
-    `Worker/run: ${record.workerId}/${candidate.runId}`,
-    `Assigned tasks: ${record.taskIds.join(", ")}`,
-    `Repository: ${candidate.workspaceRepo}`,
-    `Candidate: ${candidate.candidateId}`,
-    `Exact base: ${candidate.baseCommit}`,
-    `Exact HEAD: ${candidate.headCommit}`,
-    `Exact HEAD tree: ${candidate.headTree}`,
-    "Repository state: clean, foldable, stopped, and policy-checked before review.",
-    "",
-    "### Exact committed diff stat",
-    diffStat,
-    "",
-    "### Exact committed base..HEAD diff excerpt",
-    "```diff",
-    committedDiff,
-    "```"
-  ].join("\n");
-}
-
-function boundReviewContext(value: string, maxChars: number): string {
-  if (value.length <= maxChars) return value;
-  return `${value.slice(0, maxChars)}\n... [truncated ${value.length - maxChars} characters; inspect exact repository files with confined read-only tools]`;
 }
 
 function formatWorkerReviewResult(details: WorkerReviewDetails): string {
@@ -3173,14 +3160,14 @@ export function resolveWorkerReviewRoutes(
   settings: WorkerSettings = readWorkerSettings()
 ): { primary: ManagedWorkerReviewRoute; rateLimitFallback?: ManagedWorkerReviewRoute } {
   if (!settings.reviewRoute) {
-    throw new Error("Managed-worker review route is not configured. Set worker-settings.json reviewRoute to an exact provider/model:thinking route.");
+    throw new TrustedManagedWorkerReviewRouteError("route_config_failed", "configure_exact_route");
   }
   const primary = resolveExactWorkerReviewRoute(context, settings.reviewRoute, "primary");
   const rateLimitFallback = settings.reviewRateLimitFallbackRoute
     ? resolveExactWorkerReviewRoute(context, settings.reviewRateLimitFallbackRoute, "rate-limit fallback")
     : undefined;
   if (rateLimitFallback && rateLimitFallback.model.provider !== primary.model.provider) {
-    throw new Error("Managed-worker review primary and rate-limit fallback routes must resolve to the same exact provider.");
+    throw new TrustedManagedWorkerReviewRouteError("route_config_failed", "same_provider");
   }
   return { primary, ...(rateLimitFallback ? { rateLimitFallback } : {}) };
 }
@@ -3198,19 +3185,44 @@ function resolveExactWorkerReviewRoute(
   route: string,
   role: "primary" | "rate-limit fallback"
 ): ManagedWorkerReviewRoute {
-  assertSubagentRouteSpecAllowed(route, `Managed-worker review ${role} route`);
-  const configured = parseModelThinkingPair(route);
-  const resolved = resolveExtensionModel({
-    registry: context.modelRegistry,
-    requested: route,
-    fallbackThinkingLevel: configured.thinkingLevel,
-    label: `Managed-worker review ${role}`,
-    noModelMessage: `Managed-worker review ${role} route is not configured.`
-  });
-  if (formatModelName(resolved.model) !== configured.model || resolved.thinkingLevel !== configured.thinkingLevel) {
-    throw new Error(`Managed-worker review ${role} route cannot be honored exactly: ${route}.`);
+  try {
+    assertSubagentRouteSpecAllowed(route, `Managed-worker review ${role} route`);
+  } catch {
+    throw new TrustedManagedWorkerReviewRouteError("route_config_failed", "child_route_policy");
   }
-  assertChildAgentRouteAllowed(resolved.model, resolved.thinkingLevel, `Managed-worker review ${role} route`);
+  let configured: ReturnType<typeof parseModelThinkingPair>;
+  try {
+    configured = parseModelThinkingPair(route);
+  } catch {
+    throw new TrustedManagedWorkerReviewRouteError("route_config_failed", "exact_route_format");
+  }
+  let resolved: ManagedWorkerReviewRoute;
+  try {
+    resolved = resolveExtensionModel({
+      registry: context.modelRegistry,
+      requested: route,
+      fallbackThinkingLevel: configured.thinkingLevel,
+      label: `Managed-worker review ${role}`,
+      noModelMessage: `Managed-worker review ${role} route is not configured.`
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    if (/^Managed-worker review (?:primary|rate-limit fallback) model has no configured auth:/.test(message)) {
+      throw new TrustedManagedWorkerReviewRouteError("auth_failed");
+    }
+    if (/^Managed-worker review (?:primary|rate-limit fallback) model not found:/.test(message)) {
+      throw new TrustedManagedWorkerReviewRouteError("route_config_failed");
+    }
+    throw new TrustedManagedWorkerReviewRouteError("route_config_failed");
+  }
+  if (formatModelName(resolved.model) !== configured.model || resolved.thinkingLevel !== configured.thinkingLevel) {
+    throw new TrustedManagedWorkerReviewRouteError("route_config_failed", "exact_route_unavailable");
+  }
+  try {
+    assertChildAgentRouteAllowed(resolved.model, resolved.thinkingLevel, `Managed-worker review ${role} route`);
+  } catch {
+    throw new TrustedManagedWorkerReviewRouteError("route_config_failed", "child_route_policy");
+  }
   return resolved;
 }
 
@@ -3789,6 +3801,7 @@ function defaultDependencies(): WorkerExtensionDependencies {
     foldsRoot: defaultWorkerFoldsRoot(roots.stateRoot),
     targetRoot: path.join(homedir(), "Code"),
     prepareFold: prepareRepositoryChangeSet,
+    buildReviewEvidence: buildWorkerReviewEvidence,
     reviewWorker: runManagedWorkerReviewWithRateLimitFallback,
     resolveReviewRoutes: resolveWorkerReviewRoutes,
     inspectContainer: (container) => inspectStoppedWorkerContainer(resolveDockerPath(), container),

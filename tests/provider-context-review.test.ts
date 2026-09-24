@@ -107,6 +107,12 @@ test("provider context review command renders sanitized prompt, tool declaration
     assert.match(artifact.systemPrompt, /worker_run constraints:/);
     assert.match(artifact.systemPrompt, /worker_control constraints:/);
     assert.match(artifact.systemPrompt, /worker_review constraints:/);
+    assert.match(artifact.systemPrompt, /exact worker\/run\/tasks\/repository\/candidate\/base\/base-tree\/HEAD\/HEAD-tree identity/);
+    assert.match(artifact.systemPrompt, /bounded no-color shortstat/);
+    assert.match(artifact.systemPrompt, /at most 200 quoted changed-path\/status stat entries/);
+    assert.match(artifact.systemPrompt, /evidence_failed/);
+    assert.match(artifact.systemPrompt, /only typed recognized host route-policy\/configuration failures/);
+    assert.doesNotMatch(artifact.systemPrompt, /Candidate diff\/stat evidence/);
     assert.match(artifact.systemPrompt, /worker_fold_prepare constraints:/);
     assert.match(artifact.systemPrompt, /worker_fold_resolve constraints:/);
     assert.doesNotMatch(artifact.systemPrompt, /Batch-native tool usage:/);

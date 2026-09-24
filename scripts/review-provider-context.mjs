@@ -184,10 +184,10 @@ const resultContracts = {
     content: "worker/run/job/session/workspace/task/route state, full typed handoff JSON, errors, canonical result/log paths, and cleanup outcome"
   },
   worker_review: {
-    success: "content reports the exact reviewed worker/run/candidate/HEAD/tree, reviewer route, bounded verdict, findings, and checks",
+    success: "content reports the exact reviewed worker/run/candidate/HEAD/tree, reviewer route, bounded verdict, findings, and checks after exact-identity plus bounded shortstat/path-status evidence",
     progress: "not applicable: one foreground exact-candidate review settles before return",
-    error: "active, cross-session, changed, dirty, nonfoldable, unparked, or invalid worker results fail visibly",
-    details: "internal exact candidate identity and reviewer execution metadata",
+    error: "preflight/evidence, active/cross-session, route/auth, provider/policy/transport/5xx, output/confinement, timeout/cancellation, and lifecycle-drift failures use fixed nonleaking categories; only an actually observed Anthropic HTTP 429 response plus rate_limit_error permits fallback",
+    details: "internal exact candidate identity, bounded Git shortstat/path-status evidence metadata, and reviewer execution attempts",
     content: "exact reviewed identity, reviewer route/tool count, and bounded structured verdict/findings/checks without attestation or promotion authority"
   },
   worker_fold_prepare: {

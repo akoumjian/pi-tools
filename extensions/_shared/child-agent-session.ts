@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, Model, Provider } from "@earendil-works/pi-ai";
 import {
   createAgentSessionFromServices,
   createAgentSessionServices,
@@ -39,6 +39,8 @@ export type ChildAgentSessionOptions = {
   systemPrompts?: string[];
   customTools?: ToolDefinition[];
   extensionFactories?: ExtensionFactory[];
+  /** Trusted in-process provider instrumentation applied only to this child session. */
+  transformProvider?: (provider: Provider) => Provider;
   extensionsOverride?: (result: LoadExtensionsResult) => LoadExtensionsResult;
   onEvent?: (event: AgentSessionEvent) => void;
   onError?: (error: ExtensionError) => void;
@@ -107,7 +109,11 @@ export async function withChildAgentSession<T>(
 
   const parentProvider = context.modelRegistry.getProvider(options.model.provider);
   if (parentProvider) {
-    services.modelRuntime.registerNativeProvider(parentProvider);
+    const childProvider = options.transformProvider?.(parentProvider) ?? parentProvider;
+    if (childProvider.id !== parentProvider.id) {
+      throw new Error("Child provider instrumentation cannot change provider identity.");
+    }
+    services.modelRuntime.registerNativeProvider(childProvider);
   }
   if (await services.modelRuntime.getAuth(options.model) === undefined) {
     const parentAuth = await context.modelRegistry.getApiKeyAndHeaders(options.model);
