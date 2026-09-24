@@ -42,6 +42,12 @@ export type ManagedWorkerReviewAttemptOutcome =
   | "completed"
   | "rate_limited"
   | "failed"
+  | "evidence_failed"
+  | "policy_failed"
+  | "auth_failed"
+  | "transport_failed"
+  | "provider_failed"
+  | "provider_5xx"
   | "output_failed"
   | "confinement_failed"
   | "route_mismatch"
@@ -78,12 +84,15 @@ export type ManagedWorkerReviewExecutionResult = {
 export class ManagedWorkerReviewExecutionError extends Error {
   readonly attempts: ManagedWorkerReviewAttempt[];
   readonly outcome: ManagedWorkerReviewAttemptOutcome;
+  readonly trustedDetail?: string;
 
   constructor(attempts: ManagedWorkerReviewAttempt[], outcome: ManagedWorkerReviewAttemptOutcome, trustedDetail?: string) {
-    super(`Managed-worker review failed (${outcome}). Ordered route outcomes: ${formatManagedWorkerReviewAttempts(attempts)}.${trustedDetail ? ` Trusted host detail: ${trustedDetail}` : ""}`);
+    const boundedDetail = trustedDetail ? sanitizeTrustedReviewDetail(trustedDetail) : undefined;
+    super(`Managed-worker review failed (${outcome}). Ordered route outcomes: ${formatManagedWorkerReviewAttempts(attempts)}.${boundedDetail ? ` Trusted host detail: ${boundedDetail}` : ""}`);
     this.name = "ManagedWorkerReviewExecutionError";
     this.attempts = attempts.map((attempt) => ({ ...attempt }));
     this.outcome = outcome;
+    this.trustedDetail = boundedDetail;
   }
 }
 
@@ -94,15 +103,11 @@ export function formatManagedWorkerReviewAttempts(attempts: readonly ManagedWork
 }
 
 export function managedWorkerReviewRouteConfigError(error: unknown): ManagedWorkerReviewExecutionError {
-  const raw = error instanceof Error ? error.message : String(error);
-  const sanitized = raw
-    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ")
-    .replace(/\bbearer\s+\S+/gi, "Bearer [redacted]")
-    .replace(/\b(?:api[-_ ]?key|token|secret|password|authorization)\b\s*[:=]\s*\S+/gi, "[redacted]")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 512) || "Review route configuration is invalid.";
-  return new ManagedWorkerReviewExecutionError([], "route_config_failed", sanitized);
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  const outcome: ManagedWorkerReviewAttemptOutcome = /no configured auth|authenticat|credentials?/i.test(message)
+    ? "auth_failed"
+    : "route_config_failed";
+  return new ManagedWorkerReviewExecutionError([], outcome, managedWorkerReviewFailureDetail(outcome));
 }
 
 export class ConfirmedAnthropicRateLimitError extends Error {
@@ -113,6 +118,20 @@ export class ConfirmedAnthropicRateLimitError extends Error {
     this.name = "ConfirmedAnthropicRateLimitError";
     this.route = route;
   }
+}
+
+class ManagedWorkerReviewProviderError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ManagedWorkerReviewProviderError";
+  }
+}
+
+export function managedWorkerReviewEvidenceError(error: unknown): ManagedWorkerReviewExecutionError {
+  const detail = error instanceof Error && /git_output_limit|changed-path stat exceeded|shortstat exceeded|aggregate bound/i.test(error.message)
+    ? "Trusted Git summary exceeded the managed-review evidence bound before any provider route started."
+    : "Trusted managed-review evidence construction failed before any provider route started.";
+  return new ManagedWorkerReviewExecutionError([], "evidence_failed", detail);
 }
 
 export async function runManagedWorkerReview(
@@ -131,7 +150,7 @@ export async function runManagedWorkerReview(
     const outcome = error instanceof ConfirmedAnthropicRateLimitError
       ? "rate_limited"
       : classifyManagedWorkerReviewFailure(error, input.signal);
-    throw new ManagedWorkerReviewExecutionError([{ route, outcome }], outcome);
+    throw managedWorkerReviewExecutionError([{ route, outcome }], outcome, error);
   }
 }
 
@@ -171,17 +190,17 @@ export async function runManagedWorkerReviewWithRateLimitFallback(
         : classifyManagedWorkerReviewFailure(primaryError, scope.signal);
       const primaryAttempts: ManagedWorkerReviewAttempt[] = [{ route: primaryRoute, outcome: primaryOutcome }];
       if (!(primaryError instanceof ConfirmedAnthropicRateLimitError) || !input.rateLimitFallbackRoute || !fallbackRoute) {
-        throw new ManagedWorkerReviewExecutionError(primaryAttempts, primaryOutcome);
+        throw managedWorkerReviewExecutionError(primaryAttempts, primaryOutcome, primaryError);
       }
 
       // Cancellation or the shared timeout is authoritative: neither the
       // trusted precheck nor the fallback child may begin after it fires.
       if (scope.signal.aborted) {
         const outcome = classifyManagedWorkerReviewFailure(scope.signal.reason, scope.signal);
-        throw new ManagedWorkerReviewExecutionError(primaryAttempts, outcome);
+        throw managedWorkerReviewExecutionError(primaryAttempts, outcome, scope.signal.reason);
       }
       if (!input.beforeFallback) {
-        throw new ManagedWorkerReviewExecutionError(primaryAttempts, "precondition_failed");
+        throw new ManagedWorkerReviewExecutionError(primaryAttempts, "precondition_failed", "Trusted fallback precondition callback is unavailable.");
       }
       try {
         await input.beforeFallback(scope.signal);
@@ -190,7 +209,8 @@ export async function runManagedWorkerReviewWithRateLimitFallback(
         const outcome = scope.signal.aborted
           ? classifyManagedWorkerReviewFailure(preconditionError, scope.signal)
           : "precondition_failed";
-        throw new ManagedWorkerReviewExecutionError(primaryAttempts, outcome);
+        throw new ManagedWorkerReviewExecutionError(primaryAttempts, outcome,
+          outcome === "precondition_failed" ? "Trusted fallback precondition revalidation failed." : managedWorkerReviewFailureDetail(outcome, preconditionError));
       }
 
       try {
@@ -213,7 +233,7 @@ export async function runManagedWorkerReviewWithRateLimitFallback(
         const outcome = fallbackError instanceof ConfirmedAnthropicRateLimitError
           ? "rate_limited"
           : classifyManagedWorkerReviewFailure(fallbackError, scope.signal);
-        throw new ManagedWorkerReviewExecutionError([...primaryAttempts, { route: fallbackRoute, outcome }], outcome);
+        throw managedWorkerReviewExecutionError([...primaryAttempts, { route: fallbackRoute, outcome }], outcome, fallbackError);
       }
     }
   } finally {
@@ -232,7 +252,58 @@ export function classifyManagedWorkerReviewFailure(error: unknown, signal?: Abor
   if (/confinement blocked|outside review evidence|escapes review root/i.test(message)) return "confinement_failed";
   if (/different route identity|invalid route attempt|different repository identity|model substitution|response model|provider\/model/i.test(message)) return "route_mismatch";
   if (/without an assistant response|required VERDICT|empty output|output exceeds|findings exceed|checks exceed|findings and checks/i.test(message)) return "output_failed";
+  if (/usage policy|safety policy|violative|content policy|policy[^.]{0,80}blocked|blocked under .*policy/i.test(message)) return "policy_failed";
+  if (/\b(?:401|403)\b|unauthori[sz]ed|forbidden|authentication|credentials?[^.]{0,40}(?:missing|invalid|expired)|oauth[^.]{0,40}(?:invalid|expired|failed)/i.test(message)) return "auth_failed";
+  if (/\b(?:HTTP(?:\/\d+(?:\.\d+)?)?\s*)?(?:500|502|503|504|529)\b|overloaded_error|internal[_ ]server[_ ]error/i.test(message)) return "provider_5xx";
+  if (/fetch failed|network|socket|econn|enotfound|tls|transport|connection (?:reset|refused|closed)|stream disconnected/i.test(message)) return "transport_failed";
+  if (/unknown (?:provider|model)|model .* unavailable|provider .* not configured|child session failed to load resources/i.test(message)) return "route_config_failed";
+  if (error instanceof ManagedWorkerReviewProviderError) return "provider_failed";
   return "failed";
+}
+
+export function managedWorkerReviewFailureDetail(outcome: ManagedWorkerReviewAttemptOutcome, error?: unknown): string {
+  switch (outcome) {
+    case "evidence_failed": return "Trusted managed-review evidence construction failed before any provider route started.";
+    case "policy_failed": return "The provider rejected the managed review under its safety policy; no further fallback is permitted.";
+    case "auth_failed": return "Managed-review provider authentication or authorization failed; no further fallback is permitted.";
+    case "transport_failed": return "Managed-review provider transport failed; no further fallback is permitted.";
+    case "provider_5xx": {
+      const message = error instanceof Error ? error.message : String(error ?? "");
+      const status = /(?:^|\b)(500|502|503|504|529)(?:\b|$)/.exec(message)?.[1];
+      return status ? `Managed-review provider returned HTTP ${status}; no further fallback is permitted.` : "Managed-review provider returned a 5xx or 529 service failure; no further fallback is permitted.";
+    }
+    case "provider_failed": return "Managed-review provider request failed; no further fallback is permitted.";
+    case "output_failed": return "Managed-review output was empty, malformed, or exceeded its bound; no further fallback is permitted.";
+    case "confinement_failed": return "Managed-review confinement blocked a forbidden tool or path request; no further fallback is permitted.";
+    case "route_mismatch": return "Managed-review response or attempt route did not match the configured exact route; no further fallback is permitted.";
+    case "route_config_failed": return "Managed-review route or isolated child configuration could not be honored exactly.";
+    case "precondition_failed": return "Trusted fallback precondition revalidation failed.";
+    case "timed_out": return "Managed review exceeded its bounded timeout; no further fallback is permitted.";
+    case "cancelled": return "Managed review was cancelled; no further fallback is permitted.";
+    case "postcondition_failed": return "Trusted managed-review lifecycle or repository postcondition changed during review.";
+    case "rate_limited": return "Anthropic returned a confirmed HTTP 429 rate_limit_error.";
+    case "failed": return "Managed review failed without a more specific trusted category; no further fallback is permitted.";
+    case "completed": return "Managed review completed.";
+  }
+}
+
+function managedWorkerReviewExecutionError(
+  attempts: ManagedWorkerReviewAttempt[],
+  outcome: ManagedWorkerReviewAttemptOutcome,
+  error?: unknown
+): ManagedWorkerReviewExecutionError {
+  return new ManagedWorkerReviewExecutionError(attempts, outcome, managedWorkerReviewFailureDetail(outcome, error));
+}
+
+function sanitizeTrustedReviewDetail(value: string): string {
+  return value
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ")
+    .replace(/\bbearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(/\b(?:api[-_ ]?key|token|secret|password|authorization)\b\s*[:=]\s*\S+/gi, "[redacted]")
+    .replace(/[A-Za-z0-9_-]{80,}/g, "[redacted]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 512);
 }
 
 async function runManagedWorkerReviewAttempt(
@@ -265,7 +336,12 @@ async function runManagedWorkerReviewAttempt(
       }
     }, async (session) => {
       assertExactManagedReviewTools(session.getActiveToolNames());
-      await session.prompt(buildManagedWorkerReviewTask(input.evidence, input.focus), { source: "extension" });
+      try {
+        await session.prompt(buildManagedWorkerReviewTask(input.evidence, input.focus), { source: "extension" });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error ?? "Managed-review provider request failed.");
+        throw new ManagedWorkerReviewProviderError(message);
+      }
       throwIfAborted(scope.signal);
       const assistants = session.messages.filter((message): message is AssistantMessage => {
         return !!message && typeof message === "object" && (message as { role?: unknown }).role === "assistant";
@@ -286,7 +362,7 @@ async function runManagedWorkerReviewAttempt(
         if (assistant.stopReason === "error" && isConfirmedAnthropicRateLimitMessage(exactModel, message)) {
           throw new ConfirmedAnthropicRateLimitError(formatManagedWorkerReviewRoute({ model: exactModel, thinkingLevel: input.thinkingLevel }), message);
         }
-        throw new Error(message);
+        throw new ManagedWorkerReviewProviderError(message);
       }
       const parsed = parseManagedWorkerReviewOutput(assistantText(assistant));
       const completedAt = new Date();

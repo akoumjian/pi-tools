@@ -83,9 +83,12 @@ import {
   type RepositoryInventory,
   type RepositoryInventorySummary
 } from "./repositories.js";
+import { buildWorkerReviewEvidence } from "./review-evidence.js";
 import {
   classifyManagedWorkerReviewFailure,
   formatManagedWorkerReviewRoute,
+  managedWorkerReviewEvidenceError,
+  managedWorkerReviewFailureDetail,
   managedWorkerReviewRouteConfigError,
   ManagedWorkerReviewExecutionError,
   runManagedWorkerReviewWithRateLimitFallback,
@@ -369,6 +372,7 @@ type WorkerExtensionDependencies = {
   foldsRoot: string;
   targetRoot: string;
   prepareFold: typeof prepareRepositoryChangeSet;
+  buildReviewEvidence: typeof buildWorkerReviewEvidence;
   reviewWorker(context: Pick<ExtensionContext, "modelRegistry" | "ui">, input: ManagedWorkerReviewPlanInput): Promise<ManagedWorkerReviewExecutionResult>;
   resolveReviewRoutes(context: ExtensionContext): { primary: ManagedWorkerReviewRoute; rateLimitFallback?: ManagedWorkerReviewRoute };
   inspectContainer(container: WorkerContainerReference): StoppedWorkerContainerIdentity;
@@ -981,18 +985,33 @@ async function reviewSettledWorker(
     let reviewRoutes: ReturnType<WorkerExtensionDependencies["resolveReviewRoutes"]> | undefined;
     let execution: ManagedWorkerReviewExecutionResult | undefined;
     let reviewFailure: unknown;
+    let evidence: string | undefined;
     try {
-      reviewRoutes = dependencies.resolveReviewRoutes(context);
+      evidence = dependencies.buildReviewEvidence({
+        workerId: record.workerId,
+        runId: candidate.runId,
+        taskIds: record.taskIds,
+        candidate,
+        repository,
+        trustedStateRoot: paths.stateDir
+      });
     } catch (error) {
-      reviewFailure = managedWorkerReviewRouteConfigError(error);
+      reviewFailure = managedWorkerReviewEvidenceError(error);
     }
-    if (reviewRoutes) {
+    if (reviewFailure === undefined) {
+      try {
+        reviewRoutes = dependencies.resolveReviewRoutes(context);
+      } catch (error) {
+        reviewFailure = managedWorkerReviewRouteConfigError(error);
+      }
+    }
+    if (reviewRoutes && evidence !== undefined && reviewFailure === undefined) {
       try {
         execution = await dependencies.reviewWorker(context, {
           cwd: repository,
           primaryRoute: reviewRoutes.primary,
           rateLimitFallbackRoute: reviewRoutes.rateLimitFallback,
-          evidence: buildWorkerReviewEvidence(record, candidate, repository, paths.stateDir),
+          evidence,
           focus: input.focus,
           signal,
           beforeFallback: async (fallbackSignal) => {
@@ -1011,23 +1030,24 @@ async function reviewSettledWorker(
     } catch {
       const attempts = execution?.attempts
         ?? (reviewFailure instanceof ManagedWorkerReviewExecutionError ? reviewFailure.attempts : []);
-      throw new ManagedWorkerReviewExecutionError(attempts, "postcondition_failed");
+      throw new ManagedWorkerReviewExecutionError(attempts, "postcondition_failed", managedWorkerReviewFailureDetail("postcondition_failed"));
     }
     if (reviewFailure !== undefined) {
       if (reviewFailure instanceof ManagedWorkerReviewExecutionError) throw reviewFailure;
       const outcome = classifyManagedWorkerReviewFailure(reviewFailure, signal);
-      throw new ManagedWorkerReviewExecutionError([], outcome);
+      throw new ManagedWorkerReviewExecutionError([], outcome, managedWorkerReviewFailureDetail(outcome, reviewFailure));
     }
-    if (signal?.aborted) throw new ManagedWorkerReviewExecutionError(execution?.attempts ?? [], "cancelled");
-    if (!reviewRoutes || !execution) throw new ManagedWorkerReviewExecutionError([], "failed");
+    if (signal?.aborted) throw new ManagedWorkerReviewExecutionError(execution?.attempts ?? [], "cancelled", managedWorkerReviewFailureDetail("cancelled", signal.reason));
+    if (!reviewRoutes || !execution) throw new ManagedWorkerReviewExecutionError([], "failed", managedWorkerReviewFailureDetail("failed"));
     let review: ManagedWorkerReviewExecutionResult["review"];
     try {
       review = verifyManagedWorkerReviewExecution(execution, reviewRoutes);
     } catch (error) {
-      throw new ManagedWorkerReviewExecutionError(execution.attempts, classifyManagedWorkerReviewFailure(error, signal));
+      const outcome = classifyManagedWorkerReviewFailure(error, signal);
+      throw new ManagedWorkerReviewExecutionError(execution.attempts, outcome, managedWorkerReviewFailureDetail(outcome, error));
     }
     if (path.resolve(review.cwd) !== repository) {
-      throw new ManagedWorkerReviewExecutionError(execution.attempts, "route_mismatch");
+      throw new ManagedWorkerReviewExecutionError(execution.attempts, "route_mismatch", managedWorkerReviewFailureDetail("route_mismatch"));
     }
     return {
       workerId: input.workerId,
@@ -1115,40 +1135,6 @@ function verifyWorkerReviewRepository(
       throw new Error(`Managed-worker review rejects hardlinked worktree evidence: ${relative}`);
     }
   }
-}
-
-function buildWorkerReviewEvidence(
-  record: WorkerRecord,
-  candidate: RepositoryInventory["candidates"][number],
-  repository: string,
-  trustedStateRoot: string
-): string {
-  const runner = createGitRunner(resolveExecutable("git"), path.join(trustedStateRoot, "review-context-git"));
-  const diffStat = boundReviewContext(gitText(runner, repository, ["diff", "--no-ext-diff", "--stat", candidate.baseCommit!, candidate.headCommit!, "--"]).trim() || "(none)", 20_000);
-  const committedDiff = boundReviewContext(gitText(runner, repository, ["diff", "--no-ext-diff", "--minimal", "--unified=40", candidate.baseCommit!, candidate.headCommit!, "--"]).trim() || "(none)", 50_000);
-  return [
-    `Worker/run: ${record.workerId}/${candidate.runId}`,
-    `Assigned tasks: ${record.taskIds.join(", ")}`,
-    `Repository: ${candidate.workspaceRepo}`,
-    `Candidate: ${candidate.candidateId}`,
-    `Exact base: ${candidate.baseCommit}`,
-    `Exact HEAD: ${candidate.headCommit}`,
-    `Exact HEAD tree: ${candidate.headTree}`,
-    "Repository state: clean, foldable, stopped, and policy-checked before review.",
-    "",
-    "### Exact committed diff stat",
-    diffStat,
-    "",
-    "### Exact committed base..HEAD diff excerpt",
-    "```diff",
-    committedDiff,
-    "```"
-  ].join("\n");
-}
-
-function boundReviewContext(value: string, maxChars: number): string {
-  if (value.length <= maxChars) return value;
-  return `${value.slice(0, maxChars)}\n... [truncated ${value.length - maxChars} characters; inspect exact repository files with confined read-only tools]`;
 }
 
 function formatWorkerReviewResult(details: WorkerReviewDetails): string {
@@ -3789,6 +3775,7 @@ function defaultDependencies(): WorkerExtensionDependencies {
     foldsRoot: defaultWorkerFoldsRoot(roots.stateRoot),
     targetRoot: path.join(homedir(), "Code"),
     prepareFold: prepareRepositoryChangeSet,
+    buildReviewEvidence: buildWorkerReviewEvidence,
     reviewWorker: runManagedWorkerReviewWithRateLimitFallback,
     resolveReviewRoutes: resolveWorkerReviewRoutes,
     inspectContainer: (container) => inspectStoppedWorkerContainer(resolveDockerPath(), container),
