@@ -11,7 +11,6 @@ import { managedWorkerRoleSkillText } from "../_shared/role-skills.js";
 import nativeToolsExtension, { resolveNativeToolPath } from "../native-tools/index.js";
 
 export const MANAGED_WORKER_REVIEW_TOOLS = ["search_many", "read_many"] as const;
-export const MANAGED_WORKER_REVIEW_TIMEOUT_MS = 5 * 60_000;
 export const MAX_MANAGED_WORKER_REVIEW_FINDINGS_CHARS = 24_000;
 export const MAX_MANAGED_WORKER_REVIEW_CHECKS_CHARS = 8_000;
 export const MAX_MANAGED_WORKER_REVIEW_TOTAL_CHARS = 32_768;
@@ -159,6 +158,18 @@ class ManagedWorkerReviewProviderError extends Error {
   }
 }
 
+class ManagedWorkerReviewTimeoutError extends Error {
+  readonly timeoutMs: number | undefined;
+  readonly toolCallCount: number;
+
+  constructor(timeoutMs: number | undefined, toolCallCount: number) {
+    super(`Managed-worker review was timed out${timeoutMs === undefined ? "" : ` after ${timeoutMs}ms`} with ${toolCallCount} tool calls.`);
+    this.name = "TimeoutError";
+    this.timeoutMs = timeoutMs;
+    this.toolCallCount = toolCallCount;
+  }
+}
+
 export function managedWorkerReviewEvidenceError(error: unknown): ManagedWorkerReviewExecutionError {
   const detail = error instanceof Error && /git_output_limit|changed-path stat exceeded|shortstat exceeded|aggregate bound/i.test(error.message)
     ? "Trusted Git summary exceeded the managed-review evidence bound before any provider route started."
@@ -177,7 +188,7 @@ export async function runManagedWorkerReview(
   }
   const route = formatManagedWorkerReviewRoute(input);
   try {
-    return await runManagedWorkerReviewAttempt(context, input, input.timeoutMs ?? MANAGED_WORKER_REVIEW_TIMEOUT_MS);
+    return await runManagedWorkerReviewAttempt(context, input, input.timeoutMs);
   } catch (error) {
     const outcome = error instanceof ConfirmedAnthropicRateLimitError
       ? "rate_limited"
@@ -186,7 +197,7 @@ export async function runManagedWorkerReview(
   }
 }
 
-/** One overall timeout and at most one fresh same-provider fallback after a confirmed primary Anthropic 429. */
+/** One optional caller deadline and at most one fresh same-provider fallback after a confirmed primary Anthropic 429. */
 export async function runManagedWorkerReviewWithRateLimitFallback(
   context: Pick<ExtensionContext, "modelRegistry" | "ui">,
   input: ManagedWorkerReviewPlanInput
@@ -202,7 +213,7 @@ export async function runManagedWorkerReviewWithRateLimitFallback(
   } catch (error) {
     throw managedWorkerReviewRouteConfigError(error);
   }
-  const scope = createAbortScope(input.signal, input.timeoutMs ?? MANAGED_WORKER_REVIEW_TIMEOUT_MS);
+  const scope = createAbortScope(input.signal, input.timeoutMs);
   const primaryRoute = formatManagedWorkerReviewRoute(input.primaryRoute);
   const fallbackRoute = input.rateLimitFallbackRoute ? formatManagedWorkerReviewRoute(input.rateLimitFallbackRoute) : undefined;
   try {
@@ -326,7 +337,15 @@ export function managedWorkerReviewFailureDetail(outcome: ManagedWorkerReviewAtt
     case "route_mismatch": return "Managed-review response or attempt route did not match the configured exact route; no further fallback is permitted.";
     case "route_config_failed": return "Managed-review route or isolated child configuration could not be honored exactly.";
     case "precondition_failed": return "Trusted fallback precondition revalidation failed.";
-    case "timed_out": return "Managed review exceeded its bounded timeout; no further fallback is permitted.";
+    case "timed_out": {
+      const progress = error instanceof ManagedWorkerReviewTimeoutError
+        ? ` with ${error.toolCallCount} tool ${error.toolCallCount === 1 ? "call" : "calls"}`
+        : "";
+      const timeout = error instanceof ManagedWorkerReviewTimeoutError && error.timeoutMs !== undefined
+        ? ` after ${error.timeoutMs}ms`
+        : "";
+      return `Managed review was timed out${timeout}${progress}; no further fallback is permitted.`;
+    }
     case "cancelled": return "Managed review was cancelled; no further fallback is permitted.";
     case "postcondition_failed": return "Trusted managed-review lifecycle or repository postcondition changed during review.";
     case "rate_limited": return "Anthropic returned a confirmed HTTP 429 rate_limit_error.";
@@ -432,7 +451,10 @@ async function runManagedWorkerReviewAttempt(
       };
     });
   } catch (error) {
-    throwIfAborted(scope.signal, `Managed-worker review timed out after ${timeoutMs ?? MANAGED_WORKER_REVIEW_TIMEOUT_MS}ms.`);
+    if (scope.signal.aborted && scope.signal.reason instanceof Error && scope.signal.reason.name === "TimeoutError") {
+      throw new ManagedWorkerReviewTimeoutError(timeoutMs ?? timeoutFromAbortReason(scope.signal.reason), toolCallCount);
+    }
+    throwIfAborted(scope.signal);
     if (confinementFailure) throw new Error("Managed-worker review confinement blocked a forbidden tool request.");
     throw error;
   } finally {
@@ -696,6 +718,12 @@ function nonEmptyString(value: unknown, label: string): string {
   if (typeof value !== "string" || !value.trim()) throw new Error(`${label} must be a non-empty string.`);
   if (value.length > 4096 || value.includes("\0")) throw new Error(`${label} is malformed or too long.`);
   return value;
+}
+
+function timeoutFromAbortReason(reason: Error): number | undefined {
+  const timeout = /^Operation timed out after (\d+)ms$/.exec(reason.message)?.[1];
+  const parsed = timeout === undefined ? Number.NaN : Number(timeout);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
 function assistantText(message: AssistantMessage): string {
