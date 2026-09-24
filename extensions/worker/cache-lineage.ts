@@ -16,6 +16,7 @@ export const CODEX_CACHE_LINEAGE_API = "openai-codex-responses";
 export const CODEX_CACHE_LINEAGE_PROVIDER = "openai-codex";
 export const WORKER_CACHE_LINEAGE_MAX_BYTES = 8 * 1024 * 1024;
 export const WORKER_CACHE_LINEAGE_MAX_AGE_MS = 5 * 60 * 1000;
+export const WORKER_CACHE_LINEAGE_MAX_INSTRUCTIONS_BYTES = 1024 * 1024;
 
 export const MANAGED_WORKER_TOOL_NAMES = [
   "worker_handoff",
@@ -30,7 +31,7 @@ export const MANAGED_WORKER_TOOL_NAMES = [
 const MANAGED_WORKER_TOOL_NAME_SET = new Set<string>(MANAGED_WORKER_TOOL_NAMES);
 const CAPTURE_HOLDER_KEY = Symbol.for("@akoumjian/pi-tools/worker-cache-lineage-capture");
 const CAPTURE_HOLDER_VERSION = 1;
-const ADOPTION_VERSION = 1;
+const ADOPTION_VERSION = 2;
 
 type JsonObject = Record<string, unknown>;
 
@@ -295,6 +296,9 @@ class EligibleRuntimeController {
   private fatalReason: string | undefined;
   private networkArmed = false;
   private adoptedWorkerToolsSha256: string | undefined;
+  private adoptedWorkerInstructionsSha256: string | undefined;
+  private adoptedForkBoundarySha256: string | undefined;
+  private adoptedInitialAssignmentSha256: string | undefined;
   private originalFetch: typeof globalThis.fetch | undefined;
   private originalWebSocket: typeof globalThis.WebSocket | undefined;
 
@@ -305,21 +309,54 @@ class EligibleRuntimeController {
     if (hasAdoption && hasFallback) throw new Error("Worker cache-lineage has conflicting persisted decisions.");
     this.adopted = hasAdoption;
     if (hasAdoption) {
-      this.adoptedWorkerToolsSha256 = readAdoption(record.adoptionFile, record, this.capture);
+      const adoption = readAdoption(record.adoptionFile, record, this.capture);
+      this.adoptedWorkerToolsSha256 = adoption.workerToolsSha256;
+      this.adoptedWorkerInstructionsSha256 = adoption.workerInstructionsSha256;
+      this.adoptedForkBoundarySha256 = adoption.forkBoundarySha256;
+      this.adoptedInitialAssignmentSha256 = adoption.initialAssignmentSha256;
     } else if (hasFallback) {
       this.disabledReason = readFallback(record.fallbackFile, record, this.capture);
     }
   }
 
   transformPayload(payload: unknown, context: ExtensionContext): unknown {
-    if (this.disabledReason) return payload;
+    if (this.disabledReason) {
+      if (isJsonObject(payload) && payload.previous_response_id !== undefined) {
+        const freshPayload = cloneJsonObject(payload);
+        delete freshPayload.previous_response_id;
+        return freshPayload;
+      }
+      return payload;
+    }
+    const stripsInitialPreviousResponseId =
+      !this.adopted && isJsonObject(payload) && payload.previous_response_id !== undefined;
     try {
       const transformed = this.transformPayloadOrThrow(payload, context);
       if (this.adoptedWorkerToolsSha256 && this.adoptedWorkerToolsSha256 !== transformed.workerToolsSha256) {
         throw new Error("Managed-worker tool schemas drifted after Codex lineage adoption.");
       }
-      writeAdoption(this.record.adoptionFile, this.record, this.capture, transformed.workerToolsSha256);
+      if (this.adoptedWorkerInstructionsSha256 && this.adoptedWorkerInstructionsSha256 !== transformed.workerInstructionsSha256) {
+        throw new Error("Managed-worker system instructions drifted after Codex lineage adoption.");
+      }
+      if (this.adoptedForkBoundarySha256 && this.adoptedForkBoundarySha256 !== transformed.forkBoundarySha256) {
+        throw new Error("Managed-worker fork boundary drifted after Codex lineage adoption.");
+      }
+      if (this.adoptedInitialAssignmentSha256 && this.adoptedInitialAssignmentSha256 !== transformed.initialAssignmentSha256) {
+        throw new Error("Managed-worker initial assignment drifted after Codex lineage adoption.");
+      }
+      writeAdoption(
+        this.record.adoptionFile,
+        this.record,
+        this.capture,
+        transformed.workerToolsSha256,
+        transformed.workerInstructionsSha256,
+        transformed.forkBoundarySha256,
+        transformed.initialAssignmentSha256
+      );
       this.adoptedWorkerToolsSha256 = transformed.workerToolsSha256;
+      this.adoptedWorkerInstructionsSha256 = transformed.workerInstructionsSha256;
+      this.adoptedForkBoundarySha256 = transformed.forkBoundarySha256;
+      this.adoptedInitialAssignmentSha256 = transformed.initialAssignmentSha256;
       this.adopted = true;
       return transformed.payload;
     } catch (error) {
@@ -329,6 +366,11 @@ class EligibleRuntimeController {
           writeFallback(this.record.fallbackFile, this.record, this.capture, reason);
           this.disabledReason = reason;
           this.networkArmed = false;
+          if (stripsInitialPreviousResponseId && isJsonObject(payload)) {
+            const freshPayload = cloneJsonObject(payload);
+            delete freshPayload.previous_response_id;
+            return freshPayload;
+          }
           return payload;
         } catch (persistenceError) {
           this.fatalReason = `Unable to persist pre-adoption fallback: ${boundedReason(persistenceError)}`;
@@ -417,14 +459,22 @@ class EligibleRuntimeController {
   private transformPayloadOrThrow(
     payload: unknown,
     context: ExtensionContext
-  ): { payload: JsonObject; workerToolsSha256: string } {
+  ): {
+    payload: JsonObject;
+    workerToolsSha256: string;
+    workerInstructionsSha256: string;
+    forkBoundarySha256: string;
+    initialAssignmentSha256: string;
+  } {
     const drift = routeDriftReason(context, this.record, this.capture.data.baseUrl);
     if (drift) throw new Error(drift);
     if (!isJsonObject(payload)) throw new Error("Worker Codex provider payload is not an object.");
-    if (payload.previous_response_id !== undefined || this.capture.data.payload.previous_response_id !== undefined) {
-      throw new Error("Codex cache-lineage workers never inherit previous_response_id.");
+    if (this.capture.data.payload.previous_response_id !== undefined) {
+      throw new Error("Codex cache-lineage workers never inherit parent previous_response_id.");
     }
     if (payload.model !== this.record.model) throw new Error("Worker Codex payload model drifted before lineage adoption.");
+    const workerInstructions = boundedWorkerInstructions(payload.instructions);
+    const workerInstructionsSha256 = sha256(workerInstructions);
     const currentInput = asObjectArray(payload.input, "worker Codex input");
     const parentInput = asObjectArray(this.capture.data.payload.input, "captured parent Codex input");
     if (currentInput.length < parentInput.length || !equalJson(currentInput.slice(0, parentInput.length), parentInput)) {
@@ -453,21 +503,47 @@ class EligibleRuntimeController {
         appendedTools.push(workerTool);
       }
     }
-    const suffix = currentInput.slice(parentInput.length).filter((item) => item.type !== "additional_tools");
-    if (suffix.length === 0) throw new Error("Worker Codex input has no fork-specific suffix.");
+    const rawSuffix = currentInput.slice(parentInput.length);
+    const markerOccurrences = rawSuffix.reduce(
+      (total, item) => total + markerOccurrencesInInputItem(item, this.record.marker),
+      0
+    );
+    const markerItems = rawSuffix.filter((item) => inputItemContainsMarker(item, this.record.marker));
+    if (markerOccurrences !== 1 || markerItems.length !== 1) {
+      throw new Error(`Worker Codex input must contain exactly one initial assignment marker; found ${markerOccurrences}.`);
+    }
+    const initialAssignment = markerItems[0]!;
+    const initialAssignmentSha256 = sha256(stringifyBounded(initialAssignment, "managed-worker initial assignment"));
+    const suffix = rawSuffix.filter((item) => item.type !== "additional_tools");
+    const forkBoundary = suffix.indexOf(initialAssignment);
+    if (forkBoundary < 0) throw new Error("Worker Codex initial assignment marker is not in the stable suffix.");
+    const previousResponseId = payload.previous_response_id;
+    if (previousResponseId !== undefined) {
+      if (
+        !this.adopted ||
+        typeof previousResponseId !== "string" ||
+        !previousResponseId ||
+        Buffer.byteLength(previousResponseId, "utf8") > 1024 ||
+        !suffix.slice(forkBoundary + 1).some((item) => item.role === "assistant")
+      ) {
+        throw new Error("Worker Codex initial fork unexpectedly carries previous_response_id.");
+      }
+    }
     const boundary: JsonObject[] = [];
     if (appendedTools.length > 0) {
       boundary.push({ type: "additional_tools", role: "developer", tools: appendedTools });
     }
     boundary.push({
       role: "developer",
-      content: [{
-        type: "input_text",
-        text: `Managed-worker fork boundary ${this.record.marker}. Only these worker tools are executable: ${workerToolNames.join(", ")}. Parent tool schemas are retained solely as immutable cache prefix and are not executable.`
-      }]
+      content: [
+        {
+          type: "input_text",
+          text: `This is an isolated managed-worker fork. Only these worker tools are executable: ${workerToolNames.join(", ")}. Parent tool schemas remain immutable historical cache context and are not executable.`
+        },
+        { type: "input_text", text: workerInstructions }
+      ]
     });
     const transformed = cloneJsonObject(this.capture.data.payload);
-    const forkBoundary = suffix.length - 1;
     transformed.input = [
       ...parentInput,
       ...suffix.slice(0, forkBoundary),
@@ -479,10 +555,14 @@ class EligibleRuntimeController {
       mode: "auto",
       tools: workerToolNames.map((name) => ({ type: "function", name }))
     };
-    delete transformed.previous_response_id;
+    if (previousResponseId !== undefined) transformed.previous_response_id = previousResponseId;
+    else delete transformed.previous_response_id;
     return {
       payload: transformed,
-      workerToolsSha256: sha256(stringifyBounded(workerTools, "managed-worker Codex tool schemas"))
+      workerToolsSha256: sha256(stringifyBounded(workerTools, "managed-worker Codex tool schemas")),
+      workerInstructionsSha256,
+      forkBoundarySha256: sha256(stringifyBounded(boundary, "managed-worker Codex fork boundary")),
+      initialAssignmentSha256
     };
   }
 
@@ -490,6 +570,28 @@ class EligibleRuntimeController {
     if (this.fatalReason) throw new Error(`Managed-worker Codex cache lineage failed closed: ${this.fatalReason}`);
     if (!this.adopted) throw new Error("Managed-worker Codex cache lineage was not adopted before transport.");
   }
+}
+
+function boundedWorkerInstructions(value: unknown): string {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error("Worker Codex system instructions are missing or empty.");
+  }
+  if (Buffer.byteLength(value, "utf8") > WORKER_CACHE_LINEAGE_MAX_INSTRUCTIONS_BYTES) {
+    throw new Error("Worker Codex system instructions exceed the lineage size bound.");
+  }
+  return value;
+}
+
+function markerOccurrencesInInputItem(item: JsonObject, marker: string): number {
+  if (item.role !== "user" || !Array.isArray(item.content)) return 0;
+  return item.content.reduce((total, block) => {
+    if (!isJsonObject(block) || block.type !== "input_text" || typeof block.text !== "string") return total;
+    return total + block.text.split(marker).length - 1;
+  }, 0);
+}
+
+function inputItemContainsMarker(item: JsonObject, marker: string): boolean {
+  return markerOccurrencesInInputItem(item, marker) > 0;
 }
 
 function collectWorkerTools(payload: JsonObject, suffix: JsonObject[]): JsonObject[] {
@@ -560,7 +662,10 @@ function writeAdoption(
   file: string,
   record: Extract<WorkerCacheLineageRecord, { mode: "eligible" }>,
   capture: ParentCacheLineageCapture,
-  workerToolsSha256: string
+  workerToolsSha256: string,
+  workerInstructionsSha256: string,
+  forkBoundarySha256: string,
+  initialAssignmentSha256: string
 ): void {
   const value = {
     version: ADOPTION_VERSION,
@@ -568,14 +673,27 @@ function writeAdoption(
     snapshotSha256: record.snapshotSha256,
     payloadSha256: capture.data.payloadSha256,
     workerToolsSha256,
+    workerInstructionsSha256,
+    forkBoundarySha256,
+    initialAssignmentSha256,
+    markerSha256: sha256(record.marker),
     provider: record.provider,
     model: record.model,
     thinkingLevel: record.thinkingLevel
   };
   if (existsSync(file)) {
-    const adoptedWorkerToolsSha256 = readAdoption(file, record, capture);
-    if (adoptedWorkerToolsSha256 !== workerToolsSha256) {
+    const adoption = readAdoption(file, record, capture);
+    if (adoption.workerToolsSha256 !== workerToolsSha256) {
       throw new Error("Worker cache-lineage adoption tool schema digest mismatch.");
+    }
+    if (adoption.workerInstructionsSha256 !== workerInstructionsSha256) {
+      throw new Error("Worker cache-lineage adoption system instruction digest mismatch.");
+    }
+    if (adoption.forkBoundarySha256 !== forkBoundarySha256) {
+      throw new Error("Worker cache-lineage adoption fork boundary digest mismatch.");
+    }
+    if (adoption.initialAssignmentSha256 !== initialAssignmentSha256) {
+      throw new Error("Worker cache-lineage adoption initial assignment digest mismatch.");
     }
     return;
   }
@@ -586,7 +704,12 @@ function readAdoption(
   file: string,
   record: Extract<WorkerCacheLineageRecord, { mode: "eligible" }>,
   capture: ParentCacheLineageCapture
-): string {
+): {
+  workerToolsSha256: string;
+  workerInstructionsSha256: string;
+  forkBoundarySha256: string;
+  initialAssignmentSha256: string;
+} {
   const metadata = lstatSync(file);
   if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size <= 0 || metadata.size > 4096) {
     throw new Error("Worker cache-lineage adoption marker is invalid.");
@@ -601,9 +724,18 @@ function readAdoption(
     value.model !== record.model ||
     value.thinkingLevel !== record.thinkingLevel ||
     value.payloadSha256 !== capture.data.payloadSha256 ||
-    typeof value.workerToolsSha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.workerToolsSha256)
+    value.markerSha256 !== sha256(record.marker) ||
+    typeof value.workerToolsSha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.workerToolsSha256) ||
+    typeof value.workerInstructionsSha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.workerInstructionsSha256) ||
+    typeof value.forkBoundarySha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.forkBoundarySha256) ||
+    typeof value.initialAssignmentSha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.initialAssignmentSha256)
   ) throw new Error("Worker cache-lineage adoption marker does not match its persisted lineage.");
-  return value.workerToolsSha256;
+  return {
+    workerToolsSha256: value.workerToolsSha256,
+    workerInstructionsSha256: value.workerInstructionsSha256,
+    forkBoundarySha256: value.forkBoundarySha256,
+    initialAssignmentSha256: value.initialAssignmentSha256
+  };
 }
 
 function writeFallback(

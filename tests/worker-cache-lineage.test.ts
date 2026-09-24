@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { zstdDecompressSync } from "node:zlib";
 import test from "node:test";
+import type { Context, Model, Tool } from "@earendil-works/pi-ai";
+import { stream as streamOpenAICodexResponses } from "@earendil-works/pi-ai/api/openai-codex-responses";
+import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   MANAGED_WORKER_TOOL_NAMES,
@@ -21,6 +25,8 @@ import {
 const parentSessionFile = "/trusted/sessions/parent.jsonl";
 const parentSessionId = "parent-local-session";
 const inheritedAffinity = "parent-cache-affinity";
+const forkMarker = "fork_marker_1234";
+const workerInstructions = "WORKER_CWD_SENTINEL=/private/worker\nWORKER_TOOL_GUIDELINE_SENTINEL=use-only-managed-tools";
 const route = { provider: "openai-codex", model: "gpt-5.6-sol", thinkingLevel: "xhigh" };
 
 function codexContext(overrides: Record<string, unknown> = {}): ExtensionContext {
@@ -67,17 +73,31 @@ function parentPayload(): Record<string, unknown> {
   };
 }
 
-function workerPayload(prefix = true): Record<string, unknown> {
+function workerPayload(options: {
+  prefix?: boolean;
+  markerItems?: number;
+  instructions?: string;
+  trailing?: Record<string, unknown>[];
+} = {}): Record<string, unknown> {
   const parentInput = parentPayload().input as unknown[];
+  const markerItems = options.markerItems ?? 1;
+  const assignments = Array.from({ length: markerItems }, (_, index) => ({
+    role: "user",
+    content: [{
+      type: "input_text",
+      text: `${index === 0 ? "initial worker assignment" : `duplicate assignment ${index}`} ${forkMarker}`
+    }]
+  }));
   return {
     model: route.model,
     store: false,
     stream: true,
-    instructions: "WORKER INSTRUCTIONS THAT MUST NOT REPLACE THE PREFIX",
+    instructions: options.instructions ?? workerInstructions,
     input: [
-      ...(prefix ? parentInput : [{ role: "user", content: [{ type: "input_text", text: "drift" }] }]),
+      ...(options.prefix === false ? [{ role: "user", content: [{ type: "input_text", text: "drift" }] }] : parentInput),
       { role: "assistant", content: [{ type: "output_text", text: "parent completion" }] },
-      { role: "user", content: [{ type: "input_text", text: "worker assignment" }] }
+      ...assignments,
+      ...(options.trailing ?? [])
     ],
     tools: MANAGED_WORKER_TOOL_NAMES.map(functionTool),
     reasoning: { effort: "xhigh", summary: "auto" },
@@ -86,7 +106,11 @@ function workerPayload(prefix = true): Record<string, unknown> {
   };
 }
 
-function captureAndPrepare(root: string, exposeSessionHeader = true) {
+function captureAndPrepare(
+  root: string,
+  exposeSessionHeader = true,
+  capturedPayload: Record<string, unknown> = parentPayload()
+) {
   const handlers = new Map<string, Array<(event: any, context: ExtensionContext) => unknown>>();
   const api = {
     on(event: string, handler: (event: any, context: ExtensionContext) => unknown) {
@@ -97,7 +121,7 @@ function captureAndPrepare(root: string, exposeSessionHeader = true) {
   } as unknown as ExtensionAPI;
   registerParentCacheLineageCapture(api, root, () => new Date("2026-09-24T12:00:00.000Z"));
   const context = codexContext();
-  handlers.get("before_provider_request")![0]!({ payload: parentPayload() }, context);
+  handlers.get("before_provider_request")![0]!({ payload: capturedPayload }, context);
   const headers: Record<string, string> = {
     Authorization: "secret-never-persisted",
     "x-client-request-id": "parent-request",
@@ -111,11 +135,58 @@ function captureAndPrepare(root: string, exposeSessionHeader = true) {
     parentSessionFile,
     parentSessionId,
     route,
-    marker: "fork_marker_1234",
+    marker: forkMarker,
     now: new Date("2026-09-24T12:00:01.000Z")
   });
   assert.equal(record.mode, "eligible");
   return record;
+}
+
+function sdkTool(name: string): Tool {
+  return {
+    name,
+    description: `Trusted ${name} implementation`,
+    parameters: { type: "object", properties: {}, additionalProperties: false }
+  } as Tool;
+}
+
+function fakeJwt(): string {
+  return [
+    "e30",
+    Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acct_fixture" } })).toString("base64url"),
+    "fixture-signature"
+  ].join(".");
+}
+
+async function captureAdapterPayload(model: Model<any>, context: Context): Promise<Record<string, unknown>> {
+  const controller = new AbortController();
+  let payload: unknown;
+  const stream = streamOpenAICodexResponses(model, context, {
+    apiKey: fakeJwt(),
+    signal: controller.signal,
+    maxRetries: 0,
+    transport: "sse",
+    sessionId: parentSessionId,
+    onPayload(candidate) {
+      payload = structuredClone(candidate);
+      controller.abort();
+    }
+  });
+  for await (const _event of stream) {
+    // Abort in onPayload before network I/O after capturing the real adapter body.
+  }
+  assert.ok(payload && typeof payload === "object" && !Array.isArray(payload));
+  return payload as Record<string, unknown>;
+}
+
+function decodeCodexRequestBody(body: BodyInit | null | undefined, headers: Headers): Record<string, unknown> {
+  assert.ok(body);
+  const raw = typeof body === "string"
+    ? body
+    : headers.get("content-encoding") === "zstd"
+      ? zstdDecompressSync(Buffer.from(body as Uint8Array)).toString("utf8")
+      : Buffer.from(body as Uint8Array).toString("utf8");
+  return JSON.parse(raw) as Record<string, unknown>;
 }
 
 test("Codex lineage capture persists only the payload and effective cache-affinity header", () => {
@@ -171,7 +242,10 @@ test("Codex lineage restores the exact parent prefix and appends only managed-wo
       transformed.input[2].tools.map((tool: Record<string, unknown>) => tool.name),
       MANAGED_WORKER_TOOL_NAMES.filter((name) => name !== "shell_start")
     );
-    assert.match(transformed.input[3].content[0].text, /fork_marker_1234/);
+    assert.match(transformed.input[3].content[0].text, /Only these worker tools are executable/);
+    assert.equal(transformed.input[3].content[1].text, workerInstructions);
+    assert.equal(JSON.stringify(transformed.instructions).includes("WORKER_CWD_SENTINEL"), false);
+    assert.match(transformed.input[4].content[0].text, new RegExp(forkMarker));
     assert.deepEqual(
       transformed.tool_choice.tools.map((tool: Record<string, unknown>) => tool.name),
       MANAGED_WORKER_TOOL_NAMES
@@ -180,6 +254,14 @@ test("Codex lineage restores the exact parent prefix and appends only managed-wo
     assert.equal(runtime.status().mode, "adopted");
     assert.equal(record.mode, "eligible");
     assert.equal(existsSync(record.adoptionFile), true);
+    const adoption = JSON.parse(readFileSync(record.adoptionFile, "utf8")) as Record<string, unknown>;
+    for (const field of [
+      "markerSha256",
+      "workerToolsSha256",
+      "workerInstructionsSha256",
+      "forkBoundarySha256",
+      "initialAssignmentSha256"
+    ]) assert.match(String(adoption[field]), /^[0-9a-f]{64}$/);
     assert.deepEqual(summarizeWorkerCacheLineage(record), { mode: "adopted" });
 
     const headers: Record<string, string> = {
@@ -202,6 +284,119 @@ test("Codex lineage restores the exact parent prefix and appends only managed-wo
   }
 });
 
+test("real Codex SSE adapter sends the inherited affinity with an exact stable fork boundary", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-adapter-"));
+  const model = getBuiltinModel("openai-codex", "gpt-5.6-sol");
+  assert.ok(model);
+  const parentContext: Context = {
+    systemPrompt: "ADAPTER EXACT PARENT INSTRUCTIONS",
+    messages: [{ role: "user", content: "stable adapter parent", timestamp: 1 }],
+    tools: [sdkTool("parent_only"), sdkTool("shell_start")]
+  };
+  const capturedParent = await captureAdapterPayload(model, parentContext);
+  const originalFetch = globalThis.fetch;
+  let runtime: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
+  let request: { headers: Headers; body: Record<string, unknown> } | undefined;
+  try {
+    globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const headers = new Headers(init?.headers);
+      request = { headers, body: decodeCodexRequestBody(init?.body, headers) };
+      const completed = {
+        type: "response.completed",
+        response: {
+          id: "resp_fixture",
+          object: "response",
+          created_at: 1,
+          status: "completed",
+          model: route.model,
+          output: [],
+          usage: {
+            input_tokens: 1,
+            output_tokens: 1,
+            total_tokens: 2,
+            input_tokens_details: { cached_tokens: 1 },
+            output_tokens_details: { reasoning_tokens: 0 }
+          }
+        }
+      };
+      return new Response(`data: ${JSON.stringify(completed)}\n\n`, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      });
+    };
+    const record = captureAndPrepare(root, true, capturedParent);
+    runtime = createWorkerCacheLineageRuntime(record);
+    const requestHeaders: Record<string, string> = { "x-fixture": "adapter" };
+    const usage = {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
+    };
+    const childContext: Context = {
+      systemPrompt: workerInstructions,
+      messages: [
+        ...parentContext.messages,
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "parent completion" }],
+          api: "openai-codex-responses",
+          provider: "openai-codex",
+          model: route.model,
+          usage,
+          stopReason: "stop",
+          timestamp: 2
+        },
+        { role: "user", content: `initial worker assignment ${forkMarker}`, timestamp: 3 }
+      ],
+      tools: MANAGED_WORKER_TOOL_NAMES.map(sdkTool)
+    };
+    const stream = streamOpenAICodexResponses(model, childContext, {
+      apiKey: fakeJwt(),
+      maxRetries: 0,
+      transport: "sse",
+      sessionId: "distinct-child-session-and-request-id",
+      headers: requestHeaders,
+      onPayload(payload) {
+        const transformed = runtime!.transformPayload(payload, codexContext());
+        runtime!.transformHeaders(requestHeaders, codexContext());
+        return transformed;
+      }
+    });
+    const adapterEvents: string[] = [];
+    for await (const event of stream) {
+      adapterEvents.push(event.type);
+    }
+
+    assert.equal(adapterEvents.at(-1), "done", "the real adapter accepted the deterministic SSE response");
+    assert.equal(adapterEvents.includes("error"), false);
+    assert.ok(request);
+    assert.equal(request.headers.get("session-id"), inheritedAffinity);
+    assert.equal(request.headers.get("x-client-request-id"), "distinct-child-session-and-request-id");
+    const body = request.body as Record<string, any>;
+    assert.equal(body.instructions, capturedParent.instructions);
+    assert.deepEqual(body.input.slice(0, 1), capturedParent.input);
+    assert.equal(body.input[2].type, "additional_tools");
+    assert.deepEqual(
+      body.input[2].tools.map((tool: Record<string, unknown>) => tool.name),
+      MANAGED_WORKER_TOOL_NAMES.filter((name) => name !== "shell_start")
+    );
+    assert.equal(body.input[3].content[1].text, workerInstructions);
+    assert.match(body.input[4].content[0].text, new RegExp(forkMarker));
+    assert.deepEqual(
+      body.tool_choice.tools.map((tool: Record<string, unknown>) => tool.name),
+      MANAGED_WORKER_TOOL_NAMES
+    );
+    assert.equal(body.previous_response_id, undefined);
+  } finally {
+    runtime?.restoreNetwork();
+    globalThis.fetch = originalFetch;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Codex lineage falls back only before adoption, then fails closed on drift", () => {
   const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-fallback-"));
   let freshRuntime: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
@@ -209,7 +404,7 @@ test("Codex lineage falls back only before adoption, then fails closed on drift"
   try {
     const firstRecord = captureAndPrepare(root);
     freshRuntime = createWorkerCacheLineageRuntime(firstRecord);
-    const original = workerPayload(false);
+    const original = workerPayload({ prefix: false });
     assert.deepEqual(freshRuntime.transformPayload(original, codexContext()), original);
     assert.equal(freshRuntime.status().mode, "fresh");
     assert.equal(firstRecord.mode, "eligible");
@@ -238,6 +433,159 @@ test("Codex lineage falls back only before adoption, then fails closed on drift"
   } finally {
     freshRuntime?.restoreNetwork();
     adoptedRuntime?.restoreNetwork();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex lineage strips and rejects previous_response_id on the initial fork", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-initial-continuation-"));
+  let runtime: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
+  try {
+    const record = captureAndPrepare(root);
+    runtime = createWorkerCacheLineageRuntime(record);
+    const initial = workerPayload();
+    initial.previous_response_id = "must-not-cross-the-fork";
+    const fresh = runtime.transformPayload(initial, codexContext()) as Record<string, unknown>;
+    assert.equal(fresh.previous_response_id, undefined);
+    assert.deepEqual(runtime.status(), {
+      mode: "fresh",
+      reason: "Worker Codex initial fork unexpectedly carries previous_response_id."
+    });
+    runtime.restoreNetwork();
+    runtime = createWorkerCacheLineageRuntime(record);
+    const resumedFresh = runtime.transformPayload(initial, codexContext()) as Record<string, unknown>;
+    assert.equal(resumedFresh.previous_response_id, undefined, "persisted fresh fallback never forwards continuation state");
+  } finally {
+    runtime?.restoreNetwork();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex lineage keeps one immutable boundary across turns and persisted resume", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-multiturn-"));
+  let runtime: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
+  let resumed: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
+  try {
+    const record = captureAndPrepare(root);
+    runtime = createWorkerCacheLineageRuntime(record);
+    const first = runtime.transformPayload(workerPayload(), codexContext()) as Record<string, any>;
+    const fixedPrefix = structuredClone(first.input.slice(0, 5));
+    assert.deepEqual(fixedPrefix[4], (workerPayload().input as unknown[])[2]);
+
+    const trailing = [
+      { role: "assistant", content: [{ type: "output_text", text: "first worker answer" }] },
+      { role: "user", content: [{ type: "input_text", text: "second worker turn" }] }
+    ];
+    const continuation = workerPayload({ trailing });
+    continuation.previous_response_id = "resp_worker_one";
+    const second = runtime.transformPayload(continuation, codexContext()) as Record<string, any>;
+    assert.deepEqual(second.input.slice(0, 5), fixedPrefix);
+    assert.deepEqual(second.input.slice(5), trailing);
+    assert.equal(second.previous_response_id, "resp_worker_one");
+
+    runtime.restoreNetwork();
+    runtime = undefined;
+    resumed = createWorkerCacheLineageRuntime(record);
+    const resumeTrailing = [
+      ...trailing,
+      { role: "assistant", content: [{ type: "output_text", text: "second worker answer" }] },
+      { role: "user", content: [{ type: "input_text", text: "resume worker turn" }] }
+    ];
+    const resumedPayload = resumed.transformPayload(workerPayload({ trailing: resumeTrailing }), codexContext()) as Record<string, any>;
+    assert.deepEqual(resumedPayload.input.slice(0, 5), fixedPrefix);
+    assert.deepEqual(resumedPayload.input.slice(5), resumeTrailing);
+
+    const instructionDrift = resumed.transformPayload(
+      workerPayload({ instructions: `${workerInstructions}\nDRIFT` , trailing: resumeTrailing }),
+      codexContext()
+    ) as Record<string, unknown>;
+    assert.match(String(instructionDrift.model), /^pi-cache-lineage-blocked-/);
+    assert.deepEqual(resumed.status(), {
+      mode: "failed",
+      reason: "Managed-worker system instructions drifted after Codex lineage adoption."
+    });
+  } finally {
+    runtime?.restoreNetwork();
+    resumed?.restoreNetwork();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex lineage treats missing or duplicate initial assignment markers by adoption state", () => {
+  for (const markerItems of [0, 2]) {
+    const beforeRoot = mkdtempSync(path.join(tmpdir(), `worker-lineage-marker-before-${markerItems}-`));
+    let before: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
+    try {
+      const record = captureAndPrepare(beforeRoot);
+      before = createWorkerCacheLineageRuntime(record);
+      const original = workerPayload({ markerItems });
+      assert.deepEqual(before.transformPayload(original, codexContext()), original);
+      assert.deepEqual(before.status(), {
+        mode: "fresh",
+        reason: `Worker Codex input must contain exactly one initial assignment marker; found ${markerItems}.`
+      });
+    } finally {
+      before?.restoreNetwork();
+      rmSync(beforeRoot, { recursive: true, force: true });
+    }
+
+    const afterRoot = mkdtempSync(path.join(tmpdir(), `worker-lineage-marker-after-${markerItems}-`));
+    let after: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
+    try {
+      const record = captureAndPrepare(afterRoot);
+      after = createWorkerCacheLineageRuntime(record);
+      after.transformPayload(workerPayload(), codexContext());
+      const blocked = after.transformPayload(workerPayload({ markerItems }), codexContext()) as Record<string, unknown>;
+      assert.match(String(blocked.model), /^pi-cache-lineage-blocked-/);
+      assert.deepEqual(after.status(), {
+        mode: "failed",
+        reason: `Worker Codex input must contain exactly one initial assignment marker; found ${markerItems}.`
+      });
+    } finally {
+      after?.restoreNetwork();
+      rmSync(afterRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test("Codex lineage rejects a marker repeated within one assignment item", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-marker-repeated-"));
+  let runtime: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
+  try {
+    const record = captureAndPrepare(root);
+    runtime = createWorkerCacheLineageRuntime(record);
+    const repeated = workerPayload();
+    const input = repeated.input as Array<Record<string, any>>;
+    input[2].content[0].text += ` ${forkMarker}`;
+    assert.deepEqual(runtime.transformPayload(repeated, codexContext()), repeated);
+    assert.deepEqual(runtime.status(), {
+      mode: "fresh",
+      reason: "Worker Codex input must contain exactly one initial assignment marker; found 2."
+    });
+  } finally {
+    runtime?.restoreNetwork();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex lineage fails closed when the marked initial assignment changes after adoption", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-assignment-drift-"));
+  let runtime: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
+  try {
+    const record = captureAndPrepare(root);
+    runtime = createWorkerCacheLineageRuntime(record);
+    runtime.transformPayload(workerPayload(), codexContext());
+    const drifted = workerPayload();
+    const input = drifted.input as Array<Record<string, any>>;
+    input[2].content[0].text = `changed initial assignment ${forkMarker}`;
+    const blocked = runtime.transformPayload(drifted, codexContext()) as Record<string, unknown>;
+    assert.match(String(blocked.model), /^pi-cache-lineage-blocked-/);
+    assert.deepEqual(runtime.status(), {
+      mode: "failed",
+      reason: "Managed-worker initial assignment drifted after Codex lineage adoption."
+    });
+  } finally {
+    runtime?.restoreNetwork();
     rmSync(root, { recursive: true, force: true });
   }
 });

@@ -3263,6 +3263,9 @@ export function buildNewWorkerPrompt(
     `You are managed worker ${record.workerId} in workspace ${record.workspaceRoot}.`,
     `Assigned Beads: ${record.taskIds.join(", ")}.`,
     "The parent session was forked into this exact worker session. Work only on the assigned scope.",
+    record.cacheLineage?.mode === "eligible"
+      ? `Trusted cache-lineage initial assignment marker: ${record.cacheLineage.marker}. Preserve this exact marker in this initial assignment; do not repeat it.`
+      : undefined,
     `Trusted implementation role skill:
 ${managedWorkerRoleSkillText("implementation")}`,
     WORKER_OPERATIONAL_GUIDANCE,

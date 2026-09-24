@@ -383,6 +383,25 @@ test("managed-worker assignments inline the exact verified role contract in ever
     assert.match(prompt, /Trusted implementation role skill:/);
   }
 
+  const forkMarker = "pi_worker_fork_marker_prompt_fixture";
+  const lineagePrompt = buildNewWorkerPrompt({
+    ...baseRecord,
+    cacheLineage: {
+      version: 1,
+      mode: "eligible",
+      provider: "openai-codex",
+      model: "gpt-test",
+      thinkingLevel: "xhigh",
+      snapshotFile: "/state/snapshot.json",
+      snapshotSha256: "a".repeat(64),
+      marker: forkMarker,
+      adoptionFile: "/state/adoption.json",
+      fallbackFile: "/state/fallback.json"
+    }
+  }, "Implement exactly.", undefined);
+  assert.equal(lineagePrompt.split(forkMarker).length - 1, 1, "the immutable initial assignment carries exactly one trusted fork marker");
+  assert.doesNotMatch(buildResumeWorkerPrompt(baseRecord, "Resume exactly.", "/workspace/artifacts/parent-context.jsonl"), /pi_worker_fork_marker_prompt_fixture/);
+
   const integrationRecord: WorkerRecord = {
     ...baseRecord,
     integration: {
