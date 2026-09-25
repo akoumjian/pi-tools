@@ -38,6 +38,7 @@ const ADOPTION_VERSION = 3;
 const LINEAGE_SUMMARY_VERSION = 1;
 const RETIREMENT_VERSION = 1;
 const CAPTURE_HOLDER_MAX_SESSIONS = 4;
+const CACHE_LINEAGE_FATAL_ERROR_PREFIX = "Managed-worker Codex cache lineage failed closed: ";
 
 type JsonObject = Record<string, unknown>;
 
@@ -465,10 +466,7 @@ class EligibleRuntimeController {
   }
 
   transformPayload(payload: unknown, context: ExtensionContext): unknown {
-    if (this.fatalReason) {
-      this.transportPayload = undefined;
-      return failClosedPayload(payload, this.record.marker);
-    }
+    if (this.fatalReason) throw new Error(`${CACHE_LINEAGE_FATAL_ERROR_PREFIX}${this.fatalReason}`);
     if (this.retired) return this.transformRetiredPayload(payload);
     if (this.disabledReason) {
       this.transportPayload = undefined;
@@ -492,19 +490,14 @@ class EligibleRuntimeController {
           return payload;
         } catch (persistenceError) {
           this.setFatal(`Unable to persist pre-adoption fallback: ${boundedReason(persistenceError)}`);
-          return failClosedPayload(payload, this.record.marker);
         }
       }
       this.setFatal(reason);
-      return failClosedPayload(payload, this.record.marker);
     }
   }
 
   transformHeaders(headers: Record<string, string | null | undefined>, context: ExtensionContext): void {
-    if (this.fatalReason) {
-      this.networkArmed = true;
-      return;
-    }
+    if (this.fatalReason) throw new Error(`${CACHE_LINEAGE_FATAL_ERROR_PREFIX}${this.fatalReason}`);
     if (this.retired || this.disabledReason) {
       deleteHeader(headers, "session-id");
       this.networkArmed = false;
@@ -532,6 +525,7 @@ class EligibleRuntimeController {
   }
 
   observeProviderResponse(status: number): void {
+    if (this.fatalReason) throw new Error(`${CACHE_LINEAGE_FATAL_ERROR_PREFIX}${this.fatalReason}`);
     if (!Number.isInteger(status) || this.retired) return;
     if (!this.pendingAdoption) {
       if (this.adoption && status >= 200 && status < 300) this.networkArmed = false;
@@ -546,6 +540,7 @@ class EligibleRuntimeController {
   }
 
   observeAssistantMessage(message: unknown, context: ExtensionContext): void {
+    if (this.fatalReason) throw new Error(`${CACHE_LINEAGE_FATAL_ERROR_PREFIX}${this.fatalReason}`);
     if (!isJsonObject(message)) return;
     if (
       this.retired &&
@@ -595,6 +590,7 @@ class EligibleRuntimeController {
   }
 
   retireAfterCompaction(reason: "manual" | "threshold" | "overflow"): void {
+    if (this.fatalReason) throw new Error(`${CACHE_LINEAGE_FATAL_ERROR_PREFIX}${this.fatalReason}`);
     if (this.retired || !this.adoption) return;
     const bounded = `Cache lineage retired after trusted Pi ${reason} compaction.`;
     const retirement = { reason: bounded, firstFreshRequestPending: true };
@@ -602,7 +598,6 @@ class EligibleRuntimeController {
       writeRetirement(this.record.retirementFile, this.record, this.capture, retirement);
     } catch (error) {
       this.setFatal(`Unable to persist trusted compaction retirement: ${boundedReason(error)}`);
-      return;
     }
     this.retired = retirement;
     this.adoption = undefined;
@@ -852,7 +847,7 @@ class EligibleRuntimeController {
     writeLineageSummary(this.record, "fresh", bounded);
   }
 
-  private setFatal(reason: string): void {
+  private setFatal(reason: string): never {
     this.fatalReason = boundedTextReason(reason);
     this.networkArmed = true;
     this.transportPayload = undefined;
@@ -862,10 +857,11 @@ class EligibleRuntimeController {
     } catch {
       // Transport remains fail-closed even when diagnostic persistence fails.
     }
+    throw new Error(`${CACHE_LINEAGE_FATAL_ERROR_PREFIX}${this.fatalReason}`);
   }
 
   private assertNetworkAllowed(): void {
-    if (this.fatalReason) throw new Error(`Managed-worker Codex cache lineage failed closed: ${this.fatalReason}`);
+    if (this.fatalReason) throw new Error(`${CACHE_LINEAGE_FATAL_ERROR_PREFIX}${this.fatalReason}`);
     if (!this.adoption && !this.pendingAdoption) {
       throw new Error("Managed-worker Codex cache lineage was not verified before transport.");
     }
@@ -1201,16 +1197,6 @@ function stripPreviousResponseIdFromCompleteReplay(payload: unknown): unknown {
   const stripped = cloneJsonObject(payload);
   delete stripped.previous_response_id;
   return stripped;
-}
-
-function failClosedPayload(payload: unknown, marker: string): JsonObject {
-  const original = isJsonObject(payload) ? cloneJsonObject(payload) : {};
-  original.model = `pi-cache-lineage-blocked-${marker}`;
-  original.input = [];
-  original.tools = [];
-  original.tool_choice = "none";
-  delete original.previous_response_id;
-  return original;
 }
 
 function isCodexHttpTarget(input: RequestInfo | URL): boolean {

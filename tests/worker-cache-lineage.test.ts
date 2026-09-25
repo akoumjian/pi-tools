@@ -722,7 +722,7 @@ test("Pi 0.84.4 dispatches header, payload, final transport, and acceptance hook
   }
 });
 
-test("Codex lineage falls back only before adoption, then fails closed on drift", () => {
+test("Codex lineage falls back only before adoption, then throws persistently on fatal drift", async () => {
   const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-fallback-"));
   let freshRuntime: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
   let adoptedRuntime: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
@@ -753,8 +753,23 @@ test("Codex lineage falls back only before adoption, then fails closed on drift"
     const drifted = codexContext({
       model: { provider: "openai-codex", id: "other-model", api: "openai-codex-responses", baseUrl: "https://chatgpt.com/backend-api" }
     });
-    const blocked = adoptedRuntime.transformPayload(workerPayload(), drifted) as Record<string, unknown>;
-    assert.match(String(blocked.model), /^pi-cache-lineage-blocked-/);
+    const fatal = /Managed-worker Codex cache lineage failed closed: Worker provider\/model\/API\/thinking route drifted from the persisted Codex lineage\./;
+    assert.throws(() => adoptedRuntime!.transformPayload(workerPayload(), drifted), fatal);
+    assert.deepEqual(adoptedRuntime.status(), {
+      mode: "failed",
+      reason: "Worker provider/model/API/thinking route drifted from the persisted Codex lineage."
+    });
+    assert.deepEqual(summarizeWorkerCacheLineage(secondRecord), {
+      mode: "failed",
+      reason: "Worker provider/model/API/thinking route drifted from the persisted Codex lineage."
+    });
+    assert.throws(() => adoptedRuntime!.transformPayload(workerPayload(), codexContext()), fatal);
+    assert.throws(() => adoptedRuntime!.transformHeaders({}, codexContext()), fatal);
+    await assert.rejects(
+      () => globalThis.fetch("https://chatgpt.com/backend-api/codex/responses"),
+      fatal
+    );
+    assert.throws(() => adoptedRuntime!.retireAfterCompaction("manual"), fatal);
     assert.equal(adoptedRuntime.status().mode, "failed");
   } finally {
     freshRuntime?.restoreNetwork();
@@ -824,11 +839,13 @@ test("Codex lineage keeps one immutable boundary across turns and persisted resu
     assert.deepEqual(resumedPayload.input.slice(0, 5), fixedPrefix);
     assert.deepEqual(resumedPayload.input.slice(5), resumeTrailing);
 
-    const instructionDrift = resumed.transformPayload(
-      workerPayload({ instructions: `${workerInstructions}\nDRIFT` , trailing: resumeTrailing }),
-      codexContext()
-    ) as Record<string, unknown>;
-    assert.match(String(instructionDrift.model), /^pi-cache-lineage-blocked-/);
+    assert.throws(
+      () => resumed!.transformPayload(
+        workerPayload({ instructions: `${workerInstructions}\nDRIFT` , trailing: resumeTrailing }),
+        codexContext()
+      ),
+      /Managed-worker Codex cache lineage failed closed: Managed-worker system instructions drifted after Codex lineage adoption\./
+    );
     assert.deepEqual(resumed.status(), {
       mode: "failed",
       reason: "Managed-worker system instructions drifted after Codex lineage adoption."
@@ -907,8 +924,10 @@ test("Codex lineage fails closed when the marked initial assignment changes afte
     const drifted = workerPayload();
     const input = drifted.input as Array<Record<string, any>>;
     input[2].content[0].text = `changed initial assignment ${forkMarker}`;
-    const blocked = runtime.transformPayload(drifted, codexContext()) as Record<string, unknown>;
-    assert.match(String(blocked.model), /^pi-cache-lineage-blocked-/);
+    assert.throws(
+      () => runtime!.transformPayload(drifted, codexContext()),
+      /Managed-worker Codex cache lineage failed closed: Managed-worker initial assignment drifted after Codex lineage adoption\./
+    );
     assert.deepEqual(runtime.status(), {
       mode: "failed",
       reason: "Managed-worker initial assignment drifted after Codex lineage adoption."
@@ -930,8 +949,10 @@ test("Codex lineage fails closed when managed-worker schemas drift after adoptio
     const drifted = workerPayload();
     const tools = drifted.tools as Array<Record<string, unknown>>;
     tools[0] = { ...tools[0], description: "drifted schema" };
-    const blocked = runtime.transformPayload(drifted, codexContext()) as Record<string, unknown>;
-    assert.match(String(blocked.model), /^pi-cache-lineage-blocked-/);
+    assert.throws(
+      () => runtime!.transformPayload(drifted, codexContext()),
+      /Managed-worker Codex cache lineage failed closed: Managed-worker tool schemas drifted after Codex lineage adoption\./
+    );
     assert.deepEqual(runtime.status(), {
       mode: "failed",
       reason: "Managed-worker tool schemas drifted after Codex lineage adoption."
@@ -1294,10 +1315,12 @@ test("Codex lineage digests every pre-assignment suffix item", () => {
     const preAssignment = [{ role: "assistant", content: [{ type: "output_text", text: "stable intervening item" }] }];
     runtime.transformPayload(workerPayload({ preAssignment }), codexContext());
     completeSuccessfulResponse(runtime);
-    const blocked = runtime.transformPayload(workerPayload({ preAssignment: [
-      { role: "assistant", content: [{ type: "output_text", text: "drifted intervening item" }] }
-    ] }), codexContext()) as Record<string, unknown>;
-    assert.match(String(blocked.model), /^pi-cache-lineage-blocked-/);
+    assert.throws(
+      () => runtime!.transformPayload(workerPayload({ preAssignment: [
+        { role: "assistant", content: [{ type: "output_text", text: "drifted intervening item" }] }
+      ] }), codexContext()),
+      /Managed-worker Codex cache lineage failed closed: Managed-worker pre-assignment history drifted after Codex lineage adoption\./
+    );
     assert.deepEqual(runtime.status(), {
       mode: "failed",
       reason: "Managed-worker pre-assignment history drifted after Codex lineage adoption."
