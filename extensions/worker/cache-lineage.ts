@@ -31,7 +31,7 @@ export const MANAGED_WORKER_TOOL_NAMES = [
 
 const MANAGED_WORKER_TOOL_NAME_SET = new Set<string>(MANAGED_WORKER_TOOL_NAMES);
 const CAPTURE_HOLDER_KEY = Symbol.for("@akoumjian/pi-tools/worker-cache-lineage-capture");
-const CAPTURE_HOLDER_VERSION = 2;
+const CAPTURE_HOLDER_VERSION = 3;
 const ADOPTION_VERSION = 3;
 const LINEAGE_SUMMARY_VERSION = 1;
 const RETIREMENT_VERSION = 1;
@@ -92,11 +92,13 @@ type PendingParentHeaders = {
   observedCacheAffinitySessionId?: string;
   capturedAt: string;
 };
+type CaptureFailure = { generation: number; reason: string };
 type CaptureHolder = {
   version: typeof CAPTURE_HOLDER_VERSION;
   generation: number;
   pendingHeadersBySessionFile: Map<string, PendingParentHeaders>;
   latestBySessionFile: Map<string, ParentCacheLineageCapture & { generation: number }>;
+  latestFailureBySessionFile: Map<string, CaptureFailure>;
 };
 
 export type WorkerCacheLineageSummary = {
@@ -123,13 +125,15 @@ function captureHolder(): CaptureHolder {
     existing.version === CAPTURE_HOLDER_VERSION &&
     typeof existing.generation === "number" &&
     existing.pendingHeadersBySessionFile instanceof Map &&
-    existing.latestBySessionFile instanceof Map
+    existing.latestBySessionFile instanceof Map &&
+    existing.latestFailureBySessionFile instanceof Map
   ) return existing as CaptureHolder;
   const created: CaptureHolder = {
     version: CAPTURE_HOLDER_VERSION,
     generation: 0,
     pendingHeadersBySessionFile: new Map(),
-    latestBySessionFile: new Map()
+    latestBySessionFile: new Map(),
+    latestFailureBySessionFile: new Map()
   };
   Reflect.set(globalThis, CAPTURE_HOLDER_KEY, created);
   return created;
@@ -144,6 +148,7 @@ export function registerParentCacheLineageCapture(
   const generation = ++holder.generation;
   holder.pendingHeadersBySessionFile.clear();
   holder.latestBySessionFile.clear();
+  holder.latestFailureBySessionFile.clear();
   // Version 1 wrote one parent artifact per session. Snapshots are self-contained,
   // so these legacy request-time files are unreferenced and safe to prune.
   rmSync(path.join(path.resolve(stateRoot), ".cache-lineage"), { recursive: true, force: true });
@@ -162,8 +167,12 @@ export function registerParentCacheLineageCapture(
       !model ||
       model.provider !== CODEX_CACHE_LINEAGE_PROVIDER ||
       model.api !== CODEX_CACHE_LINEAGE_API
-    ) return;
+    ) {
+      setCaptureFailure(holder, resolvedSessionFile, generation, "The latest parent provider request is not eligible Codex Responses traffic.");
+      return;
+    }
     const candidateCacheAffinitySessionId = clampCodexSessionId(context.sessionManager.getSessionId());
+    setCaptureFailure(holder, resolvedSessionFile, generation, "Parent Codex headers were observed, but no matching request payload completed capture.");
     setBoundedCaptureEntry(holder.pendingHeadersBySessionFile, resolvedSessionFile, {
       provider: CODEX_CACHE_LINEAGE_PROVIDER,
       api: CODEX_CACHE_LINEAGE_API,
@@ -182,8 +191,12 @@ export function registerParentCacheLineageCapture(
     if (holder.generation !== generation || process.env.PI_WORKER_ID) return;
     const sessionFile = context.sessionManager.getSessionFile();
     const model = context.model;
-    if (!sessionFile || !model || !isJsonObject(event.payload)) return;
+    if (!sessionFile) return;
     const resolvedSessionFile = path.resolve(sessionFile);
+    if (!model || !isJsonObject(event.payload)) {
+      setCaptureFailure(holder, resolvedSessionFile, generation, "The parent provider request did not expose a JSON Codex payload.");
+      return;
+    }
     const pending = holder.pendingHeadersBySessionFile.get(resolvedSessionFile);
     holder.pendingHeadersBySessionFile.delete(resolvedSessionFile);
     if (
@@ -193,9 +206,14 @@ export function registerParentCacheLineageCapture(
       pending.model !== model.id ||
       pending.baseUrl !== normalizeCodexBaseUrl(model.baseUrl) ||
       pending.thinkingLevel !== String(context.thinkingLevel)
-    ) return;
+    ) {
+      setCaptureFailure(holder, resolvedSessionFile, generation, pending
+        ? "Parent Codex header and payload metadata did not match."
+        : "Parent Codex payload arrived without matching header capture.");
+      return;
+    }
     if (!jsonValueFitsBound(event.payload, WORKER_CACHE_LINEAGE_MAX_BYTES)) {
-      holder.latestBySessionFile.delete(resolvedSessionFile);
+      setCaptureFailure(holder, resolvedSessionFile, generation, "Parent Codex request payload is not bounded JSON within the snapshot limit.");
       return;
     }
     const cacheAffinitySessionId = pending.observedCacheAffinitySessionId ?? (
@@ -204,7 +222,7 @@ export function registerParentCacheLineageCapture(
         : undefined
     );
     if (!cacheAffinitySessionId) {
-      holder.latestBySessionFile.delete(resolvedSessionFile);
+      setCaptureFailure(holder, resolvedSessionFile, generation, "Parent Codex request did not expose a provable cache-affinity session ID.");
       return;
     }
     const data: ParentCaptureData = {
@@ -226,6 +244,7 @@ export function registerParentCacheLineageCapture(
       integritySha256: "",
       generation
     });
+    holder.latestFailureBySessionFile.delete(resolvedSessionFile);
   });
 }
 export function prepareWorkerCacheLineage(input: {
@@ -243,7 +262,10 @@ export function prepareWorkerCacheLineage(input: {
   const holder = captureHolder();
   const heldCapture = holder.latestBySessionFile.get(resolvedParentSessionFile);
   if (!heldCapture || heldCapture.generation !== holder.generation) {
-    return freshLineage("No validated parent Codex request capture is available.");
+    const failure = holder.latestFailureBySessionFile.get(resolvedParentSessionFile);
+    return freshLineage(failure?.generation === holder.generation
+      ? failure.reason
+      : "No validated parent Codex request capture is available.");
   }
   const now = input.now ?? new Date();
   const ageMs = now.getTime() - Date.parse(heldCapture.data.capturedAt);
@@ -1189,6 +1211,16 @@ function writePrivateText(file: string, text: string): void {
   } finally {
     rmSync(temporary, { force: true });
   }
+}
+
+function setCaptureFailure(
+  holder: CaptureHolder,
+  sessionFile: string,
+  generation: number,
+  reason: string
+): void {
+  holder.latestBySessionFile.delete(sessionFile);
+  setBoundedCaptureEntry(holder.latestFailureBySessionFile, sessionFile, { generation, reason });
 }
 
 function setBoundedCaptureEntry<T>(map: Map<string, T>, key: string, value: T): void {

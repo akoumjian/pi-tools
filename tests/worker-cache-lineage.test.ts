@@ -1291,7 +1291,7 @@ test("oversized parent payloads skip capture without throwing or persisting requ
     assert.deepEqual(record, {
       version: 1,
       mode: "fresh",
-      reason: "No validated parent Codex request capture is available."
+      reason: "Parent Codex request payload is not bounded JSON within the snapshot limit."
     });
     assert.equal(existsSync(path.join(root, ".cache-lineage")), false);
   } finally {
