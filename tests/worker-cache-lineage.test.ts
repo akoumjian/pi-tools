@@ -119,7 +119,7 @@ function workerPayload(options: {
   };
 }
 
-function captureAndPrepare(
+function captureRecord(
   root: string,
   exposeSessionHeader = true,
   capturedPayload: Record<string, unknown> = parentPayload()
@@ -151,6 +151,15 @@ function captureAndPrepare(
     marker: forkMarker,
     now: new Date("2026-09-24T12:00:01.000Z")
   });
+  return record;
+}
+
+function captureAndPrepare(
+  root: string,
+  exposeSessionHeader = true,
+  capturedPayload: Record<string, unknown> = parentPayload()
+) {
+  const record = captureRecord(root, exposeSessionHeader, capturedPayload);
   assert.equal(record.mode, "eligible");
   return record;
 }
@@ -1262,6 +1271,9 @@ test("JSON-compatible shared references and omitted values remain eligible", () 
     payload.first = shared;
     payload.second = shared;
     payload.omitted = undefined;
+    payload.omittedFunction = () => "not serialized";
+    payload.omittedSymbol = Symbol("not serialized");
+    payload.arraySemantics = [undefined, () => "not serialized", Symbol("not serialized"), Number.NaN, Infinity, -0];
     const record = captureAndPrepare(root, false, payload);
     assert.equal(record.mode, "eligible");
     const snapshot = JSON.parse(readFileSync(record.snapshotFile, "utf8")) as {
@@ -1270,6 +1282,56 @@ test("JSON-compatible shared references and omitted values remain eligible", () 
     assert.deepEqual(snapshot.data.payload.first, shared);
     assert.deepEqual(snapshot.data.payload.second, shared);
     assert.equal(Object.hasOwn(snapshot.data.payload, "omitted"), false);
+    assert.equal(Object.hasOwn(snapshot.data.payload, "omittedFunction"), false);
+    assert.equal(Object.hasOwn(snapshot.data.payload, "omittedSymbol"), false);
+    assert.deepEqual(snapshot.data.payload.arraySemantics, [null, null, null, null, null, 0]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("capture eligibility accounts for the bounded persisted snapshot envelope", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-envelope-bound-"));
+  try {
+    const payload = parentPayload();
+    const baseBytes = Buffer.byteLength(JSON.stringify({ ...payload, padding: "" }), "utf8");
+    payload.padding = "x".repeat(WORKER_CACHE_LINEAGE_MAX_BYTES - baseBytes - 64);
+    assert.deepEqual(captureRecord(root, false, payload), {
+      version: 1,
+      mode: "fresh",
+      reason: "Parent Codex request snapshot exceeds the bounded size limit."
+    });
+    assert.equal(existsSync(path.join(root, "worker-one", "cache-lineage.json")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("capture validation rejects sparse and deeply nested payloads without unbounded traversal", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-structural-bounds-"));
+  try {
+    const sparse = parentPayload();
+    sparse.input = new Array(Math.floor(WORKER_CACHE_LINEAGE_MAX_BYTES / 2) + 1);
+    assert.doesNotThrow(() => captureRecord(path.join(root, "sparse"), false, sparse));
+    assert.deepEqual(captureRecord(path.join(root, "sparse-result"), false, sparse), {
+      version: 1,
+      mode: "fresh",
+      reason: "Parent Codex request payload is not bounded JSON within the snapshot limit."
+    });
+
+    const deep = parentPayload();
+    let nested: Record<string, unknown> = {};
+    deep.deep = nested;
+    for (let depth = 0; depth < 130; depth += 1) {
+      const child: Record<string, unknown> = {};
+      nested.child = child;
+      nested = child;
+    }
+    assert.deepEqual(captureRecord(path.join(root, "deep"), false, deep), {
+      version: 1,
+      mode: "fresh",
+      reason: "Parent Codex request payload is not bounded JSON within the snapshot limit."
+    });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -162,6 +162,7 @@ export function registerParentCacheLineageCapture(
     const model = context.model;
     if (!sessionFile) return;
     const resolvedSessionFile = path.resolve(sessionFile);
+    holder.pendingHeadersBySessionFile.delete(resolvedSessionFile);
     holder.latestBySessionFile.delete(resolvedSessionFile);
     if (
       !model ||
@@ -193,12 +194,12 @@ export function registerParentCacheLineageCapture(
     const model = context.model;
     if (!sessionFile) return;
     const resolvedSessionFile = path.resolve(sessionFile);
+    const pending = holder.pendingHeadersBySessionFile.get(resolvedSessionFile);
+    holder.pendingHeadersBySessionFile.delete(resolvedSessionFile);
     if (!model || !isJsonObject(event.payload)) {
       setCaptureFailure(holder, resolvedSessionFile, generation, "The parent provider request did not expose a JSON Codex payload.");
       return;
     }
-    const pending = holder.pendingHeadersBySessionFile.get(resolvedSessionFile);
-    holder.pendingHeadersBySessionFile.delete(resolvedSessionFile);
     if (
       !pending ||
       pending.provider !== model.provider ||
@@ -285,18 +286,23 @@ export function prepareWorkerCacheLineage(input: {
   ) {
     return freshLineage("Parent Codex request capture route does not exactly match the worker route.");
   }
+  if (!jsonValueFitsBound(heldCapture.data.payload, WORKER_CACHE_LINEAGE_MAX_BYTES)) {
+    return freshLineage("The latest parent Codex request is no longer bounded JSON within the snapshot limit.");
+  }
   const payloadJson = tryStringifyBounded(heldCapture.data.payload);
   if (payloadJson === undefined) return freshLineage("The latest parent Codex request exceeds the bounded snapshot limit.");
   const payload: unknown = JSON.parse(payloadJson);
   if (!isJsonObject(payload)) return freshLineage("The latest parent Codex request is not a JSON object.");
   const data: ParentCaptureData = { ...heldCapture.data, payload, payloadSha256: sha256(payloadJson) };
-  const capture: ParentCacheLineageCapture = {
-    data,
-    integritySha256: sha256(stringifyBounded(data, "parent Codex lineage data"))
-  };
+  const dataJson = tryStringifyBounded(data);
+  if (dataJson === undefined) return freshLineage("Parent Codex request snapshot exceeds the bounded size limit.");
+  const capture: ParentCacheLineageCapture = { data, integritySha256: sha256(dataJson) };
+  const snapshotJson = tryStringifyBounded(capture);
+  if (snapshotJson === undefined || Buffer.byteLength(`${snapshotJson}\n`, "utf8") > WORKER_CACHE_LINEAGE_MAX_BYTES) {
+    return freshLineage("Parent Codex request snapshot exceeds the bounded size limit.");
+  }
   mkdirSync(input.workerStateDir, { recursive: true, mode: 0o700 });
   const snapshotFile = path.join(input.workerStateDir, "cache-lineage.json");
-  const snapshotJson = stringifyBounded(capture, "worker cache-lineage snapshot");
   writePrivateText(snapshotFile, `${snapshotJson}\n`);
   const marker = normalizeMarker(input.marker ?? randomUUID());
   const record: Extract<WorkerCacheLineageRecord, { mode: "eligible" }> = {
@@ -1235,7 +1241,8 @@ function setBoundedCaptureEntry<T>(map: Map<string, T>, key: string, value: T): 
 
 type JsonScanFrame =
   | { kind: "value"; value: unknown; arrayElement: boolean; depth: number }
-  | { kind: "exit"; value: object };
+  | { kind: "array"; value: unknown[]; index: number; depth: number }
+  | { kind: "object"; value: JsonObject; keys: Iterator<string>; emitted: boolean; depth: number };
 
 function jsonValueFitsBound(value: unknown, maxBytes: number): boolean {
   try {
@@ -1244,13 +1251,45 @@ function jsonValueFitsBound(value: unknown, maxBytes: number): boolean {
     let visits = 0;
     const stack: JsonScanFrame[] = [{ kind: "value", value, arrayElement: false, depth: 0 }];
     while (stack.length > 0) {
+      visits += 1;
+      if (visits > 1_000_000) return false;
       const frame = stack.pop()!;
-      if (frame.kind === "exit") {
-        active.delete(frame.value);
+      if (frame.kind === "array") {
+        if (frame.index >= frame.value.length) {
+          active.delete(frame.value);
+          continue;
+        }
+        if (frame.index > 0) budget -= 1;
+        if (budget < 0) return false;
+        stack.push({ ...frame, index: frame.index + 1 });
+        stack.push({
+          kind: "value",
+          value: frame.value[frame.index],
+          arrayElement: true,
+          depth: frame.depth + 1
+        });
         continue;
       }
-      visits += 1;
-      if (visits > 1_000_000 || frame.depth > 128) return false;
+      if (frame.kind === "object") {
+        const next = frame.keys.next();
+        if (next.done) {
+          active.delete(frame.value);
+          continue;
+        }
+        stack.push(frame);
+        const child = frame.value[next.value];
+        if (typeof child === "undefined" || typeof child === "function" || typeof child === "symbol") continue;
+        if (frame.emitted) budget -= 1;
+        const keyBytes = boundedJsonStringBytes(next.value, budget);
+        if (keyBytes === undefined) return false;
+        budget -= keyBytes + 1;
+        if (budget < 0) return false;
+        frame.emitted = true;
+        stack.push({ kind: "value", value: child, arrayElement: false, depth: frame.depth + 1 });
+        continue;
+      }
+
+      if (frame.depth > 128) return false;
       const current = frame.value;
       if (current === null) budget -= 4;
       else if (typeof current === "boolean") budget -= current ? 4 : 5;
@@ -1267,13 +1306,11 @@ function jsonValueFitsBound(value: unknown, maxBytes: number): boolean {
       } else if (typeof current === "bigint") return false;
       else if (Array.isArray(current)) {
         if (active.has(current) || typeof (current as { toJSON?: unknown }).toJSON === "function") return false;
+        const minimumBytes = current.length === 0 ? 2 : current.length * 2 + 1;
+        if (!Number.isSafeInteger(minimumBytes) || minimumBytes > budget) return false;
         active.add(current);
-        budget -= Math.max(0, current.length - 1) + 2;
-        if (budget < 0) return false;
-        stack.push({ kind: "exit", value: current });
-        for (let index = current.length - 1; index >= 0; index -= 1) {
-          stack.push({ kind: "value", value: current[index], arrayElement: true, depth: frame.depth + 1 });
-        }
+        budget -= 2;
+        stack.push({ kind: "array", value: current, index: 0, depth: frame.depth });
       } else if (isJsonObject(current)) {
         const prototype = Object.getPrototypeOf(current);
         if (
@@ -1282,26 +1319,26 @@ function jsonValueFitsBound(value: unknown, maxBytes: number): boolean {
           typeof (current as { toJSON?: unknown }).toJSON === "function"
         ) return false;
         active.add(current);
-        const rawEntries = Object.entries(current);
-        if (rawEntries.some(([, child]) => typeof child === "function" || typeof child === "symbol")) return false;
-        const entries = rawEntries.filter(([, child]) => typeof child !== "undefined");
-        budget -= Math.max(0, entries.length - 1) + 2;
-        for (const [key, child] of entries) {
-          const keyBytes = boundedJsonStringBytes(key, budget);
-          if (keyBytes === undefined) return false;
-          budget -= keyBytes + 1;
-        }
-        if (budget < 0) return false;
-        stack.push({ kind: "exit", value: current });
-        for (let index = entries.length - 1; index >= 0; index -= 1) {
-          stack.push({ kind: "value", value: entries[index]![1], arrayElement: false, depth: frame.depth + 1 });
-        }
+        budget -= 2;
+        stack.push({
+          kind: "object",
+          value: current,
+          keys: enumerableOwnStringKeys(current),
+          emitted: false,
+          depth: frame.depth
+        });
       } else return false;
       if (budget < 0) return false;
     }
     return true;
   } catch {
     return false;
+  }
+}
+
+function* enumerableOwnStringKeys(value: JsonObject): IterableIterator<string> {
+  for (const key in value) {
+    if (Object.hasOwn(value, key)) yield key;
   }
 }
 
