@@ -31,7 +31,7 @@ export const MANAGED_WORKER_TOOL_NAMES = [
 
 const MANAGED_WORKER_TOOL_NAME_SET = new Set<string>(MANAGED_WORKER_TOOL_NAMES);
 const CAPTURE_HOLDER_KEY = Symbol.for("@akoumjian/pi-tools/worker-cache-lineage-capture");
-const CAPTURE_HOLDER_VERSION = 2;
+const CAPTURE_HOLDER_VERSION = 3;
 const ADOPTION_VERSION = 3;
 const LINEAGE_SUMMARY_VERSION = 1;
 const RETIREMENT_VERSION = 1;
@@ -92,11 +92,13 @@ type PendingParentHeaders = {
   observedCacheAffinitySessionId?: string;
   capturedAt: string;
 };
+type CaptureFailure = { generation: number; reason: string };
 type CaptureHolder = {
   version: typeof CAPTURE_HOLDER_VERSION;
   generation: number;
   pendingHeadersBySessionFile: Map<string, PendingParentHeaders>;
   latestBySessionFile: Map<string, ParentCacheLineageCapture & { generation: number }>;
+  latestFailureBySessionFile: Map<string, CaptureFailure>;
 };
 
 export type WorkerCacheLineageSummary = {
@@ -123,13 +125,15 @@ function captureHolder(): CaptureHolder {
     existing.version === CAPTURE_HOLDER_VERSION &&
     typeof existing.generation === "number" &&
     existing.pendingHeadersBySessionFile instanceof Map &&
-    existing.latestBySessionFile instanceof Map
+    existing.latestBySessionFile instanceof Map &&
+    existing.latestFailureBySessionFile instanceof Map
   ) return existing as CaptureHolder;
   const created: CaptureHolder = {
     version: CAPTURE_HOLDER_VERSION,
     generation: 0,
     pendingHeadersBySessionFile: new Map(),
-    latestBySessionFile: new Map()
+    latestBySessionFile: new Map(),
+    latestFailureBySessionFile: new Map()
   };
   Reflect.set(globalThis, CAPTURE_HOLDER_KEY, created);
   return created;
@@ -144,6 +148,7 @@ export function registerParentCacheLineageCapture(
   const generation = ++holder.generation;
   holder.pendingHeadersBySessionFile.clear();
   holder.latestBySessionFile.clear();
+  holder.latestFailureBySessionFile.clear();
   // Version 1 wrote one parent artifact per session. Snapshots are self-contained,
   // so these legacy request-time files are unreferenced and safe to prune.
   rmSync(path.join(path.resolve(stateRoot), ".cache-lineage"), { recursive: true, force: true });
@@ -162,8 +167,12 @@ export function registerParentCacheLineageCapture(
       !model ||
       model.provider !== CODEX_CACHE_LINEAGE_PROVIDER ||
       model.api !== CODEX_CACHE_LINEAGE_API
-    ) return;
+    ) {
+      setCaptureFailure(holder, resolvedSessionFile, generation, "The latest parent provider request is not eligible Codex Responses traffic.");
+      return;
+    }
     const candidateCacheAffinitySessionId = clampCodexSessionId(context.sessionManager.getSessionId());
+    setCaptureFailure(holder, resolvedSessionFile, generation, "Parent Codex headers were observed, but no matching request payload completed capture.");
     setBoundedCaptureEntry(holder.pendingHeadersBySessionFile, resolvedSessionFile, {
       provider: CODEX_CACHE_LINEAGE_PROVIDER,
       api: CODEX_CACHE_LINEAGE_API,
@@ -182,8 +191,12 @@ export function registerParentCacheLineageCapture(
     if (holder.generation !== generation || process.env.PI_WORKER_ID) return;
     const sessionFile = context.sessionManager.getSessionFile();
     const model = context.model;
-    if (!sessionFile || !model || !isJsonObject(event.payload)) return;
+    if (!sessionFile) return;
     const resolvedSessionFile = path.resolve(sessionFile);
+    if (!model || !isJsonObject(event.payload)) {
+      setCaptureFailure(holder, resolvedSessionFile, generation, "The parent provider request did not expose a JSON Codex payload.");
+      return;
+    }
     const pending = holder.pendingHeadersBySessionFile.get(resolvedSessionFile);
     holder.pendingHeadersBySessionFile.delete(resolvedSessionFile);
     if (
@@ -193,9 +206,14 @@ export function registerParentCacheLineageCapture(
       pending.model !== model.id ||
       pending.baseUrl !== normalizeCodexBaseUrl(model.baseUrl) ||
       pending.thinkingLevel !== String(context.thinkingLevel)
-    ) return;
+    ) {
+      setCaptureFailure(holder, resolvedSessionFile, generation, pending
+        ? "Parent Codex header and payload metadata did not match."
+        : "Parent Codex payload arrived without matching header capture.");
+      return;
+    }
     if (!jsonValueFitsBound(event.payload, WORKER_CACHE_LINEAGE_MAX_BYTES)) {
-      holder.latestBySessionFile.delete(resolvedSessionFile);
+      setCaptureFailure(holder, resolvedSessionFile, generation, "Parent Codex request payload is not bounded JSON within the snapshot limit.");
       return;
     }
     const cacheAffinitySessionId = pending.observedCacheAffinitySessionId ?? (
@@ -204,7 +222,7 @@ export function registerParentCacheLineageCapture(
         : undefined
     );
     if (!cacheAffinitySessionId) {
-      holder.latestBySessionFile.delete(resolvedSessionFile);
+      setCaptureFailure(holder, resolvedSessionFile, generation, "Parent Codex request did not expose a provable cache-affinity session ID.");
       return;
     }
     const data: ParentCaptureData = {
@@ -226,6 +244,7 @@ export function registerParentCacheLineageCapture(
       integritySha256: "",
       generation
     });
+    holder.latestFailureBySessionFile.delete(resolvedSessionFile);
   });
 }
 export function prepareWorkerCacheLineage(input: {
@@ -243,7 +262,10 @@ export function prepareWorkerCacheLineage(input: {
   const holder = captureHolder();
   const heldCapture = holder.latestBySessionFile.get(resolvedParentSessionFile);
   if (!heldCapture || heldCapture.generation !== holder.generation) {
-    return freshLineage("No validated parent Codex request capture is available.");
+    const failure = holder.latestFailureBySessionFile.get(resolvedParentSessionFile);
+    return freshLineage(failure?.generation === holder.generation
+      ? failure.reason
+      : "No validated parent Codex request capture is available.");
   }
   const now = input.now ?? new Date();
   const ageMs = now.getTime() - Date.parse(heldCapture.data.capturedAt);
@@ -1074,7 +1096,8 @@ function writeLineageSummary(
       ...(reason ? { reason: truncateUtf8(reason, 512) } : {})
     });
   } catch {
-    // Summary state is observational. Authoritative launch/adoption files remain strict.
+    // Never leave stale observational state after an authoritative transition.
+    try { rmSync(record.summaryFile, { force: true }); } catch {}
   }
 }
 
@@ -1190,6 +1213,16 @@ function writePrivateText(file: string, text: string): void {
   }
 }
 
+function setCaptureFailure(
+  holder: CaptureHolder,
+  sessionFile: string,
+  generation: number,
+  reason: string
+): void {
+  holder.latestBySessionFile.delete(sessionFile);
+  setBoundedCaptureEntry(holder.latestFailureBySessionFile, sessionFile, { generation, reason });
+}
+
 function setBoundedCaptureEntry<T>(map: Map<string, T>, key: string, value: T): void {
   map.delete(key);
   map.set(key, value);
@@ -1200,30 +1233,68 @@ function setBoundedCaptureEntry<T>(map: Map<string, T>, key: string, value: T): 
   }
 }
 
+type JsonScanFrame =
+  | { kind: "value"; value: unknown; arrayElement: boolean; depth: number }
+  | { kind: "exit"; value: object };
+
 function jsonValueFitsBound(value: unknown, maxBytes: number): boolean {
   try {
-    const seen = new WeakSet<object>();
+    const active = new WeakSet<object>();
     let budget = maxBytes;
-    const stack: unknown[] = [value];
+    let visits = 0;
+    const stack: JsonScanFrame[] = [{ kind: "value", value, arrayElement: false, depth: 0 }];
     while (stack.length > 0) {
-      const current = stack.pop();
-      if (current === null || typeof current === "boolean") budget -= 5;
-      else if (typeof current === "number") budget -= 32;
-      else if (typeof current === "string") budget -= current.length * 6 + 2;
+      const frame = stack.pop()!;
+      if (frame.kind === "exit") {
+        active.delete(frame.value);
+        continue;
+      }
+      visits += 1;
+      if (visits > 1_000_000 || frame.depth > 128) return false;
+      const current = frame.value;
+      if (current === null) budget -= 4;
+      else if (typeof current === "boolean") budget -= current ? 4 : 5;
+      else if (typeof current === "number") budget -= Number.isFinite(current)
+        ? (Object.is(current, -0) ? 1 : String(current).length)
+        : 4;
+      else if (typeof current === "string") {
+        const stringBytes = boundedJsonStringBytes(current, budget);
+        if (stringBytes === undefined) return false;
+        budget -= stringBytes;
+      } else if (typeof current === "undefined" || typeof current === "function" || typeof current === "symbol") {
+        if (!frame.arrayElement) return false;
+        budget -= 4;
+      } else if (typeof current === "bigint") return false;
       else if (Array.isArray(current)) {
-        if (seen.has(current)) return false;
-        seen.add(current);
-        budget -= current.length + 2;
-        for (let index = current.length - 1; index >= 0; index -= 1) stack.push(current[index]);
+        if (active.has(current) || typeof (current as { toJSON?: unknown }).toJSON === "function") return false;
+        active.add(current);
+        budget -= Math.max(0, current.length - 1) + 2;
+        if (budget < 0) return false;
+        stack.push({ kind: "exit", value: current });
+        for (let index = current.length - 1; index >= 0; index -= 1) {
+          stack.push({ kind: "value", value: current[index], arrayElement: true, depth: frame.depth + 1 });
+        }
       } else if (isJsonObject(current)) {
-        if (seen.has(current)) return false;
-        seen.add(current);
-        const entries = Object.entries(current);
-        budget -= entries.length + 2;
+        const prototype = Object.getPrototypeOf(current);
+        if (
+          active.has(current) ||
+          (prototype !== Object.prototype && prototype !== null) ||
+          typeof (current as { toJSON?: unknown }).toJSON === "function"
+        ) return false;
+        active.add(current);
+        const rawEntries = Object.entries(current);
+        if (rawEntries.some(([, child]) => typeof child === "function" || typeof child === "symbol")) return false;
+        const entries = rawEntries.filter(([, child]) => typeof child !== "undefined");
+        budget -= Math.max(0, entries.length - 1) + 2;
         for (const [key, child] of entries) {
-          budget -= key.length * 6 + 3;
-          if (typeof child === "undefined" || typeof child === "function" || typeof child === "symbol" || typeof child === "bigint") return false;
-          stack.push(child);
+          const keyBytes = boundedJsonStringBytes(key, budget);
+          if (keyBytes === undefined) return false;
+          budget -= keyBytes + 1;
+        }
+        if (budget < 0) return false;
+        stack.push({ kind: "exit", value: current });
+        for (let index = entries.length - 1; index >= 0; index -= 1) {
+          stack.push({ kind: "value", value: entries[index]![1], arrayElement: false, depth: frame.depth + 1 });
         }
       } else return false;
       if (budget < 0) return false;
@@ -1232,6 +1303,32 @@ function jsonValueFitsBound(value: unknown, maxBytes: number): boolean {
   } catch {
     return false;
   }
+}
+
+function boundedJsonStringBytes(value: string, maxBytes: number): number | undefined {
+  let bytes = 2;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code === 0x22 || code === 0x5c || code === 0x08 || code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d) {
+      bytes += 2;
+    } else if (code < 0x20 || (code >= 0xd800 && code <= 0xdfff)) {
+      const next = value.charCodeAt(index + 1);
+      if (code >= 0xd800 && code <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        index += 1;
+      } else {
+        bytes += 6;
+      }
+    } else if (code <= 0x7f) {
+      bytes += 1;
+    } else if (code <= 0x7ff) {
+      bytes += 2;
+    } else {
+      bytes += 3;
+    }
+    if (bytes > maxBytes) return undefined;
+  }
+  return bytes;
 }
 
 function tryStringifyBounded(value: unknown): string | undefined {

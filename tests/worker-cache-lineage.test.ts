@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { zstdDecompressSync } from "node:zlib";
@@ -1238,6 +1238,43 @@ test("lineage summaries remain cheap, bounded, and non-throwing", () => {
   }
 });
 
+test("large ASCII parent payloads use their encoded size rather than a worst-case expansion", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-large-ascii-"));
+  try {
+    const payload = parentPayload();
+    payload.input = [{
+      role: "user",
+      content: [{ type: "input_text", text: "x".repeat(2 * 1024 * 1024) }]
+    }];
+    const record = captureAndPrepare(root, false, payload);
+    assert.equal(record.mode, "eligible");
+    assert.ok(statSync(record.snapshotFile).size < WORKER_CACHE_LINEAGE_MAX_BYTES);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("JSON-compatible shared references and omitted values remain eligible", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-json-semantics-"));
+  try {
+    const payload = parentPayload() as Record<string, unknown>;
+    const shared = { nested: "shared" };
+    payload.first = shared;
+    payload.second = shared;
+    payload.omitted = undefined;
+    const record = captureAndPrepare(root, false, payload);
+    assert.equal(record.mode, "eligible");
+    const snapshot = JSON.parse(readFileSync(record.snapshotFile, "utf8")) as {
+      data: { payload: Record<string, unknown> };
+    };
+    assert.deepEqual(snapshot.data.payload.first, shared);
+    assert.deepEqual(snapshot.data.payload.second, shared);
+    assert.equal(Object.hasOwn(snapshot.data.payload, "omitted"), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("oversized parent payloads skip capture without throwing or persisting request artifacts", () => {
   const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-oversized-"));
   try {
@@ -1275,7 +1312,7 @@ test("oversized parent payloads skip capture without throwing or persisting requ
     assert.deepEqual(record, {
       version: 1,
       mode: "fresh",
-      reason: "No validated parent Codex request capture is available."
+      reason: "Parent Codex request payload is not bounded JSON within the snapshot limit."
     });
     assert.equal(existsSync(path.join(root, ".cache-lineage")), false);
   } finally {
