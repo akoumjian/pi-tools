@@ -1074,7 +1074,8 @@ function writeLineageSummary(
       ...(reason ? { reason: truncateUtf8(reason, 512) } : {})
     });
   } catch {
-    // Summary state is observational. Authoritative launch/adoption files remain strict.
+    // Never leave stale observational state after an authoritative transition.
+    try { rmSync(record.summaryFile, { force: true }); } catch {}
   }
 }
 
