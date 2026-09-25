@@ -6,6 +6,7 @@ import { isAsyncJobProcessAlive } from "../_shared/async-job.js";
 import { isWorkerId } from "../_shared/worker-id.js";
 import type { CompletionDelivery } from "../_shared/completion-delivery.js";
 import type { WorkerContainerReference } from "../_shared/worker-container.js";
+import { validateWorkerCacheLineageRecord, type WorkerCacheLineageRecord } from "./cache-lineage.js";
 import { isRepositoryInventorySummary, type InitialRepositoryPin, type RepositoryInventorySummary } from "./repositories.js";
 
 export const WORKER_RECORD_VERSION = 1;
@@ -125,6 +126,7 @@ export type WorkerRecord = {
   route: WorkerRoute;
   initialRepositories?: InitialRepositoryPin[];
   integration?: WorkerIntegrationRecord;
+  cacheLineage?: WorkerCacheLineageRecord;
   status: "queued" | "running" | "handed_off" | "failed" | "cancelled";
   container?: WorkerContainerReference;
   activeRun?: {
@@ -385,11 +387,24 @@ function assertValidWorkerRecord(value: unknown, target: string): asserts value 
     !value.route ||
     !validInitialRepositories(value.initialRepositories) ||
     !validIntegrationRecord(value.integration) ||
+    !validWorkerCacheLineageRecord(value.cacheLineage, target) ||
     !validRepositoryInventorySummary(isRecord(value.lastRun) ? value.lastRun.repositoryInventory : undefined, target, isRecord(value.lastRun) ? value.lastRun.runId : undefined) ||
     (isRecord(value.lastRun) && value.lastRun.repositoryError !== undefined && (typeof value.lastRun.repositoryError !== "string" || value.lastRun.repositoryError.length > 512))
   ) {
     throw new Error(`Invalid worker record: ${target}`);
   }
+}
+
+function validWorkerCacheLineageRecord(value: unknown, recordFile: string): boolean {
+  if (value === undefined) return true;
+  if (!validateWorkerCacheLineageRecord(value)) return false;
+  if (value.mode === "fresh") return true;
+  const stateDir = path.dirname(recordFile);
+  return value.snapshotFile === path.join(stateDir, "cache-lineage.json") &&
+    value.adoptionFile === path.join(stateDir, "cache-lineage-adopted.json") &&
+    value.fallbackFile === path.join(stateDir, "cache-lineage-fallback.json") &&
+    value.retirementFile === path.join(stateDir, "cache-lineage-retired.json") &&
+    value.summaryFile === path.join(stateDir, "cache-lineage-summary.json");
 }
 
 function validIntegrationRecord(value: unknown): boolean {

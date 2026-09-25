@@ -8,6 +8,7 @@ import { resolveExecutable } from "../_shared/executable.js";
 import { assertSubagentRouteAllowed } from "../_shared/model-spec.js";
 import { managedWorkerRoleSkillPath, type ManagedWorkerRoleSkill } from "../_shared/role-skills.js";
 import type { WorkerContainerReference } from "../_shared/worker-container.js";
+import { MANAGED_WORKER_TOOL_NAMES, type WorkerCacheLineageRecord } from "./cache-lineage.js";
 import type { WorkerIntegrationRecord, WorkerRecord } from "./state.js";
 
 export type WorkerBeadsRoute = {
@@ -34,6 +35,7 @@ export type WorkerHostConfig = {
   taskIds: string[];
   roleSkill: Extract<ManagedWorkerRoleSkill, "implementation" | "integration">;
   integration?: WorkerIntegrationRecord;
+  cacheLineage?: WorkerCacheLineageRecord;
   resultFile: string;
   settledFile: string;
   processFile: string;
@@ -121,6 +123,7 @@ export function launchWorkerHost(
     taskIds: [...input.record.taskIds],
     roleSkill: input.record.integration ? "integration" : "implementation",
     integration: input.record.integration,
+    cacheLineage: input.record.cacheLineage,
     resultFile: input.resultFile,
     settledFile: path.join(input.runDir, "settled.json"),
     processFile: input.processFile,
@@ -170,6 +173,7 @@ export function launchWorkerHost(
       ...(config.parentContextSnapshot ? { PI_WORKER_PARENT_CONTEXT_SNAPSHOT: config.parentContextSnapshot } : {}),
       PI_WORKER_TASK_IDS: JSON.stringify(input.record.taskIds),
       ...(input.record.integration ? { PI_WORKER_INTEGRATION: JSON.stringify(input.record.integration) } : {}),
+      ...(input.record.cacheLineage ? { PI_WORKER_CACHE_LINEAGE: JSON.stringify(input.record.cacheLineage) } : {}),
       PI_WORKER_BD_PATH: config.bdPath,
       PI_WORKER_BEADS_ROUTE: JSON.stringify(config.beadsRoute),
       ...shellEnvironment
@@ -225,7 +229,7 @@ export function buildWorkerRpcArgs(config: WorkerHostConfig): string[] {
     "--no-themes",
     "--no-extensions",
     "--no-builtin-tools",
-    "--tools", "worker_handoff,worker_task_read,worker_task_update,shell_start,shell_status,shell_read,shell_cancel",
+    "--tools", MANAGED_WORKER_TOOL_NAMES.join(","),
     ...config.extensionPaths.flatMap((extensionPath) => ["-e", extensionPath])
   ];
 }

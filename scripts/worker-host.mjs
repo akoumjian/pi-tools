@@ -43,6 +43,7 @@ const client = new RpcClient({
     ...(config.parentContextSnapshot ? { PI_WORKER_PARENT_CONTEXT_SNAPSHOT: config.parentContextSnapshot } : {}),
     PI_WORKER_TASK_IDS: JSON.stringify(config.taskIds),
     ...(config.integration ? { PI_WORKER_INTEGRATION: JSON.stringify(config.integration) } : {}),
+    ...(config.cacheLineage ? { PI_WORKER_CACHE_LINEAGE: JSON.stringify(config.cacheLineage) } : {}),
     PI_WORKER_BD_PATH: config.bdPath,
     PI_WORKER_BEADS_ROUTE: JSON.stringify(config.beadsRoute),
     GIT_OPTIONAL_LOCKS: "0",

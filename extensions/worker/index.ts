@@ -46,6 +46,11 @@ import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/
 import { managedWorkerRoleSkillText } from "../_shared/role-skills.js";
 import { cancelPersistedAsyncShellJobsForOwner, handleAsyncShellViewerCommand, type JobMeta, type ManagedAsyncJobHandle } from "../async-shell/index.js";
 import {
+  prepareWorkerCacheLineage,
+  registerParentCacheLineageCapture,
+  summarizeWorkerCacheLineage
+} from "./cache-lineage.js";
+import {
   defaultWorkerFoldsRoot,
   prepareRepositoryChangeSet,
   readPreparedWorkerFold,
@@ -230,6 +235,7 @@ export type WorkerRunReceipt = {
   thinkingLevel: string;
   completionDelivery: "steer" | "followUp";
   state: "queued" | "running";
+  cacheLineage?: { mode: "eligible" | "adopted" | "fresh" | "retired" | "failed" | "unavailable"; reason?: string };
 };
 
 type WorkerRunDetails = { runs: WorkerRunReceipt[] };
@@ -269,6 +275,7 @@ type WorkerControlSummary = {
   workspaceRoot: string;
   taskIds: string[];
   route: WorkerRoute;
+  cacheLineage?: { mode: "eligible" | "adopted" | "fresh" | "retired" | "failed" | "unavailable"; reason?: string };
   integration?: { phase: "analysis" | "resolution"; method: "merge" | "squash"; preparedId: string; manifestSha256: string; candidateId: string; sourceCandidateIds: string[]; workspaceRepo: string; targetRepo: string; targetRef: string; targetExpectedCommit: string; candidateHeadCommit: string; contextSha256: string; analysisRunId: string; decisionsSha256?: string; resolutionRunId?: string };
   container?: { name: string; containerId?: string; runId: string };
   activeRun?: {
@@ -310,6 +317,7 @@ type WorkerControlDetails =
       workspaceRoot: string;
       taskIds: string[];
       route: WorkerRoute;
+      cacheLineage?: WorkerControlSummary["cacheLineage"];
       integration?: WorkerControlSummary["integration"];
       resultFile?: string;
       stdoutLog?: string;
@@ -415,6 +423,7 @@ export function registerWorkerExtension(
 ): void {
   const defaults = defaultDependencies();
   const dependencies: WorkerExtensionDependencies = { ...defaults, ...overrides };
+  registerParentCacheLineageCapture(api, dependencies.roots.stateRoot, dependencies.now);
   if (overrides.roots && !overrides.foldsRoot) dependencies.foldsRoot = defaultWorkerFoldsRoot(overrides.roots.stateRoot);
   if (overrides.launch && !overrides.planContainer) dependencies.planContainer = undefined;
   const pending = new Map<string, PendingWorkerRun>();
@@ -619,6 +628,7 @@ export function registerWorkerExtension(
             workspaceRoot: result.record.workspaceRoot,
             taskIds: [...result.record.taskIds],
             route: { ...result.record.route },
+            cacheLineage: cacheLineageSummary(result.record),
             integration: integrationSummary(result.record.integration),
             resultFile: lastRun.resultFile,
             stdoutLog: lastRun.stdoutLog,
@@ -816,13 +826,13 @@ export function registerWorkerExtension(
   api.registerTool(defineTool({
     name: "worker_run",
     label: "Worker Run",
-    description: "Start one or more durable engineering workers or resume exact existing workers. New workers use the configured worker-settings.json default route unless the caller supplies route, receive stable worker/run/job/session/workspace/task identities immediately, then fork the completed parent session after the current turn is durable. Resume always reuses the exact recorded worker session, workspace, provider, model, and thinking route. Worker processes run asynchronously through the shared async-shell job machinery and return typed semantic handoffs when settled.",
+    description: "Start one or more durable engineering workers or resume exact existing workers. New workers use the configured worker-settings.json default route unless the caller supplies route, receive stable worker/run/job/session/workspace/task identities immediately, then fork the completed parent session after the current turn is durable. Eligible exact OpenAI Codex launches preserve a validated parent cache prefix and cache-affinity session-id while retaining distinct worker identity and authority; other launches truthfully use the fresh-worker path. Resume always reuses the exact recorded worker session, workspace, provider, model, and thinking route. Worker processes run asynchronously through the shared async-shell job machinery and return typed semantic handoffs when settled.",
     promptSnippet: "Start or resume durable context-rich workers with runs:[...]; returns stable queued receipts immediately and typed asynchronous completion handoffs later.",
     promptGuidelines: [
       "worker_run use: Use worker_run for substantive engineering that benefits from an independent durable agent session and private workspace; use kind=new with assigned Beads and kind=resume for the exact same worker after feedback or a checkpoint. New workers use the worker-settings.json default route unless route explicitly overrides it.",
       inputJsonSchemaGuideline("worker_run", WorkerRunParams),
       outputJsonSchemaGuideline("worker_run", RetainedToolOutputSchemas.worker_run),
-      "worker_run constraints: New, explicit, and persisted resume routes reject max thinking and every Claude Fable model; legacy records remain unchanged when resume fails. The parent owns grounding, task acceptance, integration, and promotion. A new worker forks the completed current parent turn; a resume cannot change session/workspace/provider/model. Receipts are immediate, process exit is not semantic completion, and cancellation must settle all shell jobs owned by the worker. Only result content is provider-visible; details are internal."
+      "worker_run constraints: New, explicit, and persisted resume routes reject max thinking and every Claude Fable model; legacy records remain unchanged when resume fails. Cache-lineage adoption is limited to a fresh exact openai-codex-responses parent capture with matching provider/model/thinking, verified prefix and schemas, append-only additional_tools, provider allowed_tools, and a runtime tool allowlist; unsupported or pre-adoption-unprovable cases remain fresh workers, while drift after adoption fails closed. The parent owns grounding, task acceptance, integration, and promotion. A new worker forks the completed current parent turn; a resume cannot change session/workspace/provider/model. Receipts are immediate, process exit is not semantic completion, and cancellation must settle all shell jobs owned by the worker. Only result content is provider-visible; details are internal."
     ],
     parameters: WorkerRunParams,
     renderCall(args, theme) {
@@ -1617,6 +1627,16 @@ function prepareNewWorker(
       analysisSnapshot: provisioned.snapshot
     };
     }
+    const cacheLineage = integration
+      ? { version: 1 as const, mode: "fresh" as const, reason: "Integration workers are outside the Codex cache-lineage proof scope." }
+      : prepareWorkerCacheLineage({
+          stateRoot: dependencies.roots.stateRoot,
+          workerStateDir: paths.stateDir,
+          parentSessionFile: plan.parentSessionFile,
+          parentSessionId: context.sessionManager.getSessionId(),
+          route: plan.route,
+          now
+        });
     const record: WorkerRecord = {
       version: WORKER_RECORD_VERSION,
       workerId,
@@ -1629,6 +1649,7 @@ function prepareNewWorker(
         ? dependencies.pinRepositories(plan.input.initialRepos, path.join(paths.stateDir, "repository-inspection"))
         : undefined,
       integration,
+      cacheLineage,
       status: "queued",
       activeRun: {
         runId,
@@ -3246,6 +3267,7 @@ function receipt(record: WorkerRecord): WorkerRunReceipt {
     provider: record.route.provider,
     model: record.route.model,
     thinkingLevel: record.route.thinkingLevel,
+    cacheLineage: cacheLineageSummary(record),
     completionDelivery: resolveCompletionDelivery(record.activeRun.completionDelivery),
     state: record.activeRun.status
   };
@@ -3260,6 +3282,9 @@ export function buildNewWorkerPrompt(
     `You are managed worker ${record.workerId} in workspace ${record.workspaceRoot}.`,
     `Assigned Beads: ${record.taskIds.join(", ")}.`,
     "The parent session was forked into this exact worker session. Work only on the assigned scope.",
+    record.cacheLineage?.mode === "eligible"
+      ? `Trusted cache-lineage initial assignment marker: ${record.cacheLineage.marker}. Preserve this exact marker in this initial assignment; do not repeat it.`
+      : undefined,
     `Trusted implementation role skill:
 ${managedWorkerRoleSkillText("implementation")}`,
     WORKER_OPERATIONAL_GUIDANCE,
@@ -3646,9 +3671,14 @@ function formatWorkerRunReceipt(value: WorkerRunReceipt): string {
     `workspace_root: ${value.workspaceRoot}`,
     `task_ids: ${value.taskIds.join(", ")}`,
     `route: ${value.provider}/${value.model}:${value.thinkingLevel}`,
+    value.cacheLineage ? `cache_lineage: ${value.cacheLineage.mode}${value.cacheLineage.reason ? ` · ${value.cacheLineage.reason}` : ""}` : undefined,
     `completion_delivery: ${value.completionDelivery}`,
     `state: ${value.state}`
-  ].join("\n");
+  ].filter((line): line is string => line !== undefined).join("\n");
+}
+
+function cacheLineageSummary(record: WorkerRecord): { mode: "eligible" | "adopted" | "fresh" | "retired" | "failed" | "unavailable"; reason?: string } | undefined {
+  return summarizeWorkerCacheLineage(record.cacheLineage);
 }
 
 function integrationSummary(integration: WorkerIntegrationRecord | undefined): WorkerControlSummary["integration"] {
@@ -3680,6 +3710,7 @@ function workerControlSummary(record: WorkerRecord): WorkerControlSummary {
     workspaceRoot: record.workspaceRoot,
     taskIds: [...record.taskIds],
     route: { ...record.route },
+    cacheLineage: cacheLineageSummary(record),
     integration: integrationSummary(record.integration),
     container: record.container ? {
       name: record.container.name,
@@ -3730,6 +3761,7 @@ function formatWorkerControlResult(record: WorkerRecord, handoff: AcceptedWorker
     `delivery: ${lastRun.delivery ?? "not required"} · ${resolveCompletionDelivery(lastRun.completionDelivery)}`,
     `tasks: ${record.taskIds.join(", ")}`,
     `route: ${record.route.provider}/${record.route.model}:${record.route.thinkingLevel}`,
+    formatCacheLineageResult(record),
     record.integration ? `integration: ${JSON.stringify(integrationSummary(record.integration))}` : undefined,
     handoff ? `handoff: ${handoff.handoff.state} — ${handoff.handoff.summary}` : undefined,
     handoff ? `handoff_json: ${JSON.stringify(handoff.handoff)}` : undefined,
@@ -3808,12 +3840,23 @@ function formatWorkerList(
   ].filter((line): line is string => line !== undefined).join("\n");
 }
 
+function formatCacheLineageResult(record: WorkerRecord): string | undefined {
+  const summary = cacheLineageSummary(record);
+  return summary ? `cache_lineage: ${summary.mode}${summary.reason ? ` · ${summary.reason}` : ""}` : undefined;
+}
+
+function formatCacheLineageStatus(record: WorkerRecord): string | undefined {
+  const summary = cacheLineageSummary(record);
+  return summary ? `Cache lineage: ${summary.mode}${summary.reason ? ` · ${summary.reason}` : ""}` : undefined;
+}
+
 function formatWorkerRecord(record: WorkerRecord): string {
   return [
     `Worker ${record.workerId}: ${record.status}`,
     `Session: ${record.sessionId}${record.sessionFile ? ` · ${record.sessionFile}` : " · fork pending"}`,
     `Workspace: ${record.workspaceRoot}`,
     `Route: ${formatModelName({ provider: record.route.provider, id: record.route.model })}:${record.route.thinkingLevel}`,
+    formatCacheLineageStatus(record),
     record.integration ? `Integration: ${JSON.stringify(integrationSummary(record.integration))}` : undefined,
     `Tasks: ${record.taskIds.join(", ")}`,
     record.container ? `Container: ${record.container.name} · ${record.container.containerId?.slice(0, 12) ?? "planned"} · created for ${record.container.runId}` : "Container: not created",
