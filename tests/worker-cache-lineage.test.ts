@@ -119,10 +119,12 @@ function workerPayload(options: {
   };
 }
 
-function captureAndPrepare(
+function captureRecord(
   root: string,
   exposeSessionHeader = true,
-  capturedPayload: Record<string, unknown> = parentPayload()
+  capturedPayload: Record<string, unknown> = parentPayload(),
+  context: ExtensionContext = codexContext(),
+  afterCapture?: () => void
 ) {
   const handlers = new Map<string, Array<(event: any, context: ExtensionContext) => unknown>>();
   const api = {
@@ -133,7 +135,6 @@ function captureAndPrepare(
     }
   } as unknown as ExtensionAPI;
   registerParentCacheLineageCapture(api, root, () => new Date("2026-09-24T12:00:00.000Z"));
-  const context = codexContext();
   const headers: Record<string, string> = {
     Authorization: "secret-never-persisted",
     "x-client-request-id": "parent-request",
@@ -141,6 +142,7 @@ function captureAndPrepare(
   };
   handlers.get("before_provider_headers")![0]!({ headers }, context);
   handlers.get("before_provider_request")![0]!({ payload: capturedPayload }, context);
+  afterCapture?.();
   const workerStateDir = path.join(root, "worker-one");
   const record = prepareWorkerCacheLineage({
     stateRoot: root,
@@ -151,8 +153,36 @@ function captureAndPrepare(
     marker: forkMarker,
     now: new Date("2026-09-24T12:00:01.000Z")
   });
+  return record;
+}
+
+function captureAndPrepare(
+  root: string,
+  exposeSessionHeader = true,
+  capturedPayload: Record<string, unknown> = parentPayload()
+) {
+  const record = captureRecord(root, exposeSessionHeader, capturedPayload);
   assert.equal(record.mode, "eligible");
   return record;
+}
+
+function successfulAssistantMessage(stopReason = "stop"): Record<string, unknown> {
+  return {
+    role: "assistant",
+    api: "openai-codex-responses",
+    provider: "openai-codex",
+    model: route.model,
+    stopReason,
+    content: []
+  };
+}
+
+function completeSuccessfulResponse(
+  runtime: ReturnType<typeof createWorkerCacheLineageRuntime>,
+  context: ExtensionContext = codexContext()
+): void {
+  runtime.observeProviderResponse(200);
+  runtime.observeAssistantMessage(successfulAssistantMessage(), context);
 }
 
 function sdkTool(name: string): Tool {
@@ -270,15 +300,16 @@ test("Codex lineage capture persists only the payload and effective cache-affini
   const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-capture-"));
   try {
     const capturedPayload = parentPayload();
-    const record = captureAndPrepare(root, true, capturedPayload);
+    const record = captureRecord(root, true, capturedPayload, codexContext(), () => {
+      capturedPayload.instructions = "mutation after capture hook";
+    });
     assert.equal(record.mode, "eligible");
-    capturedPayload.instructions = "mutation after launch snapshot";
     const snapshot = readFileSync(record.snapshotFile, "utf8");
     assert.match(snapshot, /parent-cache-affinity/);
     assert.doesNotMatch(snapshot, /secret-never-persisted/);
     assert.doesNotMatch(snapshot, /parent-request/);
     assert.doesNotMatch(snapshot, /Authorization/);
-    assert.doesNotMatch(snapshot, /mutation after launch snapshot/);
+    assert.doesNotMatch(snapshot, /mutation after capture hook/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -296,7 +327,7 @@ test("Codex lineage derives the provider-final session-id when Pi's pre-provider
       runtime.transformHeaders(initialHeaders, codexContext());
       assert.equal(initialHeaders["session-id"], "child-local", "header hook precedes provisional payload adoption");
       runtime.transformPayload(workerPayload(), codexContext());
-      runtime.observeProviderResponse(200);
+      completeSuccessfulResponse(runtime);
       const adoptedHeaders: Record<string, string> = { "session-id": "child-next" };
       runtime.transformHeaders(adoptedHeaders, codexContext());
       assert.equal(adoptedHeaders["session-id"], parentSessionId);
@@ -338,7 +369,7 @@ test("Codex lineage restores the exact parent prefix and appends only managed-wo
     assert.equal(runtime.status().mode, "eligible");
     assert.equal(record.mode, "eligible");
     assert.equal(existsSync(record.adoptionFile), false);
-    runtime.observeProviderResponse(200);
+    completeSuccessfulResponse(runtime);
     assert.equal(runtime.status().mode, "adopted");
     assert.equal(existsSync(record.adoptionFile), true);
     const adoption = JSON.parse(readFileSync(record.adoptionFile, "utf8")) as Record<string, unknown>;
@@ -691,7 +722,7 @@ test("Pi 0.84.4 dispatches header, payload, final transport, and acceptance hook
   }
 });
 
-test("Codex lineage falls back only before adoption, then fails closed on drift", () => {
+test("Codex lineage falls back only before adoption, then throws persistently on fatal drift", async () => {
   const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-fallback-"));
   let freshRuntime: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
   let adoptedRuntime: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
@@ -718,12 +749,27 @@ test("Codex lineage falls back only before adoption, then fails closed on drift"
     const secondRecord = captureAndPrepare(root);
     adoptedRuntime = createWorkerCacheLineageRuntime(secondRecord);
     adoptedRuntime.transformPayload(workerPayload(), codexContext());
-    adoptedRuntime.observeProviderResponse(200);
+    completeSuccessfulResponse(adoptedRuntime);
     const drifted = codexContext({
       model: { provider: "openai-codex", id: "other-model", api: "openai-codex-responses", baseUrl: "https://chatgpt.com/backend-api" }
     });
-    const blocked = adoptedRuntime.transformPayload(workerPayload(), drifted) as Record<string, unknown>;
-    assert.match(String(blocked.model), /^pi-cache-lineage-blocked-/);
+    const fatal = /Managed-worker Codex cache lineage failed closed: Worker provider\/model\/API\/thinking route drifted from the persisted Codex lineage\./;
+    assert.throws(() => adoptedRuntime!.transformPayload(workerPayload(), drifted), fatal);
+    assert.deepEqual(adoptedRuntime.status(), {
+      mode: "failed",
+      reason: "Worker provider/model/API/thinking route drifted from the persisted Codex lineage."
+    });
+    assert.deepEqual(summarizeWorkerCacheLineage(secondRecord), {
+      mode: "failed",
+      reason: "Worker provider/model/API/thinking route drifted from the persisted Codex lineage."
+    });
+    assert.throws(() => adoptedRuntime!.transformPayload(workerPayload(), codexContext()), fatal);
+    assert.throws(() => adoptedRuntime!.transformHeaders({}, codexContext()), fatal);
+    await assert.rejects(
+      () => globalThis.fetch("https://chatgpt.com/backend-api/codex/responses"),
+      fatal
+    );
+    assert.throws(() => adoptedRuntime!.retireAfterCompaction("manual"), fatal);
     assert.equal(adoptedRuntime.status().mode, "failed");
   } finally {
     freshRuntime?.restoreNetwork();
@@ -743,7 +789,7 @@ test("Codex lineage strips previous_response_id from every transformed full repl
     const first = runtime.transformPayload(initial, codexContext()) as Record<string, unknown>;
     assert.equal(first.previous_response_id, undefined);
     assert.equal(runtime.status().mode, "eligible");
-    runtime.observeProviderResponse(200);
+    completeSuccessfulResponse(runtime);
     const continuation = workerPayload({ trailing: [
       { role: "assistant", content: [{ type: "output_text", text: "tool-call-only response is valid" }] },
       { role: "user", content: [{ type: "input_text", text: "turn two" }] }
@@ -766,7 +812,7 @@ test("Codex lineage keeps one immutable boundary across turns and persisted resu
     const record = captureAndPrepare(root);
     runtime = createWorkerCacheLineageRuntime(record);
     const first = runtime.transformPayload(workerPayload(), codexContext()) as Record<string, any>;
-    runtime.observeProviderResponse(200);
+    completeSuccessfulResponse(runtime);
     const fixedPrefix = structuredClone(first.input.slice(0, 5));
     assert.deepEqual(fixedPrefix[4], (workerPayload().input as unknown[])[2]);
 
@@ -793,11 +839,13 @@ test("Codex lineage keeps one immutable boundary across turns and persisted resu
     assert.deepEqual(resumedPayload.input.slice(0, 5), fixedPrefix);
     assert.deepEqual(resumedPayload.input.slice(5), resumeTrailing);
 
-    const instructionDrift = resumed.transformPayload(
-      workerPayload({ instructions: `${workerInstructions}\nDRIFT` , trailing: resumeTrailing }),
-      codexContext()
-    ) as Record<string, unknown>;
-    assert.match(String(instructionDrift.model), /^pi-cache-lineage-blocked-/);
+    assert.throws(
+      () => resumed!.transformPayload(
+        workerPayload({ instructions: `${workerInstructions}\nDRIFT` , trailing: resumeTrailing }),
+        codexContext()
+      ),
+      /Managed-worker Codex cache lineage failed closed: Managed-worker system instructions drifted after Codex lineage adoption\./
+    );
     assert.deepEqual(resumed.status(), {
       mode: "failed",
       reason: "Managed-worker system instructions drifted after Codex lineage adoption."
@@ -827,7 +875,7 @@ test("Codex lineage discovers the marker only initially and ignores marker-like 
     const afterRecord = captureAndPrepare(afterRoot);
     after = createWorkerCacheLineageRuntime(afterRecord);
     after.transformPayload(workerPayload(), codexContext());
-    after.observeProviderResponse(200);
+    completeSuccessfulResponse(after);
     const laterMarkerText = `quoted handoff, completion notice, resume instruction, and model output may repeat ${forkMarker}`;
     const transformed = after.transformPayload(workerPayload({ trailing: [
       { role: "assistant", content: [{ type: "output_text", text: laterMarkerText }] },
@@ -872,12 +920,14 @@ test("Codex lineage fails closed when the marked initial assignment changes afte
     const record = captureAndPrepare(root);
     runtime = createWorkerCacheLineageRuntime(record);
     runtime.transformPayload(workerPayload(), codexContext());
-    runtime.observeProviderResponse(200);
+    completeSuccessfulResponse(runtime);
     const drifted = workerPayload();
     const input = drifted.input as Array<Record<string, any>>;
     input[2].content[0].text = `changed initial assignment ${forkMarker}`;
-    const blocked = runtime.transformPayload(drifted, codexContext()) as Record<string, unknown>;
-    assert.match(String(blocked.model), /^pi-cache-lineage-blocked-/);
+    assert.throws(
+      () => runtime!.transformPayload(drifted, codexContext()),
+      /Managed-worker Codex cache lineage failed closed: Managed-worker initial assignment drifted after Codex lineage adoption\./
+    );
     assert.deepEqual(runtime.status(), {
       mode: "failed",
       reason: "Managed-worker initial assignment drifted after Codex lineage adoption."
@@ -895,12 +945,14 @@ test("Codex lineage fails closed when managed-worker schemas drift after adoptio
     const record = captureAndPrepare(root);
     runtime = createWorkerCacheLineageRuntime(record);
     runtime.transformPayload(workerPayload(), codexContext());
-    runtime.observeProviderResponse(200);
+    completeSuccessfulResponse(runtime);
     const drifted = workerPayload();
     const tools = drifted.tools as Array<Record<string, unknown>>;
     tools[0] = { ...tools[0], description: "drifted schema" };
-    const blocked = runtime.transformPayload(drifted, codexContext()) as Record<string, unknown>;
-    assert.match(String(blocked.model), /^pi-cache-lineage-blocked-/);
+    assert.throws(
+      () => runtime!.transformPayload(drifted, codexContext()),
+      /Managed-worker Codex cache lineage failed closed: Managed-worker tool schemas drifted after Codex lineage adoption\./
+    );
     assert.deepEqual(runtime.status(), {
       mode: "failed",
       reason: "Managed-worker tool schemas drifted after Codex lineage adoption."
@@ -918,7 +970,7 @@ test("Codex lineage snapshot and persisted adoption are integrity checked", () =
     const record = captureAndPrepare(root);
     runtime = createWorkerCacheLineageRuntime(record);
     runtime.transformPayload(workerPayload(), codexContext());
-    runtime.observeProviderResponse(200);
+    completeSuccessfulResponse(runtime);
     runtime.restoreNetwork();
     runtime = undefined;
 
@@ -946,6 +998,28 @@ test("unsupported routes truthfully retain the fresh-worker path", () => {
       mode: "fresh",
       reason: "Cache-lineage proof is limited to the openai-codex provider."
     });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("noncanonical Codex base URLs fall back before child runtime construction", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-base-url-"));
+  try {
+    const context = codexContext({
+      model: {
+        provider: "openai-codex",
+        id: route.model,
+        api: "openai-codex-responses",
+        baseUrl: "https://example.invalid/backend-api"
+      }
+    });
+    assert.deepEqual(captureRecord(root, true, parentPayload(), context), {
+      version: 1,
+      mode: "fresh",
+      reason: "The latest parent Codex request uses a noncanonical base URL."
+    });
+    assert.equal(existsSync(path.join(root, "worker-one", "cache-lineage.json")), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1045,6 +1119,71 @@ test("Codex lineage rewrites only final transport cache affinity and preserves r
 });
 
 
+test("fresh fallback closes inherited WebSockets before child-session reuse", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-websocket-reuse-"));
+  const originalWebSocket = globalThis.WebSocket;
+  const sockets: FakeWebSocket[] = [];
+  class FakeWebSocket {
+    static readonly OPEN = 1;
+    static readonly CLOSED = 3;
+    readyState = FakeWebSocket.OPEN;
+    readonly headers: Record<string, string>;
+    constructor(
+      _url: string | URL,
+      options?: { headers?: Record<string, string> }
+    ) {
+      this.headers = options?.headers ?? {};
+      sockets.push(this);
+    }
+    send(): void {}
+    close(): void {
+      this.readyState = FakeWebSocket.CLOSED;
+    }
+  }
+  let runtime: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
+  try {
+    globalThis.WebSocket = FakeWebSocket as unknown as typeof globalThis.WebSocket;
+    const record = captureAndPrepare(root);
+    runtime = createWorkerCacheLineageRuntime(record);
+    runtime.transformPayload(workerPayload(), codexContext());
+    const cached = new globalThis.WebSocket("wss://chatgpt.com/backend-api/codex/responses", {
+      headers: { "session-id": "child-session" }
+    } as unknown as string[]) as unknown as FakeWebSocket;
+    assert.equal(new Headers(cached.headers).get("session-id"), inheritedAffinity);
+
+    runtime.observeProviderResponse(429);
+    assert.equal(cached.readyState, FakeWebSocket.CLOSED, "fallback closes the inherited-handshake socket");
+
+    const unprovenDelta = {
+      previous_response_id: "child-continuation",
+      input: [{ role: "user", content: [{ type: "input_text", text: "delta" }] }]
+    };
+    assert.equal(
+      (runtime.transformPayload(unprovenDelta, codexContext()) as Record<string, unknown>).previous_response_id,
+      "child-continuation",
+      "fresh fallback does not strip an unproven delta continuation"
+    );
+    const childHeaders: Record<string, string> = { "session-id": "child-session" };
+    runtime.transformHeaders(childHeaders, codexContext());
+    assert.equal(childHeaders["session-id"], undefined);
+
+    // Faithfully model Pi's child-session socket cache: a closed inherited
+    // handshake cannot be selected, so the fresh request opens a new socket.
+    const fresh = Number(cached.readyState) === FakeWebSocket.OPEN
+      ? cached
+      : new globalThis.WebSocket("wss://chatgpt.com/backend-api/codex/responses", {
+          headers: { "session-id": "child-session" }
+        } as unknown as string[]) as unknown as FakeWebSocket;
+    assert.notEqual(fresh, cached);
+    assert.equal(new Headers(fresh.headers).get("session-id"), "child-session");
+    assert.equal(sockets.length, 2);
+  } finally {
+    runtime?.restoreNetwork();
+    globalThis.WebSocket = originalWebSocket;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Codex lineage persists pre-adoption route drift as a stable fresh fallback", () => {
   const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-route-fallback-"));
   let runtime: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
@@ -1113,6 +1252,37 @@ test("Codex lineage adopts only after acceptance and rejected first requests rem
   }
 });
 
+test("HTTP success waits for a matching successful assistant completion", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-completion-adoption-"));
+  try {
+    for (const stopReason of ["error", "aborted"] as const) {
+      const caseRoot = path.join(root, stopReason);
+      const record = captureAndPrepare(caseRoot);
+      const runtime = createWorkerCacheLineageRuntime(record);
+      try {
+        runtime.transformPayload(workerPayload(), codexContext());
+        runtime.observeProviderResponse(200);
+        assert.equal(runtime.status().mode, "eligible");
+        assert.equal(existsSync(record.adoptionFile), false);
+        runtime.observeAssistantMessage({ ...successfulAssistantMessage(), model: "other-model" }, codexContext());
+        assert.equal(runtime.status().mode, "eligible", "a mismatched completion cannot adopt lineage");
+        const incomplete = successfulAssistantMessage();
+        delete incomplete.stopReason;
+        runtime.observeAssistantMessage(incomplete, codexContext());
+        assert.equal(runtime.status().mode, "eligible", "an incomplete assistant message cannot adopt lineage");
+        runtime.observeAssistantMessage(successfulAssistantMessage(stopReason), codexContext());
+        assert.equal(runtime.status().mode, "fresh");
+        assert.equal(existsSync(record.adoptionFile), false);
+        assert.equal(existsSync(record.fallbackFile), true);
+      } finally {
+        runtime.restoreNetwork();
+      }
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Codex lineage accepts a tool-call-only first response without an assistant-text heuristic", () => {
   const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-tool-call-adoption-"));
   let runtime: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
@@ -1144,11 +1314,13 @@ test("Codex lineage digests every pre-assignment suffix item", () => {
     runtime = createWorkerCacheLineageRuntime(record);
     const preAssignment = [{ role: "assistant", content: [{ type: "output_text", text: "stable intervening item" }] }];
     runtime.transformPayload(workerPayload({ preAssignment }), codexContext());
-    runtime.observeProviderResponse(200);
-    const blocked = runtime.transformPayload(workerPayload({ preAssignment: [
-      { role: "assistant", content: [{ type: "output_text", text: "drifted intervening item" }] }
-    ] }), codexContext()) as Record<string, unknown>;
-    assert.match(String(blocked.model), /^pi-cache-lineage-blocked-/);
+    completeSuccessfulResponse(runtime);
+    assert.throws(
+      () => runtime!.transformPayload(workerPayload({ preAssignment: [
+        { role: "assistant", content: [{ type: "output_text", text: "drifted intervening item" }] }
+      ] }), codexContext()),
+      /Managed-worker Codex cache lineage failed closed: Managed-worker pre-assignment history drifted after Codex lineage adoption\./
+    );
     assert.deepEqual(runtime.status(), {
       mode: "failed",
       reason: "Managed-worker pre-assignment history drifted after Codex lineage adoption."
@@ -1176,6 +1348,8 @@ test("trusted Pi compaction retires adopted lineage and survives runtime reconst
     } as unknown as ExtensionAPI, runtime);
     handlers.get("before_provider_request")![0]!({ payload: workerPayload() }, codexContext());
     handlers.get("after_provider_response")![0]!({ status: 200 }, codexContext());
+    assert.equal(runtime.status().mode, "eligible", "HTTP success alone does not commit adoption");
+    handlers.get("message_end")![0]!({ message: successfulAssistantMessage() }, codexContext());
     assert.equal(runtime.status().mode, "adopted");
     handlers.get("session_compact")![0]!({ reason: "manual" }, codexContext());
     assert.deepEqual(runtime.status(), {
@@ -1198,7 +1372,29 @@ test("trusted Pi compaction retires adopted lineage and survives runtime reconst
     const transformed = resumed.transformPayload(firstFresh, codexContext()) as Record<string, unknown>;
     assert.equal(transformed.previous_response_id, undefined);
     assert.deepEqual(transformed.input, firstFresh.input, "retirement uses ordinary fresh payloads without inherited boundaries");
+    resumed.observeProviderResponse(500);
+    resumed.observeAssistantMessage(successfulAssistantMessage("error"), codexContext());
+    assert.equal(JSON.parse(readFileSync(record.retirementFile, "utf8")).firstFreshRequestPending, true);
+
+    const abortedRetry = workerPayload();
+    abortedRetry.previous_response_id = "still-inherited";
+    assert.equal(
+      (resumed.transformPayload(abortedRetry, codexContext()) as Record<string, unknown>).previous_response_id,
+      undefined,
+      "a failed HTTP/stream attempt leaves the one-time strip pending"
+    );
     resumed.observeProviderResponse(200);
+    resumed.observeAssistantMessage(successfulAssistantMessage("aborted"), codexContext());
+    assert.equal(JSON.parse(readFileSync(record.retirementFile, "utf8")).firstFreshRequestPending, true);
+
+    const successfulRetry = workerPayload();
+    successfulRetry.previous_response_id = "retry-after-abort";
+    assert.equal(
+      (resumed.transformPayload(successfulRetry, codexContext()) as Record<string, unknown>).previous_response_id,
+      undefined
+    );
+    completeSuccessfulResponse(resumed);
+    assert.equal(JSON.parse(readFileSync(record.retirementFile, "utf8")).firstFreshRequestPending, false);
     resumed.restoreNetwork();
     resumed = createWorkerCacheLineageRuntime(record);
     const normalContinuation = workerPayload();
@@ -1222,7 +1418,7 @@ test("lineage summaries remain cheap, bounded, and non-throwing", () => {
     const record = captureAndPrepare(root);
     runtime = createWorkerCacheLineageRuntime(record);
     runtime.transformPayload(workerPayload(), codexContext());
-    runtime.observeProviderResponse(200);
+    completeSuccessfulResponse(runtime);
     writeFileSync(record.snapshotFile, "corrupt large snapshot that operational summaries must not parse");
     for (let index = 0; index < 100; index += 1) {
       assert.deepEqual(summarizeWorkerCacheLineage(record), { mode: "adopted" });
@@ -1262,6 +1458,9 @@ test("JSON-compatible shared references and omitted values remain eligible", () 
     payload.first = shared;
     payload.second = shared;
     payload.omitted = undefined;
+    payload.omittedFunction = () => "not serialized";
+    payload.omittedSymbol = Symbol("not serialized");
+    payload.arraySemantics = [undefined, () => "not serialized", Symbol("not serialized"), Number.NaN, Infinity, -0];
     const record = captureAndPrepare(root, false, payload);
     assert.equal(record.mode, "eligible");
     const snapshot = JSON.parse(readFileSync(record.snapshotFile, "utf8")) as {
@@ -1270,6 +1469,95 @@ test("JSON-compatible shared references and omitted values remain eligible", () 
     assert.deepEqual(snapshot.data.payload.first, shared);
     assert.deepEqual(snapshot.data.payload.second, shared);
     assert.equal(Object.hasOwn(snapshot.data.payload, "omitted"), false);
+    assert.equal(Object.hasOwn(snapshot.data.payload, "omittedFunction"), false);
+    assert.equal(Object.hasOwn(snapshot.data.payload, "omittedSymbol"), false);
+    assert.deepEqual(snapshot.data.payload.arraySemantics, [null, null, null, null, null, 0]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("capture eligibility accounts for the bounded persisted snapshot envelope", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-envelope-bound-"));
+  try {
+    const payload = parentPayload();
+    const baseBytes = Buffer.byteLength(JSON.stringify({ ...payload, padding: "" }), "utf8");
+    payload.padding = "x".repeat(WORKER_CACHE_LINEAGE_MAX_BYTES - baseBytes - 64);
+    assert.deepEqual(captureRecord(root, false, payload), {
+      version: 1,
+      mode: "fresh",
+      reason: "Parent Codex request snapshot exceeds the bounded size limit."
+    });
+    assert.equal(existsSync(path.join(root, "worker-one", "cache-lineage.json")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("capture freezes payloads and rejects accessors, toJSON, proxies, and exotic objects", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-live-shapes-"));
+  try {
+    let getterCalls = 0;
+    const accessorPayload = parentPayload();
+    Object.defineProperty(accessorPayload, "unstable", {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        throw new Error("capture must not invoke getters");
+      }
+    });
+    assert.deepEqual(captureRecord(path.join(root, "accessor"), false, accessorPayload), {
+      version: 1,
+      mode: "fresh",
+      reason: "Parent Codex request payload is not bounded JSON within the snapshot limit."
+    });
+    assert.equal(getterCalls, 0);
+
+    const toJsonPayload = parentPayload();
+    toJsonPayload.toJSON = () => parentPayload();
+    assert.equal(captureRecord(path.join(root, "to-json"), false, toJsonPayload).mode, "fresh");
+
+    const proxyPayload = new Proxy(parentPayload(), {
+      ownKeys() {
+        throw new Error("capture must not traverse proxies");
+      }
+    });
+    assert.doesNotThrow(() => captureRecord(path.join(root, "proxy"), false, proxyPayload));
+    assert.equal(captureRecord(path.join(root, "proxy-result"), false, proxyPayload).mode, "fresh");
+
+    const exoticPayload = parentPayload();
+    exoticPayload.exotic = new Date(0);
+    assert.equal(captureRecord(path.join(root, "exotic"), false, exoticPayload).mode, "fresh");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("capture validation rejects sparse and deeply nested payloads without unbounded traversal", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-structural-bounds-"));
+  try {
+    const sparse = parentPayload();
+    sparse.input = new Array(Math.floor(WORKER_CACHE_LINEAGE_MAX_BYTES / 2) + 1);
+    assert.doesNotThrow(() => captureRecord(path.join(root, "sparse"), false, sparse));
+    assert.deepEqual(captureRecord(path.join(root, "sparse-result"), false, sparse), {
+      version: 1,
+      mode: "fresh",
+      reason: "Parent Codex request payload is not bounded JSON within the snapshot limit."
+    });
+
+    const deep = parentPayload();
+    let nested: Record<string, unknown> = {};
+    deep.deep = nested;
+    for (let depth = 0; depth < 130; depth += 1) {
+      const child: Record<string, unknown> = {};
+      nested.child = child;
+      nested = child;
+    }
+    assert.deepEqual(captureRecord(path.join(root, "deep"), false, deep), {
+      version: 1,
+      mode: "fresh",
+      reason: "Parent Codex request payload is not bounded JSON within the snapshot limit."
+    });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

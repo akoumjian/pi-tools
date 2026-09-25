@@ -10,11 +10,13 @@ import {
   writeFileSync
 } from "node:fs";
 import path from "node:path";
+import { types as utilTypes } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { WorkerRoute } from "./state.js";
 
 export const CODEX_CACHE_LINEAGE_API = "openai-codex-responses";
 export const CODEX_CACHE_LINEAGE_PROVIDER = "openai-codex";
+const CODEX_CACHE_LINEAGE_BASE_URL = "https://chatgpt.com/backend-api";
 export const WORKER_CACHE_LINEAGE_MAX_BYTES = 8 * 1024 * 1024;
 export const WORKER_CACHE_LINEAGE_MAX_AGE_MS = 5 * 60 * 1000;
 export const WORKER_CACHE_LINEAGE_MAX_INSTRUCTIONS_BYTES = 1024 * 1024;
@@ -36,6 +38,7 @@ const ADOPTION_VERSION = 3;
 const LINEAGE_SUMMARY_VERSION = 1;
 const RETIREMENT_VERSION = 1;
 const CAPTURE_HOLDER_MAX_SESSIONS = 4;
+const CACHE_LINEAGE_FATAL_ERROR_PREFIX = "Managed-worker Codex cache lineage failed closed: ";
 
 type JsonObject = Record<string, unknown>;
 
@@ -162,6 +165,7 @@ export function registerParentCacheLineageCapture(
     const model = context.model;
     if (!sessionFile) return;
     const resolvedSessionFile = path.resolve(sessionFile);
+    holder.pendingHeadersBySessionFile.delete(resolvedSessionFile);
     holder.latestBySessionFile.delete(resolvedSessionFile);
     if (
       !model ||
@@ -171,13 +175,18 @@ export function registerParentCacheLineageCapture(
       setCaptureFailure(holder, resolvedSessionFile, generation, "The latest parent provider request is not eligible Codex Responses traffic.");
       return;
     }
+    const baseUrl = normalizeCodexBaseUrl(model.baseUrl);
+    if (baseUrl !== CODEX_CACHE_LINEAGE_BASE_URL) {
+      setCaptureFailure(holder, resolvedSessionFile, generation, "The latest parent Codex request uses a noncanonical base URL.");
+      return;
+    }
     const candidateCacheAffinitySessionId = clampCodexSessionId(context.sessionManager.getSessionId());
     setCaptureFailure(holder, resolvedSessionFile, generation, "Parent Codex headers were observed, but no matching request payload completed capture.");
     setBoundedCaptureEntry(holder.pendingHeadersBySessionFile, resolvedSessionFile, {
       provider: CODEX_CACHE_LINEAGE_PROVIDER,
       api: CODEX_CACHE_LINEAGE_API,
       model: model.id,
-      baseUrl: normalizeCodexBaseUrl(model.baseUrl),
+      baseUrl,
       thinkingLevel: String(context.thinkingLevel),
       parentSessionFileSha256: sha256(resolvedSessionFile),
       parentSessionIdSha256: sha256(context.sessionManager.getSessionId()),
@@ -193,12 +202,13 @@ export function registerParentCacheLineageCapture(
     const model = context.model;
     if (!sessionFile) return;
     const resolvedSessionFile = path.resolve(sessionFile);
-    if (!model || !isJsonObject(event.payload)) {
+    const pending = holder.pendingHeadersBySessionFile.get(resolvedSessionFile);
+    holder.pendingHeadersBySessionFile.delete(resolvedSessionFile);
+    if (!pending && holder.latestFailureBySessionFile.get(resolvedSessionFile)?.generation === generation) return;
+    if (!model) {
       setCaptureFailure(holder, resolvedSessionFile, generation, "The parent provider request did not expose a JSON Codex payload.");
       return;
     }
-    const pending = holder.pendingHeadersBySessionFile.get(resolvedSessionFile);
-    holder.pendingHeadersBySessionFile.delete(resolvedSessionFile);
     if (
       !pending ||
       pending.provider !== model.provider ||
@@ -212,12 +222,13 @@ export function registerParentCacheLineageCapture(
         : "Parent Codex payload arrived without matching header capture.");
       return;
     }
-    if (!jsonValueFitsBound(event.payload, WORKER_CACHE_LINEAGE_MAX_BYTES)) {
+    const canonicalPayload = canonicalizeBoundedJsonObject(event.payload, WORKER_CACHE_LINEAGE_MAX_BYTES);
+    if (!canonicalPayload) {
       setCaptureFailure(holder, resolvedSessionFile, generation, "Parent Codex request payload is not bounded JSON within the snapshot limit.");
       return;
     }
     const cacheAffinitySessionId = pending.observedCacheAffinitySessionId ?? (
-      event.payload.prompt_cache_key === pending.candidateCacheAffinitySessionId
+      canonicalPayload.value.prompt_cache_key === pending.candidateCacheAffinitySessionId
         ? pending.candidateCacheAffinitySessionId
         : undefined
     );
@@ -235,8 +246,8 @@ export function registerParentCacheLineageCapture(
       parentSessionFileSha256: pending.parentSessionFileSha256,
       parentSessionIdSha256: pending.parentSessionIdSha256,
       capturedAt: pending.capturedAt,
-      payload: event.payload,
-      payloadSha256: "",
+      payload: canonicalPayload.value,
+      payloadSha256: sha256(canonicalPayload.json),
       cacheAffinitySessionId
     };
     setBoundedCaptureEntry(holder.latestBySessionFile, resolvedSessionFile, {
@@ -285,18 +296,26 @@ export function prepareWorkerCacheLineage(input: {
   ) {
     return freshLineage("Parent Codex request capture route does not exactly match the worker route.");
   }
+  if (heldCapture.data.baseUrl !== CODEX_CACHE_LINEAGE_BASE_URL) {
+    return freshLineage("The latest parent Codex request uses a noncanonical base URL.");
+  }
+  if (!jsonValueFitsBound(heldCapture.data.payload, WORKER_CACHE_LINEAGE_MAX_BYTES)) {
+    return freshLineage("The latest parent Codex request is no longer bounded JSON within the snapshot limit.");
+  }
   const payloadJson = tryStringifyBounded(heldCapture.data.payload);
   if (payloadJson === undefined) return freshLineage("The latest parent Codex request exceeds the bounded snapshot limit.");
   const payload: unknown = JSON.parse(payloadJson);
   if (!isJsonObject(payload)) return freshLineage("The latest parent Codex request is not a JSON object.");
   const data: ParentCaptureData = { ...heldCapture.data, payload, payloadSha256: sha256(payloadJson) };
-  const capture: ParentCacheLineageCapture = {
-    data,
-    integritySha256: sha256(stringifyBounded(data, "parent Codex lineage data"))
-  };
+  const dataJson = tryStringifyBounded(data);
+  if (dataJson === undefined) return freshLineage("Parent Codex request snapshot exceeds the bounded size limit.");
+  const capture: ParentCacheLineageCapture = { data, integritySha256: sha256(dataJson) };
+  const snapshotJson = tryStringifyBounded(capture);
+  if (snapshotJson === undefined || Buffer.byteLength(`${snapshotJson}\n`, "utf8") > WORKER_CACHE_LINEAGE_MAX_BYTES) {
+    return freshLineage("Parent Codex request snapshot exceeds the bounded size limit.");
+  }
   mkdirSync(input.workerStateDir, { recursive: true, mode: 0o700 });
   const snapshotFile = path.join(input.workerStateDir, "cache-lineage.json");
-  const snapshotJson = stringifyBounded(capture, "worker cache-lineage snapshot");
   writePrivateText(snapshotFile, `${snapshotJson}\n`);
   const marker = normalizeMarker(input.marker ?? randomUUID());
   const record: Extract<WorkerCacheLineageRecord, { mode: "eligible" }> = {
@@ -424,6 +443,7 @@ class EligibleRuntimeController {
   private transportPayload: JsonObject | undefined;
   private originalFetch: typeof globalThis.fetch | undefined;
   private originalWebSocket: typeof globalThis.WebSocket | undefined;
+  private readonly inheritedWebSockets = new Set<WebSocket>();
 
   constructor(private readonly record: Extract<WorkerCacheLineageRecord, { mode: "eligible" }>) {
     this.capture = readWorkerSnapshot(record);
@@ -446,19 +466,16 @@ class EligibleRuntimeController {
   }
 
   transformPayload(payload: unknown, context: ExtensionContext): unknown {
-    if (this.fatalReason) {
-      this.transportPayload = undefined;
-      return failClosedPayload(payload, this.record.marker);
-    }
+    if (this.fatalReason) throw new Error(`${CACHE_LINEAGE_FATAL_ERROR_PREFIX}${this.fatalReason}`);
     if (this.retired) return this.transformRetiredPayload(payload);
     if (this.disabledReason) {
       this.transportPayload = undefined;
-      return stripPreviousResponseId(payload);
+      return payload;
     }
     try {
       if (!this.adoption && this.pendingAdoption) {
         this.persistFallback("Initial Codex lineage request did not receive trusted provider acceptance.");
-        return stripPreviousResponseId(payload);
+        return payload;
       }
       const transformed = this.transformPayloadOrThrow(payload, context, this.adoption);
       if (!this.adoption) this.pendingAdoption = transformed.adoption;
@@ -470,22 +487,17 @@ class EligibleRuntimeController {
       if (!this.adoption) {
         try {
           this.persistFallback(reason);
-          return stripPreviousResponseId(payload);
+          return payload;
         } catch (persistenceError) {
           this.setFatal(`Unable to persist pre-adoption fallback: ${boundedReason(persistenceError)}`);
-          return failClosedPayload(payload, this.record.marker);
         }
       }
       this.setFatal(reason);
-      return failClosedPayload(payload, this.record.marker);
     }
   }
 
   transformHeaders(headers: Record<string, string | null | undefined>, context: ExtensionContext): void {
-    if (this.fatalReason) {
-      this.networkArmed = true;
-      return;
-    }
+    if (this.fatalReason) throw new Error(`${CACHE_LINEAGE_FATAL_ERROR_PREFIX}${this.fatalReason}`);
     if (this.retired || this.disabledReason) {
       deleteHeader(headers, "session-id");
       this.networkArmed = false;
@@ -513,24 +525,22 @@ class EligibleRuntimeController {
   }
 
   observeProviderResponse(status: number): void {
-    if (!Number.isInteger(status)) return;
-    if (this.retired && this.retiredFreshRequestInFlight) {
-      this.consumeRetiredFreshRequest();
-      return;
-    }
+    if (this.fatalReason) throw new Error(`${CACHE_LINEAGE_FATAL_ERROR_PREFIX}${this.fatalReason}`);
+    if (!Number.isInteger(status) || this.retired) return;
     if (!this.pendingAdoption) {
       if (this.adoption && status >= 200 && status < 300) this.networkArmed = false;
       return;
     }
+    if (status >= 200 && status < 300) return;
     try {
-      if (status >= 200 && status < 300) this.commitPendingAdoption();
-      else this.persistFallback(`Initial Codex lineage request was rejected with HTTP status ${status}.`);
+      this.persistFallback(`Initial Codex lineage request was rejected with HTTP status ${status}.`);
     } catch (error) {
       this.setFatal(`Unable to persist provider-observed lineage decision: ${boundedReason(error)}`);
     }
   }
 
   observeAssistantMessage(message: unknown, context: ExtensionContext): void {
+    if (this.fatalReason) throw new Error(`${CACHE_LINEAGE_FATAL_ERROR_PREFIX}${this.fatalReason}`);
     if (!isJsonObject(message)) return;
     if (
       this.retired &&
@@ -538,7 +548,10 @@ class EligibleRuntimeController {
       message.role === "assistant" &&
       message.provider === this.record.provider &&
       message.model === this.record.model &&
-      message.api === CODEX_CACHE_LINEAGE_API
+      message.api === CODEX_CACHE_LINEAGE_API &&
+      typeof message.stopReason === "string" &&
+      message.stopReason !== "error" &&
+      message.stopReason !== "aborted"
     ) {
       this.consumeRetiredFreshRequest();
       return;
@@ -565,6 +578,7 @@ class EligibleRuntimeController {
         message.model !== this.record.model ||
         message.api !== CODEX_CACHE_LINEAGE_API
       ) return;
+      if (typeof message.stopReason !== "string") return;
       if (message.stopReason === "error" || message.stopReason === "aborted") {
         this.persistFallback("Initial Codex lineage request was not accepted by the provider.");
         return;
@@ -576,6 +590,7 @@ class EligibleRuntimeController {
   }
 
   retireAfterCompaction(reason: "manual" | "threshold" | "overflow"): void {
+    if (this.fatalReason) throw new Error(`${CACHE_LINEAGE_FATAL_ERROR_PREFIX}${this.fatalReason}`);
     if (this.retired || !this.adoption) return;
     const bounded = `Cache lineage retired after trusted Pi ${reason} compaction.`;
     const retirement = { reason: bounded, firstFreshRequestPending: true };
@@ -583,7 +598,6 @@ class EligibleRuntimeController {
       writeRetirement(this.record.retirementFile, this.record, this.capture, retirement);
     } catch (error) {
       this.setFatal(`Unable to persist trusted compaction retirement: ${boundedReason(error)}`);
-      return;
     }
     this.retired = retirement;
     this.adoption = undefined;
@@ -592,6 +606,7 @@ class EligibleRuntimeController {
     this.fatalReason = undefined;
     this.networkArmed = false;
     this.transportPayload = undefined;
+    this.closeInheritedWebSockets();
     writeLineageSummary(this.record, "retired", bounded);
   }
 
@@ -649,11 +664,16 @@ class EligibleRuntimeController {
   }
 
   restoreNetwork(): void {
+    this.closeInheritedWebSockets();
     if (this.originalFetch) globalThis.fetch = this.originalFetch;
     if (this.originalWebSocket) globalThis.WebSocket = this.originalWebSocket;
   }
 
   private guardWebSocketSend(socket: WebSocket): WebSocket {
+    this.inheritedWebSockets.add(socket);
+    if (typeof socket.addEventListener === "function") {
+      socket.addEventListener("close", () => this.inheritedWebSockets.delete(socket), { once: true });
+    }
     const originalSend = socket.send.bind(socket);
     socket.send = ((data: Parameters<WebSocket["send"]>[0]) => {
       if (!this.networkArmed) return originalSend(data);
@@ -673,6 +693,13 @@ class EligibleRuntimeController {
       return originalSend(JSON.stringify({ ...this.transportPayload, type: "response.create" }));
     }) as WebSocket["send"];
     return socket;
+  }
+
+  private closeInheritedWebSockets(): void {
+    for (const socket of this.inheritedWebSockets) {
+      try { socket.close(1000, "cache_lineage_reset"); } catch {}
+    }
+    this.inheritedWebSockets.clear();
   }
 
   private transformPayloadOrThrow(
@@ -782,7 +809,9 @@ class EligibleRuntimeController {
     this.transportPayload = undefined;
     if (!this.retired?.firstFreshRequestPending) return payload;
     this.retiredFreshRequestInFlight = true;
-    return stripPreviousResponseId(payload);
+    // A trusted compaction event proves that this one request is Pi's complete
+    // post-compaction replay rather than an adapter-generated delta continuation.
+    return stripPreviousResponseIdFromCompleteReplay(payload);
   }
 
   private consumeRetiredFreshRequest(): void {
@@ -814,22 +843,25 @@ class EligibleRuntimeController {
     this.disabledReason = bounded;
     this.networkArmed = false;
     this.transportPayload = undefined;
+    this.closeInheritedWebSockets();
     writeLineageSummary(this.record, "fresh", bounded);
   }
 
-  private setFatal(reason: string): void {
+  private setFatal(reason: string): never {
     this.fatalReason = boundedTextReason(reason);
     this.networkArmed = true;
     this.transportPayload = undefined;
+    this.closeInheritedWebSockets();
     try {
       writeLineageSummary(this.record, "failed", this.fatalReason);
     } catch {
       // Transport remains fail-closed even when diagnostic persistence fails.
     }
+    throw new Error(`${CACHE_LINEAGE_FATAL_ERROR_PREFIX}${this.fatalReason}`);
   }
 
   private assertNetworkAllowed(): void {
-    if (this.fatalReason) throw new Error(`Managed-worker Codex cache lineage failed closed: ${this.fatalReason}`);
+    if (this.fatalReason) throw new Error(`${CACHE_LINEAGE_FATAL_ERROR_PREFIX}${this.fatalReason}`);
     if (!this.adoption && !this.pendingAdoption) {
       throw new Error("Managed-worker Codex cache lineage was not verified before transport.");
     }
@@ -897,7 +929,7 @@ function parseParentCapture(raw: string): ParentCacheLineageCapture {
     data.api !== CODEX_CACHE_LINEAGE_API ||
     data.provider !== CODEX_CACHE_LINEAGE_PROVIDER ||
     typeof data.model !== "string" || !data.model ||
-    data.baseUrl !== "https://chatgpt.com/backend-api" ||
+    data.baseUrl !== CODEX_CACHE_LINEAGE_BASE_URL ||
     typeof data.thinkingLevel !== "string" || !data.thinkingLevel ||
     typeof data.parentSessionFileSha256 !== "string" || !/^[0-9a-f]{64}$/.test(data.parentSessionFileSha256) ||
     typeof data.parentSessionIdSha256 !== "string" || !/^[0-9a-f]{64}$/.test(data.parentSessionIdSha256) ||
@@ -1160,21 +1192,11 @@ function guardManagedWorkerTool(toolNameValue: string): { block: true; reason: s
   };
 }
 
-function stripPreviousResponseId(payload: unknown): unknown {
+function stripPreviousResponseIdFromCompleteReplay(payload: unknown): unknown {
   if (!isJsonObject(payload) || payload.previous_response_id === undefined) return payload;
   const stripped = cloneJsonObject(payload);
   delete stripped.previous_response_id;
   return stripped;
-}
-
-function failClosedPayload(payload: unknown, marker: string): JsonObject {
-  const original = isJsonObject(payload) ? cloneJsonObject(payload) : {};
-  original.model = `pi-cache-lineage-blocked-${marker}`;
-  original.input = [];
-  original.tools = [];
-  original.tool_choice = "none";
-  delete original.previous_response_id;
-  return original;
 }
 
 function isCodexHttpTarget(input: RequestInfo | URL): boolean {
@@ -1235,7 +1257,8 @@ function setBoundedCaptureEntry<T>(map: Map<string, T>, key: string, value: T): 
 
 type JsonScanFrame =
   | { kind: "value"; value: unknown; arrayElement: boolean; depth: number }
-  | { kind: "exit"; value: object };
+  | { kind: "array"; value: unknown[]; index: number; depth: number }
+  | { kind: "object"; value: JsonObject; keys: Iterator<string>; emitted: boolean; depth: number };
 
 function jsonValueFitsBound(value: unknown, maxBytes: number): boolean {
   try {
@@ -1244,13 +1267,52 @@ function jsonValueFitsBound(value: unknown, maxBytes: number): boolean {
     let visits = 0;
     const stack: JsonScanFrame[] = [{ kind: "value", value, arrayElement: false, depth: 0 }];
     while (stack.length > 0) {
+      visits += 1;
+      if (visits > 1_000_000) return false;
       const frame = stack.pop()!;
-      if (frame.kind === "exit") {
-        active.delete(frame.value);
+      if (frame.kind === "array") {
+        if (frame.index >= frame.value.length) {
+          active.delete(frame.value);
+          continue;
+        }
+        if (frame.index > 0) budget -= 1;
+        if (budget < 0) return false;
+        const key = String(frame.index);
+        const descriptor = Object.getOwnPropertyDescriptor(frame.value, key);
+        if (descriptor && !("value" in descriptor)) return false;
+        if (!descriptor && key in frame.value) return false;
+        stack.push({ ...frame, index: frame.index + 1 });
+        stack.push({
+          kind: "value",
+          value: descriptor?.value,
+          arrayElement: true,
+          depth: frame.depth + 1
+        });
         continue;
       }
-      visits += 1;
-      if (visits > 1_000_000 || frame.depth > 128) return false;
+      if (frame.kind === "object") {
+        const next = frame.keys.next();
+        if (next.done) {
+          active.delete(frame.value);
+          continue;
+        }
+        stack.push(frame);
+        const descriptor = Object.getOwnPropertyDescriptor(frame.value, next.value);
+        if (!descriptor || !descriptor.enumerable) continue;
+        if (!("value" in descriptor)) return false;
+        const child = descriptor.value;
+        if (typeof child === "undefined" || typeof child === "function" || typeof child === "symbol") continue;
+        if (frame.emitted) budget -= 1;
+        const keyBytes = boundedJsonStringBytes(next.value, budget);
+        if (keyBytes === undefined) return false;
+        budget -= keyBytes + 1;
+        if (budget < 0) return false;
+        frame.emitted = true;
+        stack.push({ kind: "value", value: child, arrayElement: false, depth: frame.depth + 1 });
+        continue;
+      }
+
+      if (frame.depth > 128) return false;
       const current = frame.value;
       if (current === null) budget -= 4;
       else if (typeof current === "boolean") budget -= current ? 4 : 5;
@@ -1265,43 +1327,67 @@ function jsonValueFitsBound(value: unknown, maxBytes: number): boolean {
         if (!frame.arrayElement) return false;
         budget -= 4;
       } else if (typeof current === "bigint") return false;
+      else if (typeof current === "object" && current !== null && utilTypes.isProxy(current)) return false;
       else if (Array.isArray(current)) {
-        if (active.has(current) || typeof (current as { toJSON?: unknown }).toJSON === "function") return false;
+        if (active.has(current) || hasUnsupportedToJSON(current)) return false;
+        const minimumBytes = current.length === 0 ? 2 : current.length * 2 + 1;
+        if (!Number.isSafeInteger(minimumBytes) || minimumBytes > budget) return false;
         active.add(current);
-        budget -= Math.max(0, current.length - 1) + 2;
-        if (budget < 0) return false;
-        stack.push({ kind: "exit", value: current });
-        for (let index = current.length - 1; index >= 0; index -= 1) {
-          stack.push({ kind: "value", value: current[index], arrayElement: true, depth: frame.depth + 1 });
-        }
+        budget -= 2;
+        stack.push({ kind: "array", value: current, index: 0, depth: frame.depth });
       } else if (isJsonObject(current)) {
         const prototype = Object.getPrototypeOf(current);
         if (
           active.has(current) ||
           (prototype !== Object.prototype && prototype !== null) ||
-          typeof (current as { toJSON?: unknown }).toJSON === "function"
+          hasUnsupportedToJSON(current)
         ) return false;
         active.add(current);
-        const rawEntries = Object.entries(current);
-        if (rawEntries.some(([, child]) => typeof child === "function" || typeof child === "symbol")) return false;
-        const entries = rawEntries.filter(([, child]) => typeof child !== "undefined");
-        budget -= Math.max(0, entries.length - 1) + 2;
-        for (const [key, child] of entries) {
-          const keyBytes = boundedJsonStringBytes(key, budget);
-          if (keyBytes === undefined) return false;
-          budget -= keyBytes + 1;
-        }
-        if (budget < 0) return false;
-        stack.push({ kind: "exit", value: current });
-        for (let index = entries.length - 1; index >= 0; index -= 1) {
-          stack.push({ kind: "value", value: entries[index]![1], arrayElement: false, depth: frame.depth + 1 });
-        }
+        budget -= 2;
+        stack.push({
+          kind: "object",
+          value: current,
+          keys: enumerableOwnStringKeys(current),
+          emitted: false,
+          depth: frame.depth
+        });
       } else return false;
       if (budget < 0) return false;
     }
     return true;
   } catch {
     return false;
+  }
+}
+
+function* enumerableOwnStringKeys(value: JsonObject): IterableIterator<string> {
+  for (const key in value) {
+    if (Object.hasOwn(value, key)) yield key;
+  }
+}
+
+function hasUnsupportedToJSON(value: object): boolean {
+  let current: object | null = value;
+  while (current) {
+    const descriptor = Object.getOwnPropertyDescriptor(current, "toJSON");
+    if (descriptor) return !("value" in descriptor) || typeof descriptor.value === "function";
+    current = Object.getPrototypeOf(current) as object | null;
+  }
+  return false;
+}
+
+function canonicalizeBoundedJsonObject(
+  value: unknown,
+  maxBytes: number
+): { value: JsonObject; json: string } | undefined {
+  try {
+    if (!isJsonObject(value) || !jsonValueFitsBound(value, maxBytes)) return undefined;
+    const json = tryStringifyBounded(value);
+    if (json === undefined) return undefined;
+    const canonical: unknown = JSON.parse(json);
+    return isJsonObject(canonical) ? { value: canonical, json } : undefined;
+  } catch {
+    return undefined;
   }
 }
 
