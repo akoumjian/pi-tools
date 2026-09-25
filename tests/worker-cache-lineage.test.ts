@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { zstdDecompressSync } from "node:zlib";
@@ -1234,6 +1234,22 @@ test("lineage summaries remain cheap, bounded, and non-throwing", () => {
     });
   } finally {
     runtime?.restoreNetwork();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("large ASCII parent payloads use their encoded size rather than a worst-case expansion", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-large-ascii-"));
+  try {
+    const payload = parentPayload();
+    payload.input = [{
+      role: "user",
+      content: [{ type: "input_text", text: "x".repeat(2 * 1024 * 1024) }]
+    }];
+    const record = captureAndPrepare(root, false, payload);
+    assert.equal(record.mode, "eligible");
+    assert.ok(statSync(record.snapshotFile).size < WORKER_CACHE_LINEAGE_MAX_BYTES);
+  } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
