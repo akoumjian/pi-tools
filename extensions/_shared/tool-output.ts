@@ -438,7 +438,14 @@ const DocumentParseDetailsSchema = Type.Object({
 }, { additionalProperties: false });
 
 const WorkerCacheLineageSummarySchema = Type.Object({
-  mode: Type.Union([Type.Literal("eligible"), Type.Literal("adopted"), Type.Literal("fresh")]),
+  mode: Type.Union([
+    Type.Literal("eligible"),
+    Type.Literal("adopted"),
+    Type.Literal("fresh"),
+    Type.Literal("retired"),
+    Type.Literal("failed"),
+    Type.Literal("unavailable")
+  ]),
   reason: Type.Optional(Type.String({ minLength: 1, maxLength: 512 }))
 }, { additionalProperties: false });
 

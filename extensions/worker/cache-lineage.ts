@@ -6,6 +6,7 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  rmSync,
   writeFileSync
 } from "node:fs";
 import path from "node:path";
@@ -30,8 +31,11 @@ export const MANAGED_WORKER_TOOL_NAMES = [
 
 const MANAGED_WORKER_TOOL_NAME_SET = new Set<string>(MANAGED_WORKER_TOOL_NAMES);
 const CAPTURE_HOLDER_KEY = Symbol.for("@akoumjian/pi-tools/worker-cache-lineage-capture");
-const CAPTURE_HOLDER_VERSION = 1;
-const ADOPTION_VERSION = 2;
+const CAPTURE_HOLDER_VERSION = 2;
+const ADOPTION_VERSION = 3;
+const LINEAGE_SUMMARY_VERSION = 1;
+const RETIREMENT_VERSION = 1;
+const CAPTURE_HOLDER_MAX_SESSIONS = 4;
 
 type JsonObject = Record<string, unknown>;
 
@@ -72,37 +76,60 @@ export type WorkerCacheLineageRecord =
       marker: string;
       adoptionFile: string;
       fallbackFile: string;
+      retirementFile: string;
+      summaryFile: string;
     };
 
-type PendingCapture = Omit<ParentCaptureData, "cacheAffinitySessionId"> & {
+type PendingParentHeaders = {
+  provider: typeof CODEX_CACHE_LINEAGE_PROVIDER;
+  api: typeof CODEX_CACHE_LINEAGE_API;
+  model: string;
+  baseUrl: string;
+  thinkingLevel: string;
+  parentSessionFileSha256: string;
+  parentSessionIdSha256: string;
   candidateCacheAffinitySessionId: string;
+  observedCacheAffinitySessionId?: string;
+  capturedAt: string;
 };
 type CaptureHolder = {
   version: typeof CAPTURE_HOLDER_VERSION;
-  pendingBySessionFile: Map<string, PendingCapture>;
+  generation: number;
+  pendingHeadersBySessionFile: Map<string, PendingParentHeaders>;
+  latestBySessionFile: Map<string, ParentCacheLineageCapture & { generation: number }>;
 };
 
-export type WorkerCacheLineageRuntimeStatus = {
-  mode: "fresh" | "eligible" | "adopted" | "failed";
+export type WorkerCacheLineageSummary = {
+  mode: "eligible" | "adopted" | "fresh" | "retired" | "failed" | "unavailable";
+  reason?: string;
+};
+
+export type WorkerCacheLineageRuntimeStatus = WorkerCacheLineageSummary;
+
+type PersistedLineageSummary = {
+  version: typeof LINEAGE_SUMMARY_VERSION;
+  markerSha256: string;
+  snapshotSha256: string;
+  mode: "eligible" | "adopted" | "fresh" | "retired" | "failed";
   reason?: string;
 };
 
 function captureHolder(): CaptureHolder {
   const existing = Reflect.get(globalThis, CAPTURE_HOLDER_KEY) as Partial<CaptureHolder> | undefined;
-  if (existing !== undefined) {
-    if (
-      existing === null ||
-      typeof existing !== "object" ||
-      existing.version !== CAPTURE_HOLDER_VERSION ||
-      !(existing.pendingBySessionFile instanceof Map)
-    ) {
-      throw new Error(`Incompatible worker cache-lineage capture holder version ${CAPTURE_HOLDER_VERSION}.`);
-    }
-    return existing as CaptureHolder;
-  }
+  if (
+    existing !== undefined &&
+    existing !== null &&
+    typeof existing === "object" &&
+    existing.version === CAPTURE_HOLDER_VERSION &&
+    typeof existing.generation === "number" &&
+    existing.pendingHeadersBySessionFile instanceof Map &&
+    existing.latestBySessionFile instanceof Map
+  ) return existing as CaptureHolder;
   const created: CaptureHolder = {
     version: CAPTURE_HOLDER_VERSION,
-    pendingBySessionFile: new Map()
+    generation: 0,
+    pendingHeadersBySessionFile: new Map(),
+    latestBySessionFile: new Map()
   };
   Reflect.set(globalThis, CAPTURE_HOLDER_KEY, created);
   return created;
@@ -113,64 +140,94 @@ export function registerParentCacheLineageCapture(
   stateRoot: string,
   now: () => Date = () => new Date()
 ): void {
-  api.on("before_provider_request", (event, context) => {
+  const holder = captureHolder();
+  const generation = ++holder.generation;
+  holder.pendingHeadersBySessionFile.clear();
+  holder.latestBySessionFile.clear();
+  // Version 1 wrote one parent artifact per session. Snapshots are self-contained,
+  // so these legacy request-time files are unreferenced and safe to prune.
+  rmSync(path.join(path.resolve(stateRoot), ".cache-lineage"), { recursive: true, force: true });
+
+  // Pi 0.84.4 applies ModelRuntime.transformHeaders before the Codex adapter calls
+  // onPayload. Record only small route/header metadata here; pair it with the
+  // subsequently emitted payload in before_provider_request.
+  api.on("before_provider_headers", (event, context) => {
+    if (holder.generation !== generation || process.env.PI_WORKER_ID) return;
     const sessionFile = context.sessionManager.getSessionFile();
     const model = context.model;
+    if (!sessionFile) return;
+    const resolvedSessionFile = path.resolve(sessionFile);
+    holder.latestBySessionFile.delete(resolvedSessionFile);
     if (
-      !sessionFile ||
       !model ||
       model.provider !== CODEX_CACHE_LINEAGE_PROVIDER ||
-      model.api !== CODEX_CACHE_LINEAGE_API ||
-      !isJsonObject(event.payload)
+      model.api !== CODEX_CACHE_LINEAGE_API
     ) return;
-    if (process.env.PI_WORKER_ID) return;
-    const payload = cloneJsonObject(event.payload);
-    const payloadJson = stringifyBounded(payload, "parent Codex provider payload");
-    captureHolder().pendingBySessionFile.set(path.resolve(sessionFile), {
-      version: 1,
-      api: CODEX_CACHE_LINEAGE_API,
+    const candidateCacheAffinitySessionId = clampCodexSessionId(context.sessionManager.getSessionId());
+    setBoundedCaptureEntry(holder.pendingHeadersBySessionFile, resolvedSessionFile, {
       provider: CODEX_CACHE_LINEAGE_PROVIDER,
+      api: CODEX_CACHE_LINEAGE_API,
       model: model.id,
       baseUrl: normalizeCodexBaseUrl(model.baseUrl),
       thinkingLevel: String(context.thinkingLevel),
-      parentSessionFileSha256: sha256(path.resolve(sessionFile)),
+      parentSessionFileSha256: sha256(resolvedSessionFile),
       parentSessionIdSha256: sha256(context.sessionManager.getSessionId()),
-      candidateCacheAffinitySessionId: clampCodexSessionId(context.sessionManager.getSessionId()),
-      capturedAt: now().toISOString(),
-      payload,
-      payloadSha256: sha256(payloadJson)
+      candidateCacheAffinitySessionId,
+      observedCacheAffinitySessionId: boundedCodexSessionHeader(event.headers),
+      capturedAt: now().toISOString()
     });
   });
 
-  api.on("before_provider_headers", (event, context) => {
-    if (process.env.PI_WORKER_ID) return;
+  api.on("before_provider_request", (event, context) => {
+    if (holder.generation !== generation || process.env.PI_WORKER_ID) return;
     const sessionFile = context.sessionManager.getSessionFile();
-    if (!sessionFile) return;
+    const model = context.model;
+    if (!sessionFile || !model || !isJsonObject(event.payload)) return;
     const resolvedSessionFile = path.resolve(sessionFile);
-    const pending = captureHolder().pendingBySessionFile.get(resolvedSessionFile);
-    if (!pending) return;
-    captureHolder().pendingBySessionFile.delete(resolvedSessionFile);
-    const observedSessionId = readHeader(event.headers, "session-id");
-    const { candidateCacheAffinitySessionId, ...captured } = pending;
-    // Pi 0.84.4 invokes before_provider_headers before the Codex adapter adds its
-    // final transport headers. In that baseline, prompt_cache_key is built from
-    // the same clamped session id that the adapter subsequently writes as
-    // session-id, so require that exact payload equality before deriving it.
-    const sessionId = observedSessionId ?? (
-      pending.payload.prompt_cache_key === candidateCacheAffinitySessionId
-        ? candidateCacheAffinitySessionId
+    const pending = holder.pendingHeadersBySessionFile.get(resolvedSessionFile);
+    holder.pendingHeadersBySessionFile.delete(resolvedSessionFile);
+    if (
+      !pending ||
+      pending.provider !== model.provider ||
+      pending.api !== model.api ||
+      pending.model !== model.id ||
+      pending.baseUrl !== normalizeCodexBaseUrl(model.baseUrl) ||
+      pending.thinkingLevel !== String(context.thinkingLevel)
+    ) return;
+    if (!jsonValueFitsBound(event.payload, WORKER_CACHE_LINEAGE_MAX_BYTES)) {
+      holder.latestBySessionFile.delete(resolvedSessionFile);
+      return;
+    }
+    const cacheAffinitySessionId = pending.observedCacheAffinitySessionId ?? (
+      event.payload.prompt_cache_key === pending.candidateCacheAffinitySessionId
+        ? pending.candidateCacheAffinitySessionId
         : undefined
     );
-    if (!sessionId) return;
-    const data: ParentCaptureData = { ...captured, cacheAffinitySessionId: sessionId };
-    const capture: ParentCacheLineageCapture = {
-      data,
-      integritySha256: sha256(stringifyBounded(data, "parent Codex lineage data"))
+    if (!cacheAffinitySessionId) {
+      holder.latestBySessionFile.delete(resolvedSessionFile);
+      return;
+    }
+    const data: ParentCaptureData = {
+      version: 1,
+      api: CODEX_CACHE_LINEAGE_API,
+      provider: CODEX_CACHE_LINEAGE_PROVIDER,
+      model: pending.model,
+      baseUrl: pending.baseUrl,
+      thinkingLevel: pending.thinkingLevel,
+      parentSessionFileSha256: pending.parentSessionFileSha256,
+      parentSessionIdSha256: pending.parentSessionIdSha256,
+      capturedAt: pending.capturedAt,
+      payload: event.payload,
+      payloadSha256: "",
+      cacheAffinitySessionId
     };
-    writePrivateJson(parentCaptureFile(stateRoot, resolvedSessionFile), capture);
+    setBoundedCaptureEntry(holder.latestBySessionFile, resolvedSessionFile, {
+      data,
+      integritySha256: "",
+      generation
+    });
   });
 }
-
 export function prepareWorkerCacheLineage(input: {
   stateRoot: string;
   workerStateDir: string;
@@ -182,37 +239,45 @@ export function prepareWorkerCacheLineage(input: {
 }): WorkerCacheLineageRecord {
   const unsupportedReason = cacheLineageRouteReason(input.route);
   if (unsupportedReason) return freshLineage(unsupportedReason);
-  const source = parentCaptureFile(input.stateRoot, input.parentSessionFile);
-  if (!existsSync(source)) return freshLineage("No validated parent Codex request capture is available.");
-  let capture: ParentCacheLineageCapture;
-  try {
-    capture = readParentCapture(source);
-  } catch (error) {
-    return freshLineage(`Parent Codex request capture is invalid: ${boundedReason(error)}`);
+  const resolvedParentSessionFile = path.resolve(input.parentSessionFile);
+  const holder = captureHolder();
+  const heldCapture = holder.latestBySessionFile.get(resolvedParentSessionFile);
+  if (!heldCapture || heldCapture.generation !== holder.generation) {
+    return freshLineage("No validated parent Codex request capture is available.");
   }
   const now = input.now ?? new Date();
-  const ageMs = now.getTime() - Date.parse(capture.data.capturedAt);
+  const ageMs = now.getTime() - Date.parse(heldCapture.data.capturedAt);
   if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > WORKER_CACHE_LINEAGE_MAX_AGE_MS) {
     return freshLineage("Parent Codex request capture is stale.");
   }
   if (
-    capture.data.parentSessionFileSha256 !== sha256(path.resolve(input.parentSessionFile)) ||
-    capture.data.parentSessionIdSha256 !== sha256(input.parentSessionId)
+    heldCapture.data.parentSessionFileSha256 !== sha256(resolvedParentSessionFile) ||
+    heldCapture.data.parentSessionIdSha256 !== sha256(input.parentSessionId)
   ) {
     return freshLineage("Parent Codex request capture is bound to another parent session.");
   }
   if (
-    capture.data.provider !== input.route.provider ||
-    capture.data.model !== input.route.model ||
-    capture.data.thinkingLevel !== input.route.thinkingLevel
+    heldCapture.data.provider !== input.route.provider ||
+    heldCapture.data.model !== input.route.model ||
+    heldCapture.data.thinkingLevel !== input.route.thinkingLevel
   ) {
     return freshLineage("Parent Codex request capture route does not exactly match the worker route.");
   }
+  const payloadJson = tryStringifyBounded(heldCapture.data.payload);
+  if (payloadJson === undefined) return freshLineage("The latest parent Codex request exceeds the bounded snapshot limit.");
+  const payload: unknown = JSON.parse(payloadJson);
+  if (!isJsonObject(payload)) return freshLineage("The latest parent Codex request is not a JSON object.");
+  const data: ParentCaptureData = { ...heldCapture.data, payload, payloadSha256: sha256(payloadJson) };
+  const capture: ParentCacheLineageCapture = {
+    data,
+    integritySha256: sha256(stringifyBounded(data, "parent Codex lineage data"))
+  };
   mkdirSync(input.workerStateDir, { recursive: true, mode: 0o700 });
   const snapshotFile = path.join(input.workerStateDir, "cache-lineage.json");
   const snapshotJson = stringifyBounded(capture, "worker cache-lineage snapshot");
   writePrivateText(snapshotFile, `${snapshotJson}\n`);
-  return {
+  const marker = normalizeMarker(input.marker ?? randomUUID());
+  const record: Extract<WorkerCacheLineageRecord, { mode: "eligible" }> = {
     version: 1,
     mode: "eligible",
     provider: CODEX_CACHE_LINEAGE_PROVIDER,
@@ -220,12 +285,15 @@ export function prepareWorkerCacheLineage(input: {
     thinkingLevel: input.route.thinkingLevel,
     snapshotFile,
     snapshotSha256: sha256(`${snapshotJson}\n`),
-    marker: normalizeMarker(input.marker ?? randomUUID()),
+    marker,
     adoptionFile: path.join(input.workerStateDir, "cache-lineage-adopted.json"),
-    fallbackFile: path.join(input.workerStateDir, "cache-lineage-fallback.json")
+    fallbackFile: path.join(input.workerStateDir, "cache-lineage-fallback.json"),
+    retirementFile: path.join(input.workerStateDir, "cache-lineage-retired.json"),
+    summaryFile: path.join(input.workerStateDir, "cache-lineage-summary.json")
   };
+  writeLineageSummary(record, "eligible");
+  return record;
 }
-
 export function validateWorkerCacheLineageRecord(value: unknown): value is WorkerCacheLineageRecord {
   if (!isJsonObject(value) || value.version !== 1) return false;
   if (value.mode === "fresh") {
@@ -240,38 +308,54 @@ export function validateWorkerCacheLineageRecord(value: unknown): value is Worke
     typeof value.marker === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(value.marker) &&
     typeof value.adoptionFile === "string" && path.isAbsolute(value.adoptionFile) && path.basename(value.adoptionFile) === "cache-lineage-adopted.json" &&
     typeof value.fallbackFile === "string" && path.isAbsolute(value.fallbackFile) && path.basename(value.fallbackFile) === "cache-lineage-fallback.json" &&
+    typeof value.retirementFile === "string" && path.isAbsolute(value.retirementFile) && path.basename(value.retirementFile) === "cache-lineage-retired.json" &&
+    typeof value.summaryFile === "string" && path.isAbsolute(value.summaryFile) && path.basename(value.summaryFile) === "cache-lineage-summary.json" &&
     path.dirname(value.snapshotFile) === path.dirname(value.adoptionFile) &&
-    path.dirname(value.snapshotFile) === path.dirname(value.fallbackFile);
+    path.dirname(value.snapshotFile) === path.dirname(value.fallbackFile) &&
+    path.dirname(value.snapshotFile) === path.dirname(value.retirementFile) &&
+    path.dirname(value.snapshotFile) === path.dirname(value.summaryFile);
 }
 
 export function summarizeWorkerCacheLineage(
   record: WorkerCacheLineageRecord | undefined
-): { mode: "eligible" | "adopted" | "fresh"; reason?: string } | undefined {
+): WorkerCacheLineageSummary | undefined {
   if (!record) return undefined;
   if (record.mode === "fresh") return { mode: "fresh", reason: record.reason };
-  const capture = readWorkerSnapshot(record);
-  const hasAdoption = existsSync(record.adoptionFile);
-  const hasFallback = existsSync(record.fallbackFile);
-  if (hasAdoption && hasFallback) throw new Error("Worker cache-lineage has conflicting persisted decisions.");
-  if (hasAdoption) {
-    readAdoption(record.adoptionFile, record, capture);
-    return { mode: "adopted" };
+  try {
+    return readLineageSummary(record);
+  } catch {
+    return { mode: "unavailable", reason: "Cache-lineage summary is unavailable or invalid." };
   }
-  if (hasFallback) return { mode: "fresh", reason: readFallback(record.fallbackFile, record, capture) };
-  return { mode: "eligible" };
 }
-
-export function createWorkerCacheLineageRuntime(record: WorkerCacheLineageRecord | undefined): {
+export type WorkerCacheLineageRuntime = {
   transformPayload(payload: unknown, context: ExtensionContext): unknown;
   transformHeaders(headers: Record<string, string | null | undefined>, context: ExtensionContext): void;
+  observeProviderResponse(status: number): void;
+  observeAssistantMessage(message: unknown, context: ExtensionContext): void;
+  retireAfterCompaction(reason: "manual" | "threshold" | "overflow"): void;
   guardTool(toolName: string): { block: true; reason: string; terminate: true } | undefined;
   status(): WorkerCacheLineageRuntimeStatus;
   restoreNetwork(): void;
-} {
+};
+
+export function registerWorkerCacheLineageRuntimeHooks(api: ExtensionAPI, cacheLineage: WorkerCacheLineageRuntime): void {
+  api.on("before_provider_request", (event, context) => cacheLineage.transformPayload(event.payload, context));
+  api.on("before_provider_headers", (event, context) => cacheLineage.transformHeaders(event.headers, context));
+  api.on("after_provider_response", (event) => cacheLineage.observeProviderResponse(event.status));
+  api.on("message_end", (event, context) => cacheLineage.observeAssistantMessage(event.message, context));
+  api.on("session_compact", (event) => cacheLineage.retireAfterCompaction(event.reason));
+  api.on("tool_call", (event) => cacheLineage.guardTool(event.toolName));
+  api.on("session_shutdown", () => cacheLineage.restoreNetwork());
+}
+
+export function createWorkerCacheLineageRuntime(record: WorkerCacheLineageRecord | undefined): WorkerCacheLineageRuntime {
   if (!record || record.mode === "fresh") {
     return {
       transformPayload: (payload) => payload,
       transformHeaders: () => {},
+      observeProviderResponse: () => {},
+      observeAssistantMessage: () => {},
+      retireAfterCompaction: () => {},
       guardTool: guardManagedWorkerTool,
       status: () => ({ mode: "fresh", reason: record?.reason ?? "Cache lineage was not configured." }),
       restoreNetwork: () => {}
@@ -283,22 +367,39 @@ export function createWorkerCacheLineageRuntime(record: WorkerCacheLineageRecord
   return {
     transformPayload: (payload, context) => controller.transformPayload(payload, context),
     transformHeaders: (headers, context) => controller.transformHeaders(headers, context),
+    observeProviderResponse: (status) => controller.observeProviderResponse(status),
+    observeAssistantMessage: (message, context) => controller.observeAssistantMessage(message, context),
+    retireAfterCompaction: (reason) => controller.retireAfterCompaction(reason),
     guardTool: guardManagedWorkerTool,
     status: () => controller.status(),
     restoreNetwork: () => controller.restoreNetwork()
   };
 }
 
+type AdoptionState = {
+  workerToolsSha256: string;
+  workerInstructionsSha256: string;
+  forkBoundarySha256: string;
+  initialAssignmentSha256: string;
+  preAssignmentItemsSha256: string;
+  assignmentInputIndex: number;
+};
+
+type RetirementState = {
+  reason: string;
+  firstFreshRequestPending: boolean;
+};
+
 class EligibleRuntimeController {
   private readonly capture: ParentCacheLineageCapture;
-  private adopted: boolean;
+  private adoption: AdoptionState | undefined;
+  private pendingAdoption: AdoptionState | undefined;
   private disabledReason: string | undefined;
+  private retired: RetirementState | undefined;
+  private retiredFreshRequestInFlight = false;
   private fatalReason: string | undefined;
   private networkArmed = false;
-  private adoptedWorkerToolsSha256: string | undefined;
-  private adoptedWorkerInstructionsSha256: string | undefined;
-  private adoptedForkBoundarySha256: string | undefined;
-  private adoptedInitialAssignmentSha256: string | undefined;
+  private transportPayload: JsonObject | undefined;
   private originalFetch: typeof globalThis.fetch | undefined;
   private originalWebSocket: typeof globalThis.WebSocket | undefined;
 
@@ -306,106 +407,177 @@ class EligibleRuntimeController {
     this.capture = readWorkerSnapshot(record);
     const hasAdoption = existsSync(record.adoptionFile);
     const hasFallback = existsSync(record.fallbackFile);
-    if (hasAdoption && hasFallback) throw new Error("Worker cache-lineage has conflicting persisted decisions.");
-    this.adopted = hasAdoption;
-    if (hasAdoption) {
-      const adoption = readAdoption(record.adoptionFile, record, this.capture);
-      this.adoptedWorkerToolsSha256 = adoption.workerToolsSha256;
-      this.adoptedWorkerInstructionsSha256 = adoption.workerInstructionsSha256;
-      this.adoptedForkBoundarySha256 = adoption.forkBoundarySha256;
-      this.adoptedInitialAssignmentSha256 = adoption.initialAssignmentSha256;
+    const hasRetirement = existsSync(record.retirementFile);
+    if (!hasRetirement && hasAdoption && hasFallback) {
+      throw new Error("Worker cache-lineage has conflicting persisted decisions.");
+    }
+    if (hasRetirement) {
+      this.retired = readRetirement(record.retirementFile, record, this.capture);
+      writeLineageSummary(record, "retired", this.retired.reason);
+    } else if (hasAdoption) {
+      this.adoption = readAdoption(record.adoptionFile, record, this.capture);
+      writeLineageSummary(record, "adopted");
     } else if (hasFallback) {
       this.disabledReason = readFallback(record.fallbackFile, record, this.capture);
+      writeLineageSummary(record, "fresh", this.disabledReason);
     }
   }
 
   transformPayload(payload: unknown, context: ExtensionContext): unknown {
-    if (this.disabledReason) {
-      if (isJsonObject(payload) && payload.previous_response_id !== undefined) {
-        const freshPayload = cloneJsonObject(payload);
-        delete freshPayload.previous_response_id;
-        return freshPayload;
-      }
-      return payload;
+    if (this.fatalReason) {
+      this.transportPayload = undefined;
+      return failClosedPayload(payload, this.record.marker);
     }
-    const stripsInitialPreviousResponseId =
-      !this.adopted && isJsonObject(payload) && payload.previous_response_id !== undefined;
+    if (this.retired) return this.transformRetiredPayload(payload);
+    if (this.disabledReason) {
+      this.transportPayload = undefined;
+      return stripPreviousResponseId(payload);
+    }
     try {
-      const transformed = this.transformPayloadOrThrow(payload, context);
-      if (this.adoptedWorkerToolsSha256 && this.adoptedWorkerToolsSha256 !== transformed.workerToolsSha256) {
-        throw new Error("Managed-worker tool schemas drifted after Codex lineage adoption.");
+      if (!this.adoption && this.pendingAdoption) {
+        this.persistFallback("Initial Codex lineage request did not receive trusted provider acceptance.");
+        return stripPreviousResponseId(payload);
       }
-      if (this.adoptedWorkerInstructionsSha256 && this.adoptedWorkerInstructionsSha256 !== transformed.workerInstructionsSha256) {
-        throw new Error("Managed-worker system instructions drifted after Codex lineage adoption.");
-      }
-      if (this.adoptedForkBoundarySha256 && this.adoptedForkBoundarySha256 !== transformed.forkBoundarySha256) {
-        throw new Error("Managed-worker fork boundary drifted after Codex lineage adoption.");
-      }
-      if (this.adoptedInitialAssignmentSha256 && this.adoptedInitialAssignmentSha256 !== transformed.initialAssignmentSha256) {
-        throw new Error("Managed-worker initial assignment drifted after Codex lineage adoption.");
-      }
-      writeAdoption(
-        this.record.adoptionFile,
-        this.record,
-        this.capture,
-        transformed.workerToolsSha256,
-        transformed.workerInstructionsSha256,
-        transformed.forkBoundarySha256,
-        transformed.initialAssignmentSha256
-      );
-      this.adoptedWorkerToolsSha256 = transformed.workerToolsSha256;
-      this.adoptedWorkerInstructionsSha256 = transformed.workerInstructionsSha256;
-      this.adoptedForkBoundarySha256 = transformed.forkBoundarySha256;
-      this.adoptedInitialAssignmentSha256 = transformed.initialAssignmentSha256;
-      this.adopted = true;
+      const transformed = this.transformPayloadOrThrow(payload, context, this.adoption);
+      if (!this.adoption) this.pendingAdoption = transformed.adoption;
+      this.transportPayload = transformed.payload;
+      this.networkArmed = true;
       return transformed.payload;
     } catch (error) {
       const reason = boundedReason(error);
-      if (!this.adopted) {
+      if (!this.adoption) {
         try {
-          writeFallback(this.record.fallbackFile, this.record, this.capture, reason);
-          this.disabledReason = reason;
-          this.networkArmed = false;
-          if (stripsInitialPreviousResponseId && isJsonObject(payload)) {
-            const freshPayload = cloneJsonObject(payload);
-            delete freshPayload.previous_response_id;
-            return freshPayload;
-          }
-          return payload;
+          this.persistFallback(reason);
+          return stripPreviousResponseId(payload);
         } catch (persistenceError) {
-          this.fatalReason = `Unable to persist pre-adoption fallback: ${boundedReason(persistenceError)}`;
-          this.networkArmed = true;
+          this.setFatal(`Unable to persist pre-adoption fallback: ${boundedReason(persistenceError)}`);
           return failClosedPayload(payload, this.record.marker);
         }
       }
-      this.fatalReason = reason;
-      this.networkArmed = true;
+      this.setFatal(reason);
       return failClosedPayload(payload, this.record.marker);
     }
   }
 
   transformHeaders(headers: Record<string, string | null | undefined>, context: ExtensionContext): void {
-    if (this.disabledReason) return;
-    const drift = routeDriftReason(context, this.record, this.capture.data.baseUrl);
-    if (drift) {
-      if (this.adopted) {
-        this.fatalReason = drift;
-        this.networkArmed = true;
-      } else {
-        this.disabledReason = drift;
-      }
+    if (this.fatalReason) {
+      this.networkArmed = true;
       return;
     }
-    if (!this.adopted) return;
+    if (this.retired || this.disabledReason) {
+      deleteHeader(headers, "session-id");
+      this.networkArmed = false;
+      this.transportPayload = undefined;
+      return;
+    }
+    const drift = routeDriftReason(context, this.record, this.capture.data.baseUrl);
+    if (drift) {
+      if (this.adoption) {
+        this.setFatal(drift);
+      } else {
+        try {
+          this.persistFallback(drift);
+        } catch (error) {
+          this.setFatal(`Unable to persist pre-adoption fallback: ${boundedReason(error)}`);
+        }
+      }
+      deleteHeader(headers, "session-id");
+      return;
+    }
+    if (!this.adoption) return;
     setHeader(headers, "session-id", this.capture.data.cacheAffinitySessionId);
-    // x-client-request-id intentionally remains the child's independently generated request identity.
+    // x-client-request-id intentionally remains the child's independent request identity.
     this.networkArmed = true;
+  }
+
+  observeProviderResponse(status: number): void {
+    if (!Number.isInteger(status)) return;
+    if (this.retired && this.retiredFreshRequestInFlight) {
+      this.consumeRetiredFreshRequest();
+      return;
+    }
+    if (!this.pendingAdoption) {
+      if (this.adoption && status >= 200 && status < 300) this.networkArmed = false;
+      return;
+    }
+    try {
+      if (status >= 200 && status < 300) this.commitPendingAdoption();
+      else this.persistFallback(`Initial Codex lineage request was rejected with HTTP status ${status}.`);
+    } catch (error) {
+      this.setFatal(`Unable to persist provider-observed lineage decision: ${boundedReason(error)}`);
+    }
+  }
+
+  observeAssistantMessage(message: unknown, context: ExtensionContext): void {
+    if (!isJsonObject(message)) return;
+    if (
+      this.retired &&
+      this.retiredFreshRequestInFlight &&
+      message.role === "assistant" &&
+      message.provider === this.record.provider &&
+      message.model === this.record.model &&
+      message.api === CODEX_CACHE_LINEAGE_API
+    ) {
+      this.consumeRetiredFreshRequest();
+      return;
+    }
+    if (!this.pendingAdoption) {
+      if (
+        this.adoption &&
+        message.role === "assistant" &&
+        message.provider === this.record.provider &&
+        message.model === this.record.model &&
+        message.api === CODEX_CACHE_LINEAGE_API
+      ) this.networkArmed = false;
+      return;
+    }
+    try {
+      const drift = routeDriftReason(context, this.record, this.capture.data.baseUrl);
+      if (drift) {
+        this.persistFallback(drift);
+        return;
+      }
+      if (
+        message.role !== "assistant" ||
+        message.provider !== this.record.provider ||
+        message.model !== this.record.model ||
+        message.api !== CODEX_CACHE_LINEAGE_API
+      ) return;
+      if (message.stopReason === "error" || message.stopReason === "aborted") {
+        this.persistFallback("Initial Codex lineage request was not accepted by the provider.");
+        return;
+      }
+      this.commitPendingAdoption();
+    } catch (error) {
+      this.setFatal(`Unable to persist provider-observed lineage decision: ${boundedReason(error)}`);
+    }
+  }
+
+  retireAfterCompaction(reason: "manual" | "threshold" | "overflow"): void {
+    if (this.retired || !this.adoption) return;
+    const bounded = `Cache lineage retired after trusted Pi ${reason} compaction.`;
+    const retirement = { reason: bounded, firstFreshRequestPending: true };
+    try {
+      writeRetirement(this.record.retirementFile, this.record, this.capture, retirement);
+    } catch (error) {
+      this.setFatal(`Unable to persist trusted compaction retirement: ${boundedReason(error)}`);
+      return;
+    }
+    this.retired = retirement;
+    this.adoption = undefined;
+    this.pendingAdoption = undefined;
+    this.disabledReason = undefined;
+    this.fatalReason = undefined;
+    this.networkArmed = false;
+    this.transportPayload = undefined;
+    writeLineageSummary(this.record, "retired", bounded);
   }
 
   status(): WorkerCacheLineageRuntimeStatus {
     if (this.fatalReason) return { mode: "failed", reason: this.fatalReason };
+    if (this.retired) return { mode: "retired", reason: this.retired.reason };
     if (this.disabledReason) return { mode: "fresh", reason: this.disabledReason };
-    return { mode: this.adopted ? "adopted" : "eligible" };
+    return { mode: this.adoption ? "adopted" : "eligible" };
   }
 
   installNetworkGuards(): void {
@@ -413,11 +585,9 @@ class EligibleRuntimeController {
       this.originalFetch = globalThis.fetch;
       const controller = this;
       globalThis.fetch = (async function lineageFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-        if (!controller.networkArmed) {
+        if (!controller.networkArmed || !isCodexHttpTarget(input)) {
           return controller.originalFetch!.call(globalThis, input, init);
         }
-        if (controller.fatalReason) controller.assertNetworkAllowed();
-        if (!isCodexHttpTarget(input)) return controller.originalFetch!.call(globalThis, input, init);
         controller.assertNetworkAllowed();
         const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
         headers.set("session-id", controller.capture.data.cacheAffinitySessionId);
@@ -428,26 +598,31 @@ class EligibleRuntimeController {
       this.originalWebSocket = globalThis.WebSocket;
       const Original = this.originalWebSocket;
       const controller = this;
-      const GuardedWebSocket = class extends Original {
-        constructor(url: string | URL, protocolsOrOptions?: string | string[] | Record<string, unknown>) {
-          if (!controller.networkArmed) {
-            super(url, protocolsOrOptions as string | string[] | undefined);
-            return;
-          }
-          if (controller.fatalReason) controller.assertNetworkAllowed();
-          if (!isCodexWebSocketTarget(url)) {
-            super(url, protocolsOrOptions as string | string[] | undefined);
-            return;
-          }
+      globalThis.WebSocket = new Proxy(Original, {
+        construct(target, args, newTarget) {
+          const [url, protocolsOrOptions, callerOptions] = args as [
+            string | URL,
+            string | string[] | Record<string, unknown> | undefined,
+            Record<string, unknown> | undefined
+          ];
+          if (!controller.networkArmed || !isCodexWebSocketTarget(url)) return Reflect.construct(target, args, newTarget);
           controller.assertNetworkAllowed();
+          if (typeof protocolsOrOptions === "string" || Array.isArray(protocolsOrOptions)) {
+            const options = isJsonObject(callerOptions) ? { ...callerOptions } : {};
+            const headers = new Headers(isJsonObject(options.headers) ? options.headers as Record<string, string> : undefined);
+            headers.set("session-id", controller.capture.data.cacheAffinitySessionId);
+            options.headers = Object.fromEntries(headers.entries());
+            const socket = Reflect.construct(target, [url, protocolsOrOptions, options], newTarget) as WebSocket;
+            return controller.guardWebSocketSend(socket);
+          }
           const options = isJsonObject(protocolsOrOptions) ? { ...protocolsOrOptions } : {};
           const headers = new Headers(isJsonObject(options.headers) ? options.headers as Record<string, string> : undefined);
           headers.set("session-id", controller.capture.data.cacheAffinitySessionId);
           options.headers = Object.fromEntries(headers.entries());
-          super(url, options as unknown as string[]);
+          const socket = Reflect.construct(target, [url, options], newTarget) as WebSocket;
+          return controller.guardWebSocketSend(socket);
         }
-      };
-      globalThis.WebSocket = GuardedWebSocket as typeof globalThis.WebSocket;
+      }) as typeof globalThis.WebSocket;
     }
   }
 
@@ -456,22 +631,36 @@ class EligibleRuntimeController {
     if (this.originalWebSocket) globalThis.WebSocket = this.originalWebSocket;
   }
 
+  private guardWebSocketSend(socket: WebSocket): WebSocket {
+    const originalSend = socket.send.bind(socket);
+    socket.send = ((data: Parameters<WebSocket["send"]>[0]) => {
+      if (!this.networkArmed) return originalSend(data);
+      this.assertNetworkAllowed();
+      if (!this.transportPayload || typeof data !== "string") {
+        throw new Error("Managed-worker Codex WebSocket request cannot prove its full replay payload.");
+      }
+      let envelope: unknown;
+      try {
+        envelope = JSON.parse(data);
+      } catch {
+        throw new Error("Managed-worker Codex WebSocket request is not valid JSON.");
+      }
+      if (!isJsonObject(envelope) || envelope.type !== "response.create") {
+        throw new Error("Managed-worker Codex WebSocket request is not a response.create frame.");
+      }
+      return originalSend(JSON.stringify({ ...this.transportPayload, type: "response.create" }));
+    }) as WebSocket["send"];
+    return socket;
+  }
+
   private transformPayloadOrThrow(
     payload: unknown,
-    context: ExtensionContext
-  ): {
-    payload: JsonObject;
-    workerToolsSha256: string;
-    workerInstructionsSha256: string;
-    forkBoundarySha256: string;
-    initialAssignmentSha256: string;
-  } {
+    context: ExtensionContext,
+    adoption: AdoptionState | undefined
+  ): { payload: JsonObject; adoption: AdoptionState } {
     const drift = routeDriftReason(context, this.record, this.capture.data.baseUrl);
     if (drift) throw new Error(drift);
     if (!isJsonObject(payload)) throw new Error("Worker Codex provider payload is not an object.");
-    if (this.capture.data.payload.previous_response_id !== undefined) {
-      throw new Error("Codex cache-lineage workers never inherit parent previous_response_id.");
-    }
     if (payload.model !== this.record.model) throw new Error("Worker Codex payload model drifted before lineage adoption.");
     const workerInstructions = boundedWorkerInstructions(payload.instructions);
     const workerInstructionsSha256 = sha256(workerInstructions);
@@ -480,7 +669,8 @@ class EligibleRuntimeController {
     if (currentInput.length < parentInput.length || !equalJson(currentInput.slice(0, parentInput.length), parentInput)) {
       throw new Error("Worker Codex input does not preserve the exact captured parent prefix.");
     }
-    const workerTools = collectWorkerTools(payload, currentInput.slice(parentInput.length));
+    const rawSuffix = currentInput.slice(parentInput.length);
+    const workerTools = collectWorkerTools(payload, rawSuffix);
     if (workerTools.length === 0) throw new Error("Worker Codex payload exposes no managed-worker tool schemas.");
     const workerToolNames = workerTools.map(toolName);
     if (workerToolNames.some((name) => !MANAGED_WORKER_TOOL_NAME_SET.has(name))) {
@@ -496,43 +686,38 @@ class EligibleRuntimeController {
       const name = toolName(workerTool);
       const inherited = parentByName.get(name);
       if (inherited) {
-        if (!equalJson(inherited, workerTool)) {
-          throw new Error(`Inherited parent tool schema conflicts with managed-worker tool ${name}.`);
-        }
+        if (!equalJson(inherited, workerTool)) throw new Error(`Inherited parent tool schema conflicts with managed-worker tool ${name}.`);
       } else {
         appendedTools.push(workerTool);
       }
     }
-    const rawSuffix = currentInput.slice(parentInput.length);
-    const markerOccurrences = rawSuffix.reduce(
-      (total, item) => total + markerOccurrencesInInputItem(item, this.record.marker),
-      0
-    );
-    const markerItems = rawSuffix.filter((item) => inputItemContainsMarker(item, this.record.marker));
-    if (markerOccurrences !== 1 || markerItems.length !== 1) {
-      throw new Error(`Worker Codex input must contain exactly one initial assignment marker; found ${markerOccurrences}.`);
-    }
-    const initialAssignment = markerItems[0]!;
-    const initialAssignmentSha256 = sha256(stringifyBounded(initialAssignment, "managed-worker initial assignment"));
-    const suffix = rawSuffix.filter((item) => item.type !== "additional_tools");
-    const forkBoundary = suffix.indexOf(initialAssignment);
-    if (forkBoundary < 0) throw new Error("Worker Codex initial assignment marker is not in the stable suffix.");
-    const previousResponseId = payload.previous_response_id;
-    if (previousResponseId !== undefined) {
-      if (
-        !this.adopted ||
-        typeof previousResponseId !== "string" ||
-        !previousResponseId ||
-        Buffer.byteLength(previousResponseId, "utf8") > 1024 ||
-        !suffix.slice(forkBoundary + 1).some((item) => item.role === "assistant")
-      ) {
-        throw new Error("Worker Codex initial fork unexpectedly carries previous_response_id.");
+
+    let assignmentInputIndex: number;
+    if (adoption) {
+      assignmentInputIndex = adoption.assignmentInputIndex;
+      if (assignmentInputIndex < parentInput.length || assignmentInputIndex >= currentInput.length) {
+        throw new Error("Managed-worker initial assignment position drifted after Codex lineage adoption.");
       }
+    } else {
+      const markerOccurrences = rawSuffix.reduce(
+        (total, item) => total + markerOccurrencesInInputItem(item, this.record.marker),
+        0
+      );
+      const markerIndexes = rawSuffix.flatMap((item, index) =>
+        inputItemContainsMarker(item, this.record.marker) ? [parentInput.length + index] : []
+      );
+      if (markerOccurrences !== 1 || markerIndexes.length !== 1) {
+        throw new Error(`Worker Codex input must contain exactly one initial assignment marker; found ${markerOccurrences}.`);
+      }
+      assignmentInputIndex = markerIndexes[0]!;
     }
+    const initialAssignment = currentInput[assignmentInputIndex]!;
+    const initialAssignmentSha256 = sha256(stringifyBounded(initialAssignment, "managed-worker initial assignment"));
+    const preAssignmentItems = currentInput.slice(parentInput.length, assignmentInputIndex);
+    const preAssignmentItemsSha256 = sha256(stringifyBounded(preAssignmentItems, "managed-worker pre-assignment items"));
+
     const boundary: JsonObject[] = [];
-    if (appendedTools.length > 0) {
-      boundary.push({ type: "additional_tools", role: "developer", tools: appendedTools });
-    }
+    if (appendedTools.length > 0) boundary.push({ type: "additional_tools", role: "developer", tools: appendedTools });
     boundary.push({
       role: "developer",
       content: [
@@ -543,32 +728,89 @@ class EligibleRuntimeController {
         { type: "input_text", text: workerInstructions }
       ]
     });
+    const nextAdoption: AdoptionState = {
+      workerToolsSha256: sha256(stringifyBounded(workerTools, "managed-worker Codex tool schemas")),
+      workerInstructionsSha256,
+      forkBoundarySha256: sha256(stringifyBounded(boundary, "managed-worker Codex fork boundary")),
+      initialAssignmentSha256,
+      preAssignmentItemsSha256,
+      assignmentInputIndex
+    };
+    if (adoption) assertAdoptionUnchanged(adoption, nextAdoption);
+
+    const suffixBeforeAssignment = currentInput
+      .slice(parentInput.length, assignmentInputIndex)
+      .filter((item) => item.type !== "additional_tools");
+    const suffixFromAssignment = currentInput
+      .slice(assignmentInputIndex)
+      .filter((item) => item.type !== "additional_tools");
     const transformed = cloneJsonObject(this.capture.data.payload);
-    transformed.input = [
-      ...parentInput,
-      ...suffix.slice(0, forkBoundary),
-      ...boundary,
-      ...suffix.slice(forkBoundary)
-    ];
+    transformed.input = [...parentInput, ...suffixBeforeAssignment, ...boundary, ...suffixFromAssignment];
     transformed.tool_choice = {
       type: "allowed_tools",
       mode: "auto",
       tools: workerToolNames.map((name) => ({ type: "function", name }))
     };
-    if (previousResponseId !== undefined) transformed.previous_response_id = previousResponseId;
-    else delete transformed.previous_response_id;
-    return {
-      payload: transformed,
-      workerToolsSha256: sha256(stringifyBounded(workerTools, "managed-worker Codex tool schemas")),
-      workerInstructionsSha256,
-      forkBoundarySha256: sha256(stringifyBounded(boundary, "managed-worker Codex fork boundary")),
-      initialAssignmentSha256
-    };
+    delete transformed.previous_response_id;
+    return { payload: transformed, adoption: nextAdoption };
+  }
+
+  private transformRetiredPayload(payload: unknown): unknown {
+    this.networkArmed = false;
+    this.transportPayload = undefined;
+    if (!this.retired?.firstFreshRequestPending) return payload;
+    this.retiredFreshRequestInFlight = true;
+    return stripPreviousResponseId(payload);
+  }
+
+  private consumeRetiredFreshRequest(): void {
+    if (!this.retired?.firstFreshRequestPending) return;
+    const next = { ...this.retired, firstFreshRequestPending: false };
+    try {
+      writeRetirement(this.record.retirementFile, this.record, this.capture, next);
+      this.retired = next;
+      this.retiredFreshRequestInFlight = false;
+    } catch (error) {
+      this.setFatal(`Unable to persist post-compaction fresh request: ${boundedReason(error)}`);
+    }
+  }
+
+  private commitPendingAdoption(): void {
+    if (!this.pendingAdoption || this.adoption || this.retired || this.disabledReason) return;
+    writeAdoption(this.record.adoptionFile, this.record, this.capture, this.pendingAdoption);
+    this.adoption = this.pendingAdoption;
+    this.pendingAdoption = undefined;
+    this.networkArmed = false;
+    this.transportPayload = undefined;
+    writeLineageSummary(this.record, "adopted");
+  }
+
+  private persistFallback(reason: string): void {
+    const bounded = boundedTextReason(reason);
+    writeFallback(this.record.fallbackFile, this.record, this.capture, bounded);
+    this.pendingAdoption = undefined;
+    this.disabledReason = bounded;
+    this.networkArmed = false;
+    this.transportPayload = undefined;
+    writeLineageSummary(this.record, "fresh", bounded);
+  }
+
+  private setFatal(reason: string): void {
+    this.fatalReason = boundedTextReason(reason);
+    this.networkArmed = true;
+    this.transportPayload = undefined;
+    try {
+      writeLineageSummary(this.record, "failed", this.fatalReason);
+    } catch {
+      // Transport remains fail-closed even when diagnostic persistence fails.
+    }
   }
 
   private assertNetworkAllowed(): void {
     if (this.fatalReason) throw new Error(`Managed-worker Codex cache lineage failed closed: ${this.fatalReason}`);
-    if (!this.adopted) throw new Error("Managed-worker Codex cache lineage was not adopted before transport.");
+    if (!this.adoption && !this.pendingAdoption) {
+      throw new Error("Managed-worker Codex cache lineage was not verified before transport.");
+    }
   }
 }
 
@@ -621,13 +863,6 @@ function readWorkerSnapshot(record: Extract<WorkerCacheLineageRecord, { mode: "e
   return parseParentCapture(bytes.toString("utf8"));
 }
 
-function readParentCapture(file: string): ParentCacheLineageCapture {
-  const metadata = lstatSync(file);
-  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size <= 0 || metadata.size > WORKER_CACHE_LINEAGE_MAX_BYTES) {
-    throw new Error("Parent cache-lineage capture is not a bounded regular file.");
-  }
-  return parseParentCapture(readFileSync(file, "utf8"));
-}
 
 function parseParentCapture(raw: string): ParentCacheLineageCapture {
   const parsed: unknown = JSON.parse(raw);
@@ -647,7 +882,7 @@ function parseParentCapture(raw: string): ParentCacheLineageCapture {
     typeof data.capturedAt !== "string" || !Number.isFinite(Date.parse(data.capturedAt)) ||
     !isJsonObject(data.payload) ||
     typeof data.payloadSha256 !== "string" || !/^[0-9a-f]{64}$/.test(data.payloadSha256) ||
-    typeof data.cacheAffinitySessionId !== "string" || !data.cacheAffinitySessionId || data.cacheAffinitySessionId.length > 512
+    typeof data.cacheAffinitySessionId !== "string" || !data.cacheAffinitySessionId || Array.from(data.cacheAffinitySessionId).length > 64
   ) throw new Error("Cache-lineage capture fields are invalid.");
   if (sha256(stringifyBounded(data.payload, "captured parent payload")) !== data.payloadSha256) {
     throw new Error("Captured parent payload digest mismatch.");
@@ -662,39 +897,21 @@ function writeAdoption(
   file: string,
   record: Extract<WorkerCacheLineageRecord, { mode: "eligible" }>,
   capture: ParentCacheLineageCapture,
-  workerToolsSha256: string,
-  workerInstructionsSha256: string,
-  forkBoundarySha256: string,
-  initialAssignmentSha256: string
+  adoption: AdoptionState
 ): void {
   const value = {
     version: ADOPTION_VERSION,
     marker: record.marker,
     snapshotSha256: record.snapshotSha256,
     payloadSha256: capture.data.payloadSha256,
-    workerToolsSha256,
-    workerInstructionsSha256,
-    forkBoundarySha256,
-    initialAssignmentSha256,
     markerSha256: sha256(record.marker),
     provider: record.provider,
     model: record.model,
-    thinkingLevel: record.thinkingLevel
+    thinkingLevel: record.thinkingLevel,
+    ...adoption
   };
   if (existsSync(file)) {
-    const adoption = readAdoption(file, record, capture);
-    if (adoption.workerToolsSha256 !== workerToolsSha256) {
-      throw new Error("Worker cache-lineage adoption tool schema digest mismatch.");
-    }
-    if (adoption.workerInstructionsSha256 !== workerInstructionsSha256) {
-      throw new Error("Worker cache-lineage adoption system instruction digest mismatch.");
-    }
-    if (adoption.forkBoundarySha256 !== forkBoundarySha256) {
-      throw new Error("Worker cache-lineage adoption fork boundary digest mismatch.");
-    }
-    if (adoption.initialAssignmentSha256 !== initialAssignmentSha256) {
-      throw new Error("Worker cache-lineage adoption initial assignment digest mismatch.");
-    }
+    assertAdoptionUnchanged(readAdoption(file, record, capture), adoption);
     return;
   }
   writePrivateJson(file, value);
@@ -704,12 +921,7 @@ function readAdoption(
   file: string,
   record: Extract<WorkerCacheLineageRecord, { mode: "eligible" }>,
   capture: ParentCacheLineageCapture
-): {
-  workerToolsSha256: string;
-  workerInstructionsSha256: string;
-  forkBoundarySha256: string;
-  initialAssignmentSha256: string;
-} {
+): AdoptionState {
   const metadata = lstatSync(file);
   if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size <= 0 || metadata.size > 4096) {
     throw new Error("Worker cache-lineage adoption marker is invalid.");
@@ -728,14 +940,32 @@ function readAdoption(
     typeof value.workerToolsSha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.workerToolsSha256) ||
     typeof value.workerInstructionsSha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.workerInstructionsSha256) ||
     typeof value.forkBoundarySha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.forkBoundarySha256) ||
-    typeof value.initialAssignmentSha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.initialAssignmentSha256)
+    typeof value.initialAssignmentSha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.initialAssignmentSha256) ||
+    typeof value.preAssignmentItemsSha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.preAssignmentItemsSha256) ||
+    !Number.isInteger(value.assignmentInputIndex) || (value.assignmentInputIndex as number) < 0 || (value.assignmentInputIndex as number) > 1_000_000
   ) throw new Error("Worker cache-lineage adoption marker does not match its persisted lineage.");
   return {
     workerToolsSha256: value.workerToolsSha256,
     workerInstructionsSha256: value.workerInstructionsSha256,
     forkBoundarySha256: value.forkBoundarySha256,
-    initialAssignmentSha256: value.initialAssignmentSha256
+    initialAssignmentSha256: value.initialAssignmentSha256,
+    preAssignmentItemsSha256: value.preAssignmentItemsSha256,
+    assignmentInputIndex: value.assignmentInputIndex as number
   };
+}
+
+function assertAdoptionUnchanged(expected: AdoptionState, actual: AdoptionState): void {
+  const checks: Array<[keyof AdoptionState, string]> = [
+    ["workerToolsSha256", "Managed-worker tool schemas drifted after Codex lineage adoption."],
+    ["workerInstructionsSha256", "Managed-worker system instructions drifted after Codex lineage adoption."],
+    ["forkBoundarySha256", "Managed-worker fork boundary drifted after Codex lineage adoption."],
+    ["initialAssignmentSha256", "Managed-worker initial assignment drifted after Codex lineage adoption."],
+    ["preAssignmentItemsSha256", "Managed-worker pre-assignment history drifted after Codex lineage adoption."],
+    ["assignmentInputIndex", "Managed-worker initial assignment position drifted after Codex lineage adoption."]
+  ];
+  for (const [field, message] of checks) {
+    if (expected[field] !== actual[field]) throw new Error(message);
+  }
 }
 
 function writeFallback(
@@ -786,6 +1016,90 @@ function readFallback(
   return value.reason;
 }
 
+function writeRetirement(
+  file: string,
+  record: Extract<WorkerCacheLineageRecord, { mode: "eligible" }>,
+  capture: ParentCacheLineageCapture,
+  retirement: RetirementState
+): void {
+  writePrivateJson(file, {
+    version: RETIREMENT_VERSION,
+    markerSha256: sha256(record.marker),
+    snapshotSha256: record.snapshotSha256,
+    payloadSha256: capture.data.payloadSha256,
+    provider: record.provider,
+    model: record.model,
+    thinkingLevel: record.thinkingLevel,
+    reason: truncateUtf8(retirement.reason, 400),
+    firstFreshRequestPending: retirement.firstFreshRequestPending
+  });
+}
+
+function readRetirement(
+  file: string,
+  record: Extract<WorkerCacheLineageRecord, { mode: "eligible" }>,
+  capture: ParentCacheLineageCapture
+): RetirementState {
+  const metadata = lstatSync(file);
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size <= 0 || metadata.size > 4096) {
+    throw new Error("Worker cache-lineage retirement marker is invalid.");
+  }
+  const value: unknown = JSON.parse(readFileSync(file, "utf8"));
+  if (
+    !isJsonObject(value) ||
+    value.version !== RETIREMENT_VERSION ||
+    value.markerSha256 !== sha256(record.marker) ||
+    value.snapshotSha256 !== record.snapshotSha256 ||
+    value.payloadSha256 !== capture.data.payloadSha256 ||
+    value.provider !== record.provider ||
+    value.model !== record.model ||
+    value.thinkingLevel !== record.thinkingLevel ||
+    typeof value.reason !== "string" || !value.reason || Buffer.byteLength(value.reason, "utf8") > 400 ||
+    typeof value.firstFreshRequestPending !== "boolean"
+  ) throw new Error("Worker cache-lineage retirement marker does not match its persisted lineage.");
+  return { reason: value.reason, firstFreshRequestPending: value.firstFreshRequestPending };
+}
+
+function writeLineageSummary(
+  record: Extract<WorkerCacheLineageRecord, { mode: "eligible" }>,
+  mode: PersistedLineageSummary["mode"],
+  reason?: string
+): void {
+  try {
+    writePrivateJson(record.summaryFile, {
+      version: LINEAGE_SUMMARY_VERSION,
+      markerSha256: sha256(record.marker),
+      snapshotSha256: record.snapshotSha256,
+      mode,
+      ...(reason ? { reason: truncateUtf8(reason, 512) } : {})
+    });
+  } catch {
+    // Summary state is observational. Authoritative launch/adoption files remain strict.
+  }
+}
+
+function readLineageSummary(
+  record: Extract<WorkerCacheLineageRecord, { mode: "eligible" }>
+): WorkerCacheLineageSummary {
+  const metadata = lstatSync(record.summaryFile);
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size <= 0 || metadata.size > 2048) {
+    throw new Error("Worker cache-lineage summary is invalid.");
+  }
+  const value: unknown = JSON.parse(readFileSync(record.summaryFile, "utf8"));
+  if (
+    !isJsonObject(value) ||
+    value.version !== LINEAGE_SUMMARY_VERSION ||
+    value.markerSha256 !== sha256(record.marker) ||
+    value.snapshotSha256 !== record.snapshotSha256 ||
+    !["eligible", "adopted", "fresh", "retired", "failed"].includes(String(value.mode)) ||
+    (value.reason !== undefined && (typeof value.reason !== "string" || !value.reason || Buffer.byteLength(value.reason, "utf8") > 512))
+  ) throw new Error("Worker cache-lineage summary does not match its record.");
+  return {
+    mode: value.mode as WorkerCacheLineageSummary["mode"],
+    ...(typeof value.reason === "string" ? { reason: value.reason } : {})
+  };
+}
+
 function cacheLineageRouteReason(route: WorkerRoute): string | undefined {
   if (route.provider !== CODEX_CACHE_LINEAGE_PROVIDER) {
     return "Cache-lineage proof is limited to the openai-codex provider.";
@@ -809,9 +1123,6 @@ function routeDriftReason(
   return undefined;
 }
 
-function parentCaptureFile(stateRoot: string, parentSessionFile: string): string {
-  return path.join(path.resolve(stateRoot), ".cache-lineage", `${sha256(path.resolve(parentSessionFile))}.json`);
-}
 
 function freshLineage(reason: string): WorkerCacheLineageRecord {
   return { version: 1, mode: "fresh", reason: truncateUtf8(reason, 512) };
@@ -824,6 +1135,13 @@ function guardManagedWorkerTool(toolNameValue: string): { block: true; reason: s
     reason: `Managed worker tool ${toolNameValue} is not authorized by the worker runtime allowlist.`,
     terminate: true
   };
+}
+
+function stripPreviousResponseId(payload: unknown): unknown {
+  if (!isJsonObject(payload) || payload.previous_response_id === undefined) return payload;
+  const stripped = cloneJsonObject(payload);
+  delete stripped.previous_response_id;
+  return stripped;
 }
 
 function failClosedPayload(payload: unknown, marker: string): JsonObject {
@@ -863,9 +1181,67 @@ function writePrivateText(file: string, text: string): void {
   if (Buffer.byteLength(text, "utf8") > WORKER_CACHE_LINEAGE_MAX_BYTES) throw new Error("Cache-lineage state exceeds its bounded size.");
   mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(temporary, text, { mode: 0o600, flag: "wx" });
-  renameSync(temporary, file);
-  chmodSync(file, 0o600);
+  try {
+    writeFileSync(temporary, text, { mode: 0o600, flag: "wx" });
+    renameSync(temporary, file);
+    chmodSync(file, 0o600);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+}
+
+function setBoundedCaptureEntry<T>(map: Map<string, T>, key: string, value: T): void {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > CAPTURE_HOLDER_MAX_SESSIONS) {
+    const oldest = map.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    map.delete(oldest);
+  }
+}
+
+function jsonValueFitsBound(value: unknown, maxBytes: number): boolean {
+  try {
+    const seen = new WeakSet<object>();
+    let budget = maxBytes;
+    const stack: unknown[] = [value];
+    while (stack.length > 0) {
+      const current = stack.pop();
+      if (current === null || typeof current === "boolean") budget -= 5;
+      else if (typeof current === "number") budget -= 32;
+      else if (typeof current === "string") budget -= current.length * 6 + 2;
+      else if (Array.isArray(current)) {
+        if (seen.has(current)) return false;
+        seen.add(current);
+        budget -= current.length + 2;
+        for (let index = current.length - 1; index >= 0; index -= 1) stack.push(current[index]);
+      } else if (isJsonObject(current)) {
+        if (seen.has(current)) return false;
+        seen.add(current);
+        const entries = Object.entries(current);
+        budget -= entries.length + 2;
+        for (const [key, child] of entries) {
+          budget -= key.length * 6 + 3;
+          if (typeof child === "undefined" || typeof child === "function" || typeof child === "symbol" || typeof child === "bigint") return false;
+          stack.push(child);
+        }
+      } else return false;
+      if (budget < 0) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function tryStringifyBounded(value: unknown): string | undefined {
+  try {
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined || Buffer.byteLength(serialized, "utf8") > WORKER_CACHE_LINEAGE_MAX_BYTES) return undefined;
+    return serialized;
+  } catch {
+    return undefined;
+  }
 }
 
 function stringifyBounded(value: unknown, label: string): string {
@@ -915,12 +1291,24 @@ function readHeader(headers: Record<string, string | null | undefined>, name: st
   return undefined;
 }
 
+function boundedCodexSessionHeader(headers: Record<string, string | null | undefined>): string | undefined {
+  const value = readHeader(headers, "session-id");
+  return value && Array.from(value).length <= 64 ? value : undefined;
+}
+
 function setHeader(headers: Record<string, string | null | undefined>, name: string, value: string): void {
   const expected = name.toLowerCase();
   for (const key of Object.keys(headers)) {
     if (key.toLowerCase() === expected) delete headers[key];
   }
   headers[name] = value;
+}
+
+function deleteHeader(headers: Record<string, string | null | undefined>, name: string): void {
+  const expected = name.toLowerCase();
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === expected) delete headers[key];
+  }
 }
 
 function normalizeCodexBaseUrl(value: string): string {
@@ -944,9 +1332,13 @@ function truncateUtf8(value: string, maxBytes: number): string {
   return result;
 }
 
+function boundedTextReason(value: string): string {
+  return truncateUtf8(value.replace(/\s+/g, " ").trim() || "unknown cache-lineage state transition", 400);
+}
+
 function boundedReason(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
-  return message.replace(/\s+/g, " ").trim().slice(0, 400) || "unknown cache-lineage validation failure";
+  return boundedTextReason(message || "unknown cache-lineage validation failure");
 }
 
 function sha256(value: string | Uint8Array): string {

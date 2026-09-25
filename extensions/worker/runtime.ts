@@ -7,6 +7,7 @@ import { defineTool, type AgentToolResult, type ExtensionAPI } from "@earendil-w
 import { unsettledAsyncShellJobsForOwner, unsettledPersistedAsyncShellJobsForOwner, type AsyncShellJobOwner } from "../async-shell/index.js";
 import {
   createWorkerCacheLineageRuntime,
+  registerWorkerCacheLineageRuntimeHooks,
   validateWorkerCacheLineageRecord,
   type WorkerCacheLineageRecord
 } from "./cache-lineage.js";
@@ -131,10 +132,7 @@ export function readCacheLineageEnvironment(
 
 export default function workerRuntimeExtension(api: ExtensionAPI): void {
   const cacheLineage = createWorkerCacheLineageRuntime(readCacheLineageEnvironment());
-  api.on("before_provider_request", (event, context) => cacheLineage.transformPayload(event.payload, context));
-  api.on("before_provider_headers", (event, context) => cacheLineage.transformHeaders(event.headers, context));
-  api.on("tool_call", (event) => cacheLineage.guardTool(event.toolName));
-  api.on("session_shutdown", () => cacheLineage.restoreNetwork());
+  registerWorkerCacheLineageRuntimeHooks(api, cacheLineage);
 
   api.registerTool(defineTool({
     name: "worker_task_read",

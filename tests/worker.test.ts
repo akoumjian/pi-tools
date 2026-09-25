@@ -406,7 +406,9 @@ test("managed-worker assignments inline the exact verified role contract in ever
       snapshotSha256: "a".repeat(64),
       marker: forkMarker,
       adoptionFile: "/state/adoption.json",
-      fallbackFile: "/state/fallback.json"
+      fallbackFile: "/state/fallback.json",
+      retirementFile: "/state/retirement.json",
+      summaryFile: "/state/summary.json"
     }
   }, "Implement exactly.", undefined);
   assert.equal(lineagePrompt.split(forkMarker).length - 1, 1, "the immutable initial assignment carries exactly one trusted fork marker");

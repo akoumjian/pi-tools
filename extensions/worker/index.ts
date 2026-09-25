@@ -235,7 +235,7 @@ export type WorkerRunReceipt = {
   thinkingLevel: string;
   completionDelivery: "steer" | "followUp";
   state: "queued" | "running";
-  cacheLineage?: { mode: "eligible" | "adopted" | "fresh"; reason?: string };
+  cacheLineage?: { mode: "eligible" | "adopted" | "fresh" | "retired" | "failed" | "unavailable"; reason?: string };
 };
 
 type WorkerRunDetails = { runs: WorkerRunReceipt[] };
@@ -275,7 +275,7 @@ type WorkerControlSummary = {
   workspaceRoot: string;
   taskIds: string[];
   route: WorkerRoute;
-  cacheLineage?: { mode: "eligible" | "adopted" | "fresh"; reason?: string };
+  cacheLineage?: { mode: "eligible" | "adopted" | "fresh" | "retired" | "failed" | "unavailable"; reason?: string };
   integration?: { phase: "analysis" | "resolution"; method: "merge" | "squash"; preparedId: string; manifestSha256: string; candidateId: string; sourceCandidateIds: string[]; workspaceRepo: string; targetRepo: string; targetRef: string; targetExpectedCommit: string; candidateHeadCommit: string; contextSha256: string; analysisRunId: string; decisionsSha256?: string; resolutionRunId?: string };
   container?: { name: string; containerId?: string; runId: string };
   activeRun?: {
@@ -3677,7 +3677,7 @@ function formatWorkerRunReceipt(value: WorkerRunReceipt): string {
   ].filter((line): line is string => line !== undefined).join("\n");
 }
 
-function cacheLineageSummary(record: WorkerRecord): { mode: "eligible" | "adopted" | "fresh"; reason?: string } | undefined {
+function cacheLineageSummary(record: WorkerRecord): { mode: "eligible" | "adopted" | "fresh" | "retired" | "failed" | "unavailable"; reason?: string } | undefined {
   return summarizeWorkerCacheLineage(record.cacheLineage);
 }
 

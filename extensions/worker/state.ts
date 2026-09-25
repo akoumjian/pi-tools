@@ -402,7 +402,9 @@ function validWorkerCacheLineageRecord(value: unknown, recordFile: string): bool
   const stateDir = path.dirname(recordFile);
   return value.snapshotFile === path.join(stateDir, "cache-lineage.json") &&
     value.adoptionFile === path.join(stateDir, "cache-lineage-adopted.json") &&
-    value.fallbackFile === path.join(stateDir, "cache-lineage-fallback.json");
+    value.fallbackFile === path.join(stateDir, "cache-lineage-fallback.json") &&
+    value.retirementFile === path.join(stateDir, "cache-lineage-retired.json") &&
+    value.summaryFile === path.join(stateDir, "cache-lineage-summary.json");
 }
 
 function validIntegrationRecord(value: unknown): boolean {
