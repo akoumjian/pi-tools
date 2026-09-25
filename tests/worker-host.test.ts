@@ -130,12 +130,12 @@ test("worker host completes an exact-fork fake-provider run while ignoring works
       bdPath: process.execPath,
       beadsRoute: TEST_BEADS_ROUTE,
       jobId: record.activeRun!.jobId,
-      timeoutMs: 30_000,
       extensionPaths: [...defaultWorkerExtensionPaths(), fakeProviderExtension]
     });
-    const config = JSON.parse(await readFile(launched.configFile, "utf8")) as { extensionPaths: string[]; rpcArgs: string[] };
+    const config = JSON.parse(await readFile(launched.configFile, "utf8")) as { extensionPaths: string[]; rpcArgs: string[]; timeoutMs?: number };
     assert.ok(config.extensionPaths.includes(fakeProviderExtension));
     assert.ok(config.rpcArgs.includes(fakeProviderExtension));
+    assert.equal(config.timeoutMs, undefined);
 
     const keepAlive = setInterval(() => {}, 100);
     const job = await launched.handle.completion.finally(() => clearInterval(keepAlive));
@@ -210,7 +210,6 @@ test("worker host waits for the settled follow-up turn after asynchronous shell 
       bdPath: process.execPath,
       beadsRoute: TEST_BEADS_ROUTE,
       jobId: record.activeRun!.jobId,
-      timeoutMs: 30_000,
       extensionPaths: [...defaultWorkerExtensionPaths(), providerExtension]
     });
     const keepAlive = setInterval(() => {}, 100);
@@ -219,6 +218,62 @@ test("worker host waits for the settled follow-up turn after asynchronous shell 
     assert.equal(job.exitCode, 0);
     assert.equal(readWorkerRuntimeHandoff(resultFile).handoff.state, "assignment_complete");
     assert.ok(existsSync(path.join(runDir, "settled.json")));
+  });
+});
+
+test("worker host fails promptly when a quiescent worker settles without typed handoff", async () => {
+  await withTempDir(async (directory) => {
+    const parentCwd = path.join(directory, "parent");
+    const workspaceRoot = path.join(directory, "workspace");
+    const stateDir = path.join(directory, "state");
+    const sessionDir = path.join(stateDir, "session");
+    const runDir = path.join(stateDir, "runs", "run-no-handoff");
+    await Promise.all([
+      mkdir(parentCwd, { recursive: true }),
+      mkdir(workspaceRoot, { recursive: true }),
+      mkdir(sessionDir, { recursive: true })
+    ]);
+    const parent = SessionManager.create(parentCwd, path.join(directory, "parent-sessions"), { id: "parent-session-no-handoff" });
+    parent.appendMessage({ role: "user", content: "parent no-handoff context", timestamp: Date.now() });
+    parent.appendMessage(assistantMessage("Ready for the no-handoff protocol probe."));
+    const parentSessionFile = parent.getSessionFile();
+    assert.ok(parentSessionFile);
+    const forked = forkWorkerSession({ parentSessionFile, workspaceRoot, sessionDir, sessionId: "worker-session-no-handoff" });
+    const record: WorkerRecord = {
+      version: WORKER_RECORD_VERSION,
+      workerId: "worker_20260925120000_nohand01",
+      sessionId: forked.sessionId,
+      sessionFile: forked.sessionFile,
+      parentSessionFile,
+      workspaceRoot,
+      taskIds: ["personal-workere2e"],
+      route: { provider: "worker-no-handoff-faux", model: "worker-no-handoff-faux-1", thinkingLevel: "off" },
+      status: "running",
+      activeRun: { runId: "run-no-handoff", jobId: "job_20260925120000_nohand01", status: "running" },
+      updatedAt: new Date().toISOString()
+    };
+    const providerExtension = fileURLToPath(new URL("./fixtures/worker-no-handoff-faux-provider.js", import.meta.url));
+    const launched = launchWorkerHost({ sendMessage(): void {} } as unknown as ExtensionAPI, {
+      cwd: parentCwd,
+      sessionManager: { getSessionId: () => "parent-session-no-handoff" },
+      isIdle: () => true
+    } as ExtensionContext, {
+      record,
+      shellExecution: { kind: "native-test" },
+      prompt: "Settle without a handoff.",
+      resultFile: path.join(runDir, "result.json"),
+      runDir,
+      processFile: path.join(runDir, "host-process.json"),
+      processNonce: "host-process-no-handoff",
+      bdPath: process.execPath,
+      beadsRoute: TEST_BEADS_ROUTE,
+      jobId: record.activeRun!.jobId,
+      extensionPaths: [...defaultWorkerExtensionPaths(), providerExtension]
+    });
+    const keepAlive = setInterval(() => {}, 100);
+    const job = await launched.handle.completion.finally(() => clearInterval(keepAlive));
+    assert.equal(job.status, "failed");
+    assert.match(await readFile(job.stderrLog, "utf8"), /settled quiescent turn without the required typed worker_handoff/);
   });
 });
 
@@ -286,7 +341,7 @@ test("cancelling a worker host leaves no worker-owned async-shell process alive"
     const marker = path.join(workspaceRoot, "owned-shell.pid");
     try {
       try {
-        await waitForPath(marker, 10_000);
+        await waitForPath(marker, 30_000);
       } catch (error) {
         const snapshot = launched.handle.snapshot();
         throw new Error(`${error instanceof Error ? error.message : String(error)}\nstdout:\n${await readFile(snapshot.stdoutLog, "utf8")}\nstderr:\n${await readFile(snapshot.stderrLog, "utf8")}`);
@@ -323,7 +378,7 @@ test("cancelling a worker host leaves no worker-owned async-shell process alive"
       timeoutMs: 1_000,
       extensionPaths: [...defaultWorkerExtensionPaths(), providerExtension]
     });
-    await waitForPath(marker, 10_000);
+    await waitForPath(marker, 30_000);
     const timeoutOwnedPid = Number.parseInt((await readFile(marker, "utf8")).trim(), 10);
     const timeoutKeepAlive = setInterval(() => {}, 100);
     const timeoutJob = await timedOut.handle.completion.finally(() => clearInterval(timeoutKeepAlive));

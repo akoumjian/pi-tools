@@ -16,6 +16,9 @@ if (typeof config.authorizationFile !== "string" || !path.isAbsolute(config.auth
 if (config.shellExecution?.kind !== "docker" && config.shellExecution?.kind !== "native-test") {
   throw new Error("Worker host config requires an explicit shell execution backend.");
 }
+if (config.timeoutMs !== undefined && (!Number.isSafeInteger(config.timeoutMs) || config.timeoutMs <= 0)) {
+  throw new Error("Worker host timeoutMs must be a positive safe integer when explicitly configured.");
+}
 writeAtomicJson(config.processFile, {
   version: 1,
   workerId: config.workerId,
@@ -159,25 +162,49 @@ function assertSessionIdentity(state) {
 
 function waitForHandoffSettlement(rpcClient, resultFile, timeoutMs) {
   return new Promise((resolve, reject) => {
-    let resultObserved = existsSync(resultFile);
-    let settled = false;
+    let finished = false;
+    let timeout;
     const finish = (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
+      if (finished) return;
+      finished = true;
+      if (timeout !== undefined) clearTimeout(timeout);
       unsubscribe();
       if (error) reject(error);
       else resolve();
     };
     const unsubscribe = rpcClient.onEvent((event) => {
-      if (!resultObserved && existsSync(resultFile)) resultObserved = true;
-      if (resultObserved && event.type === "agent_settled") finish();
+      if (event.type !== "agent_settled") return;
+      if (existsSync(resultFile)) {
+        finish();
+        return;
+      }
+      try {
+        if (hasUnsettledOwnedShellJobs()) return;
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error("Worker async-shell settlement could not be verified."));
+        return;
+      }
+      finish(new Error("Worker reached a settled quiescent turn without the required typed worker_handoff."));
     });
-    const timeout = setTimeout(
-      () => finish(new Error(`Worker handoff did not reach a settled turn within ${timeoutMs}ms.`)),
-      timeoutMs
-    );
+    if (timeoutMs !== undefined) {
+      timeout = setTimeout(
+        () => finish(new Error(`Worker handoff did not reach a settled turn within the explicit ${timeoutMs}ms timeout.`)),
+        timeoutMs
+      );
+    }
   });
+}
+
+function hasUnsettledOwnedShellJobs() {
+  const jobsDirectory = path.join(config.asyncJobRoot, "jobs");
+  if (!existsSync(jobsDirectory)) return false;
+  for (const entry of readdirSync(jobsDirectory, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !/^job_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(entry.name)) continue;
+    const meta = readStrictWorkerJobMeta(jobsDirectory, entry.name);
+    if (meta.owner.workerId !== config.workerId || meta.owner.runId !== config.runId) continue;
+    if (!workerJobIsSettled(meta)) return true;
+  }
+  return false;
 }
 
 function writeAtomicJson(target, value) {

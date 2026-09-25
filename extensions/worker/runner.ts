@@ -51,7 +51,7 @@ export type WorkerHostConfig = {
   extensionPaths: string[];
   shellExecution: WorkerShellExecution;
   rpcArgs: string[];
-  timeoutMs: number;
+  timeoutMs?: number;
 };
 
 export type WorkerHostProcess = {
@@ -99,6 +99,9 @@ export function launchWorkerHost(
   if (!input.record.sessionFile) throw new Error(`Worker ${input.record.workerId} has no forked session file.`);
   if (!input.record.activeRun) throw new Error(`Worker ${input.record.workerId} has no active run to launch.`);
   const activeRun = input.record.activeRun;
+  if (input.timeoutMs !== undefined && (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs <= 0)) {
+    throw new Error("Worker host timeoutMs must be a positive safe integer when explicitly configured.");
+  }
   const stateRoot = path.dirname(path.dirname(input.runDir));
   mkdirSync(input.runDir, { recursive: true, mode: 0o700 });
   const bdPath = input.bdPath ?? resolveExecutable("bd");
@@ -135,7 +138,7 @@ export function launchWorkerHost(
     extensionPaths: input.extensionPaths ?? defaultWorkerExtensionPaths(),
     shellExecution: input.shellExecution,
     rpcArgs: [],
-    timeoutMs: input.timeoutMs ?? 3_600_000
+    ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs })
   };
   config.rpcArgs = buildWorkerRpcArgs(config);
   writeFileSync(authorizationFile, `${JSON.stringify({
