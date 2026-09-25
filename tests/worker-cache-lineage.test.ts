@@ -1254,6 +1254,27 @@ test("large ASCII parent payloads use their encoded size rather than a worst-cas
   }
 });
 
+test("JSON-compatible shared references and omitted values remain eligible", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-json-semantics-"));
+  try {
+    const payload = parentPayload() as Record<string, unknown>;
+    const shared = { nested: "shared" };
+    payload.first = shared;
+    payload.second = shared;
+    payload.omitted = undefined;
+    const record = captureAndPrepare(root, false, payload);
+    assert.equal(record.mode, "eligible");
+    const snapshot = JSON.parse(readFileSync(record.snapshotFile, "utf8")) as {
+      data: { payload: Record<string, unknown> };
+    };
+    assert.deepEqual(snapshot.data.payload.first, shared);
+    assert.deepEqual(snapshot.data.payload.second, shared);
+    assert.equal(Object.hasOwn(snapshot.data.payload, "omitted"), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("oversized parent payloads skip capture without throwing or persisting request artifacts", () => {
   const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-oversized-"));
   try {

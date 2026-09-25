@@ -1233,35 +1233,68 @@ function setBoundedCaptureEntry<T>(map: Map<string, T>, key: string, value: T): 
   }
 }
 
+type JsonScanFrame =
+  | { kind: "value"; value: unknown; arrayElement: boolean; depth: number }
+  | { kind: "exit"; value: object };
+
 function jsonValueFitsBound(value: unknown, maxBytes: number): boolean {
   try {
-    const seen = new WeakSet<object>();
+    const active = new WeakSet<object>();
     let budget = maxBytes;
-    const stack: unknown[] = [value];
+    let visits = 0;
+    const stack: JsonScanFrame[] = [{ kind: "value", value, arrayElement: false, depth: 0 }];
     while (stack.length > 0) {
-      const current = stack.pop();
-      if (current === null || typeof current === "boolean") budget -= 5;
-      else if (typeof current === "number") budget -= 32;
+      const frame = stack.pop()!;
+      if (frame.kind === "exit") {
+        active.delete(frame.value);
+        continue;
+      }
+      visits += 1;
+      if (visits > 1_000_000 || frame.depth > 128) return false;
+      const current = frame.value;
+      if (current === null) budget -= 4;
+      else if (typeof current === "boolean") budget -= current ? 4 : 5;
+      else if (typeof current === "number") budget -= Number.isFinite(current)
+        ? (Object.is(current, -0) ? 1 : String(current).length)
+        : 4;
       else if (typeof current === "string") {
         const stringBytes = boundedJsonStringBytes(current, budget);
         if (stringBytes === undefined) return false;
         budget -= stringBytes;
-      } else if (Array.isArray(current)) {
-        if (seen.has(current)) return false;
-        seen.add(current);
-        budget -= current.length + 2;
-        for (let index = current.length - 1; index >= 0; index -= 1) stack.push(current[index]);
+      } else if (typeof current === "undefined" || typeof current === "function" || typeof current === "symbol") {
+        if (!frame.arrayElement) return false;
+        budget -= 4;
+      } else if (typeof current === "bigint") return false;
+      else if (Array.isArray(current)) {
+        if (active.has(current) || typeof (current as { toJSON?: unknown }).toJSON === "function") return false;
+        active.add(current);
+        budget -= Math.max(0, current.length - 1) + 2;
+        if (budget < 0) return false;
+        stack.push({ kind: "exit", value: current });
+        for (let index = current.length - 1; index >= 0; index -= 1) {
+          stack.push({ kind: "value", value: current[index], arrayElement: true, depth: frame.depth + 1 });
+        }
       } else if (isJsonObject(current)) {
-        if (seen.has(current)) return false;
-        seen.add(current);
-        const entries = Object.entries(current);
-        budget -= entries.length + 2;
+        const prototype = Object.getPrototypeOf(current);
+        if (
+          active.has(current) ||
+          (prototype !== Object.prototype && prototype !== null) ||
+          typeof (current as { toJSON?: unknown }).toJSON === "function"
+        ) return false;
+        active.add(current);
+        const rawEntries = Object.entries(current);
+        if (rawEntries.some(([, child]) => typeof child === "function" || typeof child === "symbol")) return false;
+        const entries = rawEntries.filter(([, child]) => typeof child !== "undefined");
+        budget -= Math.max(0, entries.length - 1) + 2;
         for (const [key, child] of entries) {
           const keyBytes = boundedJsonStringBytes(key, budget);
           if (keyBytes === undefined) return false;
           budget -= keyBytes + 1;
-          if (typeof child === "undefined" || typeof child === "function" || typeof child === "symbol" || typeof child === "bigint") return false;
-          stack.push(child);
+        }
+        if (budget < 0) return false;
+        stack.push({ kind: "exit", value: current });
+        for (let index = entries.length - 1; index >= 0; index -= 1) {
+          stack.push({ kind: "value", value: entries[index]![1], arrayElement: false, depth: frame.depth + 1 });
         }
       } else return false;
       if (budget < 0) return false;
