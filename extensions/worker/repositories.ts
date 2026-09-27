@@ -28,7 +28,6 @@ const MAX_SCAN_ENTRIES = 20_000;
 const MAX_SCAN_DEPTH = 12;
 const MAX_GIT_OUTPUT_BYTES = 1024 * 1024;
 const MAX_TREE_LISTING_BYTES = 64 * 1024 * 1024;
-const MAX_WORKTREE_PATCH_BYTES = 512 * 1024 * 1024;
 const MAX_PATH_LISTING_ENTRIES = 200_000;
 const MAX_REPOSITORY_PATH_BYTES = 4096;
 const MAX_COMMIT_OBJECT_BYTES = 64 * 1024 * 1024;
@@ -478,27 +477,6 @@ export function repositoryIgnoredWorktreePaths(repoPath: string, runner: GitRunn
     "ignored_paths",
     (descriptor, size) => parseBoundedNulPathOutput(descriptor, size, "ignored_paths")
   );
-}
-
-export type RepositoryBinaryPatch = { file: string; size: number; release(): void };
-
-export function createRepositoryBinaryPatch(
-  repoPath: string,
-  expectedCommit: string,
-  desiredCommit: string,
-  runner: GitRunner,
-  timeoutMs: number | null = 300_000
-): RepositoryBinaryPatch {
-  if (!OID_PATTERN.test(expectedCommit) || !OID_PATTERN.test(desiredCommit)) throw new Error("invalid_patch_commit");
-  const lease = createBoundedRepositoryGitOutput(
-    runner,
-    repoPath,
-    ["diff", "--binary", "--full-index", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/", "--unified=3", expectedCommit, desiredCommit, "--"],
-    MAX_WORKTREE_PATCH_BYTES,
-    "worktree_patch",
-    timeoutMs
-  );
-  return { file: lease.file, size: lease.size, release: lease.release };
 }
 
 function parseBoundedNulPathOutput(descriptor: number, size: number, label: string): string[] {
@@ -1006,6 +984,39 @@ export function runStandaloneGit(runner: GitRunner, cwd: string, args: string[])
 
 export function gitBuffer(runner: GitRunner, cwd: string, args: string[], options?: GitRunOptions): Buffer {
   return runGit(runner, cwd, args, options).stdout;
+}
+
+export function gitNoTimeoutToFiles(runner: GitRunner, cwd: string, args: string[]): void {
+  const outputs = ["stdout", "stderr"].map((stream) => {
+    const file = path.join(String(runner.env.HOME), `git-${stream}-${randomUUID()}.log`);
+    const descriptor = openSync(file, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
+    return { file, descriptor, identity: fstatSync(descriptor) };
+  });
+  try {
+    const result = spawnSync(runner.gitPath, repositoryGitArgs(cwd, path.join(cwd, ".git"), args), {
+      cwd,
+      env: { ...runner.env, GIT_CEILING_DIRECTORIES: cwd },
+      shell: false,
+      stdio: ["ignore", outputs[0]!.descriptor, outputs[1]!.descriptor]
+    });
+    if (result.error) throw new Error(`git_spawn_failed:${args[0] ?? "command"}:${boundText(result.error.message, 240)}`);
+    if (result.status !== 0) {
+      const stderr = Buffer.alloc(960);
+      const count = readSync(outputs[1]!.descriptor, stderr, 0, stderr.byteLength, 0);
+      throw new Error(gitFailureMessage(args[0] ?? "command", result.status ?? -1, stderr.subarray(0, Math.max(0, count))));
+    }
+    for (const output of outputs) {
+      const after = fstatSync(output.descriptor);
+      if (after.dev !== output.identity.dev || after.ino !== output.identity.ino || after.mode !== output.identity.mode || after.nlink !== 1 || after.uid !== output.identity.uid) {
+        throw new Error(`git_${args[0] ?? "command"}_unsafe_output`);
+      }
+    }
+  } finally {
+    for (const output of outputs) {
+      closeSync(output.descriptor);
+      rmSync(output.file, { force: true });
+    }
+  }
 }
 
 export function gitText(runner: GitRunner, cwd: string, args: string[], options?: GitRunOptions): string {

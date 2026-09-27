@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { cp, link, mkdir, mkdtemp, readFile, readlink, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { cp, link, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -419,9 +419,9 @@ test("fails before CAS on ignored collisions and tracked edits without overwriti
     const manifest = prepare(root, [item]);
     const collision = path.join(item.target, "candidate-ri.txt");
     await writeFile(path.join(item.target, ".git", "info", "exclude"), "candidate-ri.txt\n");
-    const shim = path.join(root, "git-inject-ignored-collision");
-    await writeFile(shim, `#!/bin/sh\ncase " $* " in *" apply --index "*) printf '%s\n' 'late ignored output' > ${JSON.stringify(collision)};; esac\nexec ${JSON.stringify(gitPath)} "$@"\n`, { mode: 0o700 });
-    const blocked = await promote(root, manifest, { gitPath: shim });
+    const blocked = await promote(root, manifest, {
+      hooks: { beforeWorktreeSync() { writeFileSync(collision, "late ignored output\n"); } }
+    });
     assert.equal(blocked.summary.status, "partial");
     assert.equal(blocked.summary.repositories[0]!.status, "ref_updated");
     assert.equal(await readFile(collision, "utf8"), "late ignored output\n");
@@ -620,7 +620,7 @@ test("uses durable Git mutation config, no reset, and update-ref --no-deref as t
     const before = refs(item.target);
     assert.equal((await promote(root, manifest, { gitPath: shim })).summary.status, "completed");
     const invocations = (await readFile(log, "utf8")).split("\n").filter(Boolean);
-    for (const command of ["bundle unbundle", "update-ref --no-deref", "apply --index -p1 --whitespace=nowarn"]) {
+    for (const command of ["bundle unbundle", "update-ref --no-deref", "read-tree -m -u --no-sparse-checkout --no-recurse-submodules"]) {
       const invocation = invocations.find((line) => line.includes(command));
       assert.ok(invocation, `logged ${command}`);
       assert.match(invocation, /-c core\.fsync=objects,reference,index -c core\.fsyncMethod=fsync/);
@@ -778,7 +778,7 @@ test("objects-imported expected-ref dirtiness and transient inspection failures 
   });
 });
 
-test("deterministic patching handles binary mode symlink deletion rename and file-directory transitions", async () => {
+test("exact tree transition handles binary mode symlink deletion rename and file-directory transitions", async () => {
   await withTempDir(async (root) => {
     const item = await fixture(root, "paths", {
       async setupBase(target) {
@@ -819,7 +819,7 @@ test("deterministic patching handles binary mode symlink deletion rename and fil
   });
 });
 
-test("patch generation ignores hostile local diff formatting configuration", async () => {
+test("exact tree transition is independent of hostile diff formatting configuration", async () => {
   await withTempDir(async (root) => {
     const item = await fixture(root, "config");
     const manifest = prepare(root, [item]);
@@ -833,10 +833,9 @@ test("patch generation ignores hostile local diff formatting configuration", asy
     const shim = path.join(root, "hostile-config-git");
     await writeFile(shim, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(log)}\nexec ${JSON.stringify(gitPath)} "$@"\n`, { mode: 0o700 });
     assert.equal((await promote(root, manifest, { gitPath: shim })).summary.status, "completed");
-    const invocation = (await readFile(log, "utf8")).split("\n").find((line) => line.includes(" diff --binary ")) ?? "";
-    assert.match(invocation, /--full-index --no-color --no-ext-diff --no-textconv --no-renames --src-prefix=a\/ --dst-prefix=b\/ --unified=3/);
-    assert.match(invocation, /-c diff\.noprefix=false/);
-    assert.match(invocation, /-c color\.diff=false/);
+    const invocations = (await readFile(log, "utf8")).split("\n").filter(Boolean);
+    assert.ok(invocations.some((line) => line.includes(" read-tree -m -u --no-sparse-checkout --no-recurse-submodules ")));
+    assert.equal(invocations.some((line) => line.includes(" apply --index ") || line.includes(" diff --binary ")), false);
   });
 });
 
@@ -871,7 +870,7 @@ test("ignored collision discovery collapses large directories and catches parent
   });
 });
 
-test("post-CAS apply errors preserve the original cause and exact retry state", async () => {
+test("post-CAS tree transition errors preserve the original cause and exact retry state", async () => {
   await withTempDir(async (root) => {
     const item = await fixture(root, "lock");
     const manifest = prepare(root, [item]);
@@ -890,28 +889,28 @@ test("post-CAS apply errors preserve the original cause and exact retry state", 
   await withTempDir(async (root) => {
     const item = await fixture(root, "after");
     const manifest = prepare(root, [item]);
-    const shim = path.join(root, "git-apply-after-success");
-    await writeFile(shim, `#!/bin/sh\ncase " $* " in *" apply --index "*) case " $* " in *" --check "*) exec ${JSON.stringify(gitPath)} "$@";; esac; ${JSON.stringify(gitPath)} "$@" || exit $?; echo 'sentinel after exact apply' >&2; exit 73;; esac\nexec ${JSON.stringify(gitPath)} "$@"\n`, { mode: 0o700 });
+    const shim = path.join(root, "git-read-tree-after-success");
+    await writeFile(shim, `#!/bin/sh\ncase " $* " in *" read-tree -m -u "*) ${JSON.stringify(gitPath)} "$@" || exit $?; echo 'sentinel after exact tree transition' >&2; exit 73;; esac\nexec ${JSON.stringify(gitPath)} "$@"\n`, { mode: 0o700 });
     const result = await promote(root, manifest, { gitPath: shim });
     assert.equal(result.summary.status, "completed");
     assert.equal(await readFile(path.join(item.target, "candidate-after.txt"), "utf8"), "candidate after\n");
   });
 });
 
-test("post-CAS apply has no tool SIGKILL deadline and quarantine errors stay schema-bounded", async () => {
+test("post-CAS tree transition has no tool SIGKILL deadline and errors stay schema-bounded", async () => {
   await withTempDir(async (root) => {
     const item = await fixture(root, "slow");
     const manifest = prepare(root, [item]);
-    const shim = path.join(root, "git-slow-apply");
-    await writeFile(shim, `#!/bin/sh\ncase " $* " in *" apply --index "*) case " $* " in *" --check "*) :;; *) sleep 6;; esac;; esac\nexec ${JSON.stringify(gitPath)} "$@"\n`, { mode: 0o700 });
+    const shim = path.join(root, "git-slow-read-tree");
+    await writeFile(shim, `#!/bin/sh\ncase " $* " in *" read-tree -m -u "*) sleep 6;; esac\nexec ${JSON.stringify(gitPath)} "$@"\n`, { mode: 0o700 });
     assert.equal((await promote(root, manifest, { gitPath: shim })).summary.status, "completed");
   });
 
   await withTempDir(async (root) => {
     const item = await fixture(root, "huge");
     const manifest = prepare(root, [item]);
-    const shim = path.join(root, "git-huge-apply-error");
-    await writeFile(shim, `#!/bin/sh\ncase " $* " in *" apply --index "*) printf 'corrupt\\n' > ${JSON.stringify(path.join(item.target, "base.txt"))}; head -c 5000 /dev/zero | tr '\\000' X >&2; exit 74;; esac\nexec ${JSON.stringify(gitPath)} "$@"\n`, { mode: 0o700 });
+    const shim = path.join(root, "git-huge-read-tree-error");
+    await writeFile(shim, `#!/bin/sh\ncase " $* " in *" read-tree -m -u "*) printf 'corrupt\\n' > ${JSON.stringify(path.join(item.target, "base.txt"))}; head -c 5000 /dev/zero | tr '\\000' X >&2; exit 74;; esac\nexec ${JSON.stringify(gitPath)} "$@"\n`, { mode: 0o700 });
     const result = await promote(root, manifest, { gitPath: shim });
     assert.equal(result.summary.status, "quarantined");
     assert.ok(Buffer.byteLength(result.summary.error ?? "", "utf8") <= 1000);
@@ -920,7 +919,27 @@ test("post-CAS apply has no tool SIGKILL deadline and quarantine errors stay sch
   });
 });
 
-test("native apply refuses an ignored symlink parent inserted after preflight", async () => {
+test("exact tree transition cannot follow pre-existing or raced ignored symlink parents outside the worktree", async () => {
+  await withTempDir(async (root) => {
+    const item = await fixture(root, "symlinkexisting", {
+      async setupCandidate(candidate) {
+        await mkdir(path.join(candidate, "parent"));
+        await writeFile(path.join(candidate, "parent", "new.txt"), "desired\n");
+      }
+    });
+    const manifest = prepare(root, [item]);
+    await writeFile(path.join(item.target, ".git", "info", "exclude"), "parent\n");
+    const outside = path.join(root, "outside-existing");
+    await mkdir(outside);
+    const sentinel = path.join(outside, "sentinel.txt");
+    await writeFile(sentinel, "unchanged\n");
+    await symlink(outside, path.join(item.target, "parent"));
+    await assert.rejects(() => promote(root, manifest), /Ignored worktree path collides/);
+    assert.equal(await readFile(sentinel, "utf8"), "unchanged\n");
+    assert.equal(existsSync(path.join(outside, "new.txt")), false);
+    assert.equal(await readlink(path.join(item.target, "parent")), outside);
+  });
+
   await withTempDir(async (root) => {
     const item = await fixture(root, "symlinkrace", {
       async setupCandidate(candidate) {
@@ -932,12 +951,16 @@ test("native apply refuses an ignored symlink parent inserted after preflight", 
     await writeFile(path.join(item.target, ".git", "info", "exclude"), "parent\n");
     const outside = path.join(root, "outside");
     await mkdir(outside);
+    const sentinel = path.join(outside, "sentinel.txt");
+    await writeFile(sentinel, "unchanged\n");
     const shim = path.join(root, "git-symlink-race");
-    await writeFile(shim, `#!/bin/sh\ncase " $* " in *" apply --index "*) ln -s ${JSON.stringify(outside)} ${JSON.stringify(path.join(item.target, "parent"))};; esac\nexec ${JSON.stringify(gitPath)} "$@"\n`, { mode: 0o700 });
+    await writeFile(shim, `#!/bin/sh\ncase " $* " in *" read-tree -m -u "*) ln -s ${JSON.stringify(outside)} ${JSON.stringify(path.join(item.target, "parent"))};; esac\nexec ${JSON.stringify(gitPath)} "$@"\n`, { mode: 0o700 });
     const result = await promote(root, manifest, { gitPath: shim });
-    assert.notEqual(result.summary.status, "completed");
+    assert.equal(result.summary.status, "completed");
+    assert.equal(await readFile(sentinel, "utf8"), "unchanged\n");
     assert.equal(existsSync(path.join(outside, "new.txt")), false);
-    assert.equal(await readlink(path.join(item.target, "parent")), outside);
+    assert.equal(await readFile(path.join(item.target, "parent", "new.txt"), "utf8"), "desired\n");
+    assert.equal((await lstat(path.join(item.target, "parent"))).isDirectory(), true);
   });
 });
 
@@ -991,31 +1014,12 @@ test("promotion fails closed below the required Git feature floor", async () => 
   });
 });
 
-test("candidate-controlled textconv remains unsupported even though patching disables textconv", async () => {
+test("candidate-controlled textconv remains unsupported for exact tree transition", async () => {
   await withTempDir(async (root) => {
     const item = await fixture(root, "textconv");
     const manifest = prepare(root, [item]);
     git(item.target, "config", "diff.binary.textconv", "/bin/false");
     await assert.rejects(() => promote(root, manifest), /unsupported_config:diff\.binary\.textconv/);
     assert.equal(git(item.target, "rev-parse", "refs/heads/main"), manifest.repositories[0]!.targetExpectedCommit);
-  });
-});
-
-test("cancellation delivered during bounded patch generation is observed before CAS", async () => {
-  await withTempDir(async (root) => {
-    const item = await fixture(root, "patchcancel");
-    const manifest = prepare(root, [item]);
-    const controller = new AbortController();
-    const shim = path.join(root, "git-slow-patch-generation");
-    await writeFile(shim, `#!/bin/sh\ncase " $* " in *" diff --binary "*) sleep 1;; esac\nexec ${JSON.stringify(gitPath)} "$@"\n`, { mode: 0o700 });
-    await assert.rejects(() => promote(root, manifest, {
-      gitPath: shim,
-      signal: controller.signal,
-      hooks: { afterObjectsImported() { setTimeout(() => controller.abort(), 100); } }
-    }), /cancelled after 0\/1 repositories/);
-    const journal = onlyJournal(root);
-    assert.equal(journal.repositories[0]!.status, "objects_imported");
-    assert.equal(git(item.target, "rev-parse", "refs/heads/main"), manifest.repositories[0]!.targetExpectedCommit);
-    assert.equal((await promote(root, manifest)).summary.status, "completed");
   });
 });

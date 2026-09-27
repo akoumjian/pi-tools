@@ -21,8 +21,8 @@ import path from "node:path";
 import { resolveExecutable } from "../_shared/executable.js";
 import {
   createGitRunner,
-  createRepositoryBinaryPatch,
   gitBuffer,
+  gitNoTimeoutToFiles,
   gitText,
   repositoryChangedPaths,
   repositoryCommitParents,
@@ -375,7 +375,7 @@ async function promoteOneRepository(
     hooks?.afterObjectsImported?.(index, { ...repository });
     await cancellationBoundary(signal);
 
-    const commitCasAndConsistency = (patchFile?: string, patchSize = 0): void => {
+    const commitCasAndConsistency = (): void => {
       let indexGuard: PromotionIndexGuard | undefined;
       let headLock: PromotionHeadLock | undefined;
       try {
@@ -399,7 +399,7 @@ async function promoteOneRepository(
         repository.error = undefined;
         journal.updatedAt = now().toISOString();
         persistPromotionJournal(journalFile, journal);
-        synchronizeCheckedOutWorktree(journal, journalFile, index, runner, targetRoot, now, patchFile, patchSize, hooks);
+        synchronizeCheckedOutWorktree(journal, journalFile, index, runner, targetRoot, now, hooks);
         verifyCompletedRepository(repository, runner, targetRoot);
         if (repository.checkedOut) fsyncWorktreeTransition(repository, runner);
         repository.status = "completed";
@@ -413,17 +413,8 @@ async function promoteOneRepository(
       }
     };
 
-    if (repository.checkedOut) {
-      const patch = createRepositoryBinaryPatch(repository.targetRepo, repository.expectedCommit, repository.desiredCommit, runner, 300_000);
-      try {
-        await cancellationBoundary(signal);
-        commitCasAndConsistency(patch.file, patch.size);
-      } finally {
-        patch.release();
-      }
-    } else {
-      commitCasAndConsistency();
-    }
+    await cancellationBoundary(signal);
+    commitCasAndConsistency();
     return;
   }
 
@@ -435,10 +426,10 @@ async function promoteOneRepository(
     journal.updatedAt = now().toISOString();
     persistPromotionJournal(journalFile, journal);
   }
-  const completePostCas = (patchFile?: string, patchSize = 0): void => {
+  const completePostCas = (): void => {
     const headLock = repository.checkedOut ? acquirePromotionHeadLock(journal, repository) : undefined;
     try {
-      synchronizeCheckedOutWorktree(journal, journalFile, index, runner, targetRoot, now, patchFile, patchSize, hooks);
+      synchronizeCheckedOutWorktree(journal, journalFile, index, runner, targetRoot, now, hooks);
       verifyCompletedRepository(repository, runner, targetRoot);
       if (repository.checkedOut) fsyncWorktreeTransition(repository, runner);
       repository.status = "completed";
@@ -450,12 +441,7 @@ async function promoteOneRepository(
       if (headLock) releasePromotionHeadLock(headLock);
     }
   };
-  if (repository.checkedOut) {
-    const patch = createRepositoryBinaryPatch(repository.targetRepo, repository.expectedCommit, repository.desiredCommit, runner, null);
-    try { completePostCas(patch.file, patch.size); } finally { patch.release(); }
-  } else {
-    completePostCas();
-  }
+  completePostCas();
 }
 
 function synchronizeCheckedOutWorktree(
@@ -465,8 +451,6 @@ function synchronizeCheckedOutWorktree(
   runner: GitRunner,
   targetRoot: string,
   now: () => Date,
-  patchFile?: string,
-  patchSize = 0,
   hooks?: PromotionTestHooks
 ): void {
   const repository = journal.repositories[index]!;
@@ -481,33 +465,31 @@ function synchronizeCheckedOutWorktree(
   state = checkedOutWorktreeState(repository, runner);
   if (state !== "expected") quarantine(journal, journalFile, index, "Checked-out target changed before worktree synchronization.", now);
   assertNoIgnoredWorktreeCollisions(repository, runner);
-  if (!patchFile && patchSize > 0) quarantine(journal, journalFile, index, "Promotion patch identity is unavailable after CAS.", now);
-  if (patchFile && patchSize > 0) {
+  try {
+    // unpack-trees updates the live index and worktree from exact trees without following
+    // a raced symlink parent outside the worktree. Once CAS succeeds this operation is
+    // deliberately not tool-timed: killing it could leave an ambiguous index/worktree.
+    gitNoTimeoutToFiles(runner, repository.targetRepo, [
+      ...DURABLE_GIT_CONFIG,
+      "read-tree", "-m", "-u", "--no-sparse-checkout", "--no-recurse-submodules",
+      repository.expectedCommit, repository.desiredCommit
+    ]);
+  } catch (error) {
+    let current: string | undefined;
+    let after: "expected" | "desired" | "other" | undefined;
+    let inspectionError: unknown;
     try {
-      gitBuffer(runner, repository.targetRepo, ["apply", "--index", "--check", "-p1", "--whitespace=nowarn", patchFile], { timeoutMs: null });
-      validatePostCasRepositoryOrQuarantine(journal, journalFile, index, runner, targetRoot, now);
-      if (targetRefCommit(repository, runner) !== repository.desiredCommit || checkedOutWorktreeState(repository, runner) !== "expected") {
-        quarantine(journal, journalFile, index, "Checked-out target changed after patch preflight.", now);
-      }
-      assertNoIgnoredWorktreeCollisions(repository, runner);
-      durableGitBuffer(runner, repository.targetRepo, ["apply", "--index", "-p1", "--whitespace=nowarn", patchFile], { timeoutMs: null });
-    } catch (error) {
-      let current: string | undefined;
-      let after: "expected" | "desired" | "other" | undefined;
-      let inspectionError: unknown;
-      try {
-        current = targetRefCommit(repository, runner);
-        after = checkedOutWorktreeState(repository, runner);
-      } catch (failure) {
-        inspectionError = failure;
-      }
-      if (inspectionError) throw new Error(`${boundError(error)}; exact state inspection also failed: ${boundError(inspectionError)}`);
-      if (current !== repository.desiredCommit || after === "other") {
-        quarantine(journal, journalFile, index, `Worktree synchronization failed with ambiguous state: ${boundError(error)}`, now);
-      }
-      if (after === "expected") throw error;
-      // Git may report an error after durably completing the exact transition. Exact desired state wins.
+      current = targetRefCommit(repository, runner);
+      after = checkedOutWorktreeState(repository, runner);
+    } catch (failure) {
+      inspectionError = failure;
     }
+    if (inspectionError) throw new Error(`${boundError(error)}; exact state inspection also failed: ${boundError(inspectionError)}`);
+    if (current !== repository.desiredCommit || after === "other") {
+      quarantine(journal, journalFile, index, `Worktree synchronization failed with ambiguous state: ${boundError(error)}`, now);
+    }
+    if (after === "expected") throw error;
+    // Git may report an error after durably completing the exact transition. Exact desired state wins.
   }
   hooks?.afterWorktreeSynchronized?.(index, { ...repository });
   validatePostCasRepositoryOrQuarantine(journal, journalFile, index, runner, targetRoot, now);
