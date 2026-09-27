@@ -28,6 +28,8 @@ const MAX_SCAN_ENTRIES = 20_000;
 const MAX_SCAN_DEPTH = 12;
 const MAX_GIT_OUTPUT_BYTES = 1024 * 1024;
 const MAX_TREE_LISTING_BYTES = 64 * 1024 * 1024;
+const MAX_PATH_LISTING_ENTRIES = 200_000;
+const MAX_REPOSITORY_PATH_BYTES = 4096;
 const MAX_COMMIT_OBJECT_BYTES = 64 * 1024 * 1024;
 const MAX_PATH_BYTES = 1024;
 const OID_PATTERN = /^[0-9a-f]{40,64}$/;
@@ -454,6 +456,59 @@ export function repositoryDirty(repoPath: string, runner: GitRunner): boolean {
   return trackedStatus.byteLength > 0 || untrackedStatus.byteLength > 0;
 }
 
+export function repositoryChangedPaths(repoPath: string, expectedCommit: string, desiredCommit: string, runner: GitRunner): string[] {
+  if (!OID_PATTERN.test(expectedCommit) || !OID_PATTERN.test(desiredCommit)) throw new Error("invalid_changed_path_commits");
+  return withBoundedRepositoryGitOutput(
+    runner,
+    repoPath,
+    ["diff", "--no-ext-diff", "--name-only", "--no-renames", "-z", expectedCommit, desiredCommit, "--"],
+    MAX_TREE_LISTING_BYTES,
+    "changed_paths",
+    (descriptor, size) => parseBoundedNulPathOutput(descriptor, size, "changed_paths")
+  );
+}
+
+export function repositoryIgnoredWorktreePaths(repoPath: string, runner: GitRunner): string[] {
+  return withBoundedRepositoryGitOutput(
+    runner,
+    repoPath,
+    ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"],
+    MAX_TREE_LISTING_BYTES,
+    "ignored_paths",
+    (descriptor, size) => parseBoundedNulPathOutput(descriptor, size, "ignored_paths")
+  );
+}
+
+function parseBoundedNulPathOutput(descriptor: number, size: number, label: string): string[] {
+  const paths: string[] = [];
+  const buffer = Buffer.alloc(64 * 1024);
+  let remainder = Buffer.alloc(0);
+  let position = 0;
+  while (position < size) {
+    const count = readSync(descriptor, buffer, 0, Math.min(buffer.byteLength, size - position), position);
+    if (count <= 0) throw new Error(`${label}_short_read`);
+    const chunk = remainder.byteLength > 0 ? Buffer.concat([remainder, buffer.subarray(0, count)]) : buffer.subarray(0, count);
+    let start = 0;
+    for (let index = 0; index < chunk.byteLength; index += 1) {
+      if (chunk[index] !== 0) continue;
+      const raw = chunk.subarray(start, index);
+      if (raw.byteLength < 1 || raw.byteLength > MAX_REPOSITORY_PATH_BYTES || paths.length >= MAX_PATH_LISTING_ENTRIES) throw new Error(`${label}_entry_limit`);
+      let repositoryPath: string;
+      try { repositoryPath = new TextDecoder("utf-8", { fatal: true }).decode(raw); }
+      catch { throw new Error(`${label}_not_utf8`); }
+      const normalizedPath = repositoryPath.endsWith("/") ? repositoryPath.slice(0, -1) : repositoryPath;
+      if (!normalizedPath || path.posix.isAbsolute(normalizedPath) || normalizedPath.split("/").some((part) => part === "" || part === "." || part === "..")) throw new Error(`${label}_invalid_path`);
+      paths.push(normalizedPath);
+      start = index + 1;
+    }
+    remainder = Buffer.from(chunk.subarray(start));
+    if (remainder.byteLength > MAX_REPOSITORY_PATH_BYTES) throw new Error(`${label}_entry_limit`);
+    position += count;
+  }
+  if (remainder.byteLength > 0) throw new Error(`${label}_malformed_output`);
+  return paths;
+}
+
 export function repositoryTreePolicyIssues(repoPath: string, commit: string, runner: GitRunner): string[] {
   if (!OID_PATTERN.test(commit)) return ["invalid_tree_commit"];
   try {
@@ -711,6 +766,8 @@ export function createGitRunner(gitPath: string, trustedStateRoot: string): GitR
 export type GitRunOptions = {
   allowedStatuses?: readonly number[];
   deterministicCommitIdentity?: boolean;
+  indexFile?: string;
+  timeoutMs?: number | null;
 };
 
 export function runGit(
@@ -728,18 +785,23 @@ export function runGit(
     GIT_COMMITTER_EMAIL: "worker-fold@localhost",
     GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z"
   } : {};
+  const timeout = options.timeoutMs === null ? {} : { timeout: options.timeoutMs ?? 30_000, killSignal: "SIGKILL" as const };
   const result = spawnSync(runner.gitPath, repositoryGitArgs(cwd, gitDirectory, args), {
     cwd,
-    env: { ...runner.env, ...commitEnvironment, GIT_CEILING_DIRECTORIES: cwd },
+    env: {
+      ...runner.env,
+      ...commitEnvironment,
+      GIT_CEILING_DIRECTORIES: cwd,
+      ...(options.indexFile === undefined ? {} : { GIT_INDEX_FILE: options.indexFile })
+    },
     shell: false,
     stdio: ["ignore", "pipe", "pipe"],
-    timeout: 5_000,
-    killSignal: "SIGKILL",
+    ...timeout,
     maxBuffer: MAX_GIT_OUTPUT_BYTES
   });
-  if (result.error) throw new Error(`git_spawn_failed:${boundText(result.error.message, 120)}`);
+  if (result.error) throw new Error(`git_spawn_failed:${args[0] ?? "command"}:${boundText(result.error.message, 240)}`);
   const status = result.status ?? -1;
-  if (!(options.allowedStatuses ?? [0]).includes(status)) throw new Error(`git_failed:${args[0] ?? "command"}`);
+  if (!(options.allowedStatuses ?? [0]).includes(status)) throw new Error(gitFailureMessage(args[0] ?? "command", status, result.stderr));
   const output = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout ?? "");
   if (output.byteLength > MAX_GIT_OUTPUT_BYTES) throw new Error("git_output_limit");
   return { stdout: output, status };
@@ -765,6 +827,14 @@ function repositoryGitArgs(cwd: string, gitDirectory: string, args: readonly str
     "-c", "commit.gpgSign=false",
     "-c", "tag.gpgSign=false",
     "-c", "diff.external=",
+    "-c", "diff.noprefix=false",
+    "-c", "diff.srcPrefix=a/",
+    "-c", "diff.dstPrefix=b/",
+    "-c", "diff.context=3",
+    "-c", "diff.renames=false",
+    "-c", "diff.algorithm=myers",
+    "-c", "color.ui=false",
+    "-c", "color.diff=false",
     "-c", "core.attributesFile=/dev/null",
     "-c", "core.excludesFile=/dev/null",
     `--git-dir=${gitDirectory}`,
@@ -773,43 +843,81 @@ function repositoryGitArgs(cwd: string, gitDirectory: string, args: readonly str
   ];
 }
 
+type BoundedRepositoryGitOutput = {
+  descriptor: number;
+  file: string;
+  size: number;
+  release(): void;
+};
+
+function createBoundedRepositoryGitOutput(
+  runner: GitRunner,
+  cwd: string,
+  args: readonly string[],
+  maxBytes: number,
+  label: string,
+  timeoutMs: number | null
+): BoundedRepositoryGitOutput {
+  const outputFile = path.join(String(runner.env.HOME), `${label}-${randomUUID()}.bin`);
+  const output = openSync(outputFile, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
+  try {
+    const timeout = timeoutMs === null ? {} : { timeout: timeoutMs, killSignal: "SIGKILL" as const };
+    const result = spawnSync(runner.gitPath, repositoryGitArgs(cwd, path.join(cwd, ".git"), args), {
+      cwd,
+      env: { ...runner.env, GIT_CEILING_DIRECTORIES: cwd },
+      shell: false,
+      stdio: ["ignore", output, "pipe"],
+      ...timeout,
+      maxBuffer: MAX_GIT_OUTPUT_BYTES
+    });
+    if (result.error) throw new Error(`git_spawn_failed:${args[0] ?? "command"}:${boundText(result.error.message, 240)}`);
+    if (result.status !== 0) throw new Error(gitFailureMessage(args[0] ?? "command", result.status ?? -1, result.stderr));
+    const before = fstatSync(output);
+    const owned = typeof process.getuid !== "function" || before.uid === process.getuid();
+    if (!before.isFile() || before.nlink !== 1 || !owned || (before.mode & 0o077) !== 0) throw new Error(`${label}_unsafe_output`);
+    if (before.size > maxBytes) throw new Error(`${label}_output_limit`);
+    let released = false;
+    return {
+      descriptor: output,
+      file: outputFile,
+      size: before.size,
+      release() {
+        if (released) return;
+        released = true;
+        try {
+          const after = fstatSync(output);
+          if (after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size || after.mode !== before.mode || after.nlink !== before.nlink || after.uid !== before.uid || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) throw new Error(`${label}_output_changed`);
+        } finally {
+          closeSync(output);
+          rmSync(outputFile, { force: true });
+        }
+      }
+    };
+  } catch (error) {
+    closeSync(output);
+    rmSync(outputFile, { force: true });
+    throw error;
+  }
+}
+
 function withBoundedRepositoryGitOutput<T>(
   runner: GitRunner,
   cwd: string,
   args: readonly string[],
   maxBytes: number,
   label: string,
-  consume: (descriptor: number, size: number) => T
+  consume: (descriptor: number, size: number, outputFile: string) => T,
+  timeoutMs: number | null = 120_000
 ): T {
-  const outputFile = path.join(String(runner.env.HOME), `${label}-${randomUUID()}.bin`);
-  const output = openSync(outputFile, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
-  try {
-    const result = spawnSync(runner.gitPath, repositoryGitArgs(cwd, path.join(cwd, ".git"), args), {
-      cwd,
-      env: { ...runner.env, GIT_CEILING_DIRECTORIES: cwd },
-      shell: false,
-      stdio: ["ignore", output, "pipe"],
-      timeout: 10_000,
-      killSignal: "SIGKILL",
-      maxBuffer: MAX_GIT_OUTPUT_BYTES
-    });
-    if (result.error) throw new Error(`git_spawn_failed:${boundText(result.error.message, 120)}`);
-    if (result.status !== 0) throw new Error(`git_failed:${args[0] ?? "command"}`);
-    const before = fstatSync(output);
-    const owned = typeof process.getuid !== "function" || before.uid === process.getuid();
-    if (!before.isFile() || before.nlink !== 1 || !owned || (before.mode & 0o077) !== 0) throw new Error(`${label}_unsafe_output`);
-    if (before.size > maxBytes) throw new Error(`${label}_output_limit`);
-    let value: T | undefined;
-    let consumeError: unknown;
-    try { value = consume(output, before.size); } catch (error) { consumeError = error; }
-    const after = fstatSync(output);
-    if (after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size || after.mode !== before.mode || after.nlink !== before.nlink || after.uid !== before.uid || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) throw new Error(`${label}_output_changed`);
-    if (consumeError) throw consumeError;
-    return value as T;
-  } finally {
-    closeSync(output);
-    rmSync(outputFile, { force: true });
-  }
+  const lease = createBoundedRepositoryGitOutput(runner, cwd, args, maxBytes, label, timeoutMs);
+  let value: T | undefined;
+  let consumeError: unknown;
+  try { value = consume(lease.descriptor, lease.size, lease.file); } catch (error) { consumeError = error; }
+  let releaseError: unknown;
+  try { lease.release(); } catch (error) { releaseError = error; }
+  if (consumeError) throw consumeError;
+  if (releaseError) throw releaseError;
+  return value as T;
 }
 
 function hasIndexVisibilityFlags(runner: GitRunner, cwd: string): boolean {
@@ -847,6 +955,14 @@ export function runStandaloneGit(runner: GitRunner, cwd: string, args: string[])
     "-c", "commit.gpgSign=false",
     "-c", "tag.gpgSign=false",
     "-c", "diff.external=",
+    "-c", "diff.noprefix=false",
+    "-c", "diff.srcPrefix=a/",
+    "-c", "diff.dstPrefix=b/",
+    "-c", "diff.context=3",
+    "-c", "diff.renames=false",
+    "-c", "diff.algorithm=myers",
+    "-c", "color.ui=false",
+    "-c", "color.diff=false",
     "-c", "core.attributesFile=/dev/null",
     "-c", "core.excludesFile=/dev/null"
   ];
@@ -855,12 +971,12 @@ export function runStandaloneGit(runner: GitRunner, cwd: string, args: string[])
     env: { ...runner.env, GIT_CEILING_DIRECTORIES: cwd },
     shell: false,
     stdio: ["ignore", "pipe", "pipe"],
-    timeout: 5_000,
+    timeout: 30_000,
     killSignal: "SIGKILL",
     maxBuffer: MAX_GIT_OUTPUT_BYTES
   });
-  if (result.error) throw new Error(`git_spawn_failed:${boundText(result.error.message, 120)}`);
-  if (result.status !== 0) throw new Error(`git_failed:${args[0] ?? "command"}`);
+  if (result.error) throw new Error(`git_spawn_failed:${args[0] ?? "command"}:${boundText(result.error.message, 240)}`);
+  if (result.status !== 0) throw new Error(gitFailureMessage(args[0] ?? "command", result.status ?? -1, result.stderr));
   const output = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout ?? "");
   if (output.byteLength > MAX_GIT_OUTPUT_BYTES) throw new Error("git_output_limit");
   return output;
@@ -870,10 +986,49 @@ export function gitBuffer(runner: GitRunner, cwd: string, args: string[], option
   return runGit(runner, cwd, args, options).stdout;
 }
 
+export function gitNoTimeoutToFiles(runner: GitRunner, cwd: string, args: string[]): void {
+  const outputs = ["stdout", "stderr"].map((stream) => {
+    const file = path.join(String(runner.env.HOME), `git-${stream}-${randomUUID()}.log`);
+    const descriptor = openSync(file, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
+    return { file, descriptor, identity: fstatSync(descriptor) };
+  });
+  try {
+    const result = spawnSync(runner.gitPath, repositoryGitArgs(cwd, path.join(cwd, ".git"), args), {
+      cwd,
+      env: { ...runner.env, GIT_CEILING_DIRECTORIES: cwd },
+      shell: false,
+      stdio: ["ignore", outputs[0]!.descriptor, outputs[1]!.descriptor]
+    });
+    if (result.error) throw new Error(`git_spawn_failed:${args[0] ?? "command"}:${boundText(result.error.message, 240)}`);
+    if (result.status !== 0) {
+      const stderr = Buffer.alloc(960);
+      const count = readSync(outputs[1]!.descriptor, stderr, 0, stderr.byteLength, 0);
+      throw new Error(gitFailureMessage(args[0] ?? "command", result.status ?? -1, stderr.subarray(0, Math.max(0, count))));
+    }
+    for (const output of outputs) {
+      const after = fstatSync(output.descriptor);
+      if (after.dev !== output.identity.dev || after.ino !== output.identity.ino || after.mode !== output.identity.mode || after.nlink !== 1 || after.uid !== output.identity.uid) {
+        throw new Error(`git_${args[0] ?? "command"}_unsafe_output`);
+      }
+    }
+  } finally {
+    for (const output of outputs) {
+      closeSync(output.descriptor);
+      rmSync(output.file, { force: true });
+    }
+  }
+}
+
 export function gitText(runner: GitRunner, cwd: string, args: string[], options?: GitRunOptions): string {
   const output = gitBuffer(runner, cwd, args, options).toString("utf8");
   if (output.includes("\uFFFD")) throw new Error("git_output_not_utf8");
   return output;
+}
+
+function gitFailureMessage(command: string, status: number, stderr: unknown): string {
+  const text = Buffer.isBuffer(stderr) ? stderr.toString("utf8") : String(stderr ?? "");
+  const detail = boundText(text.replace(/\s+/g, " ").trim(), 700);
+  return `git_failed:${command}:status_${status}${detail ? `:${detail}` : ""}`;
 }
 
 function readLocalConfig(repoPath: string, runner: GitRunner): Map<string, string[]> {

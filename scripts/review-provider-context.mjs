@@ -203,6 +203,13 @@ const resultContracts = {
     error: "prepared/context/decision tampering, moved targets, non-pristine analysis, wrong states, route/session mismatch, and invalid resolved candidates remain model-visible",
     details: "internal structured integration-worker receipt and exact phase identities",
     content: "durable worker receipt, analysis-or-resolution phase, prepared manifest/candidate identity, context hash, and decisions hash when resumed"
+  },
+  worker_fold_promote: {
+    success: "content reports promotion/journal identities plus every exact local ref transition and completed count",
+    progress: "not applicable: each repository transition reaches a durable partial, completed, or quarantined journal state before return",
+    error: "retryable global preflight blockers, partial completion, and terminal unsafe/ambiguous post-CAS quarantine remain model-visible",
+    details: "internal typed promotion summary; durable recovery state remains in the journal",
+    content: "exact promotion status, repository outcomes, expected/desired commits, and journal path"
   }
 };
 const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
