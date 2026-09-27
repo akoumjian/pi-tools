@@ -735,14 +735,14 @@ const WorkerFoldPromotedRepositorySchema = Type.Object({
   expectedCommit: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
   desiredCommit: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
   checkedOut: Type.Boolean(),
-  status: Type.Union([Type.Literal("pending"), Type.Literal("objects_imported"), Type.Literal("ref_updated"), Type.Literal("completed"), Type.Literal("quarantined")]),
+  status: Type.Union([Type.Literal("pending"), Type.Literal("completed"), Type.Literal("failed")]),
   error: Type.Optional(Type.String({ maxLength: 1000 }))
 }, { additionalProperties: false });
 
 const WorkerFoldPromoteDetailsSchema = Type.Object({
   promotionId: Type.String({ pattern: "^promotion_[0-9a-f]{24}$" }),
   journalFile: Type.String({ minLength: 1, maxLength: 2048 }),
-  status: Type.Union([Type.Literal("promoting"), Type.Literal("partial"), Type.Literal("completed"), Type.Literal("quarantined")]),
+  status: Type.Union([Type.Literal("pending"), Type.Literal("completed"), Type.Literal("failed")]),
   preparedId: Type.String({ pattern: "^prepared_[0-9a-f]{24}$" }),
   manifestSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }),
   repositoryCount: Type.Integer({ minimum: 1, maximum: 16 }),

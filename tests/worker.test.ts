@@ -3171,7 +3171,7 @@ test("worker_fold_prepare resolves exact-session candidates and returns a strict
   });
 });
 
-test("worker_fold_promote forwards exact parent authorization and returns strict partial state", async () => {
+test("worker_fold_promote forwards exact parent authorization and returns strict failed state", async () => {
   await withTempDir(async (directory) => {
     const roots = { stateRoot: path.join(directory, "workers"), workspaceRoot: path.join(directory, "workspaces") };
     const parentSessionFile = path.join(directory, "parent.jsonl");
@@ -3188,13 +3188,13 @@ test("worker_fold_promote forwards exact parent authorization and returns strict
     const summary = {
       promotionId: "promotion_cccccccccccccccccccccccc",
       journalFile: path.join(directory, "promotions", "promotion_cccccccccccccccccccccccc", "journal.json"),
-      status: "partial" as const,
+      status: "failed" as const,
       preparedId,
       manifestSha256: "b".repeat(64),
       repositoryCount: 1,
       completedCount: 0,
       error: "target changed before CAS",
-      repositories: [{ ...params.repositories[0]!, checkedOut: true, status: "objects_imported" as const, error: "target changed before CAS" }]
+      repositories: [{ ...params.repositories[0]!, checkedOut: true, status: "failed" as const, error: "target changed before CAS" }]
     };
     const api = fakeApi();
     registerWorkerExtension(api, {
@@ -3215,7 +3215,7 @@ test("worker_fold_promote forwards exact parent authorization and returns strict
     assert.match(JSON.stringify(result.content), /target changed before CAS/);
     assert.doesNotMatch(JSON.stringify(result.content), /worktree synchronized/);
     assert.match(renderWorkerToolCall(tool, params), /Worker Promote\(1 repository\)/);
-    assert.match(renderWorkerToolResult(tool, result), /partial · promotion_…ccccccc · 0\/1 repositories/);
+    assert.match(renderWorkerToolResult(tool, result), /failed · promotion_…ccccccc · 0\/1 repositories/);
   });
 });
 

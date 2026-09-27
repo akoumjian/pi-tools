@@ -850,13 +850,13 @@ export function registerWorkerExtension(
   api.registerTool(defineTool({
     name: "worker_fold_promote",
     label: "Worker Fold Promote",
-    description: "Advance one ready prepared fold through journaled exact local-ref CAS. Use only after parent review and validation; retry the identical request for partial recovery, treat completed history as final, and stop on quarantine. Never use it for review, conflict resolution, remote operations, or release.",
-    promptSnippet: "Promote one parent-accepted ready fold with exact journaled local-ref CAS; retry partial state, preserve completed history, and stop on quarantine.",
+    description: "Apply one reviewed and validated ready fold with ordinary trusted-host Git. Checked-out refs use ff-only merge; nonchecked refs use exact CAS. Retry only the identical failed operation. Never use it for review, conflict resolution, remote operations, or release.",
+    promptSnippet: "Apply one parent-accepted ready fold sequentially with ff-only merge or exact local-ref CAS and a small retry record.",
     promptGuidelines: [
-      "worker_fold_promote use: Supply every exact identity from one ready worker_fold_prepare result only after parent review and validation. Retry only the identical request for partial/interrupted recovery. A completed result is immutable history; quarantine is terminal and requires inspection plus fresh preparation from accepted current state.",
+      "worker_fold_promote use: Supply every exact identity from one ready worker_fold_prepare result only after parent review and validation. Retry only the identical failed request: exact completed repositories are skipped, exact expected repositories are retried, and any other state requires fresh preparation.",
       inputJsonSchemaGuideline("worker_fold_promote", WorkerFoldPromoteParams),
       outputJsonSchemaGuideline("worker_fold_promote", RetainedToolOutputSchemas.worker_fold_promote),
-      "worker_fold_promote constraints: Promotion is deterministic and model-free. Before every CAS it revalidates all unmutated targets, CAS-updates only direct explicit local refs, and restores exact checked-out worktree/index consistency without a post-CAS timeout. Retryable pre-CAS blockers return partial; only unsafe or ambiguous post-CAS state quarantines. It never reviews, validates, resolves, rebases, fetches, pushes, publishes, closes tasks, or writes grounding. Only result content is provider-visible; details are internal, and thrown errors use the host's out-of-band error result."
+      "worker_fold_promote constraints: Promotion is deterministic, host-only, sequential, and not atomic. It globally preflights exact clean targets, then uses ordinary bounded `git merge --ff-only` for a checked-out target ref or one `git update-ref --no-deref` CAS otherwise. Failure stops at that repository and preserves earlier completed records. It never reviews, validates, resolves, rebases, fetches, pushes, publishes, closes tasks, or writes grounding. Only result content is provider-visible; details are internal, and thrown errors use the host's out-of-band error result."
     ],
     parameters: WorkerFoldPromoteParams,
     renderCall(args, theme) { return renderWorkerFoldPromoteCall(args as WorkerFoldPromoteInput, theme); },
@@ -3563,7 +3563,7 @@ function renderWorkerFoldPromoteResult(result: AgentToolResult<WorkerFoldPromoti
   if (options.isPartial) return new Text(workerToolResult("promoting repositories", "warning", theme), 0, 0);
   const details = result.details;
   if (!details) return new Text(workerToolResult("promotion complete", "muted", theme), 0, 0);
-  const lines = [workerToolResult(`${details.status} · ${shortWorkerId(details.promotionId)} · ${details.completedCount}/${details.repositoryCount} repositories`, details.status === "completed" ? "success" : details.status === "quarantined" ? "error" : "warning", theme)];
+  const lines = [workerToolResult(`${details.status} · ${shortWorkerId(details.promotionId)} · ${details.completedCount}/${details.repositoryCount} repositories`, details.status === "completed" ? "success" : details.status === "failed" ? "error" : "warning", theme)];
   if (options.expanded) appendBoundedWorkerRows(lines, [...(details.error ? [`error · ${truncateOneLine(details.error, 120)}`] : []), ...details.repositories.map((item) => `${shortWorkerId(item.candidateId)} · ${item.status} · ${truncateOneLine(item.targetRef, 80)}${item.error ? ` · ${truncateOneLine(item.error, 100)}` : ""}`)]);
   return new Text(lines.join("\n"), 0, 0);
 }
