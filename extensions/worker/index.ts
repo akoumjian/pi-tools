@@ -720,13 +720,13 @@ export function registerWorkerExtension(
   api.registerTool(defineTool({
     name: "worker_fold_promote",
     label: "Worker Fold Promote",
-    description: "Advance explicit local refs from one ready prepared fold with journaled exact compare-and-swap. Use only after parent review and validation; retry an exact partial/interrupted request for forward recovery, but stop on quarantine. Do not use for review, testing, conflict resolution, rebasing, remote push, or release.",
-    promptSnippet: "Promote one parent-accepted ready fold with durable exact local-ref CAS; retry partial state forward, stop and inspect quarantine, and never review, resolve, validate, or push.",
+    description: "Advance one ready prepared fold through journaled exact local-ref CAS. Use only after parent review and validation; retry the identical request for partial recovery, treat completed history as final, and stop on quarantine. Never use it for review, conflict resolution, remote operations, or release.",
+    promptSnippet: "Promote one parent-accepted ready fold with exact journaled local-ref CAS; retry partial state, preserve completed history, and stop on quarantine.",
     promptGuidelines: [
-      "worker_fold_promote use: Call only with every exact repository identity returned by one ready worker_fold_prepare result after parent review and validation. Retry the identical request for partial/interrupted forward recovery; a quarantined result is terminal and requires parent inspection plus fresh preparation from the accepted current state.",
+      "worker_fold_promote use: Supply every exact identity from one ready worker_fold_prepare result only after parent review and validation. Retry only the identical request for partial/interrupted recovery. A completed result is immutable history; quarantine is terminal and requires inspection plus fresh preparation from accepted current state.",
       inputJsonSchemaGuideline("worker_fold_promote", WorkerFoldPromoteParams),
       outputJsonSchemaGuideline("worker_fold_promote", RetainedToolOutputSchemas.worker_fold_promote),
-      "worker_fold_promote constraints: Promotion is deterministic and model-free. It revalidates exact prepared/target identities, locks and preflights all targets, imports prepared objects, journals each transition, CAS-updates only explicit local refs, synchronizes eligible clean checked-out worktrees, reports partial state, observes cancellation at safe pre-CAS boundaries, and recovers forward or quarantines ambiguity. It never reviews, validates, resolves conflicts, rebases, fetches, pushes, publishes, closes tasks, or writes grounding. Only result content is provider-visible; details are internal, and thrown errors use the host's out-of-band error result."
+      "worker_fold_promote constraints: Promotion is deterministic and model-free. Before every CAS it revalidates all unmutated targets, CAS-updates only direct explicit local refs, and restores exact checked-out worktree/index consistency without a post-CAS timeout. Retryable pre-CAS blockers return partial; only unsafe or ambiguous post-CAS state quarantines. It never reviews, validates, resolves, rebases, fetches, pushes, publishes, closes tasks, or writes grounding. Only result content is provider-visible; details are internal, and thrown errors use the host's out-of-band error result."
     ],
     parameters: WorkerFoldPromoteParams,
     renderCall(args, theme) { return renderWorkerFoldPromoteCall(args as WorkerFoldPromoteInput, theme); },

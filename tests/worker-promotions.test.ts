@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { cp, link, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { cp, link, mkdir, mkdtemp, readFile, readlink, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -43,9 +43,14 @@ function commit(cwd: string, message: string): string {
   return git(cwd, "rev-parse", "HEAD^{commit}");
 }
 
-type Fixture = { resolved: ResolvedRepositoryCandidate; selection: RepositoryChangeSetEntry; target: string };
+type Fixture = { resolved: ResolvedRepositoryCandidate; selection: RepositoryChangeSetEntry; target: string; candidateRepo: string };
+type FixtureOptions = {
+  squash?: boolean;
+  setupBase?(target: string): Promise<void>;
+  setupCandidate?(candidateRepo: string): Promise<void>;
+};
 
-async function fixture(root: string, suffix: string, options: { squash?: boolean } = {}): Promise<Fixture> {
+async function fixture(root: string, suffix: string, options: FixtureOptions = {}): Promise<Fixture> {
   const target = path.join(root, "targets", `target-${suffix}`);
   const workspace = path.join(root, `workspace-${suffix}`);
   const candidateRepo = path.join(workspace, "repos", `candidate-${suffix}`);
@@ -53,12 +58,14 @@ async function fixture(root: string, suffix: string, options: { squash?: boolean
   await mkdir(path.dirname(candidateRepo), { recursive: true });
   git(target, "init", "--initial-branch=main");
   await writeFile(path.join(target, "base.txt"), "base\n");
-  git(target, "add", "base.txt");
+  await options.setupBase?.(target);
+  git(target, "add", "-A");
   const baseCommit = commit(target, "base");
   const baseTree = git(target, "rev-parse", "HEAD^{tree}");
   git(root, "clone", "--no-hardlinks", target, candidateRepo);
   await writeFile(path.join(candidateRepo, `candidate-${suffix}.txt`), `candidate ${suffix}\n`);
-  git(candidateRepo, "add", `candidate-${suffix}.txt`);
+  await options.setupCandidate?.(candidateRepo);
+  git(candidateRepo, "add", "-A");
   const headCommit = commit(candidateRepo, `candidate ${suffix}`);
   const headTree = git(candidateRepo, "rev-parse", "HEAD^{tree}");
   await writeFile(path.join(target, `target-${suffix}.txt`), `target ${suffix}\n`);
@@ -81,6 +88,7 @@ async function fixture(root: string, suffix: string, options: { squash?: boolean
   await writeFile(inventoryFile, inventoryContent, { mode: 0o400 });
   return {
     target,
+    candidateRepo,
     resolved: {
       workspaceRoot: workspace,
       inventory: { inventoryFile, inventorySha256: createHash("sha256").update(inventoryContent).digest("hex"), reportedIssues: [], scanCoverage: { complete: true, limitations: [] } },
@@ -385,8 +393,7 @@ test("fails before CAS on ignored collisions and tracked edits without overwriti
     const record = manifest.repositories[0]!;
     await writeFile(path.join(item.target, ".git", "info", "exclude"), "candidate-q.txt\n");
     await writeFile(path.join(item.target, "candidate-q.txt"), "valuable ignored output\n");
-    const blocked = await promote(root, manifest);
-    assert.equal(blocked.summary.status, "partial");
+    await assert.rejects(() => promote(root, manifest), /Ignored worktree path collides/);
     assert.equal(git(item.target, "rev-parse", "refs/heads/main"), record.targetExpectedCommit);
     assert.equal(await readFile(path.join(item.target, "candidate-q.txt"), "utf8"), "valuable ignored output\n");
     await unlink(path.join(item.target, "candidate-q.txt"));
@@ -413,7 +420,7 @@ test("fails before CAS on ignored collisions and tracked edits without overwriti
     const collision = path.join(item.target, "candidate-ri.txt");
     await writeFile(path.join(item.target, ".git", "info", "exclude"), "candidate-ri.txt\n");
     const shim = path.join(root, "git-inject-ignored-collision");
-    await writeFile(shim, `#!/bin/sh\ncase " $* " in *" apply --index --whitespace=nowarn "*) printf '%s\n' 'late ignored output' > ${JSON.stringify(collision)};; esac\nexec ${JSON.stringify(gitPath)} "$@"\n`, { mode: 0o700 });
+    await writeFile(shim, `#!/bin/sh\ncase " $* " in *" apply --index "*) printf '%s\n' 'late ignored output' > ${JSON.stringify(collision)};; esac\nexec ${JSON.stringify(gitPath)} "$@"\n`, { mode: 0o700 });
     const blocked = await promote(root, manifest, { gitPath: shim });
     assert.equal(blocked.summary.status, "partial");
     assert.equal(blocked.summary.repositories[0]!.status, "ref_updated");
@@ -432,9 +439,12 @@ test("revalidates HEAD and target ref around worktree synchronization races", as
     const result = await promote(root, manifest, {
       hooks: { beforeWorktreeSync() { git(item.target, "symbolic-ref", "HEAD", "refs/heads/side"); } }
     });
-    assert.equal(result.summary.status, "quarantined");
+    assert.equal(result.summary.status, "partial");
+    assert.equal(git(item.target, "symbolic-ref", "HEAD"), "refs/heads/main");
     assert.equal(git(item.target, "rev-parse", "refs/heads/side"), expected);
+    assert.equal(git(item.target, "rev-parse", "refs/heads/main"), result.summary.repositories[0]!.desiredCommit);
     assert.equal(existsSync(path.join(item.target, "candidate-s.txt")), false);
+    assert.equal((await promote(root, manifest)).summary.status, "completed");
   });
 
   await withTempDir(async (root) => {
@@ -444,9 +454,10 @@ test("revalidates HEAD and target ref around worktree synchronization races", as
     const result = await promote(root, manifest, {
       hooks: { beforeWorktreeSync() { git(item.target, "update-ref", "refs/heads/main", expected); } }
     });
-    assert.equal(result.summary.status, "quarantined");
-    assert.equal(git(item.target, "rev-parse", "refs/heads/main"), expected);
+    assert.equal(result.summary.status, "partial");
+    assert.equal(git(item.target, "rev-parse", "refs/heads/main"), result.summary.repositories[0]!.desiredCommit);
     assert.equal(existsSync(path.join(item.target, "candidate-t.txt")), false);
+    assert.equal((await promote(root, manifest)).summary.status, "completed");
   });
 });
 
@@ -527,8 +538,8 @@ test("quarantines physical identity drift but retries transient exact post-CAS s
     await rename(path.join(item.target, ".git"), oldGit);
     await cp(oldGit, path.join(item.target, ".git"), { recursive: true, preserveTimestamps: true });
     const result = await promote(root, manifest);
-    assert.equal(result.summary.status, "quarantined");
-    assert.equal(result.summary.repositories[0]!.status, "quarantined");
+    assert.equal(result.summary.status, "partial");
+    assert.equal(result.summary.repositories[0]!.status, "pending");
   });
 
   await withTempDir(async (root) => {
@@ -609,7 +620,7 @@ test("uses durable Git mutation config, no reset, and update-ref --no-deref as t
     const before = refs(item.target);
     assert.equal((await promote(root, manifest, { gitPath: shim })).summary.status, "completed");
     const invocations = (await readFile(log, "utf8")).split("\n").filter(Boolean);
-    for (const command of ["bundle unbundle", "update-ref --no-deref", "apply --index --whitespace=nowarn"]) {
+    for (const command of ["bundle unbundle", "update-ref --no-deref", "apply --index -p1 --whitespace=nowarn"]) {
       const invocation = invocations.find((line) => line.includes(command));
       assert.ok(invocation, `logged ${command}`);
       assert.match(invocation, /-c core\.fsync=objects,reference,index -c core\.fsyncMethod=fsync/);
@@ -621,26 +632,28 @@ test("uses durable Git mutation config, no reset, and update-ref --no-deref as t
   });
 });
 
-test("post-CAS quarantine remains truthful when cancellation is already requested", async () => {
+test("post-CAS guards preserve exact retry state when cancellation and ref movement race", async () => {
   await withTempDir(async (root) => {
     const item = await fixture(root, "ah");
     const manifest = prepare(root, [item]);
     const expected = manifest.repositories[0]!.targetExpectedCommit;
     const controller = new AbortController();
-    const result = await promote(root, manifest, {
+    await assert.rejects(() => promote(root, manifest, {
       signal: controller.signal,
       hooks: {
         afterRefUpdated() { controller.abort(); },
         beforeWorktreeSync() { git(item.target, "update-ref", "refs/heads/main", expected); }
       }
-    });
-    assert.equal(result.summary.status, "quarantined");
-    assert.equal(result.summary.repositories[0]!.status, "quarantined");
-    assert.match(result.summary.repositories[0]!.error ?? "", /Target ref changed before worktree synchronization/);
+    }), /cancelled after 0\/1 repositories/);
+    const journal = onlyJournal(root);
+    assert.equal(journal.status, "partial");
+    assert.equal(journal.repositories[0]!.status, "ref_updated");
+    assert.equal(git(item.target, "rev-parse", "refs/heads/main"), journal.repositories[0]!.desiredCommit);
+    assert.equal((await promote(root, manifest)).summary.status, "completed");
   });
 });
 
-test("quarantines an objects-imported crash window whose expected ref has a desired worktree", async () => {
+test("keeps an objects-imported expected-ref worktree blocker retryable", async () => {
   await withTempDir(async (root) => {
     const item = await fixture(root, "ai");
     const manifest = prepare(root, [item]);
@@ -651,8 +664,358 @@ test("quarantines an objects-imported crash window whose expected ref has a desi
     git(item.target, "read-tree", "-m", "-u", record.targetExpectedCommit, record.desiredCommit!);
     assert.equal(git(item.target, "rev-parse", "refs/heads/main"), record.targetExpectedCommit);
     const result = await promote(root, manifest);
-    assert.equal(result.summary.status, "quarantined");
-    assert.match(result.summary.repositories[0]!.error ?? "", /expected ref but non-expected worktree/);
+    assert.equal(result.summary.status, "partial");
+    assert.equal(result.summary.repositories[0]!.status, "objects_imported");
+    assert.match(result.summary.error ?? "", /changed before CAS|not at its exact expected state/);
     assert.equal(await readFile(path.join(item.target, "candidate-ai.txt"), "utf8"), "candidate ai\n");
+  });
+});
+
+test("revalidates every unmutated target immediately before each CAS", async () => {
+  await withTempDir(async (root) => {
+    const first = await fixture(root, "ga");
+    const second = await fixture(root, "gb");
+    second.selection.dependsOn = [first.selection.candidateId];
+    const manifest = prepare(root, [first, second]);
+    let injected = false;
+    const blocked = await promote(root, manifest, {
+      hooks: {
+        beforeRepositoryCas(index) {
+          if (index === 0 && !injected) {
+            injected = true;
+            writeFileSync(path.join(second.target, "late-global-drift.txt"), "drift\n");
+          }
+        }
+      }
+    });
+    assert.equal(blocked.summary.status, "partial");
+    assert.equal(blocked.summary.completedCount, 0);
+    assert.equal(git(first.target, "rev-parse", "refs/heads/main"), manifest.repositories[0]!.targetExpectedCommit);
+    assert.equal(git(second.target, "rev-parse", "refs/heads/main"), manifest.repositories[1]!.targetExpectedCommit);
+    assert.match(blocked.summary.repositories[1]!.error ?? "", /Global pre-CAS preflight/);
+    await unlink(path.join(second.target, "late-global-drift.txt"));
+    assert.equal((await promote(root, manifest)).summary.status, "completed");
+  });
+
+  await withTempDir(async (root) => {
+    const first = await fixture(root, "gc");
+    const second = await fixture(root, "gd");
+    second.selection.dependsOn = [first.selection.candidateId];
+    const manifest = prepare(root, [first, second]);
+    let injected = false;
+    const blocked = await promote(root, manifest, {
+      hooks: {
+        afterRepositoryCompleted(index) {
+          if (index === 0 && !injected) {
+            injected = true;
+            writeFileSync(path.join(second.target, "between-cas-drift.txt"), "drift\n");
+          }
+        }
+      }
+    });
+    assert.equal(blocked.summary.status, "partial");
+    assert.equal(blocked.summary.repositories[0]!.status, "completed");
+    assert.equal(blocked.summary.repositories[1]!.status, "pending");
+    assert.equal(git(second.target, "rev-parse", "refs/heads/main"), manifest.repositories[1]!.targetExpectedCommit);
+    await unlink(path.join(second.target, "between-cas-drift.txt"));
+    assert.equal((await promote(root, manifest)).summary.status, "completed");
+  });
+});
+
+test("completed journal retries preserve immutable historical completion after later drift", async () => {
+  await withTempDir(async (root) => {
+    const item = await fixture(root, "hist");
+    const manifest = prepare(root, [item]);
+    const completed = await promote(root, manifest);
+    assert.equal(completed.summary.status, "completed");
+    const journalFile = completed.summary.journalFile;
+    const durableJournal = await readFile(journalFile, "utf8");
+    await writeFile(path.join(item.target, "later.txt"), "later\n");
+    git(item.target, "add", "later.txt");
+    const laterCommit = commit(item.target, "later accepted work");
+    await writeFile(path.join(item.target, "dirty-after-completion.txt"), "dirty\n");
+    const staleHeadLock = path.join(item.target, ".git", "HEAD.lock");
+    await writeFile(staleHeadLock, `pi-tools-worker-fold ${completed.summary.promotionId} ${completed.summary.repositories[0]!.candidateId}\n`, { mode: 0o600 });
+    const retry = await promote(root, manifest);
+    assert.equal(retry.summary.status, "completed");
+    assert.equal(retry.summary.completedCount, 1);
+    assert.equal(await readFile(journalFile, "utf8"), durableJournal);
+    assert.equal(existsSync(staleHeadLock), false);
+    assert.equal(git(item.target, "rev-parse", "refs/heads/main"), laterCommit);
+    assert.equal(await readFile(path.join(item.target, "dirty-after-completion.txt"), "utf8"), "dirty\n");
+  });
+});
+
+test("objects-imported expected-ref dirtiness and transient inspection failures remain retryable", async () => {
+  await withTempDir(async (root) => {
+    const item = await fixture(root, "retry");
+    const manifest = prepare(root, [item]);
+    await assert.rejects(() => promote(root, manifest, {
+      hooks: { afterObjectsImported() { throw new PromotionTestCrash("stop after import"); } }
+    }), /stop after import/);
+    await writeFile(path.join(item.target, "ordinary-local-edit.txt"), "local\n");
+    const blocked = await promote(root, manifest);
+    assert.equal(blocked.summary.status, "partial");
+    assert.equal(blocked.summary.repositories[0]!.status, "objects_imported");
+    assert.equal(git(item.target, "rev-parse", "refs/heads/main"), manifest.repositories[0]!.targetExpectedCommit);
+    await unlink(path.join(item.target, "ordinary-local-edit.txt"));
+    assert.equal((await promote(root, manifest)).summary.status, "completed");
+  });
+
+  await withTempDir(async (root) => {
+    const item = await fixture(root, "inspect");
+    const manifest = prepare(root, [item]);
+    await assert.rejects(() => promote(root, manifest, {
+      hooks: { afterJournalCreated() { throw new PromotionTestCrash("intent only"); } }
+    }), /intent only/);
+    const shim = path.join(root, "git-transient-policy-shim");
+    await writeFile(shim, `#!/bin/sh\ncase " $* " in *" config --local "*) echo 'transient policy probe' >&2; exit 71;; esac\nexec ${JSON.stringify(gitPath)} "$@"\n`, { mode: 0o700 });
+    const blocked = await promote(root, manifest, { gitPath: shim });
+    assert.equal(blocked.summary.status, "partial");
+    assert.equal(blocked.summary.repositories[0]!.status, "pending");
+    assert.match(blocked.summary.error ?? "", /retryable/);
+    assert.equal((await promote(root, manifest)).summary.status, "completed");
+  });
+});
+
+test("deterministic patching handles binary mode symlink deletion rename and file-directory transitions", async () => {
+  await withTempDir(async (root) => {
+    const item = await fixture(root, "paths", {
+      async setupBase(target) {
+        await writeFile(path.join(target, "delete.txt"), "delete me\n");
+        await writeFile(path.join(target, "rename.txt"), "rename me\n");
+        await writeFile(path.join(target, "mode.sh"), "#!/bin/sh\necho old\n");
+        chmodSync(path.join(target, "mode.sh"), 0o644);
+        await writeFile(path.join(target, "shape"), "was a file\n");
+        await mkdir(path.join(target, "dirshape"));
+        await writeFile(path.join(target, "dirshape", "child.txt"), "was a directory\n");
+        await symlink("base.txt", path.join(target, "old-link"));
+      },
+      async setupCandidate(candidate) {
+        await unlink(path.join(candidate, "delete.txt"));
+        await rename(path.join(candidate, "rename.txt"), path.join(candidate, "renamed.txt"));
+        await writeFile(path.join(candidate, "mode.sh"), "#!/bin/sh\necho new\n");
+        chmodSync(path.join(candidate, "mode.sh"), 0o755);
+        await unlink(path.join(candidate, "shape"));
+        await mkdir(path.join(candidate, "shape"));
+        await writeFile(path.join(candidate, "shape", "child.bin"), Buffer.from([0, 1, 2, 255, 0, 7]));
+        await rm(path.join(candidate, "dirshape"), { recursive: true });
+        await writeFile(path.join(candidate, "dirshape"), "now a file\n");
+        await unlink(path.join(candidate, "old-link"));
+        await symlink("renamed.txt", path.join(candidate, "old-link"));
+        await writeFile(path.join(candidate, "binary.dat"), Buffer.from([0, 255, 13, 10, 0, 128]));
+      }
+    });
+    const manifest = prepare(root, [item]);
+    assert.equal((await promote(root, manifest)).summary.status, "completed");
+    assert.equal(existsSync(path.join(item.target, "delete.txt")), false);
+    assert.equal(await readFile(path.join(item.target, "renamed.txt"), "utf8"), "rename me\n");
+    assert.match(git(item.target, "ls-files", "-s", "mode.sh"), /^100755 /);
+    assert.deepEqual(await readFile(path.join(item.target, "shape", "child.bin")), Buffer.from([0, 1, 2, 255, 0, 7]));
+    assert.equal(await readFile(path.join(item.target, "dirshape"), "utf8"), "now a file\n");
+    assert.equal(await readlink(path.join(item.target, "old-link")), "renamed.txt");
+    assert.deepEqual(await readFile(path.join(item.target, "binary.dat")), Buffer.from([0, 255, 13, 10, 0, 128]));
+    assert.equal(git(item.target, "status", "--porcelain=v1", "--untracked-files=all"), "");
+  });
+});
+
+test("patch generation ignores hostile local diff formatting configuration", async () => {
+  await withTempDir(async (root) => {
+    const item = await fixture(root, "config");
+    const manifest = prepare(root, [item]);
+    git(item.target, "config", "diff.noprefix", "true");
+    git(item.target, "config", "diff.srcPrefix", "evil/");
+    git(item.target, "config", "diff.dstPrefix", "worse/");
+    git(item.target, "config", "diff.context", "0");
+    git(item.target, "config", "color.diff", "always");
+    git(item.target, "config", "diff.external", "/bin/false");
+    const log = path.join(root, "hostile-config-git.log");
+    const shim = path.join(root, "hostile-config-git");
+    await writeFile(shim, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(log)}\nexec ${JSON.stringify(gitPath)} "$@"\n`, { mode: 0o700 });
+    assert.equal((await promote(root, manifest, { gitPath: shim })).summary.status, "completed");
+    const invocation = (await readFile(log, "utf8")).split("\n").find((line) => line.includes(" diff --binary ")) ?? "";
+    assert.match(invocation, /--full-index --no-color --no-ext-diff --no-textconv --no-renames --src-prefix=a\/ --dst-prefix=b\/ --unified=3/);
+    assert.match(invocation, /-c diff\.noprefix=false/);
+    assert.match(invocation, /-c color\.diff=false/);
+  });
+});
+
+test("ignored collision discovery collapses large directories and catches parent collisions before intent", async () => {
+  await withTempDir(async (root) => {
+    const item = await fixture(root, "scale");
+    const manifest = prepare(root, [item]);
+    await writeFile(path.join(item.target, ".git", "info", "exclude"), "node_modules/\n");
+    await mkdir(path.join(item.target, "node_modules", "package", "deep"), { recursive: true });
+    for (let index = 0; index < 500; index += 1) await writeFile(path.join(item.target, "node_modules", "package", "deep", `file-${index}.js`), "ignored\n");
+    const log = path.join(root, "ignored-list.log");
+    const shim = path.join(root, "ignored-list-git");
+    await writeFile(shim, `#!/bin/sh\ncase " $* " in *" ls-files --others --ignored --exclude-standard "*) case " $* " in *" --directory "*) :;; *) echo 'uncollapsed ignored traversal' >&2; exit 72;; esac;; esac\nprintf '%s\\n' "$*" >> ${JSON.stringify(log)}\nexec ${JSON.stringify(gitPath)} "$@"\n`, { mode: 0o700 });
+    assert.equal((await promote(root, manifest, { gitPath: shim })).summary.status, "completed");
+    assert.match(await readFile(log, "utf8"), /ls-files --others --ignored --exclude-standard --directory -z/);
+  });
+
+  await withTempDir(async (root) => {
+    const item = await fixture(root, "parent", {
+      async setupCandidate(candidate) {
+        await mkdir(path.join(candidate, "dist"));
+        await writeFile(path.join(candidate, "dist", "index.js"), "desired\n");
+      }
+    });
+    const manifest = prepare(root, [item]);
+    await writeFile(path.join(item.target, ".git", "info", "exclude"), "dist/\n");
+    await mkdir(path.join(item.target, "dist"));
+    await writeFile(path.join(item.target, "dist", "valuable.bin"), "valuable\n");
+    await assert.rejects(() => promote(root, manifest), /Ignored worktree path collides/);
+    assert.equal(await readFile(path.join(item.target, "dist", "valuable.bin"), "utf8"), "valuable\n");
+    assert.equal(git(item.target, "rev-parse", "refs/heads/main"), manifest.repositories[0]!.targetExpectedCommit);
+  });
+});
+
+test("post-CAS apply errors preserve the original cause and exact retry state", async () => {
+  await withTempDir(async (root) => {
+    const item = await fixture(root, "lock");
+    const manifest = prepare(root, [item]);
+    const indexLock = path.join(item.target, ".git", "index.lock");
+    const blocked = await promote(root, manifest, {
+      hooks: { beforeWorktreeSync() { writeFileSync(indexLock, "late external lock\n"); } }
+    });
+    assert.equal(blocked.summary.status, "partial");
+    assert.equal(blocked.summary.repositories[0]!.status, "ref_updated");
+    assert.match(blocked.summary.error ?? "", /index\.lock|Unable to create/);
+    assert.equal(existsSync(path.join(item.target, "candidate-lock.txt")), false);
+    await unlink(indexLock);
+    assert.equal((await promote(root, manifest)).summary.status, "completed");
+  });
+
+  await withTempDir(async (root) => {
+    const item = await fixture(root, "after");
+    const manifest = prepare(root, [item]);
+    const shim = path.join(root, "git-apply-after-success");
+    await writeFile(shim, `#!/bin/sh\ncase " $* " in *" apply --index "*) case " $* " in *" --check "*) exec ${JSON.stringify(gitPath)} "$@";; esac; ${JSON.stringify(gitPath)} "$@" || exit $?; echo 'sentinel after exact apply' >&2; exit 73;; esac\nexec ${JSON.stringify(gitPath)} "$@"\n`, { mode: 0o700 });
+    const result = await promote(root, manifest, { gitPath: shim });
+    assert.equal(result.summary.status, "completed");
+    assert.equal(await readFile(path.join(item.target, "candidate-after.txt"), "utf8"), "candidate after\n");
+  });
+});
+
+test("post-CAS apply has no tool SIGKILL deadline and quarantine errors stay schema-bounded", async () => {
+  await withTempDir(async (root) => {
+    const item = await fixture(root, "slow");
+    const manifest = prepare(root, [item]);
+    const shim = path.join(root, "git-slow-apply");
+    await writeFile(shim, `#!/bin/sh\ncase " $* " in *" apply --index "*) case " $* " in *" --check "*) :;; *) sleep 6;; esac;; esac\nexec ${JSON.stringify(gitPath)} "$@"\n`, { mode: 0o700 });
+    assert.equal((await promote(root, manifest, { gitPath: shim })).summary.status, "completed");
+  });
+
+  await withTempDir(async (root) => {
+    const item = await fixture(root, "huge");
+    const manifest = prepare(root, [item]);
+    const shim = path.join(root, "git-huge-apply-error");
+    await writeFile(shim, `#!/bin/sh\ncase " $* " in *" apply --index "*) printf 'corrupt\\n' > ${JSON.stringify(path.join(item.target, "base.txt"))}; head -c 5000 /dev/zero | tr '\\000' X >&2; exit 74;; esac\nexec ${JSON.stringify(gitPath)} "$@"\n`, { mode: 0o700 });
+    const result = await promote(root, manifest, { gitPath: shim });
+    assert.equal(result.summary.status, "quarantined");
+    assert.ok(Buffer.byteLength(result.summary.error ?? "", "utf8") <= 1000);
+    assert.ok(Buffer.byteLength(result.summary.repositories[0]!.error ?? "", "utf8") <= 1000);
+    assert.equal(readWorkerFoldPromotion(path.join(root, "promotions"), result.summary.promotionId).status, "quarantined");
+  });
+});
+
+test("native apply refuses an ignored symlink parent inserted after preflight", async () => {
+  await withTempDir(async (root) => {
+    const item = await fixture(root, "symlinkrace", {
+      async setupCandidate(candidate) {
+        await mkdir(path.join(candidate, "parent"));
+        await writeFile(path.join(candidate, "parent", "new.txt"), "desired\n");
+      }
+    });
+    const manifest = prepare(root, [item]);
+    await writeFile(path.join(item.target, ".git", "info", "exclude"), "parent\n");
+    const outside = path.join(root, "outside");
+    await mkdir(outside);
+    const shim = path.join(root, "git-symlink-race");
+    await writeFile(shim, `#!/bin/sh\ncase " $* " in *" apply --index "*) ln -s ${JSON.stringify(outside)} ${JSON.stringify(path.join(item.target, "parent"))};; esac\nexec ${JSON.stringify(gitPath)} "$@"\n`, { mode: 0o700 });
+    const result = await promote(root, manifest, { gitPath: shim });
+    assert.notEqual(result.summary.status, "completed");
+    assert.equal(existsSync(path.join(outside, "new.txt")), false);
+    assert.equal(await readlink(path.join(item.target, "parent")), outside);
+  });
+});
+
+test("intent-to-add and stale managed index guards block or recover without CAS ambiguity", async () => {
+  await withTempDir(async (root) => {
+    const item = await fixture(root, "ita");
+    const manifest = prepare(root, [item]);
+    const intentPath = path.join(item.target, "intent.txt");
+    let injected = false;
+    const blocked = await promote(root, manifest, {
+      hooks: {
+        afterObjectsImported() {
+          if (injected) return;
+          injected = true;
+          writeFileSync(intentPath, "intent\n");
+          git(item.target, "add", "--intent-to-add", "intent.txt");
+        }
+      }
+    });
+    assert.equal(blocked.summary.status, "partial");
+    assert.equal(blocked.summary.repositories[0]!.status, "objects_imported");
+    assert.equal(git(item.target, "rev-parse", "refs/heads/main"), manifest.repositories[0]!.targetExpectedCommit);
+    git(item.target, "reset", "--", "intent.txt");
+    await unlink(intentPath);
+    assert.equal((await promote(root, manifest)).summary.status, "completed");
+  });
+
+  await withTempDir(async (root) => {
+    const item = await fixture(root, "guard");
+    const manifest = prepare(root, [item]);
+    await assert.rejects(() => promote(root, manifest, {
+      hooks: { afterJournalCreated() { throw new PromotionTestCrash("guard crash"); } }
+    }), /guard crash/);
+    const journal = onlyJournal(root);
+    const indexLock = path.join(item.target, ".git", "index.lock");
+    await writeFile(indexLock, `pi-tools-worker-fold-index ${journal.promotionId} ${journal.repositories[0]!.candidateId}\n`, { mode: 0o600 });
+    assert.equal((await promote(root, manifest)).summary.status, "completed");
+    assert.equal(existsSync(indexLock), false);
+  });
+});
+
+test("promotion fails closed below the required Git feature floor", async () => {
+  await withTempDir(async (root) => {
+    const item = await fixture(root, "oldgit");
+    const manifest = prepare(root, [item]);
+    const shim = path.join(root, "git-old-version");
+    await writeFile(shim, `#!/bin/sh\ncase " $* " in *" --version "*) echo 'git version 2.35.9'; exit 0;; esac\nexec ${JSON.stringify(gitPath)} "$@"\n`, { mode: 0o700 });
+    await assert.rejects(() => promote(root, manifest, { gitPath: shim }), /requires Git 2\.36 or newer/);
+    assert.equal(existsSync(path.join(root, "promotions")), true);
+    assert.equal(readdirSync(path.join(root, "promotions")).filter((entry) => entry.startsWith("promotion_")).length, 0);
+  });
+});
+
+test("candidate-controlled textconv remains unsupported even though patching disables textconv", async () => {
+  await withTempDir(async (root) => {
+    const item = await fixture(root, "textconv");
+    const manifest = prepare(root, [item]);
+    git(item.target, "config", "diff.binary.textconv", "/bin/false");
+    await assert.rejects(() => promote(root, manifest), /unsupported_config:diff\.binary\.textconv/);
+    assert.equal(git(item.target, "rev-parse", "refs/heads/main"), manifest.repositories[0]!.targetExpectedCommit);
+  });
+});
+
+test("cancellation delivered during bounded patch generation is observed before CAS", async () => {
+  await withTempDir(async (root) => {
+    const item = await fixture(root, "patchcancel");
+    const manifest = prepare(root, [item]);
+    const controller = new AbortController();
+    const shim = path.join(root, "git-slow-patch-generation");
+    await writeFile(shim, `#!/bin/sh\ncase " $* " in *" diff --binary "*) sleep 1;; esac\nexec ${JSON.stringify(gitPath)} "$@"\n`, { mode: 0o700 });
+    await assert.rejects(() => promote(root, manifest, {
+      gitPath: shim,
+      signal: controller.signal,
+      hooks: { afterObjectsImported() { setTimeout(() => controller.abort(), 100); } }
+    }), /cancelled after 0\/1 repositories/);
+    const journal = onlyJournal(root);
+    assert.equal(journal.repositories[0]!.status, "objects_imported");
+    assert.equal(git(item.target, "rev-parse", "refs/heads/main"), manifest.repositories[0]!.targetExpectedCommit);
+    assert.equal((await promote(root, manifest)).summary.status, "completed");
   });
 });
