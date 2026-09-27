@@ -1,10 +1,11 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, Model, Provider } from "@earendil-works/pi-ai";
 import {
   createAgentSessionFromServices,
   createAgentSessionServices,
   getAgentDir,
   SessionManager,
+  SettingsManager,
   type AgentSessionEvent,
   type ExtensionContext,
   type ExtensionError,
@@ -14,8 +15,21 @@ import {
   type ToolDefinition
 } from "@earendil-works/pi-coding-agent";
 import { throwIfAborted } from "./cancellation.js";
+import { assertChildAgentRouteAllowed } from "./model-spec.js";
 
 export type ChildAgentSession = Awaited<ReturnType<typeof createAgentSessionFromServices>>["session"];
+
+export type IsolatedChildSettings = {
+  compaction: { enabled: false };
+  retry: { enabled: false; maxRetries: 0; provider: { maxRetries: 0 } };
+};
+
+export function createIsolatedChildSettings(): IsolatedChildSettings {
+  return {
+    compaction: { enabled: false },
+    retry: { enabled: false, maxRetries: 0, provider: { maxRetries: 0 } }
+  };
+}
 
 export type ChildAgentSessionOptions = {
   cwd: string;
@@ -25,11 +39,15 @@ export type ChildAgentSessionOptions = {
   systemPrompts?: string[];
   customTools?: ToolDefinition[];
   extensionFactories?: ExtensionFactory[];
+  /** Trusted in-process provider instrumentation applied only to this child session. */
+  transformProvider?: (provider: Provider) => Provider;
   extensionsOverride?: (result: LoadExtensionsResult) => LoadExtensionsResult;
   onEvent?: (event: AgentSessionEvent) => void;
   onError?: (error: ExtensionError) => void;
   onWarning?: (message: string) => void;
   onInteractiveDenial?: (method: string, title: string) => void;
+  /** Exact trusted system prompt plus in-memory settings and empty ambient resources. */
+  isolatedSystemPrompt?: string;
   signal?: AbortSignal;
 };
 
@@ -39,19 +57,44 @@ export async function withChildAgentSession<T>(
   run: (session: ChildAgentSession) => Promise<T>
 ): Promise<T> {
   throwIfAborted(options.signal);
+  assertChildAgentRouteAllowed(options.model, options.thinkingLevel);
   const tools = uniqueStrings(options.tools);
+  const isolatedSystemPrompt = options.isolatedSystemPrompt?.trim();
+  if (options.isolatedSystemPrompt !== undefined && !isolatedSystemPrompt) {
+    throw new Error("An isolated child session requires a non-empty trusted system prompt.");
+  }
+  if (isolatedSystemPrompt && options.systemPrompts?.length) {
+    throw new Error("An isolated child session cannot also append ambient system prompts.");
+  }
   const services = await createAgentSessionServices({
     cwd: options.cwd,
     agentDir: getAgentDir(),
+    settingsManager: isolatedSystemPrompt ? SettingsManager.inMemory(createIsolatedChildSettings()) : undefined,
     resourceLoaderOptions: {
-      appendSystemPromptOverride: options.systemPrompts?.length
-        ? (base) => [...base, ...options.systemPrompts!.filter((prompt) => prompt.trim()).map((prompt) => prompt.trim())]
-        : undefined,
+      ...(isolatedSystemPrompt ? {
+        noExtensions: true,
+        noSkills: true,
+        noPromptTemplates: true,
+        noThemes: true,
+        noContextFiles: true,
+        systemPrompt: isolatedSystemPrompt,
+        appendSystemPrompt: [],
+        skillsOverride: () => ({ skills: [], diagnostics: [] }),
+        promptsOverride: () => ({ prompts: [], diagnostics: [] }),
+        themesOverride: () => ({ themes: [], diagnostics: [] }),
+        agentsFilesOverride: () => ({ agentsFiles: [] }),
+        systemPromptOverride: () => isolatedSystemPrompt,
+        appendSystemPromptOverride: () => []
+      } : {
+        appendSystemPromptOverride: options.systemPrompts?.length
+          ? (base: string[]) => [...base, ...options.systemPrompts!.filter((prompt) => prompt.trim()).map((prompt) => prompt.trim())]
+          : undefined,
+        extensionsOverride: options.extensionsOverride
+      }),
       extensionFactories: [
         createChildToolAllowlistExtension(tools),
         ...(options.extensionFactories ?? [])
-      ],
-      extensionsOverride: options.extensionsOverride
+      ]
     }
   });
 
@@ -66,7 +109,11 @@ export async function withChildAgentSession<T>(
 
   const parentProvider = context.modelRegistry.getProvider(options.model.provider);
   if (parentProvider) {
-    services.modelRuntime.registerNativeProvider(parentProvider);
+    const childProvider = options.transformProvider?.(parentProvider) ?? parentProvider;
+    if (childProvider.id !== parentProvider.id) {
+      throw new Error("Child provider instrumentation cannot change provider identity.");
+    }
+    services.modelRuntime.registerNativeProvider(childProvider);
   }
   if (await services.modelRuntime.getAuth(options.model) === undefined) {
     const parentAuth = await context.modelRegistry.getApiKeyAndHeaders(options.model);

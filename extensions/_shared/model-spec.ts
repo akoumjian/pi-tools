@@ -26,6 +26,13 @@ export type ParsedModelThinkingPair = {
   thinkingLevel: ThinkingLevel;
 };
 
+export type SubagentRoute = {
+  provider: string;
+  model: string;
+  modelName?: string;
+  thinkingLevel: string;
+};
+
 const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 export function isValidThinkingLevel(value: unknown): value is ThinkingLevel {
@@ -38,6 +45,54 @@ export function normalizeThinkingLevel(value: unknown, fallback: ThinkingLevel):
 
 export function formatModelName(model: Pick<Model<Api>, "provider" | "id">): string {
   return `${model.provider}/${model.id}`;
+}
+
+/** Fail closed for every delegated child while leaving the parent model untouched. */
+export function assertSubagentRouteAllowed(route: SubagentRoute, label = "Subagent route"): void {
+  const rendered = `${route.provider}/${route.model}:${route.thinkingLevel}`;
+  assertSubagentThinkingLevelAllowed(route.thinkingLevel, `${label} ${rendered}`);
+  if (isClaudeFableModelReference(`${route.provider}/${route.model}`) || (route.modelName !== undefined && isClaudeFableModelName(route.modelName))) {
+    throw new Error(`${label} ${rendered} is not allowed: Claude Fable models cannot be used for subagents. Choose a non-Fable model.`);
+  }
+}
+
+export function assertSubagentThinkingLevelAllowed(thinkingLevel: string, label = "Subagent thinking level"): void {
+  if (thinkingLevel === "max") {
+    throw new Error(`${label} is not allowed: subagent thinking is capped at xhigh. Choose xhigh or a lower exact level; max is never clamped or substituted.`);
+  }
+}
+
+/** Reject forbidden explicit suffixes/models before resolution can clamp or substitute them. */
+export function assertSubagentRouteSpecAllowed(spec: string, label = "Subagent route"): void {
+  const parsed = parseOptionalModelThinkingPair(spec);
+  if (!parsed) return;
+  const rendered = `${parsed.model}:${parsed.thinkingLevel}`;
+  assertSubagentThinkingLevelAllowed(parsed.thinkingLevel, `${label} ${rendered}`);
+  if (isClaudeFableModelReference(parsed.model)) {
+    throw new Error(`${label} ${rendered} is not allowed: Claude Fable models cannot be used for subagents. Choose a non-Fable model.`);
+  }
+}
+
+export function assertChildAgentRouteAllowed(
+  model: Pick<Model<Api>, "provider" | "id" | "name">,
+  thinkingLevel: ThinkingLevel,
+  label = "Child-agent route"
+): void {
+  assertSubagentRouteAllowed({ provider: model.provider, model: model.id, modelName: model.name, thinkingLevel }, label);
+}
+
+/**
+ * Match the Claude model family token in direct, gateway-prefixed, and
+ * Bedrock-style catalog references without rejecting unrelated names such as
+ * `claude-fablet`, `fable`, or `notclaude-fable`.
+ */
+export function isClaudeFableModelReference(reference: string): boolean {
+  return /(?:^|[\/.:])claude(?:[-_.]|\s)+fable(?=$|[-_./:\s])/i.test(reference.trim());
+}
+
+/** Match human-readable resolved catalog names without substring false positives. */
+export function isClaudeFableModelName(name: string): boolean {
+  return /(?:^|[^a-z0-9])claude(?:[-_.]|\s)+fable(?=$|[^a-z0-9])/i.test(name.trim());
 }
 
 export function resolveExtensionModel(options: ResolveExtensionModelOptions): ResolvedExtensionModel {

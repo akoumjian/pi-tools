@@ -973,6 +973,9 @@ function buildRgArgs(
   if (item.glob !== undefined) {
     args.push(`--glob=${item.glob}`);
   }
+  // Git administrative data is never repository evidence. Keep these rules
+  // after caller globs so a positive `.git`/brace glob cannot re-include it.
+  args.push("--glob=!.git", "--glob=!**/.git", "--glob=!.git/**", "--glob=!**/.git/**");
 
   if (item.kind === "files") {
     return [...args, "--files", "--", pathArg];

@@ -6,9 +6,61 @@ import { isAsyncJobProcessAlive } from "../_shared/async-job.js";
 import { isWorkerId } from "../_shared/worker-id.js";
 import type { CompletionDelivery } from "../_shared/completion-delivery.js";
 import type { WorkerContainerReference } from "../_shared/worker-container.js";
+import { validateWorkerCacheLineageRecord, type WorkerCacheLineageRecord } from "./cache-lineage.js";
 import { isRepositoryInventorySummary, type InitialRepositoryPin, type RepositoryInventorySummary } from "./repositories.js";
 
 export const WORKER_RECORD_VERSION = 1;
+
+type WorkerRecordChangeListener = (recordFile: string) => void;
+const WORKER_RECORD_RUNTIME_HOLDER_KEY = Symbol.for("@akoumjian/pi-tools/worker-record-runtime");
+const WORKER_RECORD_RUNTIME_HOLDER_VERSION = 1;
+
+type WorkerRecordRuntimeHolder = {
+  version: typeof WORKER_RECORD_RUNTIME_HOLDER_VERSION;
+  listeners: Set<WorkerRecordChangeListener>;
+};
+
+function workerRecordRuntimeHolder(): WorkerRecordRuntimeHolder {
+  const existing = Reflect.get(globalThis, WORKER_RECORD_RUNTIME_HOLDER_KEY) as Partial<WorkerRecordRuntimeHolder> | undefined;
+  if (existing !== undefined) {
+    if (
+      existing === null ||
+      typeof existing !== "object" ||
+      existing.version !== WORKER_RECORD_RUNTIME_HOLDER_VERSION ||
+      !(existing.listeners instanceof Set)
+    ) {
+      throw new Error(`Incompatible worker-record runtime holder for version ${WORKER_RECORD_RUNTIME_HOLDER_VERSION}.`);
+    }
+    return existing as WorkerRecordRuntimeHolder;
+  }
+  const created: WorkerRecordRuntimeHolder = {
+    version: WORKER_RECORD_RUNTIME_HOLDER_VERSION,
+    listeners: new Set<WorkerRecordChangeListener>()
+  };
+  Reflect.set(globalThis, WORKER_RECORD_RUNTIME_HOLDER_KEY, created);
+  return created;
+}
+
+const workerRecordChangeListeners = workerRecordRuntimeHolder().listeners;
+
+export function subscribeWorkerRecordChanges(listener: WorkerRecordChangeListener): () => void {
+  workerRecordChangeListeners.add(listener);
+  return () => workerRecordChangeListeners.delete(listener);
+}
+
+export function notifyWorkerRecordRemoved(recordFile: string): void {
+  notifyWorkerRecordChange(path.resolve(recordFile));
+}
+
+function notifyWorkerRecordChange(recordFile: string): void {
+  for (const listener of workerRecordChangeListeners) {
+    try {
+      listener(recordFile);
+    } catch {
+      // Activity display is observational and must never affect durable lifecycle writes.
+    }
+  }
+}
 
 export type WorkerRoute = {
   provider: string;
@@ -74,6 +126,7 @@ export type WorkerRecord = {
   route: WorkerRoute;
   initialRepositories?: InitialRepositoryPin[];
   integration?: WorkerIntegrationRecord;
+  cacheLineage?: WorkerCacheLineageRecord;
   status: "queued" | "running" | "handed_off" | "failed" | "cancelled";
   container?: WorkerContainerReference;
   activeRun?: {
@@ -311,6 +364,7 @@ export function writeWorkerRecord(recordFile: string, record: WorkerRecord): voi
   const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
   writeFileSync(temporary, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
   renameSync(temporary, target);
+  notifyWorkerRecordChange(target);
 }
 
 export function readWorkerRecord(recordFile: string): WorkerRecord {
@@ -333,11 +387,24 @@ function assertValidWorkerRecord(value: unknown, target: string): asserts value 
     !value.route ||
     !validInitialRepositories(value.initialRepositories) ||
     !validIntegrationRecord(value.integration) ||
+    !validWorkerCacheLineageRecord(value.cacheLineage, target) ||
     !validRepositoryInventorySummary(isRecord(value.lastRun) ? value.lastRun.repositoryInventory : undefined, target, isRecord(value.lastRun) ? value.lastRun.runId : undefined) ||
     (isRecord(value.lastRun) && value.lastRun.repositoryError !== undefined && (typeof value.lastRun.repositoryError !== "string" || value.lastRun.repositoryError.length > 512))
   ) {
     throw new Error(`Invalid worker record: ${target}`);
   }
+}
+
+function validWorkerCacheLineageRecord(value: unknown, recordFile: string): boolean {
+  if (value === undefined) return true;
+  if (!validateWorkerCacheLineageRecord(value)) return false;
+  if (value.mode === "fresh") return true;
+  const stateDir = path.dirname(recordFile);
+  return value.snapshotFile === path.join(stateDir, "cache-lineage.json") &&
+    value.adoptionFile === path.join(stateDir, "cache-lineage-adopted.json") &&
+    value.fallbackFile === path.join(stateDir, "cache-lineage-fallback.json") &&
+    value.retirementFile === path.join(stateDir, "cache-lineage-retired.json") &&
+    value.summaryFile === path.join(stateDir, "cache-lineage-summary.json");
 }
 
 function validIntegrationRecord(value: unknown): boolean {

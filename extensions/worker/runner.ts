@@ -5,8 +5,10 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { startManagedAsyncJob, type ManagedAsyncJobHandle } from "../async-shell/index.js";
 import { resolveExecutable } from "../_shared/executable.js";
+import { assertSubagentRouteAllowed } from "../_shared/model-spec.js";
 import { managedWorkerRoleSkillPath, type ManagedWorkerRoleSkill } from "../_shared/role-skills.js";
 import type { WorkerContainerReference } from "../_shared/worker-container.js";
+import { MANAGED_WORKER_TOOL_NAMES, type WorkerCacheLineageRecord } from "./cache-lineage.js";
 import type { WorkerIntegrationRecord, WorkerRecord } from "./state.js";
 
 export type WorkerBeadsRoute = {
@@ -33,6 +35,7 @@ export type WorkerHostConfig = {
   taskIds: string[];
   roleSkill: Extract<ManagedWorkerRoleSkill, "implementation" | "integration">;
   integration?: WorkerIntegrationRecord;
+  cacheLineage?: WorkerCacheLineageRecord;
   resultFile: string;
   settledFile: string;
   processFile: string;
@@ -50,7 +53,7 @@ export type WorkerHostConfig = {
   extensionPaths: string[];
   shellExecution: WorkerShellExecution;
   rpcArgs: string[];
-  timeoutMs: number;
+  timeoutMs?: number;
 };
 
 export type WorkerHostProcess = {
@@ -94,9 +97,13 @@ export function launchWorkerHost(
   context: ExtensionContext,
   input: LaunchWorkerHostInput
 ): { handle: ManagedAsyncJobHandle; config: WorkerHostConfig; configFile: string } {
+  assertSubagentRouteAllowed(input.record.route, `Worker ${input.record.workerId} host route`);
   if (!input.record.sessionFile) throw new Error(`Worker ${input.record.workerId} has no forked session file.`);
   if (!input.record.activeRun) throw new Error(`Worker ${input.record.workerId} has no active run to launch.`);
   const activeRun = input.record.activeRun;
+  if (input.timeoutMs !== undefined && (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs <= 0)) {
+    throw new Error("Worker host timeoutMs must be a positive safe integer when explicitly configured.");
+  }
   const stateRoot = path.dirname(path.dirname(input.runDir));
   mkdirSync(input.runDir, { recursive: true, mode: 0o700 });
   const bdPath = input.bdPath ?? resolveExecutable("bd");
@@ -116,6 +123,7 @@ export function launchWorkerHost(
     taskIds: [...input.record.taskIds],
     roleSkill: input.record.integration ? "integration" : "implementation",
     integration: input.record.integration,
+    cacheLineage: input.record.cacheLineage,
     resultFile: input.resultFile,
     settledFile: path.join(input.runDir, "settled.json"),
     processFile: input.processFile,
@@ -133,7 +141,7 @@ export function launchWorkerHost(
     extensionPaths: input.extensionPaths ?? defaultWorkerExtensionPaths(),
     shellExecution: input.shellExecution,
     rpcArgs: [],
-    timeoutMs: input.timeoutMs ?? 3_600_000
+    ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs })
   };
   config.rpcArgs = buildWorkerRpcArgs(config);
   writeFileSync(authorizationFile, `${JSON.stringify({
@@ -165,6 +173,7 @@ export function launchWorkerHost(
       ...(config.parentContextSnapshot ? { PI_WORKER_PARENT_CONTEXT_SNAPSHOT: config.parentContextSnapshot } : {}),
       PI_WORKER_TASK_IDS: JSON.stringify(input.record.taskIds),
       ...(input.record.integration ? { PI_WORKER_INTEGRATION: JSON.stringify(input.record.integration) } : {}),
+      ...(input.record.cacheLineage ? { PI_WORKER_CACHE_LINEAGE: JSON.stringify(input.record.cacheLineage) } : {}),
       PI_WORKER_BD_PATH: config.bdPath,
       PI_WORKER_BEADS_ROUTE: JSON.stringify(config.beadsRoute),
       ...shellEnvironment
@@ -220,7 +229,7 @@ export function buildWorkerRpcArgs(config: WorkerHostConfig): string[] {
     "--no-themes",
     "--no-extensions",
     "--no-builtin-tools",
-    "--tools", "worker_handoff,worker_task_read,worker_task_update,shell_start,shell_status,shell_read,shell_cancel",
+    "--tools", MANAGED_WORKER_TOOL_NAMES.join(","),
     ...config.extensionPaths.flatMap((extensionPath) => ["-e", extensionPath])
   ];
 }

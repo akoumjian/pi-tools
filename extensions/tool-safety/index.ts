@@ -332,7 +332,7 @@ export function applyReviewCriteria(
   if (criteria === "conservative" || decision.action === "deny") {
     return decision;
   }
-  if (getToolName(event) === "worker_control") {
+  if (["worker_control", "worker_review"].includes(getToolName(event))) {
     // Preserve exact worker lifecycle validation before generic environment narrowing:
     // valid shapes are allowed, while malformed IDs, fields, actions, and confirmation stay reviewed.
     return decision;
@@ -603,6 +603,10 @@ function evaluateToolCall(event: ToolCallEvent, context: ExtensionContext): Safe
     return evaluateWorkerControl(input);
   }
 
+  if (toolName === "worker_review") {
+    return evaluateWorkerReview(input);
+  }
+
   if (["write", "edit"].includes(toolName)) {
     return evaluatePathMutation(input, context, toolName);
   }
@@ -721,6 +725,40 @@ export function evaluateWorkerControl(input: unknown): SafetyDecision {
     reason: "Unsupported or malformed worker_control action requires review.",
     ruleId: "worker-control-action-review",
     tags: ["worker", "lifecycle"]
+  };
+}
+
+export function evaluateWorkerReview(input: unknown): SafetyDecision {
+  const allowedKeys = new Set(["workerId", "runId", "workspaceRepo", "focus"]);
+  const workspaceRepo = isRecord(input) && typeof input.workspaceRepo === "string" ? input.workspaceRepo : undefined;
+  const validWorkspaceRepo = workspaceRepo !== undefined
+    && workspaceRepo.length >= 7
+    && workspaceRepo.length <= 1024
+    && /^repos\/[A-Za-z0-9._/-]+$/.test(workspaceRepo)
+    && workspaceRepo.split("/").slice(1).every((part) => part !== "" && part !== "." && part !== "..");
+  const valid = isRecord(input)
+    && Object.keys(input).every((key) => allowedKeys.has(key))
+    && isWorkerId(input.workerId)
+    && typeof input.runId === "string"
+    && input.runId.length <= 128
+    && /^run_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(input.runId)
+    && validWorkspaceRepo
+    && (input.focus === undefined || (typeof input.focus === "string" && input.focus.length >= 1 && input.focus.length <= 4000));
+  if (!valid) {
+    return {
+      action: "review",
+      risk: "medium",
+      reason: "Malformed worker_review input requires review.",
+      ruleId: "worker-review-shape-review",
+      tags: ["worker", "review"]
+    };
+  }
+  return {
+    action: "allow",
+    risk: "low",
+    reason: "Worker review inspects one exact clean settled worker repository with an already-stopped container and read-only tools.",
+    ruleId: "worker-review-read-only",
+    tags: ["worker", "review", "read-only", "subagent"]
   };
 }
 

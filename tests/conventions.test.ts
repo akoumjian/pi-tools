@@ -60,8 +60,6 @@ test("pi-tools registered extensions have shipping default config files where re
     "config/completion-notifications-settings.json",
     "config/mutation-review-settings.json",
     "config/mutation-review-guidance.md",
-    "config/review-subagent-settings.json",
-    "config/review-subagent-guidance.md",
     "config/tool-display-settings.json",
     "config/file-open-settings.json",
     "docs/README.md",
@@ -72,7 +70,6 @@ test("pi-tools registered extensions have shipping default config files where re
     "docs/extensions/manual-retry.md",
     "docs/extensions/mutation-review.md",
     "docs/extensions/native-tools.md",
-    "docs/extensions/review-subagent.md",
     "docs/extensions/searxng-search.md",
     "docs/extensions/theme-preview.md",
     "docs/extensions/tmux-scrollback.md",
@@ -85,6 +82,18 @@ test("pi-tools registered extensions have shipping default config files where re
   for (const file of requiredConfigs) {
     assert.ok(readText(file).length > 0, file);
   }
+});
+
+test("legacy review-subagent package surfaces are absent", () => {
+  const manifest = packageJson();
+  assert.equal((manifest.pi?.extensions ?? []).includes("extensions/review-subagent/index.ts"), false);
+  for (const removed of [
+    "extensions/review-subagent/index.ts",
+    "tests/review-subagent.test.ts",
+    "config/review-subagent-settings.json",
+    "config/review-subagent-guidance.md",
+    "docs/extensions/review-subagent.md"
+  ]) assert.equal(existsSync(path.join(packageRoot, removed)), false, removed);
 });
 
 test("extension load order preserves async-shell and context dependencies", () => {
@@ -111,7 +120,6 @@ test("extension load order preserves async-shell and context dependencies", () =
 test("pi-tools package defaults do not own personal profile model or trust choices", () => {
   const toolSafety = readJson("config/tool-safety-settings.json");
   const mutationReview = readJson("config/mutation-review-settings.json");
-  const reviewSubagent = readJson("config/review-subagent-settings.json");
 
   assert.equal(toolSafety.approvalModel, undefined);
   assert.equal(toolSafety.trustedWorkspaceRoot, undefined);
@@ -127,18 +135,12 @@ test("pi-tools package defaults do not own personal profile model or trust choic
   assert.equal(mutationReview.defaultModel, undefined);
   assert.equal(mutationReview.guidance, undefined);
   assert.equal(mutationReview.guidanceFile, "mutation-review-guidance.md");
-  assert.equal(reviewSubagent.defaultModel, undefined);
-  assert.equal(reviewSubagent.guidance, undefined);
-  assert.equal(reviewSubagent.guidanceFile, "review-subagent-guidance.md");
 
   const mutationGuidance = readText("config/mutation-review-guidance.md");
-  const reviewGuidance = readText("config/review-subagent-guidance.md");
   assert.match(mutationGuidance, /Package default mutation-review guidance/);
-  assert.match(reviewGuidance, /Package default review guidance/);
   const personalName = ["Al", "eck"].join("");
   const personalHomePattern = new RegExp(`${personalName}|/Users/${personalName.toLowerCase()}|~/${["Co", "de"].join("")}`, "i");
   assert.doesNotMatch(mutationGuidance, personalHomePattern);
-  assert.doesNotMatch(reviewGuidance, personalHomePattern);
 });
 
 test("pi-tools package ships managed-worker role skills without removed Hunk resources", () => {

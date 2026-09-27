@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { parseModelThinkingPair, resolveExtensionModel } from "../extensions/_shared/model-spec.js";
+import {
+  assertChildAgentRouteAllowed,
+  assertSubagentRouteAllowed,
+  assertSubagentRouteSpecAllowed,
+  parseModelThinkingPair,
+  resolveExtensionModel
+} from "../extensions/_shared/model-spec.js";
 
 function fakeModel(
   provider: string,
@@ -157,4 +163,38 @@ test("parseModelThinkingPair splits on the last colon and validates thinking", (
   });
   assert.throws(() => parseModelThinkingPair("openrouter/foo:exacto"), /Invalid thinking level exacto/);
   assert.throws(() => parseModelThinkingPair("openai/gpt-4o"), /model:thinking/);
+});
+
+
+test("subagent route policy rejects max and Claude Fable without false positives", () => {
+  assert.throws(
+    () => assertSubagentRouteSpecAllowed("openai-codex/gpt-6:max", "Worker route"),
+    /capped at xhigh.*never clamped or substituted/
+  );
+  assert.throws(
+    () => assertSubagentRouteAllowed({ provider: "anthropic", model: "claude-fable-5-1", thinkingLevel: "xhigh" }, "Review route"),
+    /Claude Fable models cannot be used for subagents/
+  );
+  assert.throws(
+    () => assertChildAgentRouteAllowed(fakeModel("anthropic", "claude-fable-5"), "low"),
+    /non-Fable model/
+  );
+  for (const spec of [
+    "vercel-ai-gateway/anthropic/claude-fable-5:xhigh",
+    "amazon-bedrock/us.anthropic.claude-fable-5-20260901-v1:0:xhigh",
+    "gateway/catalog/CLAUDE.FABLE_5:xhigh"
+  ]) assert.throws(() => assertSubagentRouteSpecAllowed(spec), /Claude Fable/);
+  assert.throws(
+    () => assertChildAgentRouteAllowed(fakeModel("amazon-bedrock", "us.anthropic.claude-fable-5-20260901-v1:0"), "xhigh"),
+    /Claude Fable/
+  );
+  assert.throws(
+    () => assertChildAgentRouteAllowed({ ...fakeModel("amazon-bedrock", "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/profile-opaque"), name: "Anthropic Claude Fable 5" }, "xhigh"),
+    /Claude Fable/
+  );
+  assert.doesNotThrow(() => assertSubagentRouteAllowed({ provider: "anthropic", model: "claude-opus-5-5", thinkingLevel: "xhigh" }));
+  assert.doesNotThrow(() => assertSubagentRouteAllowed({ provider: "example", model: "claude-fablet-5", thinkingLevel: "high" }));
+  assert.doesNotThrow(() => assertSubagentRouteAllowed({ provider: "example", model: "my-fable-model", thinkingLevel: "off" }));
+  assert.doesNotThrow(() => assertSubagentRouteAllowed({ provider: "example", model: "notclaude-fable-5", thinkingLevel: "off" }));
+  assert.doesNotThrow(() => assertSubagentRouteAllowed({ provider: "example", model: "vendor/claude-fablet-5", thinkingLevel: "off" }));
 });

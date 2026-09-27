@@ -106,3 +106,40 @@ test("child sessions fail before loading resources when the parent is already ab
   );
   assert.equal(ran, false);
 });
+
+
+test("shared child sessions reject max before loading any child resources", async () => {
+  let ran = false;
+  await assert.rejects(
+    withChildAgentSession(
+      {} as Pick<ExtensionContext, "modelRegistry" | "ui">,
+      {
+        cwd: "/repo",
+        model: { provider: "openai-codex", id: "gpt-test" } as never,
+        thinkingLevel: "max",
+        tools: []
+      },
+      async () => { ran = true; }
+    ),
+    /subagent thinking is capped at xhigh/
+  );
+  assert.equal(ran, false);
+});
+
+test("shared child sessions reject prefixed Bedrock Claude Fable before loading resources", async () => {
+  let ran = false;
+  await assert.rejects(
+    withChildAgentSession(
+      {} as Pick<ExtensionContext, "modelRegistry" | "ui">,
+      {
+        cwd: "/repo",
+        model: { provider: "amazon-bedrock", id: "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/profile-opaque", name: "Prod Claude Fable 5" } as never,
+        thinkingLevel: "xhigh",
+        tools: []
+      },
+      async () => { ran = true; }
+    ),
+    /Claude Fable models cannot be used for subagents/
+  );
+  assert.equal(ran, false);
+});

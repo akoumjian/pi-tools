@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   buildWorkerContainerEnvironment,
   createWorkerContainer,
+  inspectStoppedWorkerContainer,
   parkWorkerContainer,
   planWorkerContainer,
   prepareWorkerContainerProcess,
@@ -91,11 +92,11 @@ const load = () => fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFi
 const save = (value) => fs.writeFileSync(stateFile, JSON.stringify(value));
 const missing = () => { process.stderr.write("Error response from daemon: No such object\\n"); process.exit(1); };
 if (args[0] === "image" && args[1] === "inspect") process.exit(0);
-if (args[0] === "container" && args[1] === "inspect") { const state = load(); if (!state) missing(); process.stdout.write(JSON.stringify([{ Id: state.id, State: { Running: state.running, ExitCode: state.exitCode }, Config: { Labels: state.labels } }])); process.exit(0); }
-if (args[0] === "create") { const id = "a".repeat(64); const labels = {}; for (let i=0;i<args.length;i++) if (args[i] === "--label") { const [k,v] = args[++i].split("=",2); labels[k]=v; } save({ id, labels, running:false, exitCode:0 }); process.stdout.write(id + "\\n"); process.exit(0); }
-if (args[0] === "start") { const state=load(); state.running=true; save(state); process.stdout.write(state.id + "\\n"); process.exit(0); }
+if (args[0] === "container" && args[1] === "inspect") { const state = load(); if (!state) missing(); process.stdout.write(JSON.stringify([{ Id: state.id, State: { Running: state.running, ExitCode: state.exitCode, Status: state.running ? "running" : "exited", StartedAt: state.startedAt, FinishedAt: state.finishedAt, OOMKilled: false, Error: "" }, RestartCount: state.restartCount, Config: { Labels: state.labels } }])); process.exit(0); }
+if (args[0] === "create") { const id = "a".repeat(64); const labels = {}; for (let i=0;i<args.length;i++) if (args[i] === "--label") { const [k,v] = args[++i].split("=",2); labels[k]=v; } save({ id, labels, running:false, exitCode:0, startedAt:"0001-01-01T00:00:00Z", finishedAt:"0001-01-01T00:00:00Z", restartCount:0 }); process.stdout.write(id + "\\n"); process.exit(0); }
+if (args[0] === "start") { const state=load(); state.running=true; state.startedAt="2026-09-17T14:00:00.000000000Z"; state.finishedAt="0001-01-01T00:00:00Z"; save(state); process.stdout.write(state.id + "\\n"); process.exit(0); }
 if (args[0] === "exec") process.exit(0);
-if (args[0] === "stop" || args[0] === "kill") { const state=load(); state.running=false; state.exitCode=137; save(state); process.stdout.write(state.id + "\\n"); process.exit(0); }
+if (args[0] === "stop" || args[0] === "kill") { const state=load(); state.running=false; state.exitCode=137; state.finishedAt="2026-09-17T14:30:00.000000000Z"; save(state); process.stdout.write(state.id + "\\n"); process.exit(0); }
 if (args[0] === "wait") { const state=load(); if (!state) missing(); process.stdout.write(String(state.exitCode) + "\\n"); process.exit(0); }
 if (args[0] === "rm") { const state=load(); if (!state) missing(); fs.unlinkSync(stateFile); process.stdout.write(state.id + "\\n"); process.exit(0); }
 process.stderr.write("unsupported fake docker call: " + JSON.stringify(args) + "\\n"); process.exit(2);
@@ -112,7 +113,26 @@ process.stderr.write("unsupported fake docker call: " + JSON.stringify(args) + "
     const created = createWorkerContainer(fakeDocker, planned);
     assert.equal(created.containerId, "a".repeat(64));
     signalWorkerContainerJob(fakeDocker, created, "job_20260917140000_signalk1", "SIGKILL");
+    assert.throws(() => inspectStoppedWorkerContainer(fakeDocker, created), /is running/);
     parkWorkerContainer(fakeDocker, created);
+    const callsBeforeReadOnlyInspect = (await readFile(callsFile, "utf8")).trim().split("\n").length;
+    const stoppedFingerprint = inspectStoppedWorkerContainer(fakeDocker, created);
+    assert.deepEqual(stoppedFingerprint, {
+      containerId: created.containerId,
+      exitCode: 137,
+      status: "exited",
+      startedAt: "2026-09-17T14:00:00.000000000Z",
+      finishedAt: "2026-09-17T14:30:00.000000000Z",
+      oomKilled: false,
+      error: "",
+      restartCount: 0
+    });
+    const inspectOnlyCalls = (await readFile(callsFile, "utf8")).trim().split("\n").slice(callsBeforeReadOnlyInspect).map((line) => JSON.parse(line) as string[]);
+    assert.deepEqual(inspectOnlyCalls.map((args) => args.slice(0, 2)), [["container", "inspect"]], "read-only stopped inspection must not stop, start, kill, wait, or remove");
+    const parkedState = JSON.parse(await readFile(stateFile, "utf8")) as { labels: Record<string, string>; running: boolean };
+    await writeFile(stateFile, JSON.stringify({ ...parkedState, labels: { ...parkedState.labels, "pi.nonce": "forged" } }));
+    assert.throws(() => inspectStoppedWorkerContainer(fakeDocker, created), /identity mismatch/);
+    await writeFile(stateFile, JSON.stringify(parkedState));
     const reused = createWorkerContainer(fakeDocker, created);
     assert.equal(reused.containerId, created.containerId);
     settleWorkerContainer(fakeDocker, reused);

@@ -806,6 +806,15 @@ test("selectMutationReviewModel resolves configured models and auth", () => {
   const registry = fakeRegistry([gpt, spark], new Set(["openai-codex/gpt-5.3-codex"]));
 
   assert.deepEqual(selectMutationReviewModel(registry, "openai-codex/gpt-5.3-codex", spark, "low"), { model: gpt, thinkingLevel: "low" });
+  assert.throws(() => selectMutationReviewModel(registry, "openai-codex/gpt-5.3-codex:max", spark, "low"), /capped at xhigh/);
+  assert.throws(() => selectMutationReviewModel(registry, "openai-codex/gpt-5.3-codex", spark, "max"), /inherited thinking level.*capped at xhigh/);
+  const fable = fakeModel("anthropic", "claude-fable-5");
+  assert.throws(() => selectMutationReviewModel(fakeRegistry([fable]), "anthropic/claude-fable-5:xhigh", undefined, "low"), /Claude Fable/);
+  const bedrockFable = fakeModel("amazon-bedrock", "us.anthropic.claude-fable-5-20260901-v1:0");
+  assert.throws(() => selectMutationReviewModel(fakeRegistry([bedrockFable]), "amazon-bedrock/us.anthropic.claude-fable-5-20260901-v1:0:xhigh", undefined, "low"), /Claude Fable/);
+  assert.throws(() => selectMutationReviewModel(fakeRegistry([bedrockFable]), undefined, bedrockFable, "low"), /Claude Fable/);
+  const namedFable = { ...fakeModel("amazon-bedrock", "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/profile-opaque"), name: "(Claude Fable 5)" };
+  assert.throws(() => selectMutationReviewModel(fakeRegistry([namedFable]), undefined, namedFable, "low"), /Claude Fable/);
   assert.throws(() => selectMutationReviewModel(registry, "openai-codex/gpt-5.3-codex-spark", gpt), /no configured auth/);
   assert.throws(() => selectMutationReviewModel(registry, "missing-format", gpt), /not found/);
 });

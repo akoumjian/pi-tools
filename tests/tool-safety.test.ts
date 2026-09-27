@@ -21,6 +21,7 @@ import toolSafetyExtension, {
   evaluatePathReads,
   evaluateWebFetchMany,
   evaluateWorkerControl,
+  evaluateWorkerReview,
   parseApprovalModelPreference,
   parseToolSafetyReviewCriteria,
   resolveApprovalModelPreference,
@@ -1029,6 +1030,31 @@ test("worker_control allows every valid exact-session lifecycle action without s
         applyReviewCriteria(toolCall("worker_control", input), decision, reviewCriteria).action,
         "review",
         `malformed worker_control input stays reviewed under ${reviewCriteria}`
+      );
+    }
+  }
+});
+
+test("worker_review allows exact read-only review shapes and keeps malformed calls reviewed", () => {
+  const valid = {
+    workerId: "worker_20260910190000_12345678",
+    runId: "run_20260910193000_87654321",
+    workspaceRepo: "repos/project",
+    focus: "Check lifecycle races."
+  };
+  for (const reviewCriteria of ["conservative", "production-or-unapproved-environment"] as const) {
+    assert.equal(
+      applyReviewCriteria(toolCall("worker_review", valid), evaluateWorkerReview(valid), reviewCriteria).action,
+      "allow"
+    );
+    for (const malformed of [
+      { ...valid, workspaceRepo: "../outside" },
+      { ...valid, workspaceRepo: "repos/../outside" },
+      { ...valid, unexpected: true }
+    ]) {
+      assert.equal(
+        applyReviewCriteria(toolCall("worker_review", malformed), evaluateWorkerReview(malformed), reviewCriteria).action,
+        "review"
       );
     }
   }
