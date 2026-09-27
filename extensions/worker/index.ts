@@ -72,6 +72,12 @@ import {
   type IntegrationContextBundle,
   type NormalizedIntegrationContextBundle
 } from "./integration.js";
+import {
+  defaultWorkerPromotionsRoot,
+  promotePreparedWorkerFold,
+  type WorkerFoldPromotionRequest,
+  type WorkerFoldPromotionSummary
+} from "./promotions.js";
 import { launchWorkerHost, readWorkerHostProcess, readWorkerHostSettlement } from "./runner.js";
 import { readWorkerRuntimeHandoff, type AcceptedWorkerHandoff } from "./runtime.js";
 import {
@@ -214,10 +220,25 @@ export const WorkerFoldPrepareParams = Type.Object({
   repositories: Type.Array(RepositoryChangeSetEntrySchema, { minItems: 1, maxItems: 16 })
 }, { additionalProperties: false });
 
+const WorkerFoldPromotionRepositorySchema = Type.Object({
+  candidateId: Type.String({ pattern: "^candidate_[0-9a-f]{24}$" }),
+  targetRepo: Type.String({ minLength: 1, maxLength: 1024 }),
+  targetRef: Type.String({ pattern: "^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,239}$" }),
+  expectedCommit: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
+  desiredCommit: Type.String({ pattern: "^[0-9a-f]{40,64}$" })
+}, { additionalProperties: false });
+
+export const WorkerFoldPromoteParams = Type.Object({
+  preparedId: Type.String({ pattern: "^prepared_[0-9a-f]{24}$" }),
+  manifestSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }),
+  repositories: Type.Array(WorkerFoldPromotionRepositorySchema, { minItems: 1, maxItems: 16 })
+}, { additionalProperties: false });
+
 export type WorkerRunInput = Static<typeof WorkerRunParams>;
 export type WorkerControlInput = Static<typeof WorkerControlParams>;
 export type WorkerReviewInput = Static<typeof WorkerReviewParams>;
 export type WorkerFoldPrepareInput = Static<typeof WorkerFoldPrepareParams>;
+export type WorkerFoldPromoteInput = Static<typeof WorkerFoldPromoteParams>;
 export type WorkerFoldResolveRequest =
   | { kind: "start"; preparedId: string; manifestSha256: string; candidateId: string; taskIds: string[]; context: IntegrationContextBundle; route?: string; completionDelivery?: "steer" | "followUp" }
   | { kind: "resume"; workerId: string; message: string; settledDecisions: string[]; completionDelivery?: "steer" | "followUp" };
@@ -379,8 +400,10 @@ type WorkerExtensionDependencies = {
   random(): string;
   pinRepositories(requested: readonly { source: string; revision?: string }[], trustedStateRoot: string): InitialRepositoryPin[];
   foldsRoot: string;
+  promotionsRoot: string;
   targetRoot: string;
   prepareFold: typeof prepareRepositoryChangeSet;
+  promoteFold: typeof promotePreparedWorkerFold;
   buildReviewEvidence: typeof buildWorkerReviewEvidence;
   reviewWorker(context: Pick<ExtensionContext, "modelRegistry" | "ui">, input: ManagedWorkerReviewPlanInput): Promise<ManagedWorkerReviewExecutionResult>;
   resolveReviewRoutes(context: ExtensionContext): { primary: ManagedWorkerReviewRoute; rateLimitFallback?: ManagedWorkerReviewRoute };
@@ -425,6 +448,7 @@ export function registerWorkerExtension(
   const dependencies: WorkerExtensionDependencies = { ...defaults, ...overrides };
   registerParentCacheLineageCapture(api, dependencies.roots.stateRoot, dependencies.now);
   if (overrides.roots && !overrides.foldsRoot) dependencies.foldsRoot = defaultWorkerFoldsRoot(overrides.roots.stateRoot);
+  if (overrides.roots && !overrides.promotionsRoot) dependencies.promotionsRoot = defaultWorkerPromotionsRoot(overrides.roots.stateRoot);
   if (overrides.launch && !overrides.planContainer) dependencies.planContainer = undefined;
   const pending = new Map<string, PendingWorkerRun>();
   const active = new Map<string, { runId: string; handle: ManagedWorkerHandle }>();
@@ -820,6 +844,43 @@ export function registerWorkerExtension(
       const text = formatWorkerFoldResolveReceipt(details);
       onUpdate?.({ content: [{ type: "text", text }], details });
       return { content: [{ type: "text", text }], details };
+    }
+  }));
+
+  api.registerTool(defineTool({
+    name: "worker_fold_promote",
+    label: "Worker Fold Promote",
+    description: "Apply one reviewed and validated ready fold with ordinary trusted-host Git. Checked-out refs use ff-only merge; nonchecked refs use exact CAS. Retry only the identical failed operation. Never use it for review, conflict resolution, remote operations, or release.",
+    promptSnippet: "Apply one parent-accepted ready fold sequentially with ff-only merge or exact local-ref CAS and a small retry record.",
+    promptGuidelines: [
+      "worker_fold_promote use: Supply every exact identity from one ready worker_fold_prepare result only after parent review and validation. Retry only the identical failed request: exact completed repositories are skipped, exact expected repositories are retried, and any other state requires fresh preparation.",
+      inputJsonSchemaGuideline("worker_fold_promote", WorkerFoldPromoteParams),
+      outputJsonSchemaGuideline("worker_fold_promote", RetainedToolOutputSchemas.worker_fold_promote),
+      "worker_fold_promote constraints: Promotion is deterministic, host-only, sequential, and not atomic. It globally preflights exact clean targets, then uses ordinary bounded `git merge --ff-only` for a checked-out target ref or one `git update-ref --no-deref` CAS otherwise. Failure stops at that repository and preserves earlier completed records. It never reviews, validates, resolves, rebases, fetches, pushes, publishes, closes tasks, or writes grounding. Only result content is provider-visible; details are internal, and thrown errors use the host's out-of-band error result."
+    ],
+    parameters: WorkerFoldPromoteParams,
+    renderCall(args, theme) { return renderWorkerFoldPromoteCall(args as WorkerFoldPromoteInput, theme); },
+    renderResult(result, options, theme, context) { return renderWorkerFoldPromoteResult(result as AgentToolResult<WorkerFoldPromotionSummary>, options, theme, context); },
+    executionMode: "sequential",
+    async execute(_toolCallId, params, signal, _onUpdate, context): Promise<AgentToolResult<WorkerFoldPromotionSummary>> {
+      throwIfAborted(signal);
+      const parentSessionFile = context.sessionManager.getSessionFile();
+      if (!parentSessionFile) throw new Error("worker_fold_promote requires a persisted parent session.");
+      const request: WorkerFoldPromotionRequest = {
+        preparedId: params.preparedId,
+        manifestSha256: params.manifestSha256,
+        repositories: params.repositories.map((repository) => ({ ...repository }))
+      };
+      const { summary } = await dependencies.promoteFold({
+        request,
+        parentSessionFile,
+        foldsRoot: dependencies.foldsRoot,
+        promotionsRoot: dependencies.promotionsRoot,
+        targetRoot: dependencies.targetRoot,
+        now: dependencies.now,
+        signal
+      });
+      return { content: [{ type: "text", text: formatWorkerFoldPromotionSummary(summary) }], details: summary };
     }
   }));
 
@@ -3491,6 +3552,22 @@ function renderWorkerFoldPrepareResult(
   return new Text(lines.join("\n"), 0, 0);
 }
 
+function renderWorkerFoldPromoteCall(args: WorkerFoldPromoteInput, theme: WorkerRenderTheme): Text {
+  const count = isRecord(args) && Array.isArray(args.repositories) ? args.repositories.length : 0;
+  return new Text(workerToolCall("Worker Promote", `${count} ${count === 1 ? "repository" : "repositories"}`, theme), 0, 0);
+}
+
+function renderWorkerFoldPromoteResult(result: AgentToolResult<WorkerFoldPromotionSummary>, options: WorkerRenderOptions, theme: WorkerRenderTheme, context?: WorkerRenderContext): Text {
+  const error = renderWorkerToolError(result, theme, context);
+  if (error !== undefined) return error;
+  if (options.isPartial) return new Text(workerToolResult("promoting repositories", "warning", theme), 0, 0);
+  const details = result.details;
+  if (!details) return new Text(workerToolResult("promotion complete", "muted", theme), 0, 0);
+  const lines = [workerToolResult(`${details.status} · ${shortWorkerId(details.promotionId)} · ${details.completedCount}/${details.repositoryCount} repositories`, details.status === "completed" ? "success" : details.status === "failed" ? "error" : "warning", theme)];
+  if (options.expanded) appendBoundedWorkerRows(lines, [...(details.error ? [`error · ${truncateOneLine(details.error, 120)}`] : []), ...details.repositories.map((item) => `${shortWorkerId(item.candidateId)} · ${item.status} · ${truncateOneLine(item.targetRef, 80)}${item.error ? ` · ${truncateOneLine(item.error, 100)}` : ""}`)]);
+  return new Text(lines.join("\n"), 0, 0);
+}
+
 function renderWorkerFoldResolveCall(args: unknown, theme: WorkerRenderTheme): Text {
   const request = isRecord(args) && isRecord(args.request) ? args.request : undefined;
   const kind = request?.kind === "resume" ? "resume" : request?.kind === "start" ? "start" : undefined;
@@ -3789,6 +3866,19 @@ function formatWorkerFoldPrepareSummary(summary: PreparedWorkerFoldSummary): str
   ].join("\n");
 }
 
+function formatWorkerFoldPromotionSummary(summary: WorkerFoldPromotionSummary): string {
+  return [
+    `promotion: ${summary.promotionId}`,
+    `status: ${summary.status}`,
+    `prepared_fold: ${summary.preparedId}`,
+    `repositories: ${summary.completedCount}/${summary.repositoryCount} completed`,
+    summary.error ? `error: ${summary.error}` : undefined,
+    ...summary.repositories.map((item) => `repository: ${item.candidateId} · ${item.status} · ${item.targetRepo}#${item.targetRef} · expected ${item.expectedCommit} · desired ${item.desiredCommit}${summary.status === "completed" && item.checkedOut && item.status === "completed" && !item.error ? " · worktree synchronized" : ""}${item.error ? ` · ${item.error}` : ""}`),
+    `journal: ${summary.journalFile}`,
+    `manifest_sha256: ${summary.manifestSha256}`
+  ].filter((line): line is string => line !== undefined).join("\n");
+}
+
 function formatRepositoryInventorySummary(summary: RepositoryInventorySummary | undefined): string[] {
   if (!summary) return [];
   const candidates = summary.candidates.slice(0, 8).map((candidate) =>
@@ -3918,8 +4008,10 @@ function defaultDependencies(): WorkerExtensionDependencies {
     random: () => randomUUID(),
     pinRepositories: (requested, trustedStateRoot) => pinInitialRepositories(requested, trustedStateRoot),
     foldsRoot: defaultWorkerFoldsRoot(roots.stateRoot),
+    promotionsRoot: defaultWorkerPromotionsRoot(roots.stateRoot),
     targetRoot: path.join(homedir(), "Code"),
     prepareFold: prepareRepositoryChangeSet,
+    promoteFold: promotePreparedWorkerFold,
     buildReviewEvidence: buildWorkerReviewEvidence,
     reviewWorker: runManagedWorkerReviewWithRateLimitFallback,
     resolveReviewRoutes: resolveWorkerReviewRoutes,
