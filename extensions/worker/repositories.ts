@@ -412,6 +412,9 @@ export function repositoryPolicyIssues(repoPath: string, runner: GitRunner, exac
       lower === "core.sparsecheckout" ||
       lower === "core.sparsecheckoutcone" ||
       lower === "core.worktree" ||
+      (lower.startsWith("branch.") && lower.endsWith(".mergeoptions")) ||
+      lower === "merge.autostash" ||
+      lower === "merge.verifysignatures" ||
       lower.startsWith("filter.") ||
       (lower.startsWith("diff.") && (lower.endsWith(".textconv") || lower.endsWith(".command"))) ||
       (lower.startsWith("merge.") && lower.endsWith(".driver")) ||
@@ -984,39 +987,6 @@ export function runStandaloneGit(runner: GitRunner, cwd: string, args: string[])
 
 export function gitBuffer(runner: GitRunner, cwd: string, args: string[], options?: GitRunOptions): Buffer {
   return runGit(runner, cwd, args, options).stdout;
-}
-
-export function gitNoTimeoutToFiles(runner: GitRunner, cwd: string, args: string[]): void {
-  const outputs = ["stdout", "stderr"].map((stream) => {
-    const file = path.join(String(runner.env.HOME), `git-${stream}-${randomUUID()}.log`);
-    const descriptor = openSync(file, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
-    return { file, descriptor, identity: fstatSync(descriptor) };
-  });
-  try {
-    const result = spawnSync(runner.gitPath, repositoryGitArgs(cwd, path.join(cwd, ".git"), args), {
-      cwd,
-      env: { ...runner.env, GIT_CEILING_DIRECTORIES: cwd },
-      shell: false,
-      stdio: ["ignore", outputs[0]!.descriptor, outputs[1]!.descriptor]
-    });
-    if (result.error) throw new Error(`git_spawn_failed:${args[0] ?? "command"}:${boundText(result.error.message, 240)}`);
-    if (result.status !== 0) {
-      const stderr = Buffer.alloc(960);
-      const count = readSync(outputs[1]!.descriptor, stderr, 0, stderr.byteLength, 0);
-      throw new Error(gitFailureMessage(args[0] ?? "command", result.status ?? -1, stderr.subarray(0, Math.max(0, count))));
-    }
-    for (const output of outputs) {
-      const after = fstatSync(output.descriptor);
-      if (after.dev !== output.identity.dev || after.ino !== output.identity.ino || after.mode !== output.identity.mode || after.nlink !== 1 || after.uid !== output.identity.uid) {
-        throw new Error(`git_${args[0] ?? "command"}_unsafe_output`);
-      }
-    }
-  } finally {
-    for (const output of outputs) {
-      closeSync(output.descriptor);
-      rmSync(output.file, { force: true });
-    }
-  }
 }
 
 export function gitText(runner: GitRunner, cwd: string, args: string[], options?: GitRunOptions): string {

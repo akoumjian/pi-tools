@@ -11,7 +11,6 @@ import {
   readdirSync,
   realpathSync,
   renameSync,
-  rmSync,
   statSync,
   unlinkSync,
   writeFileSync
@@ -227,7 +226,7 @@ function preflightAllRepositories(
       if (state !== "expected" && state !== "desired") {
         throw new Error(`Promotion target is neither the exact expected nor desired commit: ${repository.targetRef}`);
       }
-      if (state === "expected") assertNoIgnoredWorktreeCollisions(repository, runner);
+      if (repository.checkedOut && state === "expected") assertNoIgnoredWorktreeCollisions(repository, runner);
       repository.error = undefined;
     } catch (error) {
       return { index, error };
@@ -240,9 +239,8 @@ function promoteOneRepository(repository: PromotionRepositoryRecord, runner: Git
   const state = inspectRepositoryState(repository, runner, targetRoot);
   if (state === "desired") return;
   if (state !== "expected") throw new Error(`Promotion target changed before update: ${repository.targetRef}`);
-  assertNoIgnoredWorktreeCollisions(repository, runner);
-
   if (repository.checkedOut) {
+    assertNoIgnoredWorktreeCollisions(repository, runner);
     gitBuffer(runner, repository.targetRepo, [
       ...DURABLE_GIT_CONFIG,
       "merge", "--ff-only", "--no-edit", "--no-stat", repository.desiredCommit

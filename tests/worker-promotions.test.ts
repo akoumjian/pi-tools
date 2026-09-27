@@ -163,7 +163,7 @@ test("checked-out targets use one ordinary ff-only merge and retry idempotently"
   });
 });
 
-test("nonchecked targets use exact ref CAS without changing HEAD or other refs", async () => {
+test("nonchecked targets use exact ref CAS without inspecting unrelated ignored worktree files", async () => {
   await withTempDir(async (root) => {
     const item = await fixture(root, "b");
     const manifest = prepare(root, [item]);
@@ -171,6 +171,8 @@ test("nonchecked targets use exact ref CAS without changing HEAD or other refs",
     git(item.target, "branch", "side", record.targetExpectedCommit);
     git(item.target, "checkout", "--detach", record.targetExpectedCommit);
     const beforeHead = git(item.target, "rev-parse", "HEAD");
+    await writeFile(path.join(item.target, ".git", "info", "exclude"), "candidate-b.txt\n");
+    await writeFile(path.join(item.target, "candidate-b.txt"), "unrelated ignored worktree content\n");
     const result = await promote(root, manifest);
     assert.equal(result.summary.status, "completed");
     assert.equal(result.summary.repositories[0]!.checkedOut, false);
@@ -199,6 +201,20 @@ test("global dirty or locked preflight prevents the first repository update", as
     assert.equal(git(first.target, "rev-parse", "refs/heads/main"), manifest.repositories[0]!.targetExpectedCommit);
     await unlink(path.join(second.target, ".git", "index.lock"));
     assert.equal((await promote(root, manifest)).summary.status, "completed");
+  });
+});
+
+test("hostile branch mergeOptions fails global preflight before mutation", async () => {
+  await withTempDir(async (root) => {
+    const item = await fixture(root, "merge-options");
+    const manifest = prepare(root, [item]);
+    const expected = manifest.repositories[0]!.targetExpectedCommit;
+    git(item.target, "config", "--local", "branch.main.mergeOptions", "--squash");
+    const result = await promote(root, manifest);
+    assert.equal(result.summary.status, "failed");
+    assert.match(result.summary.error ?? "", /unsupported_config:branch\.main\.mergeoptions/);
+    assert.equal(git(item.target, "rev-parse", "refs/heads/main"), expected);
+    assert.equal(existsSync(path.join(item.target, "candidate-merge-options.txt")), false);
   });
 });
 
