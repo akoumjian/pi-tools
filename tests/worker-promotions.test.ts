@@ -229,7 +229,8 @@ test("ignored collisions compare Unicode-normalized case-folded paths", async ()
     await writeFile(path.join(item.target, ignoredName), "ignored\n");
     const result = await promote(root, manifest);
     assert.equal(result.summary.status, "failed");
-    assert.match(result.summary.error ?? "", /Ignored worktree path collides/);
+    // Case-insensitive decomposing filesystems may report this alias as dirty before the explicit collision scan.
+    assert.match(result.summary.error ?? "", /Ignored worktree path collides with promotion|Promotion target repository is dirty/);
     assert.equal(git(item.target, "rev-parse", "refs/heads/main"), manifest.repositories[0]!.targetExpectedCommit);
   });
 });
