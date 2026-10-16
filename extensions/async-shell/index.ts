@@ -24,7 +24,7 @@ import { prepareWorkspaceSandboxProcess } from "../_shared/workspace-sandbox.js"
 import { prepareWorkerContainerProcess, signalWorkerContainerJob, workerContainerFromEnvironment } from "../_shared/worker-container.js";
 import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
-import { workerHandoffAdmissionPath } from "../_shared/worker-contract.js";
+import { workerResultAdmissionPath } from "../_shared/worker-contract.js";
 import { readStrictWorkerJobMeta, workerJobIsSettled } from "../_shared/worker-job-settlement.js";
 
 export type JobStatus = "running" | "exited" | "failed" | "cancelled" | "unknown";
@@ -2256,7 +2256,7 @@ function assertWorkerRunAcceptsSideEffects(): void {
   const resultFile = process.env.PI_WORKER_RESULT_FILE?.trim();
   if (!resultFile) throw new Error("Managed worker shell_start requires PI_WORKER_RESULT_FILE.");
   const resolvedResultFile = path.resolve(resultFile);
-  if (existsSync(resolvedResultFile) || existsSync(workerHandoffAdmissionPath(resolvedResultFile))) {
+  if (existsSync(resolvedResultFile) || existsSync(workerResultAdmissionPath(resolvedResultFile))) {
     throw new Error("Managed worker shell_start is sealed during or after worker_result_submit admission.");
   }
 }

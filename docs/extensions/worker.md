@@ -15,7 +15,7 @@ Parent tools:
 
 Worker-only tools:
 
-- `worker_result_submit`: submit one role-valid outcome, concise summary/question, and workspace repository/artifact paths after all shell jobs settle.
+- `worker_result_submit`: submit one role-valid outcome, concise summary/question, and canonical workspace repository/artifact paths; the runtime seals and reconciles owned work internally.
 - `worker_beads_tasks`: bounded assigned/get/search reads and assigned-only work/integration progress updates.
 
 Human commands are `/worker:list [status] [role]`, `/worker:show <workerId> [runId]`, `/worker:logs <workerId> [runId]`, `/worker:cancel <workerId>`, and `/worker:discard <workerId> --confirm`.
@@ -30,7 +30,7 @@ Completion settlement inserts a stable delivery record in the same transaction. 
 
 ## Roles and results
 
-`work` and `integration` may submit `completed`, `needs_input`, or `blocked`. `review` may submit `approve`, `request_changes`, `needs_input`, or `blocked`; approve/request-changes requires a retained detailed report artifact. Only the worker system creates `failed` or `cancelled`. Every result records `outcomeSource` as `worker` or `system`.
+`work` and `integration` may submit `completed`, `needs_input`, or `blocked`. `review` may submit `approve`, `request_changes`, `needs_input`, or `blocked`; approve/request-changes requires a retained detailed report artifact. Only the worker system creates `failed` or `cancelled`. Semantic rejection returns coded field errors without sealing. Every accepted result records `outcomeSource` as `worker` or `system`.
 
 Role instructions are verified regular UTF-8 files under `worker-roles/`. Ambient/project skill discovery remains disabled. The package exposes only `skills/managed-worker-parent/SKILL.md` to parents.
 
@@ -40,11 +40,11 @@ Repository paths must identify contained Git repositories. Artifact paths may id
 
 A review receives the exact subject run/session metadata, repository/artifact entry points, and additional-input mapping in `/review/context.json`. `/review/subject` is a disposable writable view of the complete unchanged subject workspace; reviewer reports belong under `/workspace`. The reviewed worker is leased against resume while review runs. Review workers have no credentials, Beads mutation, fix implementation, push, target mutation, or acceptance authority.
 
-Supported rootful Docker environments use a local-driver OverlayFS view with Docker-managed upper/work storage. Unsupported/rootless environments fail preflight. Writes to the subject view are deleted after settlement; reviewer session/workspace/reports remain retained.
+Supported rootful Docker environments use a local-driver OverlayFS view with one Docker-managed scratch volume containing sibling upper/work directories. Unsupported/rootless environments fail preflight. Writes to the subject view are deleted after settlement; reviewer session/workspace/reports remain retained.
 
 ## Merge testing and application
 
-`worker_merge_test` accepts 1–16 request-local repository IDs, candidate repositories/revisions, target repositories/branch refs, merge or squash methods, commit messages, and a dependency DAG. It resolves exact commits and creates ordinary isolated prepared repositories containing target and candidate history. Ready repositories contain exact commits; conflicts retain ordinary Git index/worktree state.
+`worker_merge_test` accepts 1–16 trusted `candidateId` values, target repositories/branch refs, merge or squash methods, commit messages, and a candidate-ID dependency DAG. It resolves exact commits and creates ordinary isolated prepared repositories containing target and candidate history. Ready repositories contain exact commits; conflicts retain ordinary Git index/worktree state.
 
 The tool never mutates targets. Historical managed-worker candidates are allowed and produce provenance warnings. Every call creates a new `preparedId`. Any target movement requires a fresh test. A complete conflicted set can be atomically moved into one integration worker workspace, consuming that prepared set.
 

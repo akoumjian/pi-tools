@@ -1,10 +1,57 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { renderWorkerRuntimePrompt } from "../extensions/worker/prompts.js";
 const base = { workerId: "worker_1", runId: "run_2", workspaceRoot: "/workspace", codeRoot: "/code", taskIds: ["personal-test"], roleInstructions: "Do the role.", instructions: "Do the assignment." };
-test("role prompts preserve exact session identity and authority context", () => {
-  const work = renderWorkerRuntimePrompt("work", base); assert.match(work, /starting a work session/); assert.match(work, /Assigned Beads tasks:\npersonal-test/);
-  const review = renderWorkerRuntimePrompt("review", { ...base, reviewContextPath: "/review/context.json" }); assert.match(review, /\/review\/subject/); assert.match(review, /disposable/);
-  const integration = renderWorkerRuntimePrompt("integration", { ...base, resumed: true, integrationContextPath: "/integration/context.json" }); assert.match(integration, /resuming a prior integration session/); assert.match(integration, /prior integration work remain/); assert.doesNotMatch(integration, /fork/);
+
+test("work start prompt matches the approved structure exactly", () => {
+  assert.equal(renderWorkerRuntimePrompt("work", { ...base, repositoryBaselines: [{ path: "/code/project", resolvedCommit: "abc" }] }), `You are worker worker_1, run run_2, forked from a parent session. You are running in a sandboxed environment with modified file access and permissions.
+
+Writable workspace:
+/workspace
+
+General read-only access:
+/code
+
+The complete Code directory is available for your reference as needed.
+
+Assigned Beads tasks:
+personal-test
+
+Role instructions:
+Do the role.
+
+Assignment:
+Do the assignment.
+
+Repository baselines:
+- /code/project at abc
+
+These baselines identify exact source revisions relevant to the assignment. They do not populate the workspace.`);
 });
-test("cancelled resume adds a trusted recovery warning", () => { assert.match(renderWorkerRuntimePrompt("work", { ...base, resumed: true, cancelledPreviously: true }), /Do not remove locks/); });
+
+test("work resume prompt retains exact session semantics and lists additional inputs", () => {
+  const prompt = renderWorkerRuntimePrompt("work", { ...base, resumed: true, additionalInputs: [{ sourcePath: "/host/spec", mountedPath: "/inputs/01-spec", type: "file" }] });
+  assert.match(prompt, /^You are worker worker_1, run run_2, resuming a prior session\./); assert.match(prompt, /Parent instructions:\nDo the assignment\./); assert.match(prompt, /- \/host\/spec -> \/inputs\/01-spec \(file\)/); assert.doesNotMatch(prompt, /snapshot|refork/i);
+});
+
+test("review start and resume prompts are independent and name only trusted launch paths", () => {
+  const start = renderWorkerRuntimePrompt("review", { ...base, instructions: undefined, reviewSubjectPath: "/review/subject", reviewContextPath: "/review/context.json" });
+  assert.match(start, /^You are worker worker_1, run run_2, starting an independent review\./); assert.match(start, /Reviewed workspace:\n\/review\/subject/); assert.match(start, /writable disposable view/); assert.doesNotMatch(start, /Assigned Beads|Parent review instructions|artifacts\//);
+  const resume = renderWorkerRuntimePrompt("review", { ...base, resumed: true, reviewSubjectPath: "/review/subject", reviewContextPath: "/review/context.json" });
+  assert.match(resume, /resuming a prior review session/); assert.match(resume, /fresh writable disposable view of the same reviewed run/); assert.match(resume, /Parent instructions:/); assert.doesNotMatch(resume, /fork/);
+});
+
+test("integration prompts include ordinary conflict-state and retained-repository guidance", () => {
+  const start = renderWorkerRuntimePrompt("integration", { ...base, integrationContextPath: "/integration/context.json" }); assert.match(start, /starting repository integration/); assert.match(start, /ordinary Git conflict state produced by `worker_merge_test`/);
+  const resume = renderWorkerRuntimePrompt("integration", { ...base, resumed: true, integrationContextPath: "/integration/context.json" }); assert.match(resume, /prepared repositories and prior integration work remain/); assert.doesNotMatch(resume, /fork|snapshot/i);
+});
+
+test("cancelled resume adds only the trusted interrupted-operation warning", () => { assert.match(renderWorkerRuntimePrompt("work", { ...base, resumed: true, cancelledPreviously: true }), /Do not remove locks or abort Git state/); });
+
+test("approved role instruction files contain no shell choreography or hard-coded launch paths", () => {
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "worker-roles");
+  for (const role of ["work", "review", "integration"]) { const text = readFileSync(path.join(root, `${role}.md`), "utf8"); assert.match(text, new RegExp(`^# ${role[0]!.toUpperCase()}${role.slice(1)}-Role Instructions`)); assert.doesNotMatch(text, /shell_(?:status|read|cancel)|owned asynchronous|wait for|\/review\/subject|\/integration\/context/); }
+});

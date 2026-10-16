@@ -1,6 +1,5 @@
 import { Type, type TSchema } from "@earendil-works/pi-ai";
 import { CompletionDeliverySchema } from "./completion-delivery.js";
-import { AcceptedWorkerHandoffSchema, MAX_WORKER_TASK_IDS } from "./worker-contract.js";
 
 const NonNegativeIntegerSchema = Type.Integer({ minimum: 0 });
 const PositiveIntegerSchema = Type.Integer({ minimum: 1 });
@@ -437,321 +436,6 @@ const DocumentParseDetailsSchema = Type.Object({
   warnings: Type.Optional(Type.Array(Type.String()))
 }, { additionalProperties: false });
 
-const WorkerCacheLineageSummarySchema = Type.Object({
-  mode: Type.Union([
-    Type.Literal("eligible"),
-    Type.Literal("adopted"),
-    Type.Literal("fresh"),
-    Type.Literal("retired"),
-    Type.Literal("failed"),
-    Type.Literal("unavailable")
-  ]),
-  reason: Type.Optional(Type.String({ minLength: 1, maxLength: 512 }))
-}, { additionalProperties: false });
-
-const WorkerRunReceiptSchema = Type.Object({
-  workerId: Type.String({ minLength: 1 }),
-  runId: Type.String({ minLength: 1 }),
-  jobId: Type.String({ minLength: 1 }),
-  sessionId: Type.String({ minLength: 1 }),
-  sessionFile: Type.Optional(Type.String({ minLength: 1 })),
-  workspaceRoot: Type.String({ minLength: 1 }),
-  taskIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: MAX_WORKER_TASK_IDS }),
-  provider: Type.String({ minLength: 1 }),
-  model: Type.String({ minLength: 1 }),
-  thinkingLevel: Type.String({ minLength: 1 }),
-  completionDelivery: CompletionDeliverySchema,
-  state: Type.Union([Type.Literal("queued"), Type.Literal("running")]),
-  cacheLineage: Type.Optional(WorkerCacheLineageSummarySchema)
-}, { additionalProperties: false });
-
-const WorkerRunDetailsSchema = Type.Object({
-  runs: Type.Array(WorkerRunReceiptSchema, { minItems: 1, maxItems: 8 })
-}, { additionalProperties: false });
-
-const WorkerReviewAttemptSchema = Type.Object({
-  route: Type.String({ minLength: 1, maxLength: 512 }),
-  outcome: Type.Union([Type.Literal("completed"), Type.Literal("rate_limited")])
-}, { additionalProperties: false });
-
-const WorkerReviewDetailsSchema = Type.Object({
-  workerId: Type.String({ minLength: 1, maxLength: 128 }),
-  runId: Type.String({ minLength: 1, maxLength: 128 }),
-  candidateId: Type.String({ pattern: "^candidate_[0-9a-f]{24}$" }),
-  workspaceRepo: Type.String({ minLength: 1, maxLength: 1024 }),
-  headCommit: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
-  headTree: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
-  model: Type.String({ minLength: 1, maxLength: 512 }),
-  thinkingLevel: Type.String({ minLength: 1, maxLength: 16 }),
-  startedAt: Type.String({ minLength: 1, maxLength: 64 }),
-  completedAt: Type.String({ minLength: 1, maxLength: 64 }),
-  durationMs: NonNegativeNumberSchema,
-  toolCallCount: NonNegativeIntegerSchema,
-  attempts: Type.Array(WorkerReviewAttemptSchema, { minItems: 1, maxItems: 2 }),
-  verdict: Type.Union([Type.Literal("approve"), Type.Literal("request_changes"), Type.Literal("blocked")]),
-  findings: Type.String({ minLength: 1, maxLength: 24000 }),
-  checks: Type.String({ minLength: 1, maxLength: 8000 })
-}, { additionalProperties: false });
-
-const WorkerFoldResolveDetailsSchema = Type.Object({
-  workerId: Type.String({ minLength: 1 }), runId: Type.String({ minLength: 1 }), jobId: Type.String({ minLength: 1 }), sessionId: Type.String({ minLength: 1 }),
-  sessionFile: Type.Optional(Type.String({ minLength: 1 })), workspaceRoot: Type.String({ minLength: 1 }), taskIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: MAX_WORKER_TASK_IDS }),
-  provider: Type.String({ minLength: 1 }), model: Type.String({ minLength: 1 }), thinkingLevel: Type.String({ minLength: 1 }), completionDelivery: CompletionDeliverySchema,
-  state: Type.Union([Type.Literal("queued"), Type.Literal("running")]), cacheLineage: Type.Optional(WorkerCacheLineageSummarySchema), phase: Type.Union([Type.Literal("analysis"), Type.Literal("resolution")]), method: Type.Union([Type.Literal("merge"), Type.Literal("squash")]),
-  preparedId: Type.String({ pattern: "^prepared_[0-9a-f]{24}$" }), manifestSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }), candidateId: Type.String({ pattern: "^candidate_[0-9a-f]{24}$" }),
-  contextSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }), decisionsSha256: Type.Optional(Type.String({ pattern: "^[0-9a-f]{64}$" }))
-}, { additionalProperties: false });
-
-const WorkerStatusSchema = Type.Union([
-  Type.Literal("queued"),
-  Type.Literal("running"),
-  Type.Literal("handed_off"),
-  Type.Literal("failed"),
-  Type.Literal("cancelled")
-]);
-
-const WorkerRouteSchema = Type.Object({
-  provider: Type.String({ minLength: 1 }),
-  model: Type.String({ minLength: 1 }),
-  thinkingLevel: Type.String({ minLength: 1 })
-}, { additionalProperties: false });
-
-const RepositoryIntegrationLineageSchema = Type.Object({
-  kind: Type.Literal("integration_resolution"),
-  preparedId: Type.String({ pattern: "^prepared_[0-9a-f]{24}$" }),
-  manifestSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }),
-  sourceCandidateIds: Type.Array(Type.String({ pattern: "^candidate_[0-9a-f]{24}$" }), { minItems: 1, maxItems: 16 }),
-  contextSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }),
-  decisionsSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }),
-  analysisRunId: Type.String({ minLength: 1 }),
-  resolutionWorkerId: Type.String({ minLength: 1 }),
-  resolutionRunId: Type.String({ minLength: 1 }),
-  workspaceRepo: Type.String({ minLength: 1, maxLength: 1024 }),
-  targetExpectedCommit: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
-  targetExpectedTree: Type.String({ pattern: "^[0-9a-f]{40,64}$" })
-}, { additionalProperties: false });
-
-const WorkerIntegrationSummarySchema = Type.Object({
-  phase: Type.Union([Type.Literal("analysis"), Type.Literal("resolution")]),
-  method: Type.Union([Type.Literal("merge"), Type.Literal("squash")]),
-  preparedId: Type.String({ pattern: "^prepared_[0-9a-f]{24}$" }),
-  manifestSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }),
-  candidateId: Type.String({ pattern: "^candidate_[0-9a-f]{24}$" }),
-  sourceCandidateIds: Type.Array(Type.String({ pattern: "^candidate_[0-9a-f]{24}$" }), { minItems: 1, maxItems: 16 }),
-  workspaceRepo: Type.String({ minLength: 1, maxLength: 1024 }),
-  targetRepo: Type.String({ minLength: 1 }),
-  targetRef: Type.String({ minLength: 1 }),
-  targetExpectedCommit: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
-  candidateHeadCommit: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
-  contextSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }),
-  analysisRunId: Type.String({ minLength: 1 }),
-  decisionsSha256: Type.Optional(Type.String({ pattern: "^[0-9a-f]{64}$" })),
-  resolutionRunId: Type.Optional(Type.String({ minLength: 1 }))
-}, { additionalProperties: false });
-
-const RepositoryPolicyIssuesSchema = Type.Array(Type.String({ maxLength: 160 }), { maxItems: 64 });
-
-const RepositoryCandidateSummarySchema = Type.Object({
-  candidateId: Type.String({ pattern: "^candidate_[0-9a-f]{24}$" }),
-  workspaceRepo: Type.String({ minLength: 1, maxLength: 1024 }),
-  reported: Type.Boolean(),
-  dirty: Type.Boolean(),
-  committedChanged: Type.Boolean(),
-  foldable: Type.Boolean(),
-  policyIssues: RepositoryPolicyIssuesSchema,
-  lineage: Type.Optional(RepositoryIntegrationLineageSchema)
-}, { additionalProperties: false });
-
-const ReportedRepositoryIssueSchema = Type.Object({
-  kind: Type.Union([Type.Literal("reported_missing"), Type.Literal("reported_not_repository")]),
-  workspaceRepo: Type.String({ minLength: 1, maxLength: 1024 })
-}, { additionalProperties: false });
-
-const RepositoryScanLimitationSchema = Type.Union([
-  Type.Literal("entry_limit"),
-  Type.Literal("repository_limit"),
-  Type.Literal("depth_limit"),
-  Type.Literal("path_limit"),
-  Type.Literal("unreadable_directory")
-]);
-
-const RepositoryScanCoverageSchema = Type.Object({
-  complete: Type.Boolean(),
-  limitations: Type.Array(RepositoryScanLimitationSchema, { maxItems: 5 })
-}, { additionalProperties: false });
-
-const RepositoryInventorySummarySchema = Type.Object({
-  inventoryFile: Type.String({ minLength: 1 }),
-  inventorySha256: Type.String({ pattern: "^[0-9a-f]{64}$" }),
-  candidateCount: Type.Integer({ minimum: 0, maximum: 32 }),
-  foldableCount: Type.Integer({ minimum: 0, maximum: 32 }),
-  reportedIssueCount: Type.Integer({ minimum: 0, maximum: 16 }),
-  candidates: Type.Array(RepositoryCandidateSummarySchema, { maxItems: 32 }),
-  reportedIssues: Type.Array(ReportedRepositoryIssueSchema, { maxItems: 16 }),
-  scanCoverage: RepositoryScanCoverageSchema
-}, { additionalProperties: false });
-
-const RepositoryCandidateSchema = Type.Object({
-  candidateId: Type.String({ pattern: "^candidate_[0-9a-f]{24}$" }),
-  workerId: Type.String({ minLength: 1 }),
-  runId: Type.String({ minLength: 1 }),
-  workspaceRepo: Type.String({ minLength: 1, maxLength: 1024 }),
-  reported: Type.Boolean(),
-  purpose: Type.Optional(Type.String({ minLength: 1, maxLength: 2000 })),
-  dependsOn: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 16 }),
-  source: Type.Optional(Type.String({ minLength: 1, maxLength: 2048 })),
-  baseCommit: Type.Optional(Type.String({ pattern: "^[0-9a-f]{40,64}$" })),
-  baseTree: Type.Optional(Type.String({ pattern: "^[0-9a-f]{40,64}$" })),
-  headCommit: Type.Optional(Type.String({ pattern: "^[0-9a-f]{40,64}$" })),
-  headTree: Type.Optional(Type.String({ pattern: "^[0-9a-f]{40,64}$" })),
-  dirty: Type.Boolean(),
-  committedChanged: Type.Boolean(),
-  foldable: Type.Boolean(),
-  policyIssues: RepositoryPolicyIssuesSchema,
-  lineage: Type.Optional(RepositoryIntegrationLineageSchema)
-}, { additionalProperties: false });
-
-const RepositoryInventorySchema = Type.Object({
-  version: Type.Literal(2),
-  workerId: Type.String({ minLength: 1 }),
-  runId: Type.String({ minLength: 1 }),
-  workspaceRoot: Type.String({ minLength: 1 }),
-  generatedAt: Type.String({ minLength: 1 }),
-  candidates: Type.Array(RepositoryCandidateSchema, { maxItems: 32 }),
-  reportedIssues: Type.Array(ReportedRepositoryIssueSchema, { maxItems: 16 }),
-  scanCoverage: RepositoryScanCoverageSchema
-}, { additionalProperties: false });
-
-const WorkerControlSummarySchema = Type.Object({
-  workerId: Type.String({ minLength: 1 }),
-  status: WorkerStatusSchema,
-  sessionId: Type.String({ minLength: 1 }),
-  sessionFile: Type.Optional(Type.String({ minLength: 1 })),
-  workspaceRoot: Type.String({ minLength: 1 }),
-  taskIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: MAX_WORKER_TASK_IDS }),
-  route: WorkerRouteSchema,
-  cacheLineage: Type.Optional(WorkerCacheLineageSummarySchema),
-  integration: Type.Optional(WorkerIntegrationSummarySchema),
-  container: Type.Optional(Type.Object({
-    name: Type.String({ minLength: 1 }),
-    containerId: Type.Optional(Type.String({ minLength: 1 })),
-    runId: Type.String({ minLength: 1 })
-  }, { additionalProperties: false })),
-  activeRun: Type.Optional(Type.Object({
-    runId: Type.String({ minLength: 1 }),
-    jobId: Type.String({ minLength: 1 }),
-    status: Type.Union([Type.Literal("queued"), Type.Literal("running")]),
-    completionDelivery: CompletionDeliverySchema,
-    recoveryError: Type.Optional(Type.String()),
-    stdoutLog: Type.Optional(Type.String({ minLength: 1 })),
-    stderrLog: Type.Optional(Type.String({ minLength: 1 }))
-  }, { additionalProperties: false })),
-  lastRun: Type.Optional(Type.Object({
-    runId: Type.String({ minLength: 1 }),
-    jobId: Type.String({ minLength: 1 }),
-    status: Type.Union([Type.Literal("handed_off"), Type.Literal("failed"), Type.Literal("cancelled")]),
-    delivery: Type.Optional(Type.Union([Type.Literal("pending"), Type.Literal("delivered")])),
-    completionDelivery: CompletionDeliverySchema,
-    resultFile: Type.Optional(Type.String({ minLength: 1 })),
-    stdoutLog: Type.Optional(Type.String({ minLength: 1 })),
-    stderrLog: Type.Optional(Type.String({ minLength: 1 })),
-    error: Type.Optional(Type.String()),
-    repositoryInventory: Type.Optional(RepositoryInventorySummarySchema),
-    repositoryError: Type.Optional(Type.String({ maxLength: 512 }))
-  }, { additionalProperties: false })),
-  updatedAt: Type.String({ minLength: 1 })
-}, { additionalProperties: false });
-
-const WorkerControlDetailsSchema = Type.Union([
-  Type.Object({
-    action: Type.Literal("status"),
-    workers: Type.Array(WorkerControlSummarySchema, { maxItems: 100 })
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("result"),
-    workerId: Type.String({ minLength: 1 }),
-    runId: Type.String({ minLength: 1 }),
-    jobId: Type.String({ minLength: 1 }),
-    status: Type.Union([Type.Literal("handed_off"), Type.Literal("failed"), Type.Literal("cancelled")]),
-    delivery: Type.Optional(Type.Union([Type.Literal("pending"), Type.Literal("delivered")])),
-    completionDelivery: CompletionDeliverySchema,
-    sessionId: Type.String({ minLength: 1 }),
-    workspaceRoot: Type.String({ minLength: 1 }),
-    taskIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: MAX_WORKER_TASK_IDS }),
-    route: WorkerRouteSchema,
-    cacheLineage: Type.Optional(WorkerCacheLineageSummarySchema),
-    integration: Type.Optional(WorkerIntegrationSummarySchema),
-    resultFile: Type.Optional(Type.String({ minLength: 1 })),
-    stdoutLog: Type.Optional(Type.String({ minLength: 1 })),
-    stderrLog: Type.Optional(Type.String({ minLength: 1 })),
-    error: Type.Optional(Type.String()),
-    handoff: Type.Optional(AcceptedWorkerHandoffSchema),
-    repositories: Type.Optional(RepositoryInventorySchema),
-    repositoryError: Type.Optional(Type.String({ maxLength: 512 })),
-    acknowledgedDelivery: Type.Boolean()
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("cancel"),
-    workerId: Type.String({ minLength: 1 }),
-    outcome: Type.Union([Type.Literal("cancelled"), Type.Literal("not_active")]),
-    status: WorkerStatusSchema,
-    runId: Type.Optional(Type.String({ minLength: 1 })),
-    jobId: Type.Optional(Type.String({ minLength: 1 }))
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("discard"),
-    workerId: Type.String({ minLength: 1 }),
-    discarded: Type.Literal(true)
-  }, { additionalProperties: false })
-]);
-
-const WorkerFoldPreparedRepositorySchema = Type.Object({
-  candidateId: Type.String({ minLength: 34, maxLength: 34, pattern: "^candidate_[0-9a-f]{24}$" }),
-  targetRepo: Type.String({ minLength: 1, maxLength: 1024 }),
-  targetRef: Type.String({ minLength: 12, maxLength: 251, pattern: "^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,239}$" }),
-  method: Type.Union([Type.Literal("merge"), Type.Literal("squash")]),
-  status: Type.Union([Type.Literal("ready"), Type.Literal("resolution_required")]),
-  expectedCommit: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
-  desiredCommit: Type.Optional(Type.String({ pattern: "^[0-9a-f]{40,64}$" })),
-  artifactFile: Type.String({ minLength: 1, maxLength: 2048 }),
-  viewPath: Type.String({ minLength: 1, maxLength: 2048 })
-}, { additionalProperties: false });
-
-const WorkerFoldPrepareDetailsSchema = Type.Object({
-  preparedId: Type.String({ minLength: 33, maxLength: 33, pattern: "^prepared_[0-9a-f]{24}$" }),
-  manifestFile: Type.String({ minLength: 1, maxLength: 2048 }),
-  manifestSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }),
-  status: Type.Union([Type.Literal("ready"), Type.Literal("resolution_required")]),
-  repositoryCount: Type.Integer({ minimum: 1, maximum: 16 }),
-  resolutionCaseCount: Type.Integer({ minimum: 0, maximum: 16 }),
-  overlapCount: Type.Integer({ minimum: 0, maximum: 16 }),
-  repositories: Type.Array(WorkerFoldPreparedRepositorySchema, { minItems: 1, maxItems: 16 })
-}, { additionalProperties: false });
-
-const WorkerFoldPromotedRepositorySchema = Type.Object({
-  candidateId: Type.String({ pattern: "^candidate_[0-9a-f]{24}$" }),
-  targetRepo: Type.String({ minLength: 1, maxLength: 1024 }),
-  targetRef: Type.String({ pattern: "^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,239}$" }),
-  expectedCommit: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
-  desiredCommit: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
-  checkedOut: Type.Boolean(),
-  status: Type.Union([Type.Literal("pending"), Type.Literal("completed"), Type.Literal("failed")]),
-  error: Type.Optional(Type.String({ maxLength: 1000 }))
-}, { additionalProperties: false });
-
-const WorkerFoldPromoteDetailsSchema = Type.Object({
-  promotionId: Type.String({ pattern: "^promotion_[0-9a-f]{24}$" }),
-  journalFile: Type.String({ minLength: 1, maxLength: 2048 }),
-  status: Type.Union([Type.Literal("pending"), Type.Literal("completed"), Type.Literal("failed")]),
-  preparedId: Type.String({ pattern: "^prepared_[0-9a-f]{24}$" }),
-  manifestSha256: Type.String({ pattern: "^[0-9a-f]{64}$" }),
-  repositoryCount: Type.Integer({ minimum: 1, maximum: 16 }),
-  completedCount: Type.Integer({ minimum: 0, maximum: 16 }),
-  error: Type.Optional(Type.String({ maxLength: 1000 })),
-  repositories: Type.Array(WorkerFoldPromotedRepositorySchema, { minItems: 1, maxItems: 16 })
-}, { additionalProperties: false });
-
-
 const WorkerV2RoleSchema = Type.Union([Type.Literal("work"), Type.Literal("review"), Type.Literal("integration")]);
 const WorkerRunV2ReceiptSchema = Type.Object({
   action: Type.Union([Type.Literal("start"), Type.Literal("resume")]), role: WorkerV2RoleSchema,
@@ -760,17 +444,24 @@ const WorkerRunV2ReceiptSchema = Type.Object({
   modelSelection: Type.Optional(Type.String()), reviewedRunId: Type.Optional(Type.String()), preparedId: Type.Optional(Type.String())
 }, { additionalProperties: false });
 const WorkerRunV2DetailsSchema = Type.Object({ runs: Type.Array(WorkerRunV2ReceiptSchema, { minItems: 1, maxItems: 8 }) }, { additionalProperties: false });
+const WorkerOutcomeV2Schema = Type.Union([Type.Literal("completed"),Type.Literal("needs_input"),Type.Literal("blocked"),Type.Literal("approve"),Type.Literal("request_changes"),Type.Literal("failed"),Type.Literal("cancelled")]);
+const WorkerOutcomeSourceV2Schema = Type.Union([Type.Literal("worker"),Type.Literal("system")]);
+const WorkerListItemV2Schema = Type.Object({ workerId: Type.String(), role: WorkerV2RoleSchema, status: Type.Union([Type.Literal("idle"),Type.Literal("queued"),Type.Literal("running")]), activeRunId: Type.Optional(Type.String()), latestResult: Type.Optional(Type.Object({ runId: Type.String(), outcome: WorkerOutcomeV2Schema, outcomeSource: WorkerOutcomeSourceV2Schema }, { additionalProperties: false })), taskIds: Type.Array(Type.String()), modelSelection: Type.Optional(Type.String()), recoveryRequired: Type.Optional(Type.Literal(true)), lastActivityAt: Type.String() }, { additionalProperties: false });
+const WorkerSlimRunV2Schema = Type.Object({ runId: Type.String(), status: Type.Union([Type.Literal("queued"),Type.Literal("running"),Type.Literal("settled")]), outcome: Type.Optional(WorkerOutcomeV2Schema), outcomeSource: Type.Optional(WorkerOutcomeSourceV2Schema), createdAt: Type.String(), startedAt: Type.Optional(Type.String()), settledAt: Type.Optional(Type.String()) }, { additionalProperties: false });
+const WorkerRepositoryV2Schema = Type.Object({ candidateId: Type.String(), path: Type.String(), source: Type.Optional(Type.String()), reported: Type.Boolean(), changed: Type.Boolean(), dirty: Type.Boolean(), eligible: Type.Boolean(), issues: Type.Optional(Type.Array(Type.String())) }, { additionalProperties: false });
+const WorkerScopedErrorV2Schema = Type.Object({ scope: Type.Union([Type.Literal("run"),Type.Literal("repositories"),Type.Literal("artifacts")]), message: Type.String() }, { additionalProperties: false });
+const WorkerGetV2Schema = Type.Object({ workerId: Type.String(), role: WorkerV2RoleSchema, runId: Type.String(), status: Type.Union([Type.Literal("queued"),Type.Literal("running"),Type.Literal("settled")]), taskIds: Type.Array(Type.String()), modelSelection: Type.Optional(Type.String()), createdAt: Type.String(), startedAt: Type.Optional(Type.String()), settledAt: Type.Optional(Type.String()), jobId: Type.String(), stdoutLog: Type.String(), stderrLog: Type.String(), sessionId: Type.String(), sessionFile: Type.Optional(Type.String()), sessionRange: Type.Object({ startLine: NonNegativeIntegerSchema, endLine: Type.Optional(NonNegativeIntegerSchema) }, { additionalProperties: false }), workspaceRoot: Type.String(), binding: Type.Optional(Type.Unknown()), recoveryError: Type.Optional(Type.String()), outcome: Type.Optional(WorkerOutcomeV2Schema), outcomeSource: Type.Optional(WorkerOutcomeSourceV2Schema), summary: Type.Optional(Type.String()), question: Type.Optional(Type.String()), repositories: Type.Optional(Type.Array(WorkerRepositoryV2Schema)), artifacts: Type.Optional(Type.Array(Type.String())), errors: Type.Optional(Type.Array(WorkerScopedErrorV2Schema)) }, { additionalProperties: false });
 const WorkerControlV2DetailsSchema = Type.Union([
-  Type.Object({ action: Type.Literal("list"), workers: Type.Array(Type.Unknown()), total: NonNegativeIntegerSchema, counts: Type.Object({ idle: NonNegativeIntegerSchema, queued: NonNegativeIntegerSchema, running: NonNegativeIntegerSchema }), nextOffset: Type.Optional(NonNegativeIntegerSchema) }),
-  Type.Object({ action: Type.Literal("runs"), workerId: Type.String(), runs: Type.Array(Type.Unknown()), total: NonNegativeIntegerSchema, nextOffset: Type.Optional(NonNegativeIntegerSchema) }),
-  Type.Object({ action: Type.Literal("get"), workerId: Type.String(), role: WorkerV2RoleSchema, workspaceRoot: Type.String(), sessionId: Type.Optional(Type.String()), sessionFile: Type.Optional(Type.String()), run: Type.Unknown() }),
-  Type.Object({ action: Type.Literal("cancel"), cancellation: Type.Union([Type.Literal("cancelled"), Type.Literal("not_active")]), worker: Type.Unknown() }),
-  Type.Object({ action: Type.Literal("discard"), workerId: Type.String(), discarded: Type.Literal(true) })
+  Type.Object({ workers: Type.Array(WorkerListItemV2Schema), total: NonNegativeIntegerSchema, counts: Type.Object({ idle: NonNegativeIntegerSchema, queued: NonNegativeIntegerSchema, running: NonNegativeIntegerSchema }, { additionalProperties: false }), nextOffset: Type.Optional(NonNegativeIntegerSchema) }, { additionalProperties: false }),
+  Type.Object({ workerId: Type.String(), runs: Type.Array(WorkerSlimRunV2Schema), total: NonNegativeIntegerSchema, nextOffset: Type.Optional(NonNegativeIntegerSchema) }, { additionalProperties: false }),
+  WorkerGetV2Schema,
+  Type.Object({ cancellation: Type.Union([Type.Literal("cancelled"),Type.Literal("not_active")]), worker: WorkerListItemV2Schema }, { additionalProperties: false }),
+  Type.Object({ workerId: Type.String(), discarded: Type.Literal(true) }, { additionalProperties: false })
 ]);
 const WorkerMergeRepositoryV2Schema = Type.Object({
   id: Type.String(), candidateRepo: Type.String(), candidateCommit: Type.String(), targetRepo: Type.String(), targetRef: Type.String(), method: Type.Union([Type.Literal("merge"), Type.Literal("squash")]),
   status: Type.Union([Type.Literal("ready"), Type.Literal("resolution_required")]), expectedCommit: Type.String(), desiredCommit: Type.Optional(Type.String()), preparedPath: Type.String(), overlapCount: NonNegativeIntegerSchema,
-  dependsOn: Type.Array(Type.String()), source: Type.Optional(Type.Unknown()), warnings: Type.Optional(Type.Array(Type.String()))
+  dependsOn: Type.Array(Type.String()), source: Type.Optional(Type.Object({ workerId: Type.String(), runId: Type.Optional(Type.String()), latest: Type.Boolean() }, { additionalProperties: false })), warnings: Type.Optional(Type.Array(Type.String()))
 }, { additionalProperties: false });
 const WorkerMergeTestDetailsSchema = Type.Object({ preparedId: Type.String(), status: Type.Union([Type.Literal("ready"), Type.Literal("resolution_required")]), order: Type.Array(Type.String()), repositories: Type.Array(WorkerMergeRepositoryV2Schema), resolutionCases: Type.Optional(Type.Array(Type.Unknown())) }, { additionalProperties: false });
 const WorkerMergeApplyDetailsSchema = Type.Object({ preparedId: Type.String(), status: Type.Union([Type.Literal("completed"), Type.Literal("partial"), Type.Literal("failed")]), repositories: Type.Array(Type.Unknown()), error: Type.Optional(Type.String()) }, { additionalProperties: false });
@@ -794,11 +485,5 @@ export const RetainedToolOutputSchemas = {
   worker_merge_apply: finalResultSchema(WorkerMergeApplyDetailsSchema)
 } satisfies Record<string, TSchema>;
 
-export const LegacyWorkerOutputSchemas = {
-  worker_review: finalResultSchema(WorkerReviewDetailsSchema),
-  worker_fold_prepare: finalResultSchema(WorkerFoldPrepareDetailsSchema),
-  worker_fold_resolve: finalResultSchema(WorkerFoldResolveDetailsSchema),
-  worker_fold_promote: finalResultSchema(WorkerFoldPromoteDetailsSchema)
-};
 
 export type RetainedToolName = keyof typeof RetainedToolOutputSchemas;

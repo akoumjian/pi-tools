@@ -1,9 +1,10 @@
 import { chmodSync, mkdirSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { DatabaseSync as SQLiteDatabaseSync, SQLInputValue } from "node:sqlite";
 
-export const WORKER_REGISTRY_SCHEMA_VERSION = 1;
+export const WORKER_REGISTRY_SCHEMA_VERSION = 2;
 export const DEFAULT_WORKER_RUNTIME_ROOT = path.join(homedir(), ".local", "share", "agent", "worker-runtime");
 
 export type WorkerRole = "work" | "review" | "integration";
@@ -20,7 +21,8 @@ export type WorkerOutcome =
   | "cancelled";
 
 export type WorkerRepositoryResult = {
-  repositoryPath: string;
+  candidateId: string;
+  path: string;
   commit: string;
   source?: string;
   reported: boolean;
@@ -53,6 +55,9 @@ export type WorkerRegistryRecord = {
   workspaceRoot: string;
   recoveryError?: string;
   reviewedByWorkerId?: string;
+  runtime?: Record<string, unknown>;
+  operationKind?: "discard";
+  operationNonce?: string;
   version: number;
   createdAt: string;
   updatedAt: string;
@@ -78,6 +83,9 @@ export type WorkerRunRecord = {
   repositories: WorkerRepositoryResult[];
   artifacts: string[];
   errors: WorkerScopedError[];
+  runtime?: Record<string, unknown>;
+  claimKind?: "launch" | "settlement" | "cancellation";
+  claimNonce?: string;
   createdAt: string;
   startedAt?: string;
   settledAt?: string;
@@ -120,6 +128,9 @@ CREATE TABLE IF NOT EXISTS workers (
   workspace_root TEXT NOT NULL,
   recovery_error TEXT,
   reviewed_by_worker_id TEXT,
+  runtime_json TEXT NOT NULL DEFAULT '{}',
+  operation_kind TEXT CHECK (operation_kind IS NULL OR operation_kind IN ('discard')),
+  operation_nonce TEXT,
   version INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -144,6 +155,9 @@ CREATE TABLE IF NOT EXISTS runs (
   repositories_json TEXT NOT NULL DEFAULT '[]',
   artifacts_json TEXT NOT NULL DEFAULT '[]',
   errors_json TEXT NOT NULL DEFAULT '[]',
+  runtime_json TEXT NOT NULL DEFAULT '{}',
+  claim_kind TEXT CHECK (claim_kind IS NULL OR claim_kind IN ('launch','settlement','cancellation')),
+  claim_nonce TEXT,
   created_at TEXT NOT NULL,
   started_at TEXT,
   settled_at TEXT
@@ -184,6 +198,8 @@ CREATE TABLE IF NOT EXISTS prepared_repositories (
 ) STRICT;
 `;
 
+const WORKER_REGISTRY_SCHEMA_HASH = createHash("sha256").update(SCHEMA).digest("hex");
+
 export function openWorkerRegistry(runtimeRoot = DEFAULT_WORKER_RUNTIME_ROOT): WorkerRegistry {
   mkdirSync(runtimeRoot, { recursive: true, mode: 0o700 });
   chmodSync(runtimeRoot, 0o700);
@@ -200,10 +216,12 @@ export function openWorkerRegistry(runtimeRoot = DEFAULT_WORKER_RUNTIME_ROOT): W
   try {
     database.exec(SCHEMA);
     const row = database.prepare("SELECT value FROM registry_meta WHERE key = 'schema_version'").get() as { value?: string } | undefined;
+    const fingerprint = database.prepare("SELECT value FROM registry_meta WHERE key = 'schema_hash'").get() as { value?: string } | undefined;
     if (row === undefined) {
       database.prepare("INSERT INTO registry_meta(key,value) VALUES('schema_version',?)").run(String(WORKER_REGISTRY_SCHEMA_VERSION));
-    } else if (Number(row.value) !== WORKER_REGISTRY_SCHEMA_VERSION) {
-      throw new Error(`Unsupported worker registry schema ${row.value}; expected ${WORKER_REGISTRY_SCHEMA_VERSION}.`);
+      database.prepare("INSERT INTO registry_meta(key,value) VALUES('schema_hash',?)").run(WORKER_REGISTRY_SCHEMA_HASH);
+    } else if (Number(row.value) !== WORKER_REGISTRY_SCHEMA_VERSION || fingerprint?.value !== WORKER_REGISTRY_SCHEMA_HASH) {
+      throw new Error(`Unsupported worker registry schema ${row.value ?? "missing"} or schema fingerprint mismatch.`);
     }
     database.exec(`PRAGMA user_version = ${WORKER_REGISTRY_SCHEMA_VERSION}`);
     database.exec("COMMIT");
@@ -233,10 +251,7 @@ export function registerParentRuntime(registry: WorkerRegistry, parentSessionFil
 
 export function createWorkerAndRun(registry: WorkerRegistry, worker: Omit<WorkerRegistryRecord, "version">, run: WorkerRunRecord): void {
   transaction(registry, () => {
-    registry.database.prepare(`INSERT INTO workers(worker_id,parent_session_file,role,status,active_run_id,latest_run_id,task_ids_json,model_selection,session_id,session_file,workspace_root,recovery_error,version,created_at,updated_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)`).run(
-      worker.workerId, worker.parentSessionFile, worker.role, worker.status, nullable(worker.activeRunId), nullable(worker.latestRunId), json(worker.taskIds), nullable(worker.modelSelection), nullable(worker.sessionId), nullable(worker.sessionFile), worker.workspaceRoot, nullable(worker.recoveryError), worker.createdAt, worker.updatedAt
-    );
+    insertWorker(registry, worker);
     insertRun(registry, run);
   });
 }
@@ -279,7 +294,7 @@ export function settleWorkerRun(registry: WorkerRegistry, input: {
     const deliveryId = `worker-run:${input.workerId}:${input.runId}`;
     const current = readRunRow(registry, input.runId);
     if (current.worker_id !== input.workerId || current.status === "settled") throw staleRun(input.workerId, input.runId);
-    registry.database.prepare(`UPDATE runs SET status='settled',outcome=?,outcome_source=?,summary=?,question=?,repositories_json=?,artifacts_json=?,errors_json=?,session_start_line=?,session_end_line=?,settled_at=? WHERE run_id=? AND status IN ('queued','running')`)
+    registry.database.prepare(`UPDATE runs SET status='settled',outcome=?,outcome_source=?,summary=?,question=?,repositories_json=?,artifacts_json=?,errors_json=?,session_start_line=?,session_end_line=?,settled_at=?,claim_kind=NULL,claim_nonce=NULL WHERE run_id=? AND status IN ('queued','running')`)
       .run(input.outcome, input.outcomeSource, nullable(input.summary), nullable(input.question), json(input.repositories ?? []), json(input.artifacts ?? []), json(input.errors ?? []), nullable(input.sessionStartLine), nullable(input.sessionEndLine), input.settledAt, input.runId);
     const worker = registry.database.prepare(`UPDATE workers SET status='idle',active_run_id=NULL,latest_run_id=?,recovery_error=NULL,version=version+1,updated_at=? WHERE worker_id=? AND active_run_id=?`)
       .run(input.runId, input.settledAt, input.workerId, input.runId);
@@ -367,9 +382,9 @@ export function discardWorkerRegistryRecord(registry: WorkerRegistry, workerId: 
 }
 
 function insertRun(registry: WorkerRegistry, run: WorkerRunRecord): void {
-  registry.database.prepare(`INSERT INTO runs(run_id,worker_id,status,task_ids_json,model_selection,completion_delivery,binding_json,job_id,stdout_log,stderr_log,session_start_line,session_end_line,outcome,outcome_source,summary,question,repositories_json,artifacts_json,errors_json,created_at,started_at,settled_at)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-    run.runId, run.workerId, run.status, json(run.taskIds), nullable(run.modelSelection), run.completionDelivery, run.binding === undefined ? null : json(run.binding), nullable(run.jobId), nullable(run.stdoutLog), nullable(run.stderrLog), nullable(run.sessionStartLine), nullable(run.sessionEndLine), nullable(run.outcome), nullable(run.outcomeSource), nullable(run.summary), nullable(run.question), json(run.repositories), json(run.artifacts), json(run.errors), run.createdAt, nullable(run.startedAt), nullable(run.settledAt)
+  registry.database.prepare(`INSERT INTO runs(run_id,worker_id,status,task_ids_json,model_selection,completion_delivery,binding_json,job_id,stdout_log,stderr_log,session_start_line,session_end_line,outcome,outcome_source,summary,question,repositories_json,artifacts_json,errors_json,runtime_json,claim_kind,claim_nonce,created_at,started_at,settled_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    run.runId, run.workerId, run.status, json(run.taskIds), nullable(run.modelSelection), run.completionDelivery, run.binding === undefined ? null : json(run.binding), nullable(run.jobId), nullable(run.stdoutLog), nullable(run.stderrLog), nullable(run.sessionStartLine), nullable(run.sessionEndLine), nullable(run.outcome), nullable(run.outcomeSource), nullable(run.summary), nullable(run.question), json(run.repositories), json(run.artifacts), json(run.errors), json(run.runtime ?? {}), nullable(run.claimKind), nullable(run.claimNonce), run.createdAt, nullable(run.startedAt), nullable(run.settledAt)
   );
 }
 
@@ -388,7 +403,8 @@ function transaction<T>(registry: WorkerRegistry, fn: () => T): T {
 
 function assertSchema(registry: WorkerRegistry): void {
   const row = registry.database.prepare("SELECT value FROM registry_meta WHERE key='schema_version'").get() as { value?: string } | undefined;
-  if (Number(row?.value) !== WORKER_REGISTRY_SCHEMA_VERSION) throw new Error(`Unsupported worker registry schema ${row?.value ?? "missing"}.`);
+  const fingerprint = registry.database.prepare("SELECT value FROM registry_meta WHERE key='schema_hash'").get() as { value?: string } | undefined;
+  if (Number(row?.value) !== WORKER_REGISTRY_SCHEMA_VERSION || fingerprint?.value !== WORKER_REGISTRY_SCHEMA_HASH) throw new Error(`Unsupported worker registry schema ${row?.value ?? "missing"} or schema fingerprint mismatch.`);
 }
 
 function boundedPage(value: number | undefined): number {
@@ -410,13 +426,13 @@ function readRunRow(registry: WorkerRegistry, runId: string): RunRow {
 type WorkerRow = {
   worker_id: string; parent_session_file: string; role: WorkerRole; status: WorkerStatus; active_run_id: string | null; latest_run_id: string | null;
   task_ids_json: string; model_selection: string | null; session_id: string | null; session_file: string | null; workspace_root: string;
-  recovery_error: string | null; reviewed_by_worker_id: string | null; version: number; created_at: string; updated_at: string;
+  recovery_error: string | null; reviewed_by_worker_id: string | null; runtime_json: string; operation_kind: "discard" | null; operation_nonce: string | null; version: number; created_at: string; updated_at: string;
 };
 type RunRow = {
   run_id: string; worker_id: string; status: WorkerRunStatus; task_ids_json: string; model_selection: string | null; completion_delivery: "steer" | "followUp";
   binding_json: string | null; job_id: string | null; stdout_log: string | null; stderr_log: string | null; session_start_line: number | null; session_end_line: number | null;
   outcome: WorkerOutcome | null; outcome_source: WorkerOutcomeSource | null; summary: string | null; question: string | null; repositories_json: string; artifacts_json: string;
-  errors_json: string; created_at: string; started_at: string | null; settled_at: string | null;
+  errors_json: string; runtime_json: string; claim_kind: "launch" | "settlement" | "cancellation" | null; claim_nonce: string | null; created_at: string; started_at: string | null; settled_at: string | null;
 };
 type DeliveryRow = {
   delivery_id: string; parent_session_file: string; worker_id: string; run_id: string; completion_delivery: "steer" | "followUp"; state: "pending" | "claimed" | "delivered";
@@ -429,7 +445,7 @@ function decodeWorker(row: WorkerRow): WorkerRegistryRecord {
     ...(row.active_run_id === null ? {} : { activeRunId: row.active_run_id }), ...(row.latest_run_id === null ? {} : { latestRunId: row.latest_run_id }),
     taskIds: parseJson<string[]>(row.task_ids_json), ...(row.model_selection === null ? {} : { modelSelection: row.model_selection }),
     ...(row.session_id === null ? {} : { sessionId: row.session_id }), ...(row.session_file === null ? {} : { sessionFile: row.session_file }),
-    workspaceRoot: row.workspace_root, ...(row.recovery_error === null ? {} : { recoveryError: row.recovery_error }), ...(row.reviewed_by_worker_id === null ? {} : { reviewedByWorkerId: row.reviewed_by_worker_id }), version: row.version,
+    workspaceRoot: row.workspace_root, ...(row.recovery_error === null ? {} : { recoveryError: row.recovery_error }), ...(row.reviewed_by_worker_id === null ? {} : { reviewedByWorkerId: row.reviewed_by_worker_id }), runtime: parseJson<Record<string, unknown>>(row.runtime_json), ...(row.operation_kind === null ? {} : { operationKind: row.operation_kind }), ...(row.operation_nonce === null ? {} : { operationNonce: row.operation_nonce }), version: row.version,
     createdAt: row.created_at, updatedAt: row.updated_at
   };
 }
@@ -442,7 +458,7 @@ function decodeRun(row: RunRow): WorkerRunRecord {
     ...(row.session_start_line === null ? {} : { sessionStartLine: row.session_start_line }), ...(row.session_end_line === null ? {} : { sessionEndLine: row.session_end_line }),
     ...(row.outcome === null ? {} : { outcome: row.outcome }), ...(row.outcome_source === null ? {} : { outcomeSource: row.outcome_source }),
     ...(row.summary === null ? {} : { summary: row.summary }), ...(row.question === null ? {} : { question: row.question }),
-    repositories: parseJson<WorkerRepositoryResult[]>(row.repositories_json), artifacts: parseJson<string[]>(row.artifacts_json), errors: parseJson<WorkerScopedError[]>(row.errors_json),
+    repositories: parseJson<WorkerRepositoryResult[]>(row.repositories_json), artifacts: parseJson<string[]>(row.artifacts_json), errors: parseJson<WorkerScopedError[]>(row.errors_json), runtime: parseJson<Record<string, unknown>>(row.runtime_json), ...(row.claim_kind === null ? {} : { claimKind: row.claim_kind }), ...(row.claim_nonce === null ? {} : { claimNonce: row.claim_nonce }),
     createdAt: row.created_at, ...(row.started_at === null ? {} : { startedAt: row.started_at }), ...(row.settled_at === null ? {} : { settledAt: row.settled_at })
   };
 }
@@ -500,4 +516,182 @@ export function reconcileWorkerDeliveries(registry: WorkerRegistry, parentSessio
     for (const deliveryId of deliveredIds) mark.run(now, parentSessionFile, deliveryId);
     registry.database.prepare("UPDATE deliveries SET state='pending',runtime_generation=NULL WHERE parent_session_file=? AND state='claimed'").run(parentSessionFile);
   });
+}
+
+export type WorkerBatchCreateItem =
+  | { kind: "new"; worker: Omit<WorkerRegistryRecord, "version">; run: WorkerRunRecord }
+  | { kind: "resume"; workerId: string; expectedVersion: number; taskIds: string[]; runtime?: Record<string, unknown>; run: WorkerRunRecord };
+export type WorkerReviewLeaseClaim = { subjectWorkerId: string; reviewerWorkerId: string; reviewedRunId: string };
+
+/** Atomically publishes a fully provisioned independent batch as launchable queued runs. */
+export function createWorkerRunBatch(registry: WorkerRegistry, input: {
+  items: WorkerBatchCreateItem[];
+  reviewLeases?: WorkerReviewLeaseClaim[];
+  consumedPrepared?: Array<{ preparedId: string; parentSessionFile: string }>;
+  now: string;
+}): void {
+  transaction(registry, () => {
+    for (const lease of input.reviewLeases ?? []) {
+      const result = registry.database.prepare(`UPDATE workers SET reviewed_by_worker_id=?,version=version+1,updated_at=?
+        WHERE worker_id=? AND status='idle' AND reviewed_by_worker_id IS NULL AND latest_run_id=? AND role IN ('work','integration')`)
+        .run(lease.reviewerWorkerId, input.now, lease.subjectWorkerId, lease.reviewedRunId);
+      if (Number(result.changes) !== 1) throw new Error(`Worker ${lease.subjectWorkerId} is not available for review of ${lease.reviewedRunId}.`);
+    }
+    for (const prepared of input.consumedPrepared ?? []) {
+      const result = registry.database.prepare("UPDATE prepared_sets SET status='consumed',updated_at=? WHERE prepared_id=? AND parent_session_file=? AND status='resolution_required'")
+        .run(input.now, prepared.preparedId, prepared.parentSessionFile);
+      if (Number(result.changes) !== 1) throw new Error(`Prepared set ${prepared.preparedId} is not available for integration.`);
+    }
+    for (const item of input.items) {
+      if (item.kind === "new") insertWorker(registry, item.worker);
+      else {
+        const update = registry.database.prepare(`UPDATE workers SET status='queued',active_run_id=?,task_ids_json=?,runtime_json=?,recovery_error=NULL,version=version+1,updated_at=?
+          WHERE worker_id=? AND version=? AND status='idle' AND operation_kind IS NULL`)
+          .run(item.run.runId, json(item.taskIds), json(item.runtime ?? {}), input.now, item.workerId, item.expectedVersion);
+        if (Number(update.changes) !== 1) throw staleWorker(item.workerId);
+      }
+      insertRun(registry, item.run);
+    }
+  });
+}
+
+export function claimWorkerRun(registry: WorkerRegistry, workerId: string, runId: string, kind: "launch" | "settlement" | "cancellation", nonce: string, allowed: WorkerRunStatus[]): boolean {
+  return transaction(registry, () => {
+    const placeholders = allowed.map(() => "?").join(",");
+    const result = registry.database.prepare(`UPDATE runs SET claim_kind=?,claim_nonce=? WHERE worker_id=? AND run_id=? AND claim_kind IS NULL AND status IN (${placeholders})`)
+      .run(kind, nonce, workerId, runId, ...allowed);
+    return Number(result.changes) === 1;
+  });
+}
+
+export function releaseWorkerRunClaim(registry: WorkerRegistry, workerId: string, runId: string, kind: "launch" | "settlement" | "cancellation", nonce: string): boolean {
+  return transaction(registry, () => Number(registry.database.prepare("UPDATE runs SET claim_kind=NULL,claim_nonce=NULL WHERE worker_id=? AND run_id=? AND claim_kind=? AND claim_nonce=?")
+    .run(workerId, runId, kind, nonce).changes) === 1);
+}
+
+export function finalizeWorkerRunLaunch(registry: WorkerRegistry, input: {
+  workerId: string; runId: string; claimNonce: string; modelSelection: string; sessionId: string; sessionFile: string;
+  sessionStartLine: number; jobId: string; stdoutLog: string; stderrLog: string; runtime: Record<string, unknown>; startedAt: string;
+}): void {
+  transaction(registry, () => {
+    const run = registry.database.prepare(`UPDATE runs SET status='running',model_selection=?,job_id=?,stdout_log=?,stderr_log=?,session_start_line=?,runtime_json=?,started_at=?,claim_kind=NULL,claim_nonce=NULL
+      WHERE worker_id=? AND run_id=? AND status='queued' AND claim_kind='launch' AND claim_nonce=?`)
+      .run(input.modelSelection, input.jobId, input.stdoutLog, input.stderrLog, input.sessionStartLine, json(input.runtime), input.startedAt, input.workerId, input.runId, input.claimNonce);
+    const worker = registry.database.prepare(`UPDATE workers SET status='running',model_selection=?,session_id=?,session_file=?,version=version+1,updated_at=?
+      WHERE worker_id=? AND active_run_id=? AND status='queued'`)
+      .run(input.modelSelection, input.sessionId, input.sessionFile, input.startedAt, input.workerId, input.runId);
+    if (Number(run.changes) !== 1 || Number(worker.changes) !== 1) throw staleRun(input.workerId, input.runId);
+  });
+}
+
+export function finalizeClaimedWorkerRun(registry: WorkerRegistry, input: {
+  parentSessionFile: string; workerId: string; runId: string; claimKind: "launch" | "settlement" | "cancellation"; claimNonce: string;
+  outcome: WorkerOutcome; outcomeSource: WorkerOutcomeSource; summary?: string; question?: string; repositories?: WorkerRepositoryResult[];
+  artifacts?: string[]; errors?: WorkerScopedError[]; sessionStartLine?: number; sessionEndLine?: number; settledAt: string;
+}): string {
+  return transaction(registry, () => {
+    const current = readRunRow(registry, input.runId);
+    if (current.worker_id !== input.workerId || current.status === "settled" || current.claim_kind !== input.claimKind || current.claim_nonce !== input.claimNonce) throw staleRun(input.workerId, input.runId);
+    const deliveryId = `worker-run:${input.workerId}:${input.runId}`;
+    const run = registry.database.prepare(`UPDATE runs SET status='settled',outcome=?,outcome_source=?,summary=?,question=?,repositories_json=?,artifacts_json=?,errors_json=?,session_start_line=COALESCE(session_start_line,?),session_end_line=?,settled_at=?,claim_kind=NULL,claim_nonce=NULL
+      WHERE worker_id=? AND run_id=? AND status IN ('queued','running') AND claim_kind=? AND claim_nonce=?`)
+      .run(input.outcome, input.outcomeSource, nullable(input.summary), nullable(input.question), json(input.repositories ?? []), json(input.artifacts ?? []), json(input.errors ?? []), nullable(input.sessionStartLine), nullable(input.sessionEndLine), input.settledAt, input.workerId, input.runId, input.claimKind, input.claimNonce);
+    const worker = registry.database.prepare(`UPDATE workers SET status='idle',active_run_id=NULL,latest_run_id=?,recovery_error=NULL,version=version+1,updated_at=? WHERE worker_id=? AND active_run_id=?`)
+      .run(input.runId, input.settledAt, input.workerId, input.runId);
+    if (Number(run.changes) !== 1 || Number(worker.changes) !== 1) throw staleRun(input.workerId, input.runId);
+    if (current.binding_json) {
+      const binding = parseJson<WorkerBinding>(current.binding_json);
+      if ("reviewedWorkerId" in binding && (input.outcome !== "needs_input" && input.outcome !== "blocked" || input.outcomeSource === "system")) {
+        registry.database.prepare("UPDATE workers SET reviewed_by_worker_id=NULL,version=version+1,updated_at=? WHERE worker_id=? AND reviewed_by_worker_id=?")
+          .run(input.settledAt, binding.reviewedWorkerId, input.workerId);
+      }
+    }
+    registry.database.prepare(`INSERT INTO deliveries(delivery_id,parent_session_file,worker_id,run_id,completion_delivery,state,created_at) VALUES(?,?,?,?,?,'pending',?)`)
+      .run(deliveryId, input.parentSessionFile, input.workerId, input.runId, current.completion_delivery, input.settledAt);
+    return deliveryId;
+  });
+}
+
+export function updateWorkerAndRunRuntime(registry: WorkerRegistry, input: { workerId: string; runId: string; workerRuntime?: Record<string, unknown>; runRuntime?: Record<string, unknown>; now: string }): void {
+  transaction(registry, () => {
+    if (input.workerRuntime) {
+      const result = registry.database.prepare("UPDATE workers SET runtime_json=?,version=version+1,updated_at=? WHERE worker_id=? AND active_run_id=?").run(json(input.workerRuntime), input.now, input.workerId, input.runId);
+      if (Number(result.changes) !== 1) throw staleRun(input.workerId, input.runId);
+    }
+    if (input.runRuntime) {
+      const result = registry.database.prepare("UPDATE runs SET runtime_json=? WHERE worker_id=? AND run_id=? AND status!='settled'").run(json(input.runRuntime), input.workerId, input.runId);
+      if (Number(result.changes) !== 1) throw staleRun(input.workerId, input.runId);
+    }
+  });
+}
+
+export function claimWorkerDiscard(registry: WorkerRegistry, workerId: string, expectedVersion: number, nonce: string, now: string): WorkerRunRecord | undefined {
+  return transaction(registry, () => {
+    const worker = getWorker(registry, workerId);
+    if (!worker || worker.version !== expectedVersion || worker.status !== "idle" || worker.reviewedByWorkerId || worker.operationKind) throw staleWorker(workerId);
+    const changed = registry.database.prepare("UPDATE workers SET operation_kind='discard',operation_nonce=?,version=version+1,updated_at=? WHERE worker_id=? AND version=? AND status='idle' AND reviewed_by_worker_id IS NULL AND operation_kind IS NULL")
+      .run(nonce, now, workerId, expectedVersion);
+    if (Number(changed.changes) !== 1) throw staleWorker(workerId);
+    return worker.latestRunId ? getWorkerRun(registry, workerId, worker.latestRunId) : undefined;
+  });
+}
+
+export function finalizeWorkerDiscard(registry: WorkerRegistry, workerId: string, nonce: string): void {
+  transaction(registry, () => {
+    const row = registry.database.prepare("SELECT latest_run_id FROM workers WHERE worker_id=? AND operation_kind='discard' AND operation_nonce=?").get(workerId, nonce) as { latest_run_id: string | null } | undefined;
+    if (!row) throw staleWorker(workerId);
+    if (row.latest_run_id) {
+      const run = readRunRow(registry, row.latest_run_id);
+      if (run.binding_json) {
+        const binding = parseJson<WorkerBinding>(run.binding_json);
+        if ("reviewedWorkerId" in binding) registry.database.prepare("UPDATE workers SET reviewed_by_worker_id=NULL,version=version+1 WHERE worker_id=? AND reviewed_by_worker_id=?").run(binding.reviewedWorkerId, workerId);
+        else registry.database.prepare("DELETE FROM prepared_sets WHERE prepared_id=? AND status='consumed'").run(binding.preparedId);
+      }
+    }
+    const result = registry.database.prepare("DELETE FROM workers WHERE worker_id=? AND operation_kind='discard' AND operation_nonce=?").run(workerId, nonce);
+    if (Number(result.changes) !== 1) throw staleWorker(workerId);
+  });
+}
+
+export function abandonWorkerDiscard(registry: WorkerRegistry, workerId: string, nonce: string, error: string, now: string): void {
+  transaction(registry, () => registry.database.prepare("UPDATE workers SET operation_kind=NULL,operation_nonce=NULL,recovery_error=?,version=version+1,updated_at=? WHERE worker_id=? AND operation_kind='discard' AND operation_nonce=?")
+    .run(error.slice(0, 2048), now, workerId, nonce));
+}
+
+export function countWorkers(registry: WorkerRegistry, parentSessionFile: string): { idle: number; queued: number; running: number } {
+  const rows = registry.database.prepare("SELECT status,COUNT(*) AS count FROM workers WHERE parent_session_file=? GROUP BY status").all(parentSessionFile) as Array<{ status: WorkerStatus; count: number }>;
+  const result = { idle: 0, queued: 0, running: 0 };
+  for (const row of rows) result[row.status] = Number(row.count);
+  return result;
+}
+
+export function findWorkerRunById(registry: WorkerRegistry, runId: string): { worker: WorkerRegistryRecord; run: WorkerRunRecord } | undefined {
+  const row = registry.database.prepare("SELECT worker_id FROM runs WHERE run_id=?").get(runId) as { worker_id: string } | undefined;
+  if (!row) return undefined;
+  const worker = getWorker(registry, row.worker_id); const run = getWorkerRun(registry, row.worker_id, runId);
+  return worker && run ? { worker, run } : undefined;
+}
+
+function insertWorker(registry: WorkerRegistry, worker: Omit<WorkerRegistryRecord, "version">): void {
+  registry.database.prepare(`INSERT INTO workers(worker_id,parent_session_file,role,status,active_run_id,latest_run_id,task_ids_json,model_selection,session_id,session_file,workspace_root,recovery_error,reviewed_by_worker_id,runtime_json,operation_kind,operation_nonce,version,created_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)`).run(
+    worker.workerId, worker.parentSessionFile, worker.role, worker.status, nullable(worker.activeRunId), nullable(worker.latestRunId), json(worker.taskIds), nullable(worker.modelSelection), nullable(worker.sessionId), nullable(worker.sessionFile), worker.workspaceRoot, nullable(worker.recoveryError), nullable(worker.reviewedByWorkerId), json(worker.runtime ?? {}), nullable(worker.operationKind), nullable(worker.operationNonce), worker.createdAt, worker.updatedAt
+  );
+}
+
+export function claimWorkerCancellation(registry: WorkerRegistry, workerId: string, runId: string, nonce: string, now: string): boolean {
+  return transaction(registry, () => {
+    const worker = registry.database.prepare("SELECT recovery_error FROM workers WHERE worker_id=? AND active_run_id=? AND status IN ('queued','running')").get(workerId, runId) as { recovery_error: string | null } | undefined;
+    if (!worker) return false;
+    const result = worker.recovery_error
+      ? registry.database.prepare("UPDATE runs SET claim_kind='cancellation',claim_nonce=? WHERE worker_id=? AND run_id=? AND status IN ('queued','running') AND (claim_kind IS NULL OR claim_kind='settlement')").run(nonce, workerId, runId)
+      : registry.database.prepare("UPDATE runs SET claim_kind='cancellation',claim_nonce=? WHERE worker_id=? AND run_id=? AND status IN ('queued','running') AND (claim_kind IS NULL OR claim_kind='launch')").run(nonce, workerId, runId);
+    if (Number(result.changes) === 1) registry.database.prepare("UPDATE workers SET updated_at=? WHERE worker_id=?").run(now, workerId);
+    return Number(result.changes) === 1;
+  });
+}
+
+export function activeRunsForParent(registry: WorkerRegistry, parentSessionFile: string): Array<{ worker: WorkerRegistryRecord; run: WorkerRunRecord }> {
+  const rows = registry.database.prepare("SELECT worker_id,active_run_id FROM workers WHERE parent_session_file=? AND active_run_id IS NOT NULL ORDER BY created_at,worker_id").all(parentSessionFile) as Array<{ worker_id: string; active_run_id: string }>;
+  return rows.flatMap((row) => { const worker = getWorker(registry, row.worker_id); const run = getWorkerRun(registry, row.worker_id, row.active_run_id); return worker && run ? [{ worker, run }] : []; });
 }

@@ -28,6 +28,7 @@ const retainedToolNames = [
 function anthropicWireSchema(parameters: unknown): unknown {
   const schema = structuredClone(parameters) as Record<string, unknown>;
   delete schema.additionalProperties;
+  delete schema.anyOf;
   schema.required ??= [];
   return schema;
 }
@@ -103,11 +104,10 @@ test("provider context review command renders sanitized prompt, tool declaration
     assert.match(artifact.systemPrompt, /Current working directory: \/review\/workspace/);
     assert.doesNotMatch(artifact.systemPrompt, /<DATE>|<repo>|\/Users\//);
     assert.match(artifact.systemPrompt, /read_many use:/);
-    assert.match(artifact.systemPrompt, /worker_run constraints:/);
-    assert.match(artifact.systemPrompt, /worker_control constraints:/);
-    assert.match(artifact.systemPrompt, /worker_merge_test constraints:/);
-    assert.match(artifact.systemPrompt, /worker_merge_apply constraints:/);
-    assert.match(artifact.systemPrompt, /historical managed-worker provenance produces warnings/);
+    assert.match(artifact.systemPrompt, /Use `start` with role `work`/);
+    assert.match(artifact.systemPrompt, /Do not poll workers; rely on asynchronous completion notifications/);
+    assert.match(artifact.systemPrompt, /worker_merge_test use: Prepare exact merges/);
+    assert.match(artifact.systemPrompt, /worker_merge_apply use: Apply only after parent inspection/);
     assert.doesNotMatch(artifact.systemPrompt, /Batch-native tool usage:/);
     assert.doesNotMatch(artifact.systemPrompt, /hunk_session/);
 

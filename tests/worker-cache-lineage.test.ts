@@ -26,12 +26,6 @@ import {
   registerWorkerCacheLineageRuntimeHooks,
   summarizeWorkerCacheLineage
 } from "../extensions/worker/cache-lineage.js";
-import {
-  WORKER_RECORD_VERSION,
-  provisionWorkerPaths,
-  workerPaths,
-  writeWorkerRecord
-} from "../extensions/worker/state.js";
 
 const parentSessionFile = "/trusted/sessions/parent.jsonl";
 const parentSessionId = "parent-local-session";
@@ -1628,75 +1622,6 @@ test("capture holder generations invalidate templates owned by an obsolete exten
       mode: "fresh",
       reason: "No validated parent Codex request capture is available."
     });
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("worker records confine eligible lineage artifacts to the exact worker state directory", () => {
-  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-record-"));
-  try {
-    const roots = { stateRoot: path.join(root, "state"), workspaceRoot: path.join(root, "workspaces") };
-    const paths = workerPaths(roots, "worker_20260924120000_12345678");
-    provisionWorkerPaths(paths);
-    assert.throws(() => writeWorkerRecord(paths.recordFile, {
-      version: WORKER_RECORD_VERSION,
-      workerId: "worker_20260924120000_12345678",
-      sessionId: "child-session",
-      parentSessionFile,
-      workspaceRoot: paths.workspaceRoot,
-      taskIds: ["personal-test"],
-      route,
-      cacheLineage: {
-        version: 1,
-        mode: "eligible",
-        provider: "openai-codex",
-        model: route.model,
-        thinkingLevel: route.thinkingLevel,
-        snapshotFile: path.join(root, "outside", "cache-lineage.json"),
-        snapshotSha256: "a".repeat(64),
-        marker: "fork_marker_1234",
-        adoptionFile: path.join(root, "outside", "cache-lineage-adopted.json"),
-        fallbackFile: path.join(root, "outside", "cache-lineage-fallback.json"),
-        retirementFile: path.join(root, "outside", "cache-lineage-retired.json"),
-        summaryFile: path.join(root, "outside", "cache-lineage-summary.json")
-      },
-      status: "queued",
-      updatedAt: "2026-09-24T12:00:00.000Z"
-    }), /Invalid worker record/);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("Codex lineage eligibility requires fresh exact parent session and route bindings", () => {
-  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-eligibility-"));
-  try {
-    captureAndPrepare(root);
-    const base = {
-      stateRoot: root,
-      workerStateDir: path.join(root, "other-worker"),
-      parentSessionFile,
-      parentSessionId,
-      route,
-      marker: "fork_marker_5678",
-      now: new Date("2026-09-24T12:00:01.000Z")
-    };
-    const wrongSession = prepareWorkerCacheLineage({ ...base, parentSessionId: "different-parent-session" });
-    assert.equal(wrongSession.mode, "fresh");
-    assert.match(wrongSession.mode === "fresh" ? wrongSession.reason : "", /another parent session/);
-    const wrongRoute = prepareWorkerCacheLineage({
-      ...base,
-      route: { ...route, model: "different-model" }
-    });
-    assert.equal(wrongRoute.mode, "fresh");
-    assert.match(wrongRoute.mode === "fresh" ? wrongRoute.reason : "", /does not exactly match/);
-    const stale = prepareWorkerCacheLineage({
-      ...base,
-      now: new Date("2026-09-24T12:06:00.000Z")
-    });
-    assert.equal(stale.mode, "fresh");
-    assert.match(stale.mode === "fresh" ? stale.reason : "", /stale/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

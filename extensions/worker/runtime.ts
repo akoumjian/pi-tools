@@ -4,13 +4,13 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { Type, validateToolArguments, type Tool, type ToolCall } from "@earendil-works/pi-ai";
 import { defineTool, type AgentToolResult, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { unsettledAsyncShellJobsForOwner, unsettledPersistedAsyncShellJobsForOwner, type AsyncShellJobOwner } from "../async-shell/index.js";
+import { activeAsyncShellJobsForOwner, cancelAsyncShellJobsForOwner, cancelPersistedAsyncShellJobsForOwner, unsettledPersistedAsyncShellJobsForOwner, type AsyncShellJobOwner } from "../async-shell/index.js";
 import { createWorkerCacheLineageRuntime, registerWorkerCacheLineageRuntimeHooks, validateWorkerCacheLineageRecord, type WorkerCacheLineageRecord } from "./cache-lineage.js";
-import { WorkerBeadsTasksParams, WorkerResultSubmitParams, normalizeWorkspaceResultPaths, validateWorkerResultInput, type WorkerResultSubmitInput } from "./contract.js";
+import { WorkerBeadsTasksParams, WorkerBeadsTasksReadParams, WorkerResultSubmitParams, WorkerResultValidationError, normalizeWorkspaceResultPaths, validateWorkerResultInput, type WorkerResultSubmitInput } from "./contract.js";
 import type { WorkerRole } from "./registry.js";
-import type { WorkerIntegrationRecord } from "./state.js";
-import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
-import { MAX_WORKER_TASK_IDS, workerHandoffAdmissionPath, type AcceptedWorkerHandoff as LegacyAcceptedWorkerHandoff } from "../_shared/worker-contract.js";
+import { inputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
+import { trustedGit } from "./trusted-git.js";
+import { MAX_WORKER_TASK_IDS, workerResultAdmissionPath } from "../_shared/worker-contract.js";
 
 export type AcceptedWorkerResult = { version: 2; workerId: string; runId: string; acceptedAt: string; result: WorkerResultSubmitInput & { repositories?: string[]; artifacts?: string[] } };
 export type WorkerTaskUpdate = { taskId: string; note: string; status?: "in_progress" | "blocked" };
@@ -18,8 +18,9 @@ export type WorkerTaskRead = { taskIds?: string[]; query?: string; offset?: numb
 type WorkerTaskReadDetails = { scope: "assigned" | "requested" | "search"; offset?: number; limit: number; totalAssigned: number; returned: number; nextOffset?: number; contentBytes: number; truncated: boolean };
 type WorkerTaskRelationView = { id: string; assigned: boolean; title: string; status: string; priority: number; issueType: string; dependencyType?: string; truncatedFields: string[] };
 type WorkerTaskView = { id: string; assigned: boolean; title: string; status: string; priority: number; issueType: string; assignee?: string; parent?: { id: string; assigned: boolean }; description?: string; notes?: string; acceptanceCriteria?: string; dependencyCount: number; dependentCount: number; dependencies: WorkerTaskRelationView[]; dependents: WorkerTaskRelationView[]; truncatedFields: string[] };
-type WorkerResultDetails = { accepted: true; resultFile: string } | { accepted: false; activeJobIds: string[] };
-const MAX_WORKER_TASK_READ_LIMIT = 32;
+type WorkerResultError = { code: string; path: string; message: string };
+type WorkerResultDetails = { status: "accepted"; outcome: string } | { status: "rejected"; errors: WorkerResultError[] };
+const MAX_WORKER_TASK_READ_LIMIT = 4;
 const MAX_WORKER_TASK_RELATIONS = 4;
 const MAX_WORKER_BEADS_OUTPUT_BYTES = 512 * 1024;
 const MAX_WORKER_TASK_READ_CONTENT_BYTES = 64 * 1024;
@@ -37,15 +38,15 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
   const cacheLineage = createWorkerCacheLineageRuntime(readCacheLineageEnvironment());
   registerWorkerCacheLineageRuntimeHooks(api, cacheLineage);
   api.registerTool(defineTool({
-    name: "worker_beads_tasks", label: "Worker Beads Tasks",
-    description: "Read assigned or relevant central Beads tasks, search bounded task metadata, or append progress to one assigned task. Only work and integration workers may update tasks; closure and dependency changes remain parent-owned.",
-    promptSnippet: "Read/search Beads tasks or update one assigned task with worker_beads_tasks.",
+    name: "worker_beads_tasks", label: "Read and Update Beads Tasks",
+    description: "Read bounded assigned or relevant central Beads tasks, search task metadata, or append a progress note to one assigned task. Work and integration workers may update only assigned tasks; review workers have read-only branches. The tool cannot close tasks or change dependencies.",
+    promptSnippet: "Read or search Beads tasks, and when permitted update one assigned task.",
     promptGuidelines: [
       "worker_beads_tasks use: Use assigned for this worker's task page, get for exact task IDs, search for bounded discovery, and update only for meaningful progress or blockers on one assigned task.",
       inputJsonSchemaGuideline("worker_beads_tasks", WorkerBeadsTasksParams),
       "worker_beads_tasks constraints: Reads are bounded. Updates append notes and may set only in_progress or blocked; review workers cannot update. The adapter never exposes the database, routing, or arbitrary commands."
     ],
-    parameters: WorkerBeadsTasksParams, executionMode: "sequential",
+    parameters: workerRuntimeRole() === "review" ? WorkerBeadsTasksReadParams : WorkerBeadsTasksParams, executionMode: "sequential",
     async execute(_id, params): Promise<AgentToolResult<unknown>> {
       assertRuntimeOpen("worker_beads_tasks");
       validateBeadsAction(params);
@@ -58,29 +59,40 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
   }));
   api.registerTool(defineTool({
     name: "worker_result_submit", label: "Submit Worker Result",
-    description: "Submit the final typed result for the current managed-worker run after every owned asynchronous shell job is durably terminal. Outcomes and allowed repository reporting depend on the worker role.",
-    promptSnippet: "Settle every shell job, then submit one final worker result.",
+    description: "End the current worker run by submitting a structured result. Use it for completed work, requests for guidance, blockers, and review verdicts. The tool records the outcome, summary, optional question, and reported repository and artifact paths, then seals the run and returns control to the parent. It does not approve work, apply repositories, close tasks, or discard the worker.",
+    promptSnippet: "Submit the current run’s completed work, request for guidance, blocker, or review verdict.",
     promptGuidelines: [
-      "worker_result_submit use: Call exactly once when the run should return to the parent. Use completed/approve/request_changes only with concise evidence; needs_input requires one focused question.",
+      "Use `worker_result_submit` when the current run should return control to the parent. Use `completed` only when the assigned work is finished, `needs_input` for parent-answerable questions required to continue, and `blocked` when an unavailable prerequisite or required intervention prevents progress. Review workers use `approve` or `request_changes` for completed reviews. Summarize the result and report useful repository and artifact entry points.",
       inputJsonSchemaGuideline("worker_result_submit", WorkerResultSubmitParams),
-      "worker_result_submit constraints: The runtime rejects active shell jobs, invalid role outcomes, paths outside the workspace, non-repository repository paths, duplicate paths, and review decisions without a report artifact."
+      "worker_result_submit constraints: Rejected semantic results return stable coded field errors and do not seal the run. The runtime canonicalizes every reported path and internally reconciles owned work before acceptance."
     ],
     parameters: WorkerResultSubmitParams, executionMode: "sequential",
     async execute(_id, params): Promise<AgentToolResult<WorkerResultDetails>> {
       const identity = workerRuntimeIdentity();
       if (existsSync(identity.resultFile)) throw new Error(`Worker result was already accepted for ${identity.workerId}/${identity.runId}.`);
-      const role = workerRuntimeRole();
-      validateWorkerResultInput(role, params);
-      const repositories = normalizeWorkspaceResultPaths(identity.workspaceRoot, params.repositories ?? [], "repository", resultPathMetadata);
-      const artifacts = normalizeWorkspaceResultPaths(identity.workspaceRoot, params.artifacts ?? [], "artifact", resultPathMetadata);
-      const admissionFile = beginWorkerHandoffAdmission(identity);
+      const errors: WorkerResultError[] = [];
+      let repositories: string[] = []; let artifacts: string[] = [];
       try {
-        const unsettledJobs = [...unsettledAsyncShellJobsForOwner(identity.owner), ...unsettledPersistedAsyncShellJobsForOwner(identity.asyncJobRoot, identity.owner)];
-        const activeJobIds = [...new Set(unsettledJobs.map((job) => job.jobId))].sort();
-        if (activeJobIds.length > 0) return { content: [{ type: "text", text: `Worker result was not accepted because ${activeJobIds.length} owned async-shell job${activeJobIds.length === 1 ? " is" : "s are"} still active: ${activeJobIds.join(", ")}.` }], details: { accepted: false, activeJobIds } };
+        validateWorkerResultInput(workerRuntimeRole(), params);
+        repositories = normalizeWorkspaceResultPaths(identity.workspaceRoot, params.repositories ?? [], "repository", resultPathMetadata);
+        artifacts = normalizeWorkspaceResultPaths(identity.workspaceRoot, params.artifacts ?? [], "artifact", resultPathMetadata);
+      } catch (error) {
+        const semantic = error instanceof WorkerResultValidationError ? error : undefined;
+        errors.push({ code: semantic?.code ?? "unsupported_path_type", path: semantic?.fieldPath ?? "result", message: error instanceof Error ? error.message : String(error) });
+      }
+      if (errors.length) return rejectedResult(errors);
+      const admissionFile = beginWorkerResultAdmission(identity);
+      try {
+        await cancelAsyncShellJobsForOwner(identity.owner, "SIGTERM", 2_000);
+        await cancelPersistedAsyncShellJobsForOwner(identity.asyncJobRoot, identity.owner, 2_000);
+        const active = [...activeAsyncShellJobsForOwner(identity.owner), ...unsettledPersistedAsyncShellJobsForOwner(identity.asyncJobRoot, identity.owner)].filter((job) => job.status === "running" || job.status === "unknown");
+        if (active.length) return rejectedResult([{ code: "unsupported_path_type", path: "run", message: `Owned asynchronous work could not be reconciled: ${[...new Set(active.map((job) => job.jobId))].sort().join(", ")}.` }]);
         const accepted: AcceptedWorkerResult = { version: 2, workerId: identity.workerId, runId: identity.runId, acceptedAt: new Date().toISOString(), result: { ...params, ...(repositories.length ? { repositories } : {}), ...(artifacts.length ? { artifacts } : {}) } };
         writeAtomicJson(identity.resultFile, accepted);
-        return { content: [{ type: "text", text: `Worker result accepted for ${identity.workerId}/${identity.runId}.` }], details: { accepted: true, resultFile: identity.resultFile } };
+        const details = { status: "accepted" as const, outcome: params.outcome };
+        return { content: [{ type: "text", text: `Worker result accepted for ${identity.workerId}/${identity.runId}.` }], details };
+      } catch (error) {
+        return rejectedResult([{ code: "unsupported_path_type", path: "run", message: error instanceof Error ? error.message : String(error) }]);
       } finally { rmSync(admissionFile, { force: true }); }
     }
   }));
@@ -97,17 +109,8 @@ export function readWorkerRuntimeResult(resultFile: string): AcceptedWorkerResul
 }
 
 
-/** Internal compatibility envelope for the existing durable host settlement machinery. */
-export type AcceptedWorkerHandoff = LegacyAcceptedWorkerHandoff;
-export function readWorkerRuntimeHandoff(resultFile: string): AcceptedWorkerHandoff {
-  const accepted = readWorkerRuntimeResult(resultFile);
-  const outcome = accepted.result.outcome;
-  const state: AcceptedWorkerHandoff["handoff"]["state"] = outcome === "completed" || outcome === "approve" || outcome === "request_changes" ? "assignment_complete" : outcome;
-  return { version: 1, workerId: accepted.workerId, runId: accepted.runId, acceptedAt: accepted.acceptedAt, handoff: {
-    state, summary: accepted.result.summary, taskUpdates: [],
-    ...(accepted.result.repositories?.length ? { repositories: accepted.result.repositories.map((workspaceRepo) => ({ workspaceRepo, purpose: "Reported worker repository" })) } : {}),
-    checks: [], ...(accepted.result.question ? { question: accepted.result.question } : {})
-  } };
+function rejectedResult(errors: WorkerResultError[]): AgentToolResult<WorkerResultDetails> {
+  return { content: [{ type: "text", text: `Worker result rejected: ${errors.map((error) => `${error.code} at ${error.path}: ${error.message}`).join("; ")}` }], details: { status: "rejected", errors } };
 }
 
 function validateBeadsAction(params: any): void {
@@ -124,7 +127,7 @@ function resultPathMetadata(value: string): { exists: boolean; directory: boolea
   if (!existsSync(value)) return { exists: false, directory: false, file: false, repository: false };
   const metadata = lstatSync(value);
   let repository = false;
-  if (metadata.isDirectory()) { try { execFileSync("git", ["-C", value, "rev-parse", "--git-dir"], { stdio: "ignore", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" } }); repository = true; } catch {} }
+  if (metadata.isDirectory()) { try { trustedGit(value, ["rev-parse", "--git-dir"]); repository = true; } catch {} }
   return { exists: true, directory: metadata.isDirectory(), file: metadata.isFile(), repository };
 }
 
@@ -342,26 +345,22 @@ function workerRuntimeIdentity(): {
   workspaceRoot: string;
   asyncJobRoot: string;
   owner: AsyncShellJobOwner;
-  integration?: WorkerIntegrationRecord;
 } {
   const workerId = requiredEnvironment("PI_WORKER_ID");
   const runId = requiredEnvironment("PI_WORKER_RUN_ID");
-  const integrationValue = process.env.PI_WORKER_INTEGRATION?.trim();
-  const integration = integrationValue ? JSON.parse(integrationValue) as WorkerIntegrationRecord : undefined;
-  return {
-    workerId,
-    runId,
-    resultFile: path.resolve(requiredEnvironment("PI_WORKER_RESULT_FILE")),
-    workspaceRoot: path.resolve(requiredEnvironment("PI_WORKER_WORKSPACE_ROOT")),
-    asyncJobRoot: path.resolve(requiredEnvironment("PI_WORKER_ASYNC_JOB_ROOT")),
-    integration,
-    owner: { kind: "worker-run", workerId, runId }
-  };
+  const stateRoot = realpathSync(path.resolve(requiredEnvironment("PI_WORKER_STATE_ROOT")));
+  const workspaceRoot = realpathSync(path.resolve(requiredEnvironment("PI_WORKER_WORKSPACE_ROOT")));
+  const asyncJobRoot = realpathSync(path.resolve(requiredEnvironment("PI_WORKER_ASYNC_JOB_ROOT")));
+  const requestedResult = path.resolve(requiredEnvironment("PI_WORKER_RESULT_FILE"));
+  if (existsSync(requestedResult) && lstatSync(requestedResult).isSymbolicLink()) throw new Error("PI_WORKER_RESULT_FILE may not be a symbolic link.");
+  const resultFile = path.join(realpathSync(path.dirname(requestedResult)), path.basename(requestedResult));
+  if (!pathWithin(stateRoot, resultFile) || !pathWithin(stateRoot, asyncJobRoot)) throw new Error("Worker runtime state paths must remain beneath PI_WORKER_STATE_ROOT.");
+  return { workerId, runId, resultFile, workspaceRoot, asyncJobRoot, owner: { kind: "worker-run", workerId, runId } };
 }
 
-function beginWorkerHandoffAdmission(identity: ReturnType<typeof workerRuntimeIdentity>): string {
+function beginWorkerResultAdmission(identity: ReturnType<typeof workerRuntimeIdentity>): string {
   mkdirSync(path.dirname(identity.resultFile), { recursive: true, mode: 0o700 });
-  const admissionFile = workerHandoffAdmissionPath(identity.resultFile);
+  const admissionFile = workerResultAdmissionPath(identity.resultFile);
   try {
     writeFileSync(admissionFile, `${JSON.stringify({
       version: 1,
@@ -372,12 +371,14 @@ function beginWorkerHandoffAdmission(identity: ReturnType<typeof workerRuntimeId
     })}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
   } catch (cause) {
     if ((cause as NodeJS.ErrnoException).code === "EEXIST") {
-      throw new Error(`Worker handoff admission is already active for ${identity.workerId}/${identity.runId}.`);
+      throw new Error(`Worker result admission is already active for ${identity.workerId}/${identity.runId}.`);
     }
     throw cause;
   }
   return admissionFile;
 }
+
+function pathWithin(root: string, candidate: string): boolean { const relative = path.relative(root, candidate); return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)); }
 
 function requiredEnvironment(name: string): string {
   const value = process.env[name]?.trim();
@@ -568,7 +569,7 @@ function workerTaskUpdateOutputSchema() {
   }, { additionalProperties: false });
 }
 
-function workerHandoffOutputSchema() {
+function workerResultOutputSchema() {
   const textContent = Type.Object({ type: Type.Literal("text"), text: Type.String() }, { additionalProperties: false });
   return Type.Object({
     content: Type.Array(textContent, { minItems: 1, maxItems: 1 }),

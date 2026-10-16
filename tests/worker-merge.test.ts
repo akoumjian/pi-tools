@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -78,10 +78,35 @@ test("integration transfer refuses a target that moved after conflict preparatio
 });
 
 
-test("merge preparation rejects callback-bearing Git attributes", () => {
+test("merge preparation permits inert attributes under trusted config", () => {
   const f = fixture();
   try {
     commit(f.candidate, ".gitattributes", "*.txt merge=hostile\n", "hostile attributes");
-    assert.throws(() => prepareWorkerMerges("/parent.jsonl", [{ id: "unsafe", candidateRepo: f.candidate, targetRepo: f.target, targetRef: "refs/heads/main", method: "merge", commitMessage: "unsafe" }], { preparedRoot: f.preparedRoot, targetRoot: f.targets, randomHex: () => "f".repeat(24) }), /callback-bearing/);
+    const prepared = prepareWorkerMerges("/parent.jsonl", [{ id: "unsafe", candidateRepo: f.candidate, targetRepo: f.target, targetRef: "refs/heads/main", method: "merge", commitMessage: "safe attributes" }], { preparedRoot: f.preparedRoot, targetRoot: f.targets, randomHex: () => "f".repeat(24) });
+    assert.equal(prepared.status, "ready");
+  } finally { f.close(); }
+});
+
+test("merge preparation rejects hostile local Git callbacks before any hook executes", () => {
+  const f = fixture(); try {
+    const marker = path.join(f.root, "executed"); const hook = path.join(f.root, "fsmonitor.sh"); writeFileSync(hook, `#!/bin/sh\ntouch '${marker}'\n`); execFileSync("chmod", ["+x", hook]); git(f.candidate, ["config", "core.fsmonitor", hook]);
+    assert.throws(() => prepareWorkerMerges("/parent.jsonl", [{ id: "unsafe-config", candidateRepo: f.candidate, targetRepo: f.target, targetRef: "refs/heads/main", method: "merge", commitMessage: "unsafe" }], { preparedRoot: f.preparedRoot, targetRoot: f.targets, randomHex: () => "1".repeat(24) }), /core.fsmonitor/); assert.equal(existsSync(marker), false);
+  } finally { f.close(); }
+});
+
+test("merge preparation reuses candidate HEAD when it already contains the exact target", () => {
+  const f = fixture(); try {
+    const candidateHead = commit(f.candidate, "candidate.txt", "candidate\n", "candidate");
+    const set = prepareWorkerMerges("/parent.jsonl", [{ id: "integrated", candidateRepo: f.candidate, targetRepo: f.target, targetRef: "refs/heads/main", method: "merge", commitMessage: "must not create redundant merge" }], { preparedRoot: f.preparedRoot, targetRoot: f.targets, randomHex: () => "2".repeat(24) });
+    assert.equal(set.repositories[0]?.desiredCommit, candidateHead); assert.equal(git(set.repositories[0]!.preparedPath, ["rev-parse", "refs/worker/candidate"]), candidateHead); assert.equal(git(set.repositories[0]!.preparedPath, ["rev-parse", "HEAD"]), candidateHead);
+  } finally { f.close(); }
+});
+
+test("merge preparation rejects replace refs and graft metadata", () => {
+  const f = fixture(); try {
+    const head = git(f.candidate, ["rev-parse", "HEAD"]); git(f.candidate, ["update-ref", `refs/replace/${head}`, head]);
+    assert.throws(() => prepareWorkerMerges("/parent.jsonl", [{ id: "replace", candidateRepo: f.candidate, targetRepo: f.target, targetRef: "refs/heads/main", method: "merge", commitMessage: "no" }], { preparedRoot: f.preparedRoot, targetRoot: f.targets, randomHex: () => "3".repeat(24) }), /replace refs/);
+    git(f.candidate, ["update-ref", "-d", `refs/replace/${head}`]); const graft = path.join(f.candidate, ".git", "info", "grafts"); writeFileSync(graft, `${head}\n`);
+    assert.throws(() => prepareWorkerMerges("/parent.jsonl", [{ id: "graft", candidateRepo: f.candidate, targetRepo: f.target, targetRef: "refs/heads/main", method: "merge", commitMessage: "no" }], { preparedRoot: f.preparedRoot, targetRoot: f.targets, randomHex: () => "4".repeat(24) }), /grafts/);
   } finally { f.close(); }
 });

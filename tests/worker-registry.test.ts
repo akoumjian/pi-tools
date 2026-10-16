@@ -4,9 +4,12 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import {
+  claimWorkerCancellation,
   claimWorkerDelivery,
   createWorkerAndRun,
+  createWorkerRunBatch,
   discardWorkerRegistryRecord,
+  finalizeClaimedWorkerRun,
   getWorker,
   getWorkerRun,
   leaseWorkerForReview,
@@ -144,3 +147,35 @@ test("delivery reconciliation marks session-observed IDs and requeues uncertain 
     reconcileWorkerDeliveries(f.registry, parent, [deliveryId]); assert.equal(pendingWorkerDeliveries(f.registry, parent).length, 0);
   } finally { f.close(); }
 });
+
+test("batch publication rolls back workers and review leases on a later insert failure", () => {
+  const f = fixture(); try {
+    const subjectId = "worker_20260101000000_subject1"; const subjectRun = "run_20260101000000_subject1"; const reviewerId = "worker_20260101000000_review11"; const reviewerRun = "run_20260101000000_review11";
+    createWorkerAndRun(f.registry, { workerId: subjectId, parentSessionFile: "/sessions/parent.jsonl", role: "work", status: "queued", activeRunId: subjectRun, taskIds: ["personal-test"], workspaceRoot: "/workspace/subject", createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }, queuedRun(subjectId, subjectRun));
+    settleWorkerRun(f.registry, { parentSessionFile: "/sessions/parent.jsonl", workerId: subjectId, runId: subjectRun, outcome: "completed", outcomeSource: "worker", settledAt: "2026-01-01T00:00:01.000Z" });
+    const worker = { workerId: reviewerId, parentSessionFile: "/sessions/parent.jsonl", role: "review" as const, status: "queued" as const, activeRunId: reviewerRun, taskIds: ["personal-test"], workspaceRoot: "/workspace/reviewer", runtime: {}, createdAt: "2026-01-01T00:00:02.000Z", updatedAt: "2026-01-01T00:00:02.000Z" };
+    assert.throws(() => createWorkerRunBatch(f.registry, { items: [
+      { kind: "new", worker, run: { ...queuedRun(reviewerId, reviewerRun), binding: { reviewedWorkerId: subjectId, reviewedRunId: subjectRun } } },
+      { kind: "new", worker, run: { ...queuedRun(reviewerId, "run_20260101000000_duplicate"), runId: "run_20260101000000_duplicate" } }
+    ], reviewLeases: [{ subjectWorkerId: subjectId, reviewerWorkerId: reviewerId, reviewedRunId: subjectRun }], now: "2026-01-01T00:00:02.000Z" }));
+    assert.equal(getWorker(f.registry, reviewerId), undefined); assert.equal(getWorker(f.registry, subjectId)?.reviewedByWorkerId, undefined);
+  } finally { f.close(); }
+});
+
+test("cancellation CAS revokes an in-flight launch and finalizes one cancelled delivery", () => {
+  const f = fixture(); try {
+    const workerId = "worker_20260101000000_cancel11"; const runId = "run_20260101000000_cancel11"; const parent = "/sessions/parent.jsonl";
+    createWorkerAndRun(f.registry, { workerId, parentSessionFile: parent, role: "work", status: "queued", activeRunId: runId, taskIds: ["personal-test"], workspaceRoot: "/workspace/cancel", runtime: {}, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }, queuedRun(workerId, runId));
+    const launchNonce = "launch"; assert.equal((awaitableClaim(f.registry, workerId, runId, launchNonce)), true);
+    assert.equal(claimWorkerCancellation(f.registry, workerId, runId, "cancel", "2026-01-01T00:00:01.000Z"), true);
+    finalizeClaimedWorkerRun(f.registry, { parentSessionFile: parent, workerId, runId, claimKind: "cancellation", claimNonce: "cancel", outcome: "cancelled", outcomeSource: "system", settledAt: "2026-01-01T00:00:02.000Z" });
+    assert.equal(getWorkerRun(f.registry, workerId, runId)?.outcome, "cancelled"); assert.equal(pendingWorkerDeliveries(f.registry, parent).length, 1);
+    assert.throws(() => finalizeClaimedWorkerRun(f.registry, { parentSessionFile: parent, workerId, runId, claimKind: "cancellation", claimNonce: "cancel", outcome: "cancelled", outcomeSource: "system", settledAt: "2026-01-01T00:00:03.000Z" }), /changed state/);
+    assert.equal(pendingWorkerDeliveries(f.registry, parent).length, 1);
+  } finally { f.close(); }
+});
+
+function awaitableClaim(registry: ReturnType<typeof openWorkerRegistry>, workerId: string, runId: string, nonce: string): boolean {
+  const result = registry.database.prepare("UPDATE runs SET claim_kind='launch',claim_nonce=? WHERE worker_id=? AND run_id=? AND claim_kind IS NULL").run(nonce, workerId, runId);
+  return Number(result.changes) === 1;
+}

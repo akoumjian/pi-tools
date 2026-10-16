@@ -9,10 +9,6 @@ export type WorkerModelPreferences = Record<WorkerRole, string[]>;
 export type WorkerSettings = {
   modelPreferences: WorkerModelPreferences;
   configSource: string;
-  /** Internal bridge for the pre-v2 launcher during this release. */
-  defaultRoute: string;
-  reviewRoute: string;
-  reviewRateLimitFallbackRoute?: string;
 };
 
 export function readWorkerSettings(settingsPath?: ConfigPath): WorkerSettings {
@@ -31,11 +27,7 @@ export function normalizeWorkerSettings(value: unknown, configSource: string): W
   const preferences = Object.fromEntries(roles.map((role) => [role, normalizeSelections((value.modelPreferences as Record<string, unknown>)[role], role, configSource)])) as WorkerModelPreferences;
   const extraRoles = Object.keys(value.modelPreferences).filter((role) => !roles.includes(role as WorkerRole));
   if (extraRoles.length) throw new Error(`${configSource} modelPreferences contains unsupported roles: ${extraRoles.join(", ")}.`);
-  return {
-    modelPreferences: preferences, configSource,
-    defaultRoute: preferences.work[0]!, reviewRoute: preferences.review[0]!,
-    ...(preferences.review[1]?.startsWith(preferences.review[0]!.split("/")[0] + "/") ? { reviewRateLimitFallbackRoute: preferences.review[1] } : {})
-  };
+  return { modelPreferences: preferences, configSource };
 }
 
 export function preferredWorkerModel(role: WorkerRole, explicit?: string, settings = readWorkerSettings()): string[] {
@@ -50,7 +42,7 @@ function normalizeSelections(value: unknown, role: WorkerRole, source: string): 
   return selections;
 }
 function normalizeSelection(value: unknown, label: string): string {
-  if (typeof value !== "string" || !value.trim() || value.length > 512 || !/^[^\s/:]+\/[^\s]+:(?:off|minimal|low|medium|high|xhigh)$/.test(value.trim())) throw new Error(`${label} must be an exact provider/model:thinking selection of at most 512 characters.`);
+  if (typeof value !== "string" || !value.trim() || Buffer.byteLength(value.trim()) > 512 || !/^[^\s/:]+\/[^\s]+:(?:off|minimal|low|medium|high|xhigh)$/.test(value.trim())) throw new Error(`${label} must be an exact provider/model:thinking selection of at most 512 UTF-8 bytes.`);
   const selection = value.trim(); assertSubagentRouteSpecAllowed(selection, label); return selection;
 }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }

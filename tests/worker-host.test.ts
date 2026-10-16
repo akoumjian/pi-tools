@@ -7,10 +7,15 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { defaultWorkerExtensionPaths, launchWorkerHost } from "../extensions/worker/runner.js";
-import { readWorkerRuntimeHandoff } from "../extensions/worker/runtime.js";
+import { defaultWorkerExtensionPaths, launchWorkerHost, type WorkerLaunchRecord } from "../extensions/worker/runner.js";
+import { readWorkerRuntimeResult } from "../extensions/worker/runtime.js";
 import { forkWorkerSession } from "../extensions/worker/session.js";
-import { WORKER_RECORD_VERSION, type WorkerRecord } from "../extensions/worker/state.js";
+const WORKER_RECORD_VERSION = 1;
+type WorkerRecord = {
+  version: number; workerId: string; sessionId: string; sessionFile?: string; workspaceRoot: string; taskIds: string[];
+  route: { provider: string; model: string; thinkingLevel: string }; role?: "work" | "review" | "integration";
+  activeRun?: { runId: string; jobId: string; status: string }; [key: string]: unknown;
+};
 
 const TEST_BEADS_ROUTE = { prefix: "personal" as const, path: "/test/central-beads", databasePath: "/test/central-beads/database" };
 
@@ -64,12 +69,17 @@ function assistantMessage(text: string) {
   };
 }
 
+function launchRecord(record: WorkerRecord): WorkerLaunchRecord {
+  if (!record.activeRun || !record.sessionFile) throw new Error("test record is not launchable");
+  return { workerId: record.workerId, runId: record.activeRun.runId, jobId: record.activeRun.jobId, sessionId: record.sessionId, sessionFile: record.sessionFile, workspaceRoot: record.workspaceRoot, taskIds: record.taskIds, role: record.role ?? "work", modelSelection: `${record.route.provider}/${record.route.model}:${record.route.thinkingLevel}` };
+}
+
 test("worker host completes an exact-fork fake-provider run while ignoring workspace startup poison", async () => {
   await withTempDir(async (directory) => {
     const parentCwd = path.join(directory, "parent");
     const parentSessionDir = path.join(directory, "parent-sessions");
-    const workspaceRoot = path.join(directory, "workspace");
     const stateDir = path.join(directory, "state");
+    const workspaceRoot = path.join(stateDir, "workspace");
     const sessionDir = path.join(stateDir, "session");
     const runDir = path.join(stateDir, "runs", "run-test");
     const resultFile = path.join(runDir, "result.json");
@@ -77,6 +87,7 @@ test("worker host completes an exact-fork fake-provider run while ignoring works
       mkdir(parentCwd, { recursive: true }),
       mkdir(workspaceRoot, { recursive: true }),
       mkdir(sessionDir, { recursive: true }),
+      mkdir(path.join(stateDir, "async-shell"), { recursive: true }),
       mkdir(path.join(workspaceRoot, ".pi", "extensions"), { recursive: true })
     ]);
 
@@ -120,7 +131,7 @@ test("worker host completes an exact-fork fake-provider run while ignoring works
       isIdle: () => true
     } as ExtensionContext;
     const launched = launchWorkerHost(api, context, {
-      record,
+      record: launchRecord(record),
       shellExecution: { kind: "native-test" },
       prompt: "WORKER_PROMPT_MARKER: verify the managed worker lifecycle.",
       resultFile,
@@ -129,7 +140,6 @@ test("worker host completes an exact-fork fake-provider run while ignoring works
       processNonce: "host-process-e2e",
       bdPath: process.execPath,
       beadsRoute: TEST_BEADS_ROUTE,
-      jobId: record.activeRun!.jobId,
       extensionPaths: [...defaultWorkerExtensionPaths(), fakeProviderExtension]
     });
     const config = JSON.parse(await readFile(launched.configFile, "utf8")) as { extensionPaths: string[]; rpcArgs: string[]; timeoutMs?: number };
@@ -142,12 +152,12 @@ test("worker host completes an exact-fork fake-provider run while ignoring works
     assert.equal(job.status, "exited", await readFile(job.stderrLog, "utf8"));
     assert.equal(job.exitCode, 0);
 
-    const accepted = readWorkerRuntimeHandoff(resultFile);
+    const accepted = readWorkerRuntimeResult(resultFile);
     assert.equal(accepted.workerId, record.workerId);
     assert.equal(accepted.runId, "run-test");
-    assert.equal(accepted.handoff.state, "assignment_complete");
-    assert.match(accepted.handoff.summary, /verified the exact fork/);
-    assert.match(accepted.handoff.summary, /verified the exact fork/);
+    assert.equal(accepted.result.outcome, "completed");
+    assert.match(accepted.result.summary, /verified the exact fork/);
+    assert.match(accepted.result.summary, /verified the exact fork/);
     assert.equal(existsSync(path.join(workspaceRoot, "poison-loaded")), false);
     assert.equal(existsSync(path.join(workspaceRoot, "post-handoff-side-effect")), false);
     const workerSession = await readFile(forked.sessionFile, "utf8");
@@ -198,7 +208,7 @@ test("worker host waits for the settled follow-up turn after asynchronous shell 
       sessionManager: { getSessionId: () => "parent-session-multiturn" },
       isIdle: () => true
     } as ExtensionContext, {
-      record,
+      record: launchRecord(record),
       shellExecution: { kind: "native-test" },
       prompt: "Complete the multiturn lifecycle.",
       resultFile,
@@ -207,14 +217,13 @@ test("worker host waits for the settled follow-up turn after asynchronous shell 
       processNonce: "host-process-multiturn",
       bdPath: process.execPath,
       beadsRoute: TEST_BEADS_ROUTE,
-      jobId: record.activeRun!.jobId,
       extensionPaths: [...defaultWorkerExtensionPaths(), providerExtension]
     });
     const keepAlive = setInterval(() => {}, 100);
     const job = await launched.handle.completion.finally(() => clearInterval(keepAlive));
     assert.equal(job.status, "exited", await readFile(job.stderrLog, "utf8"));
     assert.equal(job.exitCode, 0);
-    assert.equal(readWorkerRuntimeHandoff(resultFile).handoff.state, "assignment_complete");
+    assert.equal(readWorkerRuntimeResult(resultFile).result.outcome, "completed");
     assert.ok(existsSync(path.join(runDir, "settled.json")));
   });
 });
@@ -256,7 +265,7 @@ test("worker host fails promptly when a quiescent worker settles without typed r
       sessionManager: { getSessionId: () => "parent-session-no-handoff" },
       isIdle: () => true
     } as ExtensionContext, {
-      record,
+      record: launchRecord(record),
       shellExecution: { kind: "native-test" },
       prompt: "Settle without a result.",
       resultFile: path.join(runDir, "result.json"),
@@ -265,7 +274,6 @@ test("worker host fails promptly when a quiescent worker settles without typed r
       processNonce: "host-process-no-handoff",
       bdPath: process.execPath,
       beadsRoute: TEST_BEADS_ROUTE,
-      jobId: record.activeRun!.jobId,
       extensionPaths: [...defaultWorkerExtensionPaths(), providerExtension]
     });
     const keepAlive = setInterval(() => {}, 100);
@@ -323,7 +331,7 @@ test("cancelling a worker host leaves no worker-owned async-shell process alive"
       isIdle: () => true
     } as ExtensionContext;
     const launched = launchWorkerHost(api, context, {
-      record,
+      record: launchRecord(record),
       shellExecution: { kind: "native-test" },
       prompt: "Start the cancellation probe.",
       resultFile,
@@ -332,7 +340,6 @@ test("cancelling a worker host leaves no worker-owned async-shell process alive"
       processNonce: "host-process-cancel",
       bdPath: process.execPath,
       beadsRoute: TEST_BEADS_ROUTE,
-      jobId: record.activeRun!.jobId,
       timeoutMs: 30_000,
       extensionPaths: [...defaultWorkerExtensionPaths(), providerExtension]
     });
@@ -363,7 +370,7 @@ test("cancelling a worker host leaves no worker-owned async-shell process alive"
       activeRun: { runId: "run-timeout", jobId: "job_20260910200000_timeout1", status: "running" }
     };
     const timedOut = launchWorkerHost(api, context, {
-      record: timeoutRecord,
+      record: launchRecord(timeoutRecord),
       shellExecution: { kind: "native-test" },
       prompt: "Start the timeout cleanup probe.",
       resultFile: path.join(timeoutRunDir, "result.json"),
@@ -372,7 +379,6 @@ test("cancelling a worker host leaves no worker-owned async-shell process alive"
       processNonce: "host-process-timeout",
       bdPath: process.execPath,
       beadsRoute: TEST_BEADS_ROUTE,
-      jobId: timeoutRecord.activeRun!.jobId,
       timeoutMs: 1_000,
       extensionPaths: [...defaultWorkerExtensionPaths(), providerExtension]
     });

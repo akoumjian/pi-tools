@@ -194,7 +194,7 @@ const samples: Record<RetainedToolName, unknown> = {
   },
   worker_control: {
     content: [text("0 workers")],
-    details: { action: "list", workers: [], total: 0, counts: { idle: 0, queued: 0, running: 0 } }
+    details: { workers: [], total: 0, counts: { idle: 0, queued: 0, running: 0 } }
   },
   worker_merge_test: {
     content: [text("ready")],

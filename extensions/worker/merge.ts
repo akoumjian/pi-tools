@@ -1,8 +1,8 @@
-import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
+import { assertTrustedGitPolicy, canonicalRepository as trustedCanonicalRepository, runTrustedGit } from "./trusted-git.js";
 
 export type WorkerMergeMethod = "merge" | "squash";
 export type WorkerMergeTestRepositoryInput = {
@@ -31,6 +31,8 @@ export type PreparedMergeRepository = {
   dependsOn: string[];
   source?: ManagedCandidateSource;
   warnings?: string[];
+  targetPrivateRef: string; candidatePrivateRef: string; mergeBase: string;
+  conflicts?: Array<{ path: string; status: string }>; mergeMessages?: string[];
 };
 export type PreparedMergeSet = {
   version: 1;
@@ -120,6 +122,21 @@ export function consumePreparedMergeSet(parentSessionFile: string, preparedId: s
   return moved;
 }
 
+export function restoreConsumedPreparedMergeSet(parentSessionFile: string, preparedId: string, workerWorkspace: string, options: MergeRuntimeOptions = {}): void {
+  const root = path.resolve(options.preparedRoot ?? defaultPreparedMergeRoot());
+  const source = path.join(path.resolve(workerWorkspace), "prepared", preparedId);
+  const destination = path.join(root, preparedId);
+  if (!existsSync(source)) return;
+  if (existsSync(destination)) throw new Error(`Cannot roll back consumed prepared set because destination exists: ${destination}.`);
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const set = JSON.parse(readFileSync(path.join(source, "prepared.json"), "utf8")) as PreparedMergeSet;
+  if (path.resolve(set.parentSessionFile) !== path.resolve(parentSessionFile)) throw new Error(`Prepared set ${preparedId} rollback parent mismatch.`);
+  const restored = { ...set, repositories: set.repositories.map((item) => ({ ...item, preparedPath: path.join(destination, item.id) })) };
+  delete restored.consumedByWorkerId;
+  writeJson(path.join(source, "prepared.json"), restored);
+  renameSync(source, destination);
+}
+
 export function applyPreparedWorkerMerges(parentSessionFile: string, preparedId: string, options: MergeRuntimeOptions = {}): WorkerMergeApplyResult {
   const set = readPreparedMergeSet(parentSessionFile, preparedId, options);
   if (set.status !== "ready") throw new Error(`Prepared set ${preparedId} is not ready.`);
@@ -157,53 +174,58 @@ export function applyPreparedWorkerMerges(parentSessionFile: string, preparedId:
     }
   }
   const setRoot = path.dirname(path.resolve(ordered[0]?.preparedPath ?? path.join(options.preparedRoot ?? defaultPreparedMergeRoot(), preparedId, "placeholder")));
-  if (path.basename(setRoot) === preparedId) {
-    for (const repository of ordered) rmSync(repository.preparedPath, { recursive: true, force: true });
-  }
+  if (path.basename(setRoot) === preparedId) rmSync(setRoot, { recursive: true, force: true });
   return { preparedId, status: "completed", repositories: results };
 }
 
 function prepareOne(input: Required<Pick<WorkerMergeTestRepositoryInput, "id" | "candidateRepo" | "candidateRef" | "targetRepo" | "targetRef" | "method" | "commitMessage">> & { dependsOn: string[] }, preparedPath: string, sourceResolver?: MergeRuntimeOptions["sourceForCandidate"]): PreparedMergeRepository {
   const branch = input.targetRef.slice("refs/heads/".length);
+  assertTrustedGitPolicy(input.targetRepo); assertTrustedGitPolicy(input.candidateRepo);
   runGit(["clone", "--no-local", "--no-tags", "--single-branch", "--branch", branch, input.targetRepo, preparedPath]);
   const expectedCommit = git(preparedPath, ["rev-parse", "HEAD"]);
+  const targetPrivateRef = "refs/worker/target"; const candidatePrivateRef = "refs/worker/candidate";
+  git(preparedPath, ["update-ref", targetPrivateRef, expectedCommit]);
   assertSafeGitTree(preparedPath, expectedCommit, input.id, "target");
   git(preparedPath, ["checkout", "--detach", expectedCommit]);
   git(preparedPath, ["remote", "remove", "origin"]);
   const candidateCommit = git(input.candidateRepo, ["rev-parse", `${input.candidateRef}^{commit}`]);
   assertSafeGitTree(input.candidateRepo, candidateCommit, input.id, "candidate");
-  git(preparedPath, ["fetch", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", input.candidateRepo, `${candidateCommit}:refs/worker/candidate`]);
-  if (git(preparedPath, ["rev-parse", "refs/worker/candidate^{commit}"]) !== candidateCommit) throw new Error(`Candidate commit changed during preparation for ${input.id}.`);
+  assertNoCrossTreeSymlinkEscape(preparedPath, expectedCommit, input.candidateRepo, candidateCommit, input.id);
+  git(preparedPath, ["fetch", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", input.candidateRepo, `${candidateCommit}:${candidatePrivateRef}`]);
+  if (git(preparedPath, ["rev-parse", `${candidatePrivateRef}^{commit}`]) !== candidateCommit) throw new Error(`Candidate commit changed during preparation for ${input.id}.`);
+  const mergeBase = git(preparedPath, ["merge-base", targetPrivateRef, candidatePrivateRef]);
   let status: PreparedMergeRepository["status"] = "ready";
-  try {
-    if (input.method === "merge") {
-      runGitIn(preparedPath, ["-c", "user.name=Managed Worker", "-c", "user.email=worker@localhost", "merge", "--no-edit", "--no-ff", "--no-commit", "refs/worker/candidate"]);
-    } else {
-      runGitIn(preparedPath, ["-c", "user.name=Managed Worker", "-c", "user.email=worker@localhost", "merge", "--squash", "refs/worker/candidate"]);
-    }
-  } catch {
-    const overlapCount = unmergedCount(preparedPath);
-    if (overlapCount === 0) throw new Error(`Git ${input.method} failed for ${input.id} without conflict state.`);
-    status = "resolution_required";
-  }
   let desiredCommit: string | undefined;
-  const overlapCount = unmergedCount(preparedPath);
-  if (status === "ready") {
-    if (hasIndexChanges(preparedPath)) {
-      runGitIn(preparedPath, ["-c", "user.name=Managed Worker", "-c", "user.email=worker@localhost", "commit", "--no-verify", "-m", input.commitMessage]);
-      desiredCommit = git(preparedPath, ["rev-parse", "HEAD"]);
-    } else {
-      desiredCommit = expectedCommit;
+  const targetIsAncestor = gitSucceeds(preparedPath, ["merge-base", "--is-ancestor", targetPrivateRef, candidatePrivateRef]);
+  if (input.method === "merge" && targetIsAncestor) {
+    desiredCommit = candidateCommit;
+    git(preparedPath, ["checkout", "--detach", candidatePrivateRef]);
+  } else {
+    try {
+      if (input.method === "merge") runGitIn(preparedPath, ["-c", "user.name=Managed Worker", "-c", "user.email=worker@localhost", "merge", "--no-edit", "--no-ff", "--no-commit", candidatePrivateRef]);
+      else runGitIn(preparedPath, ["-c", "user.name=Managed Worker", "-c", "user.email=worker@localhost", "merge", "--squash", candidatePrivateRef]);
+    } catch {
+      if (unmergedCount(preparedPath) === 0) throw new Error(`Git ${input.method} failed for ${input.id} without conflict state.`);
+      status = "resolution_required";
+    }
+    if (status === "ready") {
+      if (hasIndexChanges(preparedPath)) {
+        runGitIn(preparedPath, ["-c", "user.name=Managed Worker", "-c", "user.email=worker@localhost", "commit", "--no-verify", "-m", input.commitMessage]);
+        desiredCommit = git(preparedPath, ["rev-parse", "HEAD"]);
+      } else desiredCommit = expectedCommit;
     }
   }
+  const conflicts = status === "resolution_required" ? conflictEvidence(preparedPath) : [];
+  const overlapCount = conflicts.length;
+  const mergeMessages = status === "resolution_required" ? boundedMergeMessages(preparedPath) : [];
   const provenance = sourceResolver?.(input.candidateRepo, candidateCommit) ?? {};
   return {
     id: input.id, candidateRepo: input.candidateRepo, candidateCommit, targetRepo: input.targetRepo, targetRef: input.targetRef,
     method: input.method, status, expectedCommit, ...(desiredCommit ? { desiredCommit } : {}), preparedPath, overlapCount, dependsOn: input.dependsOn,
+    targetPrivateRef, candidatePrivateRef, mergeBase, ...(conflicts.length ? { conflicts } : {}), ...(mergeMessages.length ? { mergeMessages } : {}),
     ...(provenance.source ? { source: provenance.source } : {}), ...(provenance.warnings?.length ? { warnings: provenance.warnings } : {})
   };
 }
-
 function validateMergeInputs(inputs: WorkerMergeTestRepositoryInput[], targetRoot: string) {
   if (inputs.length < 1 || inputs.length > 16) throw new Error("worker_merge_test requires 1 to 16 repositories.");
   const ids = new Set<string>();
@@ -214,13 +236,15 @@ function validateMergeInputs(inputs: WorkerMergeTestRepositoryInput[], targetRoo
     ids.add(item.id);
     if (!/^refs\/heads\/[A-Za-z0-9][A-Za-z0-9._/-]{0,239}$/.test(item.targetRef)) throw new Error(`Invalid targetRef for ${item.id}.`);
     if (!item.commitMessage || item.commitMessage.includes("\0") || Buffer.byteLength(item.commitMessage) > 16 * 1024) throw new Error(`Invalid commitMessage for ${item.id}.`);
+    const dependsOn = item.dependsOn ?? [];
+    if (new Set(dependsOn).size !== dependsOn.length) throw new Error(`Duplicate dependency for ${item.id}.`);
     const candidateRepo = canonicalRepository(item.candidateRepo, "candidateRepo", item.id);
     const targetRepo = canonicalRepository(item.targetRepo, "targetRepo", item.id);
     if (!strictlyWithin(root, targetRepo)) throw new Error(`Target repository ${targetRepo} is outside ${root}.`);
     const targetIdentity = realpathSync(git(targetRepo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]));
     if (targets.has(targetIdentity)) throw new Error(`Physical target repository is duplicated: ${targetRepo}.`);
     targets.add(targetIdentity);
-    return { ...item, candidateRepo, targetRepo, candidateRef: item.candidateRef ?? "HEAD", dependsOn: [...new Set(item.dependsOn ?? [])] };
+    return { ...item, candidateRepo, targetRepo, candidateRef: item.candidateRef ?? "HEAD", dependsOn: [...dependsOn] };
   });
   for (const item of normalized) for (const dependency of item.dependsOn) {
     if (dependency === item.id || !ids.has(dependency)) throw new Error(`Invalid dependency ${dependency} for ${item.id}.`);
@@ -244,15 +268,14 @@ function assertSafeGitTree(repo: string, commit: string, id: string, label: stri
   const output = runGit(["-C", repo, "ls-tree", "-r", "-z", "--full-tree", commit]);
   for (const entry of output.split("\0").filter(Boolean)) {
     const tab = entry.indexOf("\t"); if (tab < 0) throw new Error(`Invalid ${label} tree entry for ${id}.`);
-    const metadata = entry.slice(0, tab).split(" "); const file = entry.slice(tab + 1); const base = path.posix.basename(file).normalize("NFC").toLocaleLowerCase("en-US");
-    if (metadata[0] === "160000" || base === ".gitattributes" || base === ".gitmodules") throw new Error(`${label} tree for ${id} contains unsupported callback-bearing Git content: ${file}.`);
+    const metadata = entry.slice(0, tab).split(" "); const file = entry.slice(tab + 1);
+    if (metadata[0] === "160000") throw new Error(`${label} tree for ${id} contains an unsupported gitlink: ${file}.`);
+    if (file.split("/").some((part) => part === ".git" || part === ".." || part === "")) throw new Error(`${label} tree for ${id} contains an unsafe path: ${file}.`);
   }
 }
 function canonicalRepository(value: string, field: string, id: string): string {
   if (!value || Buffer.byteLength(value) > 4096) throw new Error(`${field} for ${id} is invalid.`);
-  const exact = realpathSync(path.resolve(value));
-  git(exact, ["rev-parse", "--git-dir"]);
-  return exact;
+  return trustedCanonicalRepository(value);
 }
 function assertTargetClean(repo: string): void {
   if (git(repo, ["status", "--porcelain=v1", "--untracked-files=all"]) !== "") throw new Error(`Target repository is dirty: ${repo}.`);
@@ -266,9 +289,25 @@ function hasIndexChanges(repo: string): boolean {
 }
 function git(repo: string, args: string[]): string { return runGit(["-C", repo, ...args]).trim(); }
 function runGitIn(repo: string, args: string[]): string { return runGit(["-C", repo, ...args]); }
-function runGit(args: string[]): string {
-  const env = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "/usr/bin/false", SSH_ASKPASS: "/usr/bin/false", GIT_CONFIG_COUNT: "6", GIT_CONFIG_KEY_0: "core.hooksPath", GIT_CONFIG_VALUE_0: "/dev/null", GIT_CONFIG_KEY_1: "commit.gpgSign", GIT_CONFIG_VALUE_1: "false", GIT_CONFIG_KEY_2: "tag.gpgSign", GIT_CONFIG_VALUE_2: "false", GIT_CONFIG_KEY_3: "merge.autoStash", GIT_CONFIG_VALUE_3: "false", GIT_CONFIG_KEY_4: "merge.verifySignatures", GIT_CONFIG_VALUE_4: "false", GIT_CONFIG_KEY_5: "credential.helper", GIT_CONFIG_VALUE_5: "" };
-  return execFileSync("git", args, { encoding: "utf8", env, stdio: ["ignore", "pipe", "pipe"] });
+function runGit(args: string[]): string { return runTrustedGit(args); }
+function gitSucceeds(repo: string, args: string[]): boolean { try { runGitIn(repo, args); return true; } catch { return false; } }
+function treeEntries(repo: string, commit: string): Array<{ mode: string; path: string }> {
+  return runGit(["-C", repo, "ls-tree", "-r", "-z", "--full-tree", commit]).split("\0").filter(Boolean).map((entry) => {
+    const tab = entry.indexOf("\t"); const meta = entry.slice(0, tab).split(" "); return { mode: meta[0]!, path: entry.slice(tab + 1) };
+  });
+}
+function assertNoCrossTreeSymlinkEscape(targetRepo: string, targetCommit: string, candidateRepo: string, candidateCommit: string, id: string): void {
+  const target = treeEntries(targetRepo, targetCommit); const candidate = treeEntries(candidateRepo, candidateCommit);
+  for (const symlink of [...target, ...candidate].filter((entry) => entry.mode === "120000")) {
+    if ([...target, ...candidate].some((entry) => entry.path.startsWith(`${symlink.path}/`))) throw new Error(`Repository ${id} has a cross-tree path below symlink ${symlink.path}.`);
+  }
+}
+function conflictEvidence(repo: string): Array<{ path: string; status: string }> {
+  return git(repo, ["status", "--porcelain=v1", "-z"]).split("\0").filter(Boolean).filter((line) => line.startsWith("UU ") || line.startsWith("AA ") || line.startsWith("DD ") || /^.U |^U. /.test(line)).slice(0, 256).map((line) => ({ status: line.slice(0, 2), path: line.slice(3) }));
+}
+function boundedMergeMessages(repo: string): string[] {
+  const gitDir = git(repo, ["rev-parse", "--path-format=absolute", "--git-dir"]); const files = ["MERGE_MSG", "SQUASH_MSG"];
+  return files.flatMap((name) => { try { const text = readFileSync(path.join(gitDir, name), "utf8").slice(0, 4096).trim(); return text ? [text] : []; } catch { return []; } }).slice(0, 4);
 }
 function writeJson(file: string, value: unknown): void { writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 }); }
 function strictlyWithin(root: string, candidate: string): boolean { const relative = path.relative(root, candidate); return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative); }

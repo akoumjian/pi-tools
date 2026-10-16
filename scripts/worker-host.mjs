@@ -40,10 +40,7 @@ const client = new RpcClient({
     PI_WORKER_WORKSPACE_ROOT: config.workspaceRoot,
     PI_WORKER_STATE_ROOT: config.stateRoot,
     PI_WORKER_ASYNC_JOB_ROOT: config.asyncJobRoot,
-    ...(config.parentContextSnapshot ? { PI_WORKER_PARENT_CONTEXT_SNAPSHOT: config.parentContextSnapshot } : {}),
     PI_WORKER_TASK_IDS: JSON.stringify(config.taskIds),
-    ...(config.integration ? { PI_WORKER_INTEGRATION: JSON.stringify(config.integration) } : {}),
-    ...(config.cacheLineage ? { PI_WORKER_CACHE_LINEAGE: JSON.stringify(config.cacheLineage) } : {}),
     PI_WORKER_BD_PATH: config.bdPath,
     PI_WORKER_BEADS_ROUTE: JSON.stringify(config.beadsRoute),
     GIT_OPTIONAL_LOCKS: "0",
@@ -164,35 +161,40 @@ function assertSessionIdentity(state) {
 function waitForResultSettlement(rpcClient, resultFile, timeoutMs) {
   return new Promise((resolve, reject) => {
     let finished = false;
+    let checking = false;
     let timeout;
     const finish = (error) => {
       if (finished) return;
       finished = true;
       if (timeout !== undefined) clearTimeout(timeout);
       unsubscribe();
-      if (error) reject(error);
-      else resolve();
+      if (error) reject(error); else resolve();
+    };
+    const reconcileSettledTurn = async () => {
+      if (checking || finished) return;
+      checking = true;
+      try {
+        const deadline = Date.now() + 5_000;
+        while (!finished && Date.now() < deadline) {
+          if (existsSync(resultFile)) return finish();
+          if (hasUnsettledOwnedShellJobs()) return;
+          const state = await rpcClient.getState();
+          if (state.isStreaming || state.isCompacting || state.pendingMessageCount !== 0) return;
+          await delay(50);
+        }
+        if (!finished && !existsSync(resultFile) && !hasUnsettledOwnedShellJobs()) {
+          finish(new Error("Worker reached a settled quiescent turn without the required typed worker_result_submit."));
+        }
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error("Worker async-shell settlement could not be verified."));
+      } finally { checking = false; }
     };
     const unsubscribe = rpcClient.onEvent((event) => {
       if (event.type !== "agent_settled") return;
-      if (existsSync(resultFile)) {
-        finish();
-        return;
-      }
-      try {
-        if (hasUnsettledOwnedShellJobs()) return;
-      } catch (error) {
-        finish(error instanceof Error ? error : new Error("Worker async-shell settlement could not be verified."));
-        return;
-      }
-      finish(new Error("Worker reached a settled quiescent turn without the required typed worker_result_submit."));
+      if (existsSync(resultFile)) return finish();
+      void reconcileSettledTurn();
     });
-    if (timeoutMs !== undefined) {
-      timeout = setTimeout(
-        () => finish(new Error(`Worker result did not reach a settled turn within the explicit ${timeoutMs}ms timeout.`)),
-        timeoutMs
-      );
-    }
+    if (timeoutMs !== undefined) timeout = setTimeout(() => finish(new Error(`Worker result did not reach a settled turn within the explicit ${timeoutMs}ms timeout.`)), timeoutMs);
   });
 }
 

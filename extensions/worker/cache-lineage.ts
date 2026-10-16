@@ -12,7 +12,7 @@ import {
 import path from "node:path";
 import { types as utilTypes } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { WorkerRoute } from "./state.js";
+type WorkerRoute = { provider: string; model: string; thinkingLevel: string };
 
 export const CODEX_CACHE_LINEAGE_API = "openai-codex-responses";
 export const CODEX_CACHE_LINEAGE_PROVIDER = "openai-codex";
