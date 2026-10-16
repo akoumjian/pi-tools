@@ -7,7 +7,7 @@ import type { AgentSessionEvent, ExtensionContext, ExtensionFactory, ToolCallEve
 import { createAbortScope, throwIfAborted } from "../_shared/cancellation.js";
 import { withChildAgentSession } from "../_shared/child-agent-session.js";
 import { assertChildAgentRouteAllowed, formatModelName } from "../_shared/model-spec.js";
-import { managedWorkerRoleSkillText } from "../_shared/role-skills.js";
+import { workerRoleInstructions } from "../_shared/role-instructions.js";
 import nativeToolsExtension, { resolveNativeToolPath } from "../native-tools/index.js";
 
 export const MANAGED_WORKER_REVIEW_TOOLS = ["search_many", "read_many"] as const;
@@ -383,7 +383,7 @@ async function runManagedWorkerReviewAttempt(
   let toolCallCount = 0;
   let confinementFailure: string | undefined;
   const providerHttp: ManagedReviewProviderHttpObservation = {};
-  const systemPrompt = managedWorkerRoleSkillText("review");
+  const systemPrompt = workerRoleInstructions("review").text;
   const exactModel = exactManagedWorkerReviewModel(input.model);
   try {
     return await withChildAgentSession(context, {

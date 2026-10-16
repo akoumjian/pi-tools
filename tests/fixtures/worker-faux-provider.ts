@@ -41,21 +41,13 @@ export default function workerFauxProviderExtension(api: ExtensionAPI): void {
         gitOptionalLocksDisabled: process.env.GIT_OPTIONAL_LOCKS === "0",
         requiredGitMutationLocks,
         projectPoisonAbsent: !(context.systemPrompt ?? "").includes("WORKSPACE_SYSTEM_POISON") && !serialized.includes("WORKSPACE_SYSTEM_POISON"),
-        exactTools: JSON.stringify(toolNames) === JSON.stringify(["shell_cancel", "shell_read", "shell_start", "shell_status", "worker_handoff", "worker_task_read", "worker_task_update"])
+        exactTools: JSON.stringify(toolNames) === JSON.stringify(["shell_cancel", "shell_read", "shell_start", "shell_status", "worker_beads_tasks", "worker_result_submit"])
       };
       const passed = Object.values(checks).every(Boolean);
-      return fauxAssistantMessage(fauxToolCall("worker_handoff", {
-        state: passed ? "assignment_complete" : "failed",
+      return fauxAssistantMessage(fauxToolCall("worker_result_submit", {
+        outcome: passed ? "completed" : "blocked",
         summary: passed ? "Fake provider verified the exact fork and isolated startup surface." : `Fake provider checks failed: ${JSON.stringify(checks)}`,
-        taskUpdates: [{
-          taskId: "personal-workere2e",
-          update: JSON.stringify(checks)
-        }],
-        checks: [{
-          cwd: ".",
-          command: "fake-provider-startup-contract",
-          outcome: passed ? "passed" : "failed"
-        }]
+        artifacts: []
       }), { stopReason: "toolUse" });
     },
     fauxAssistantMessage(fauxToolCall("shell_start", {

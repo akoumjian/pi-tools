@@ -6,7 +6,7 @@ import test from "node:test";
 import { fauxAssistantMessage, fauxProvider, type Api, type Context, type Model, type Provider } from "@earendil-works/pi-ai";
 import type { ExtensionContext, ExtensionUIContext, ToolCallEvent } from "@earendil-works/pi-coding-agent";
 import { createIsolatedChildSettings } from "../extensions/_shared/child-agent-session.js";
-import { managedWorkerRoleSkillText } from "../extensions/_shared/role-skills.js";
+import { workerRoleInstructions } from "../extensions/_shared/role-instructions.js";
 import { searchMany } from "../extensions/native-tools/index.js";
 import {
   MAX_MANAGED_WORKER_REVIEW_CHECKS_CHARS,
@@ -116,7 +116,7 @@ test("dedicated managed review child ignores poisoned project resources in the r
     assert.equal((captured.tools ?? []).map((tool) => tool.name).sort().join(","), "read_many,search_many");
     const systemPrompt = captured.systemPrompt ?? "";
     assert.ok(systemPrompt);
-    const role = managedWorkerRoleSkillText("review");
+    const role = workerRoleInstructions("review").text;
     assert.equal((systemPrompt.match(new RegExp(role.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")) ?? []).length, 1);
     assert.doesNotMatch(systemPrompt, /skeptical Pi review subagent|recent work from the parent Pi session/);
     assert.deepEqual(statusCalls, [], "dedicated review must not touch legacy/general review UI status");

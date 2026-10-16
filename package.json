@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "license": "MIT",
   "type": "module",
-  "description": "Reusable Pi coding-agent extensions: async shell jobs, batch file tools, web research, tool safety, managed-worker review, and compact TUI rendering.",
+  "description": "Reusable Pi coding-agent extensions: async shell jobs, batch file tools, web research, tool safety, durable managed workers, and compact TUI rendering.",
   "engines": {
     "node": ">=22.19.0"
   },
@@ -15,7 +15,7 @@
   "scripts": {
     "check": "tsc --noEmit",
     "pretest": "rm -rf .pi/test-build",
-    "test": "PI_TOOLS_CONFIG_DIR=config tsc -p tsconfig.test.json && cp -R skills .pi/test-build/skills && PI_TOOLS_CONFIG_DIR=config node --test .pi/test-build/tests/*.test.js",
+    "test": "PI_TOOLS_CONFIG_DIR=config tsc -p tsconfig.test.json && cp -R skills .pi/test-build/skills && cp -R worker-roles .pi/test-build/worker-roles && PI_TOOLS_CONFIG_DIR=config node --test .pi/test-build/tests/*.test.js",
     "validate": "npm run check && npm test && git diff --check",
     "pi": "pi -e .",
     "dev:pi": "node scripts/dev-pi.mjs",
@@ -73,6 +73,7 @@
     "config/",
     "docs/",
     "extensions/",
+    "worker-roles/",
     "skills/",
     "scripts/dev-pi.mjs",
     "scripts/review-provider-context.mjs",

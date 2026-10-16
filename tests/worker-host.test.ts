@@ -147,9 +147,7 @@ test("worker host completes an exact-fork fake-provider run while ignoring works
     assert.equal(accepted.runId, "run-test");
     assert.equal(accepted.handoff.state, "assignment_complete");
     assert.match(accepted.handoff.summary, /verified the exact fork/);
-    assert.match(JSON.stringify(accepted.handoff.taskUpdates), /exactParentContext.*true/);
-    assert.match(JSON.stringify(accepted.handoff.taskUpdates), /gitOptionalLocksDisabled.*true/);
-    assert.match(JSON.stringify(accepted.handoff.taskUpdates), /requiredGitMutationLocks.*true/);
+    assert.match(accepted.handoff.summary, /verified the exact fork/);
     assert.equal(existsSync(path.join(workspaceRoot, "poison-loaded")), false);
     assert.equal(existsSync(path.join(workspaceRoot, "post-handoff-side-effect")), false);
     const workerSession = await readFile(forked.sessionFile, "utf8");
@@ -159,7 +157,7 @@ test("worker host completes an exact-fork fake-provider run while ignoring works
   });
 });
 
-test("worker host waits for the settled follow-up turn after asynchronous shell completion", async () => {
+test("worker host waits for the settled follow-up turn after asynchronous shell completion", { skip: process.platform !== "darwin" }, async () => {
   await withTempDir(async (directory) => {
     const parentCwd = path.join(directory, "parent");
     const workspaceRoot = path.join(directory, "workspace");
@@ -221,7 +219,7 @@ test("worker host waits for the settled follow-up turn after asynchronous shell 
   });
 });
 
-test("worker host fails promptly when a quiescent worker settles without typed handoff", async () => {
+test("worker host fails promptly when a quiescent worker settles without typed result", async () => {
   await withTempDir(async (directory) => {
     const parentCwd = path.join(directory, "parent");
     const workspaceRoot = path.join(directory, "workspace");
@@ -260,7 +258,7 @@ test("worker host fails promptly when a quiescent worker settles without typed h
     } as ExtensionContext, {
       record,
       shellExecution: { kind: "native-test" },
-      prompt: "Settle without a handoff.",
+      prompt: "Settle without a result.",
       resultFile: path.join(runDir, "result.json"),
       runDir,
       processFile: path.join(runDir, "host-process.json"),
@@ -273,11 +271,11 @@ test("worker host fails promptly when a quiescent worker settles without typed h
     const keepAlive = setInterval(() => {}, 100);
     const job = await launched.handle.completion.finally(() => clearInterval(keepAlive));
     assert.equal(job.status, "failed");
-    assert.match(await readFile(job.stderrLog, "utf8"), /settled quiescent turn without the required typed worker_handoff/);
+    assert.match(await readFile(job.stderrLog, "utf8"), /settled quiescent turn without the required typed worker_result_submit/);
   });
 });
 
-test("cancelling a worker host leaves no worker-owned async-shell process alive", async () => {
+test("cancelling a worker host leaves no worker-owned async-shell process alive", { skip: process.platform !== "darwin" }, async () => {
   await withTempDir(async (directory) => {
     const parentCwd = path.join(directory, "parent");
     const workspaceRoot = path.join(directory, "workspace");

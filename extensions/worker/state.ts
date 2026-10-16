@@ -5,7 +5,9 @@ import { randomUUID } from "node:crypto";
 import { isAsyncJobProcessAlive } from "../_shared/async-job.js";
 import { isWorkerId } from "../_shared/worker-id.js";
 import type { CompletionDelivery } from "../_shared/completion-delivery.js";
-import type { WorkerContainerReference } from "../_shared/worker-container.js";
+import type { WorkerBinding, WorkerRole } from "./registry.js";
+import type { WorkerContainerMount, WorkerContainerReference } from "../_shared/worker-container.js";
+import type { ReviewOverlayRecord } from "./review-workspace.js";
 import { validateWorkerCacheLineageRecord, type WorkerCacheLineageRecord } from "./cache-lineage.js";
 import { isRepositoryInventorySummary, type InitialRepositoryPin, type RepositoryInventorySummary } from "./repositories.js";
 
@@ -123,6 +125,11 @@ export type WorkerRecord = {
   parentSessionFile: string;
   workspaceRoot: string;
   taskIds: string[];
+  role?: WorkerRole;
+  binding?: WorkerBinding;
+  additionalInputs?: string[];
+  reviewOverlay?: ReviewOverlayRecord;
+  additionalInputMounts?: WorkerContainerMount[];
   route: WorkerRoute;
   initialRepositories?: InitialRepositoryPin[];
   integration?: WorkerIntegrationRecord;
@@ -188,10 +195,8 @@ export type WorkerPaths = {
 };
 
 export function defaultWorkerRoots(home = homedir()): WorkerRoots {
-  return {
-    stateRoot: path.join(home, ".local", "share", "agent", "workers"),
-    workspaceRoot: path.join(home, ".local", "share", "agent", "workspaces")
-  };
+  const workersRoot = path.join(home, ".local", "share", "agent", "worker-runtime", "workers");
+  return { stateRoot: workersRoot, workspaceRoot: workersRoot };
 }
 
 export function createWorkerId(now = new Date(), random: string = randomUUID()): string {
@@ -205,7 +210,8 @@ export function createWorkerRunId(now = new Date(), random: string = randomUUID(
 export function workerPaths(roots: WorkerRoots, workerId: string): WorkerPaths {
   assertWorkerId(workerId);
   const stateDir = path.join(path.resolve(roots.stateRoot), workerId);
-  const workspaceRoot = path.join(path.resolve(roots.workspaceRoot), workerId);
+  const sharedWorkerRoot = path.resolve(roots.workspaceRoot) === path.resolve(roots.stateRoot);
+  const workspaceRoot = sharedWorkerRoot ? path.join(stateDir, "workspace") : path.join(path.resolve(roots.workspaceRoot), workerId);
   return {
     stateDir,
     recordFile: path.join(stateDir, "worker.json"),

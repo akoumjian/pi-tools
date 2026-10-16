@@ -6,7 +6,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { startManagedAsyncJob, type ManagedAsyncJobHandle } from "../async-shell/index.js";
 import { resolveExecutable } from "../_shared/executable.js";
 import { assertSubagentRouteAllowed } from "../_shared/model-spec.js";
-import { managedWorkerRoleSkillPath, type ManagedWorkerRoleSkill } from "../_shared/role-skills.js";
+import type { WorkerRole } from "./registry.js";
 import type { WorkerContainerReference } from "../_shared/worker-container.js";
 import { MANAGED_WORKER_TOOL_NAMES, type WorkerCacheLineageRecord } from "./cache-lineage.js";
 import type { WorkerIntegrationRecord, WorkerRecord } from "./state.js";
@@ -33,7 +33,7 @@ export type WorkerHostConfig = {
   asyncJobRoot: string;
   parentContextSnapshot?: string;
   taskIds: string[];
-  roleSkill: Extract<ManagedWorkerRoleSkill, "implementation" | "integration">;
+  role: WorkerRole;
   integration?: WorkerIntegrationRecord;
   cacheLineage?: WorkerCacheLineageRecord;
   resultFile: string;
@@ -121,7 +121,7 @@ export function launchWorkerHost(
     asyncJobRoot: path.join(stateRoot, "async-shell"),
     parentContextSnapshot: input.parentContextSnapshot,
     taskIds: [...input.record.taskIds],
-    roleSkill: input.record.integration ? "integration" : "implementation",
+    role: input.record.role ?? (input.record.integration ? "integration" : "work"),
     integration: input.record.integration,
     cacheLineage: input.record.cacheLineage,
     resultFile: input.resultFile,
@@ -172,6 +172,7 @@ export function launchWorkerHost(
       PI_WORKER_ASYNC_JOB_ROOT: config.asyncJobRoot,
       ...(config.parentContextSnapshot ? { PI_WORKER_PARENT_CONTEXT_SNAPSHOT: config.parentContextSnapshot } : {}),
       PI_WORKER_TASK_IDS: JSON.stringify(input.record.taskIds),
+      PI_WORKER_ROLE: config.role,
       ...(input.record.integration ? { PI_WORKER_INTEGRATION: JSON.stringify(input.record.integration) } : {}),
       ...(input.record.cacheLineage ? { PI_WORKER_CACHE_LINEAGE: JSON.stringify(input.record.cacheLineage) } : {}),
       PI_WORKER_BD_PATH: config.bdPath,
@@ -224,7 +225,6 @@ export function buildWorkerRpcArgs(config: WorkerHostConfig): string[] {
     "--no-approve",
     "--no-context-files",
     "--no-skills",
-    "--skill", managedWorkerRoleSkillPath(config.roleSkill),
     "--no-prompt-templates",
     "--no-themes",
     "--no-extensions",

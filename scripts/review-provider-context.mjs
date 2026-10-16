@@ -170,46 +170,32 @@ const resultContracts = {
     content: "saved output/screenshot paths and read_many/visual-inspection next actions"
   },
   worker_run: {
-    success: "content reports every stable worker/run/job/session/workspace/task/route identity and queued state",
-    progress: "partial content reports the same durable receipts before deferred post-turn launch",
-    error: "invalid routes, parent/session mismatches, active workers, launch failures, and process failures remain model-visible",
-    details: "internal structured receipts and asynchronous worker process/handoff records",
-    content: "all durable receipt identities plus asynchronous typed handoff JSON, process state, errors, and canonical log paths"
+    success: "content reports action, role, durable worker/run identity, selected model, tasks, scheduling, and review/prepared binding",
+    progress: "partial content reports the same queued receipts before deferred launch",
+    error: "invalid models, bindings, parent ownership, active workers, and provisioning failures remain visible",
+    details: "internal structured v2 receipts",
+    content: "compact queued/running role and worker identity"
   },
   worker_control: {
-    success: "content reports exact-session status, validated typed result and observation state, cancellation settlement, or confirmed discard",
-    progress: "not applicable: one bounded exact-session lifecycle action settles before return",
-    error: "unknown/cross-session workers, active result reads, poisoned handoffs, cleanup uncertainty, and unsafe discard remain model-visible",
-    details: "internal bounded worker summaries and validated handoff/control outcomes",
-    content: "worker/run/job/session/workspace/task/route state, full typed handoff JSON, errors, canonical result/log paths, and cleanup outcome"
+    success: "content reports paginated workers/runs, one exact run, cancellation, or discard",
+    progress: "not applicable: one bounded lifecycle action",
+    error: "unknown ownership, invalid state, and cleanup uncertainty remain visible",
+    details: "internal slim registry-backed lifecycle records",
+    content: "compact exact worker/run result without delivery bookkeeping"
   },
-  worker_review: {
-    success: "content reports the exact reviewed worker/run/candidate/HEAD/tree, reviewer route, bounded verdict, findings, and checks after exact-identity plus bounded shortstat/path-status evidence",
-    progress: "not applicable: one foreground exact-candidate review settles before return",
-    error: "preflight/evidence, active/cross-session, route/auth, provider/policy/transport/5xx, output/confinement, timeout/cancellation, and lifecycle-drift failures use fixed nonleaking categories; only an actually observed Anthropic HTTP 429 response plus rate_limit_error permits fallback",
-    details: "internal exact candidate identity, bounded Git shortstat/path-status evidence metadata, and reviewer execution attempts",
-    content: "exact reviewed identity, reviewer route/tool count, and bounded structured verdict/findings/checks without attestation or promotion authority"
+  worker_merge_test: {
+    success: "content reports a fresh prepared set with exact candidates, targets, methods, commits, paths, conflicts, and warnings",
+    progress: "not applicable: deterministic bounded Git preparation",
+    error: "invalid DAGs, repositories, refs, target policy, Git failures, and conflicts remain visible",
+    details: "internal prepared-set repository records",
+    content: "prepared identity, ready/conflict status, exact repository results, and advisory provenance warnings"
   },
-  worker_fold_prepare: {
-    success: "content reports prepared id/hash/status, every candidate-to-target expected/desired identity, immutable artifact, disposable view, and manifest path",
-    progress: "not applicable: one deterministic bounded preparation settles before return",
-    error: "invalid/stale/ambiguous candidates, target policy/cleanliness/ref movement, dependency cycles, conflicts, and artifact limits remain model-visible",
-    details: "internal immutable prepared-manifest summary and exact repository records",
-    content: "prepared manifest identity/path/hash, dependency-ordered repository methods/status/OIDs/artifacts/views, and resolution-case count"
-  },
-  worker_fold_resolve: {
-    success: "content reports exact worker/run/session/workspace/route, phase, prepared manifest/candidate identity, and immutable context/decisions hashes",
-    progress: "partial content reports the same durable two-phase integration receipt before deferred post-turn launch",
-    error: "prepared/context/decision tampering, moved targets, non-pristine analysis, wrong states, route/session mismatch, and invalid resolved candidates remain model-visible",
-    details: "internal structured integration-worker receipt and exact phase identities",
-    content: "durable worker receipt, analysis-or-resolution phase, prepared manifest/candidate identity, context hash, and decisions hash when resumed"
-  },
-  worker_fold_promote: {
-    success: "content reports promotion/journal identities, every exact local update, and completed count",
-    progress: "not applicable: the sequential host operation returns completed or failed after persisting its small operation record",
-    error: "global preflight blockers, earlier completed repositories, the failed repository, and exact retry requirements remain model-visible",
-    details: "internal typed promotion summary; simple retry state remains in the operation record",
-    content: "exact completed-or-failed status, repository outcomes, expected/desired commits, and journal path"
+  worker_merge_apply: {
+    success: "content reports completed, partial, or failed dependency-ordered exact target application",
+    progress: "not applicable: one sequential trusted-host operation",
+    error: "global preflight, target drift, and exact failed repository remain visible",
+    details: "internal exact prepared-set application outcomes",
+    content: "prepared identity and per-repository applied/pending/failed outcomes"
   }
 };
 const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };

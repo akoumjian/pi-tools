@@ -332,7 +332,7 @@ export function applyReviewCriteria(
   if (criteria === "conservative" || decision.action === "deny") {
     return decision;
   }
-  if (["worker_control", "worker_review"].includes(getToolName(event))) {
+  if (["worker_control", "worker_merge_test", "worker_merge_apply"].includes(getToolName(event))) {
     // Preserve exact worker lifecycle validation before generic environment narrowing:
     // valid shapes are allowed, while malformed IDs, fields, actions, and confirmation stay reviewed.
     return decision;
@@ -603,8 +603,8 @@ function evaluateToolCall(event: ToolCallEvent, context: ExtensionContext): Safe
     return evaluateWorkerControl(input);
   }
 
-  if (toolName === "worker_review") {
-    return evaluateWorkerReview(input);
+  if (toolName === "worker_merge_test" || toolName === "worker_merge_apply") {
+    return evaluateWorkerMergeTool(toolName, input);
   }
 
   if (["write", "edit"].includes(toolName)) {
@@ -661,106 +661,35 @@ function evaluateToolCall(event: ToolCallEvent, context: ExtensionContext): Safe
 }
 
 export function evaluateWorkerControl(input: unknown): SafetyDecision {
-  if (!isRecord(input) || typeof input.action !== "string") {
-    return {
-      action: "review",
-      risk: "medium",
-      reason: "Malformed worker_control input requires review.",
-      ruleId: "worker-control-shape-review",
-      tags: ["worker", "lifecycle"]
-    };
-  }
-  const allowedKeys = input.action === "status" ? new Set(["action", "workerId"]) :
-    input.action === "discard" ? new Set(["action", "workerId", "confirm"]) :
-    new Set(["action", "workerId"]);
-  const hasValidWorkerId = isWorkerId(input.workerId);
-  if (!Object.keys(input).every((key) => allowedKeys.has(key))) {
-    return {
-      action: "review",
-      risk: "medium",
-      reason: "worker_control contains unsupported fields.",
-      ruleId: "worker-control-fields-review",
-      tags: ["worker", "lifecycle"]
-    };
-  }
-  if (input.action === "status" && (input.workerId === undefined || hasValidWorkerId)) {
-    return {
-      action: "allow",
-      risk: "low",
-      reason: "Worker status only reads workers owned by the exact parent session.",
-      ruleId: "worker-control-status",
-      tags: ["worker", "read-only"]
-    };
-  }
-  if (input.action === "result" && hasValidWorkerId) {
-    return {
-      action: "allow",
-      risk: "low",
-      reason: "Worker result validates and observes one exact-session settled result.",
-      ruleId: "worker-control-result",
-      tags: ["worker", "result"]
-    };
-  }
-  if (input.action === "cancel" && hasValidWorkerId) {
-    return {
-      action: "allow",
-      risk: "low",
-      reason: "Worker cancellation is restricted to an exact-session managed run and uses authoritative cleanup.",
-      ruleId: "worker-control-cancel",
-      tags: ["worker", "lifecycle", "cancel"]
-    };
-  }
-  if (input.action === "discard" && hasValidWorkerId && input.confirm === true) {
-    return {
-      action: "allow",
-      risk: "medium",
-      reason: "Confirmed worker discard is restricted to a settled exact-session worker and uses authoritative cleanup.",
-      ruleId: "worker-control-discard",
-      tags: ["worker", "lifecycle", "discard", "destructive"]
-    };
-  }
-  return {
-    action: "review",
-    risk: "medium",
-    reason: "Unsupported or malformed worker_control action requires review.",
-    ruleId: "worker-control-action-review",
-    tags: ["worker", "lifecycle"]
-  };
+  if (!isRecord(input) || typeof input.action !== "string") return workerShapeReview("Malformed worker_control input requires review.");
+  const action = input.action;
+  const keys = new Set(Object.keys(input));
+  const exactKeys = (allowed: string[]) => [...keys].every((key) => allowed.includes(key));
+  const page = (input.limit === undefined || (Number.isInteger(input.limit) && Number(input.limit) >= 1 && Number(input.limit) <= 100))
+    && (input.offset === undefined || (Number.isInteger(input.offset) && Number(input.offset) >= 0));
+  const valid = action === "list"
+    ? exactKeys(["action", "status", "role", "limit", "offset"]) && page
+      && (input.status === undefined || ["idle", "queued", "running"].includes(String(input.status)))
+      && (input.role === undefined || ["work", "review", "integration"].includes(String(input.role)))
+    : action === "runs"
+      ? exactKeys(["action", "workerId", "limit", "offset"]) && isWorkerId(input.workerId) && page
+      : action === "get"
+        ? exactKeys(["action", "workerId", "runId"]) && isWorkerId(input.workerId) && typeof input.runId === "string" && /^run_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(input.runId)
+        : action === "cancel" || action === "discard"
+          ? exactKeys(["action", "workerId"]) && isWorkerId(input.workerId)
+          : false;
+  if (!valid) return workerShapeReview("Unsupported or malformed worker_control action requires review.");
+  return { action: "allow", risk: action === "discard" ? "medium" : "low", reason: `Valid exact-session worker_control ${action} uses the trusted lifecycle implementation.`, ruleId: `worker-control-${action}`, tags: ["worker", "lifecycle"] };
 }
 
-export function evaluateWorkerReview(input: unknown): SafetyDecision {
-  const allowedKeys = new Set(["workerId", "runId", "workspaceRepo", "focus"]);
-  const workspaceRepo = isRecord(input) && typeof input.workspaceRepo === "string" ? input.workspaceRepo : undefined;
-  const validWorkspaceRepo = workspaceRepo !== undefined
-    && workspaceRepo.length >= 7
-    && workspaceRepo.length <= 1024
-    && /^repos\/[A-Za-z0-9._/-]+$/.test(workspaceRepo)
-    && workspaceRepo.split("/").slice(1).every((part) => part !== "" && part !== "." && part !== "..");
-  const valid = isRecord(input)
-    && Object.keys(input).every((key) => allowedKeys.has(key))
-    && isWorkerId(input.workerId)
-    && typeof input.runId === "string"
-    && input.runId.length <= 128
-    && /^run_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(input.runId)
-    && validWorkspaceRepo
-    && (input.focus === undefined || (typeof input.focus === "string" && input.focus.length >= 1 && input.focus.length <= 4000));
-  if (!valid) {
-    return {
-      action: "review",
-      risk: "medium",
-      reason: "Malformed worker_review input requires review.",
-      ruleId: "worker-review-shape-review",
-      tags: ["worker", "review"]
-    };
-  }
-  return {
-    action: "allow",
-    risk: "low",
-    reason: "Worker review inspects one exact clean settled worker repository with an already-stopped container and read-only tools.",
-    ruleId: "worker-review-read-only",
-    tags: ["worker", "review", "read-only", "subagent"]
-  };
+export function evaluateWorkerMergeTool(toolName: string, input: unknown): SafetyDecision {
+  const validPrepared = isRecord(input) && Object.keys(input).length === 1 && typeof input.preparedId === "string" && /^prepared_[0-9a-f]{24}$/.test(input.preparedId);
+  if (toolName === "worker_merge_apply" && validPrepared) return { action: "allow", risk: "medium", reason: "Exact prepared merge application uses trusted set-wide preflight and ref updates.", ruleId: "worker-merge-apply", tags: ["worker", "git", "mutation"] };
+  if (toolName === "worker_merge_test" && isRecord(input) && Object.keys(input).length === 1 && Array.isArray(input.repositories) && input.repositories.length >= 1 && input.repositories.length <= 16) return { action: "allow", risk: "low", reason: "Merge testing creates isolated prepared repositories without target mutation.", ruleId: "worker-merge-test", tags: ["worker", "git", "prepare"] };
+  return workerShapeReview(`Malformed ${toolName} input requires review.`);
 }
+
+function workerShapeReview(reason: string): SafetyDecision { return { action: "review", risk: "medium", reason, ruleId: "worker-shape-review", tags: ["worker"] }; }
 
 export function evaluateBash(command: string): SafetyDecision {
   if (!command.trim()) {

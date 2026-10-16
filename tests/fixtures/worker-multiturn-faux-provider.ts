@@ -3,7 +3,7 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 
 export default function workerMultiturnFauxProviderExtension(api: ExtensionAPI): void {
   const workspaceRoot = requiredEnvironment("PI_WORKER_WORKSPACE_ROOT");
-  const source = "setTimeout(() => {}, 6500)";
+  const source = "setTimeout(() => {}, 9000)";
   const faux = fauxProvider({
     api: "worker-multiturn-faux-api",
     provider: "worker-multiturn-faux",
@@ -25,11 +25,10 @@ export default function workerMultiturnFauxProviderExtension(api: ExtensionAPI):
       }]
     }), { stopReason: "toolUse" }),
     fauxAssistantMessage("The asynchronous command is still running; I will hand off after its completion follow-up."),
-    fauxAssistantMessage(fauxToolCall("worker_handoff", {
-      state: "assignment_complete",
+    fauxAssistantMessage(fauxToolCall("worker_result_submit", {
+      outcome: "completed",
       summary: "Completed handoff on the asynchronous follow-up turn.",
-      taskUpdates: [{ taskId: "personal-workere2e", update: "Multiturn lifecycle passed." }],
-      checks: [{ cwd: ".", command: "async follow-up", outcome: "passed" }]
+      artifacts: []
     }), { stopReason: "toolUse" }),
     fauxAssistantMessage("The multiturn handoff is durable.")
   ]);

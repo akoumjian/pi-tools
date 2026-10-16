@@ -22,9 +22,8 @@ export const WORKER_CACHE_LINEAGE_MAX_AGE_MS = 5 * 60 * 1000;
 export const WORKER_CACHE_LINEAGE_MAX_INSTRUCTIONS_BYTES = 1024 * 1024;
 
 export const MANAGED_WORKER_TOOL_NAMES = [
-  "worker_handoff",
-  "worker_task_read",
-  "worker_task_update",
+  "worker_beads_tasks",
+  "worker_result_submit",
   "shell_start",
   "shell_status",
   "shell_read",

@@ -31,6 +31,8 @@ const CONTAINER_BOOTSTRAP = [
   "done"
 ].join("\n");
 
+export type WorkerContainerMount = { kind: "bind" | "volume"; source: string; target: string; readOnly?: boolean };
+
 export type WorkerContainerReference = {
   version: typeof WORKER_CONTAINER_VERSION;
   workerId: string;
@@ -40,6 +42,7 @@ export type WorkerContainerReference = {
   image: string;
   codeRoot: string;
   workspaceRoot: string;
+  mounts?: WorkerContainerMount[];
   containerId?: string;
 };
 
@@ -55,6 +58,7 @@ export function planWorkerContainer(input: {
   nonce: string;
   workspaceRoot: string;
   codeRoot?: string;
+  mounts?: WorkerContainerMount[];
 }): WorkerContainerReference {
   const workspaceRoot = realDirectory(input.workspaceRoot, "worker workspace");
   const codeRoot = realDirectory(input.codeRoot ?? path.join(homedir(), "Code"), "worker read-only source root");
@@ -66,7 +70,8 @@ export function planWorkerContainer(input: {
     nonce: input.nonce,
     image: WORKER_CONTAINER_IMAGE,
     codeRoot,
-    workspaceRoot
+    workspaceRoot,
+    ...(input.mounts?.length ? { mounts: input.mounts.map((mount) => ({ ...mount })) } : {})
   };
 }
 
@@ -100,6 +105,7 @@ export function createWorkerContainer(
       "--label", `pi.nonce=${reference.nonce}`,
       "--mount", bindMount(reference.codeRoot, true),
       "--mount", bindMount(reference.workspaceRoot, false),
+      ...containerMountArgs(reference.mounts ?? []),
       "--workdir", reference.workspaceRoot,
       "--network", "bridge",
       "--restart", "no",
@@ -194,8 +200,7 @@ export function settleWorkerContainer(dockerPath: string, reference: WorkerConta
   assertWorkerContainerReference(reference);
   assertExecutable(dockerPath, "Docker CLI");
   if (!inspectWorkerContainer(dockerPath, reference)) return;
-  parkWorkerContainer(dockerPath, reference);
-  execDocker(dockerPath, ["rm", reference.containerId ?? reference.name]);
+  execDocker(dockerPath, ["rm", "--force", reference.containerId ?? reference.name]);
   if (inspectWorkerContainer(dockerPath, reference)) {
     throw new Error(`Docker worker container ${reference.name} still exists after removal.`);
   }
@@ -212,7 +217,9 @@ export function prepareWorkerContainerProcess(input: {
 }): WorkerContainerProcess {
   assertWorkerContainerReference(input.container);
   assertExecutable(input.dockerPath, "Docker CLI");
-  const cwd = realDirectory(input.cwd, "worker shell cwd");
+  const requestedCwd = path.resolve(input.cwd);
+  const mountedCwd = (input.container.mounts ?? []).some((mount) => requestedCwd === path.resolve(mount.target) || requestedCwd.startsWith(`${path.resolve(mount.target)}${path.sep}`));
+  const cwd = mountedCwd ? requestedCwd : realDirectory(requestedCwd, "worker shell cwd");
   assertContainerPath(cwd, input.container);
   const config = {
     version: 1,
@@ -409,6 +416,12 @@ function inspectWorkerContainer(
 
 function assertWorkerContainerReference(value: unknown): asserts value is WorkerContainerReference {
   const candidate = value as Partial<WorkerContainerReference> | undefined;
+  const mountsValid = candidate?.mounts === undefined || (Array.isArray(candidate.mounts) && candidate.mounts.length <= 32 && candidate.mounts.every((mount) =>
+    mount !== null && typeof mount === "object" && (mount.kind === "bind" || mount.kind === "volume")
+    && typeof mount.source === "string" && mount.source.length > 0 && typeof mount.target === "string" && path.isAbsolute(mount.target)
+    && (mount.readOnly === undefined || typeof mount.readOnly === "boolean")
+    && (mount.kind === "bind" ? path.isAbsolute(mount.source) : /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(mount.source))
+  ) && new Set(candidate.mounts.map((mount) => path.resolve(mount.target))).size === candidate.mounts.length);
   if (
     candidate?.version !== WORKER_CONTAINER_VERSION ||
     typeof candidate.workerId !== "string" || !candidate.workerId ||
@@ -418,6 +431,7 @@ function assertWorkerContainerReference(value: unknown): asserts value is Worker
     typeof candidate.image !== "string" || !candidate.image ||
     typeof candidate.codeRoot !== "string" || !path.isAbsolute(candidate.codeRoot) ||
     typeof candidate.workspaceRoot !== "string" || !path.isAbsolute(candidate.workspaceRoot) ||
+    !mountsValid ||
     (candidate.containerId !== undefined && !/^[a-f0-9]{64}$/.test(candidate.containerId))
   ) {
     throw new Error("Managed worker Docker identity is invalid.");
@@ -426,12 +440,18 @@ function assertWorkerContainerReference(value: unknown): asserts value is Worker
 
 function assertContainerPath(value: string, container: WorkerContainerReference): void {
   const resolved = path.resolve(value);
-  const allowed = [container.workspaceRoot, container.codeRoot].some(
-    (root) => resolved === root || resolved.startsWith(`${root}${path.sep}`)
+  const allowed = [container.workspaceRoot, container.codeRoot, ...(container.mounts ?? []).map((mount) => mount.target)].some(
+    (root) => resolved === path.resolve(root) || resolved.startsWith(`${path.resolve(root)}${path.sep}`)
   );
   if (!allowed) {
     throw new Error(`Managed worker shell cwd is not mounted in its Docker container: ${resolved}`);
   }
+}
+
+function containerMountArgs(mounts: WorkerContainerMount[]): string[] {
+  return mounts.flatMap((mount) => ["--mount", mount.kind === "bind"
+    ? `type=bind,src=${mount.source},dst=${mount.target},${mount.readOnly ? "readonly," : ""}bind-propagation=rprivate`
+    : `type=volume,src=${mount.source},dst=${mount.target}${mount.readOnly ? ",readonly" : ""}`]);
 }
 
 function bindMount(root: string, readonly: boolean): string {

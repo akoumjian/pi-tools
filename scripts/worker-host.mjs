@@ -90,12 +90,12 @@ try {
   await client.start();
   const initialState = await client.getState();
   assertSessionIdentity(initialState);
-  const handoffSettlement = waitForHandoffSettlement(client, config.resultFile, config.timeoutMs);
-  await Promise.all([client.prompt(config.prompt), handoffSettlement]);
+  const resultSettlement = waitForResultSettlement(client, config.resultFile, config.timeoutMs);
+  await Promise.all([client.prompt(config.prompt), resultSettlement]);
   const state = await client.getState();
   assertSessionIdentity(state);
   if (state.isStreaming || state.isCompacting || state.pendingMessageCount !== 0) {
-    throw new Error(`Worker RPC was not quiescent after handoff: ${JSON.stringify({ isStreaming: state.isStreaming, isCompacting: state.isCompacting, pendingMessageCount: state.pendingMessageCount })}`);
+    throw new Error(`Worker RPC was not quiescent after result submission: ${JSON.stringify({ isStreaming: state.isStreaming, isCompacting: state.isCompacting, pendingMessageCount: state.pendingMessageCount })}`);
   }
   assertOwnedShellQuiescence();
   writeAtomicJson(config.settledFile, {
@@ -126,7 +126,7 @@ function assertOwnedShellQuiescence() {
     const meta = readStrictWorkerJobMeta(jobsDirectory, entry.name);
     if (meta.owner.workerId !== config.workerId || meta.owner.runId !== config.runId) continue;
     if (!workerJobIsSettled(meta)) {
-      throw new Error(`Worker handoff settlement found active or unverifiable owned async-shell job ${entry.name}.`);
+      throw new Error(`Worker result settlement found active or unverifiable owned async-shell job ${entry.name}.`);
     }
   }
 }
@@ -161,7 +161,7 @@ function assertSessionIdentity(state) {
   }
 }
 
-function waitForHandoffSettlement(rpcClient, resultFile, timeoutMs) {
+function waitForResultSettlement(rpcClient, resultFile, timeoutMs) {
   return new Promise((resolve, reject) => {
     let finished = false;
     let timeout;
@@ -185,11 +185,11 @@ function waitForHandoffSettlement(rpcClient, resultFile, timeoutMs) {
         finish(error instanceof Error ? error : new Error("Worker async-shell settlement could not be verified."));
         return;
       }
-      finish(new Error("Worker reached a settled quiescent turn without the required typed worker_handoff."));
+      finish(new Error("Worker reached a settled quiescent turn without the required typed worker_result_submit."));
     });
     if (timeoutMs !== undefined) {
       timeout = setTimeout(
-        () => finish(new Error(`Worker handoff did not reach a settled turn within the explicit ${timeoutMs}ms timeout.`)),
+        () => finish(new Error(`Worker result did not reach a settled turn within the explicit ${timeoutMs}ms timeout.`)),
         timeoutMs
       );
     }

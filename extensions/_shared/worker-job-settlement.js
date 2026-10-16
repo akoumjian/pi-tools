@@ -8,7 +8,7 @@ const JOB_STATUSES = new Set(["running", "exited", "failed", "cancelled", "unkno
 const TERMINAL_JOB_STATUSES = new Set(["exited", "failed", "cancelled"]);
 
 /**
- * Strictly parse one trusted-host worker async-job record. Both worker_handoff
+ * Strictly parse one trusted-host worker async-job record. Both worker_result_submit
  * admission and worker-host settlement use this exact validator so malformed
  * metadata cannot fall through different checks.
  *

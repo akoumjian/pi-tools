@@ -2257,7 +2257,7 @@ function assertWorkerRunAcceptsSideEffects(): void {
   if (!resultFile) throw new Error("Managed worker shell_start requires PI_WORKER_RESULT_FILE.");
   const resolvedResultFile = path.resolve(resultFile);
   if (existsSync(resolvedResultFile) || existsSync(workerHandoffAdmissionPath(resolvedResultFile))) {
-    throw new Error("Managed worker shell_start is sealed during or after worker_handoff admission.");
+    throw new Error("Managed worker shell_start is sealed during or after worker_result_submit admission.");
   }
 }
 

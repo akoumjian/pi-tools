@@ -143,15 +143,16 @@ test("pi-tools package defaults do not own personal profile model or trust choic
   assert.doesNotMatch(mutationGuidance, personalHomePattern);
 });
 
-test("pi-tools package ships managed-worker role skills without removed Hunk resources", () => {
+test("pi-tools packages plain worker role instructions and one parent skill", () => {
   const manifest = packageJson();
   assert.deepEqual(manifest.pi?.skills, ["skills"]);
-  for (const role of ["parent", "implementation", "review", "integration"]) {
-    assert.ok(existsSync(path.join(packageRoot, "skills", `managed-worker-${role}`, "SKILL.md")), role);
+  assert.ok(existsSync(path.join(packageRoot, "skills", "managed-worker-parent", "SKILL.md")));
+  for (const role of ["work", "review", "integration"]) {
+    assert.ok(existsSync(path.join(packageRoot, "worker-roles", `${role}.md`)), role);
   }
-  assert.equal(manifest.pi?.extensions?.some((entry: string) => entry.includes("hunk-review")), false);
-  assert.equal(existsSync(path.join(packageRoot, "extensions", "hunk-review")), false);
-  assert.equal(existsSync(path.join(packageRoot, "skills", "hunk-review")), false);
+  assert.equal(existsSync(path.join(packageRoot, "skills", "managed-worker-implementation")), false);
+  assert.equal(existsSync(path.join(packageRoot, "skills", "managed-worker-review")), false);
+  assert.equal(existsSync(path.join(packageRoot, "skills", "managed-worker-integration")), false);
 });
 
 test("pi-tools package files whitelist excludes tests and local runtime artifacts", () => {
@@ -161,6 +162,7 @@ test("pi-tools package files whitelist excludes tests and local runtime artifact
     "config/",
     "docs/",
     "extensions/",
+    "worker-roles/",
     "skills/",
     "scripts/dev-pi.mjs",
     "scripts/review-provider-context.mjs",

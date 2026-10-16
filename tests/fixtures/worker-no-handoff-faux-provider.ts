@@ -15,7 +15,7 @@ export default function workerNoHandoffFauxProviderExtension(api: ExtensionAPI):
     }]
   });
   faux.setResponses([
-    fauxAssistantMessage("I am stopping without the required typed worker_handoff.")
+    fauxAssistantMessage("I am stopping without the required typed worker_result_submit.")
   ]);
   api.registerProvider(faux.provider);
 }

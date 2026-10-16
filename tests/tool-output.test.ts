@@ -189,123 +189,20 @@ const samples: Record<RetainedToolName, unknown> = {
     }
   },
   worker_run: {
-    content: [text("worker queued")],
-    details: {
-      runs: [{
-        workerId: "worker_20260910190000_12345678",
-        runId: "run_20260910190000_87654321",
-        jobId: "job_20260910190000_abcdefgh",
-        sessionId: "019c0000-0000-7000-8000-000000000001",
-        workspaceRoot: "/tmp/workspaces/worker_20260910190000_12345678",
-        taskIds: ["personal-test"],
-        provider: "openai-codex",
-        model: "gpt-test",
-        thinkingLevel: "xhigh",
-        completionDelivery: "steer",
-        state: "queued"
-      }]
-    }
-  },
-  worker_review: {
-    content: [text("independent critique")],
-    details: {
-      workerId: "worker_20260910190000_12345678",
-      runId: "run_20260910190000_87654321",
-      candidateId: "candidate_bbbbbbbbbbbbbbbbbbbbbbbb",
-      workspaceRepo: "repos/project",
-      headCommit: "c".repeat(40),
-      headTree: "d".repeat(40),
-      model: "anthropic/claude-opus-test",
-      thinkingLevel: "xhigh",
-      startedAt: "2026-09-10T19:00:00.000Z",
-      completedAt: "2026-09-10T19:00:01.000Z",
-      durationMs: 1000,
-      toolCallCount: 3,
-      attempts: [{ route: "anthropic/claude-opus-test:xhigh", outcome: "completed" }],
-      verdict: "request_changes",
-      findings: "High: fix exact issue.",
-      checks: "Inspected exact files."
-    }
-  },
-  worker_fold_prepare: {
-    content: [text("prepared fold")],
-    details: {
-      preparedId: "prepared_aaaaaaaaaaaaaaaaaaaaaaaa",
-      manifestFile: "/tmp/worker-folds/prepared_aaaaaaaaaaaaaaaaaaaaaaaa/manifest.json",
-      manifestSha256: "a".repeat(64),
-      status: "ready",
-      repositoryCount: 1,
-      resolutionCaseCount: 0,
-      overlapCount: 0,
-      repositories: [{
-        candidateId: "candidate_bbbbbbbbbbbbbbbbbbbbbbbb",
-        targetRepo: "/tmp/targets/project",
-        targetRef: "refs/heads/main",
-        method: "merge",
-        status: "ready",
-        expectedCommit: "c".repeat(40),
-        desiredCommit: "d".repeat(40),
-        artifactFile: "/tmp/worker-folds/prepared_aaaaaaaaaaaaaaaaaaaaaaaa/repositories/01/prepared-objects.bundle",
-        viewPath: "/tmp/worker-folds/prepared_aaaaaaaaaaaaaaaaaaaaaaaa/repositories/01/view"
-      }]
-    }
-  },
-  worker_fold_resolve: {
-    content: [text("integration worker queued")],
-    details: {
-      workerId: "worker_20260910190000_12345678", runId: "run_20260910190000_87654321", jobId: "job_20260910190000_abcdefgh",
-      sessionId: "019c0000-0000-7000-8000-000000000001", workspaceRoot: "/tmp/workspaces/worker_20260910190000_12345678",
-      taskIds: ["personal-test"], provider: "openai-codex", model: "gpt-test", thinkingLevel: "xhigh", completionDelivery: "steer", state: "queued",
-      phase: "analysis", method: "merge", preparedId: "prepared_aaaaaaaaaaaaaaaaaaaaaaaa", manifestSha256: "a".repeat(64), candidateId: "candidate_bbbbbbbbbbbbbbbbbbbbbbbb", contextSha256: "b".repeat(64)
-    }
-  },
-  worker_fold_promote: {
-    content: [text("promotion complete")],
-    details: {
-      promotionId: "promotion_cccccccccccccccccccccccc",
-      journalFile: "/tmp/worker-promotions/promotion_cccccccccccccccccccccccc/journal.json",
-      status: "completed",
-      preparedId: "prepared_aaaaaaaaaaaaaaaaaaaaaaaa",
-      manifestSha256: "a".repeat(64),
-      repositoryCount: 1,
-      completedCount: 1,
-      repositories: [{
-        candidateId: "candidate_bbbbbbbbbbbbbbbbbbbbbbbb",
-        targetRepo: "/tmp/targets/project",
-        targetRef: "refs/heads/main",
-        expectedCommit: "c".repeat(40),
-        desiredCommit: "d".repeat(40),
-        checkedOut: true,
-        status: "completed"
-      }]
-    }
+    content: [text("queued · work · 12345678")],
+    details: { runs: [{ action: "start", role: "work", workerId: "worker_20260910190000_12345678", runId: "run_20260910190000_87654321", status: "queued", taskIds: ["personal-test"], completionDelivery: "steer", modelSelection: "openai-codex/gpt-test:xhigh" }] }
   },
   worker_control: {
-    content: [text("Worker status")],
-    details: {
-      action: "status",
-      workers: [{
-        workerId: "worker_20260910190000_12345678",
-        status: "handed_off",
-        sessionId: "019c0000-0000-7000-8000-000000000001",
-        sessionFile: "/tmp/workers/worker_20260910190000_12345678/session/session.jsonl",
-        workspaceRoot: "/tmp/workspaces/worker_20260910190000_12345678",
-        taskIds: ["personal-test"],
-        route: { provider: "openai-codex", model: "gpt-test", thinkingLevel: "xhigh" },
-        container: { name: "pi-worker-test", containerId: "container-1", runId: "run_20260910190000_87654321" },
-        lastRun: {
-          runId: "run_20260910190000_87654321",
-          jobId: "job_20260910190000_abcdefgh",
-          status: "handed_off",
-          delivery: "delivered",
-          completionDelivery: "steer",
-          resultFile: "/tmp/workers/worker_20260910190000_12345678/runs/run_20260910190000_87654321/result.json",
-          stdoutLog: "/tmp/stdout.log",
-          stderrLog: "/tmp/stderr.log"
-        },
-        updatedAt: "2026-09-10T19:32:00.000Z"
-      }]
-    }
+    content: [text("0 workers")],
+    details: { action: "list", workers: [], total: 0, counts: { idle: 0, queued: 0, running: 0 } }
+  },
+  worker_merge_test: {
+    content: [text("ready")],
+    details: { preparedId: "prepared_aaaaaaaaaaaaaaaaaaaaaaaa", status: "ready", order: ["repo"], repositories: [{ id: "repo", candidateRepo: "/candidate", candidateCommit: "a".repeat(40), targetRepo: "/target", targetRef: "refs/heads/main", method: "merge", status: "ready", expectedCommit: "b".repeat(40), desiredCommit: "c".repeat(40), preparedPath: "/prepared/repo", overlapCount: 0, dependsOn: [] }] }
+  },
+  worker_merge_apply: {
+    content: [text("completed")],
+    details: { preparedId: "prepared_aaaaaaaaaaaaaaaaaaaaaaaa", status: "completed", repositories: [] }
   }
 };
 

@@ -751,6 +751,30 @@ const WorkerFoldPromoteDetailsSchema = Type.Object({
   repositories: Type.Array(WorkerFoldPromotedRepositorySchema, { minItems: 1, maxItems: 16 })
 }, { additionalProperties: false });
 
+
+const WorkerV2RoleSchema = Type.Union([Type.Literal("work"), Type.Literal("review"), Type.Literal("integration")]);
+const WorkerRunV2ReceiptSchema = Type.Object({
+  action: Type.Union([Type.Literal("start"), Type.Literal("resume")]), role: WorkerV2RoleSchema,
+  workerId: Type.String({ minLength: 1 }), runId: Type.String({ minLength: 1 }), status: Type.Union([Type.Literal("queued"), Type.Literal("running")]),
+  taskIds: Type.Array(Type.String()), completionDelivery: Type.Union([Type.Literal("steer"), Type.Literal("followUp")]),
+  modelSelection: Type.Optional(Type.String()), reviewedRunId: Type.Optional(Type.String()), preparedId: Type.Optional(Type.String())
+}, { additionalProperties: false });
+const WorkerRunV2DetailsSchema = Type.Object({ runs: Type.Array(WorkerRunV2ReceiptSchema, { minItems: 1, maxItems: 8 }) }, { additionalProperties: false });
+const WorkerControlV2DetailsSchema = Type.Union([
+  Type.Object({ action: Type.Literal("list"), workers: Type.Array(Type.Unknown()), total: NonNegativeIntegerSchema, counts: Type.Object({ idle: NonNegativeIntegerSchema, queued: NonNegativeIntegerSchema, running: NonNegativeIntegerSchema }), nextOffset: Type.Optional(NonNegativeIntegerSchema) }),
+  Type.Object({ action: Type.Literal("runs"), workerId: Type.String(), runs: Type.Array(Type.Unknown()), total: NonNegativeIntegerSchema, nextOffset: Type.Optional(NonNegativeIntegerSchema) }),
+  Type.Object({ action: Type.Literal("get"), workerId: Type.String(), role: WorkerV2RoleSchema, workspaceRoot: Type.String(), sessionId: Type.Optional(Type.String()), sessionFile: Type.Optional(Type.String()), run: Type.Unknown() }),
+  Type.Object({ action: Type.Literal("cancel"), cancellation: Type.Union([Type.Literal("cancelled"), Type.Literal("not_active")]), worker: Type.Unknown() }),
+  Type.Object({ action: Type.Literal("discard"), workerId: Type.String(), discarded: Type.Literal(true) })
+]);
+const WorkerMergeRepositoryV2Schema = Type.Object({
+  id: Type.String(), candidateRepo: Type.String(), candidateCommit: Type.String(), targetRepo: Type.String(), targetRef: Type.String(), method: Type.Union([Type.Literal("merge"), Type.Literal("squash")]),
+  status: Type.Union([Type.Literal("ready"), Type.Literal("resolution_required")]), expectedCommit: Type.String(), desiredCommit: Type.Optional(Type.String()), preparedPath: Type.String(), overlapCount: NonNegativeIntegerSchema,
+  dependsOn: Type.Array(Type.String()), source: Type.Optional(Type.Unknown()), warnings: Type.Optional(Type.Array(Type.String()))
+}, { additionalProperties: false });
+const WorkerMergeTestDetailsSchema = Type.Object({ preparedId: Type.String(), status: Type.Union([Type.Literal("ready"), Type.Literal("resolution_required")]), order: Type.Array(Type.String()), repositories: Type.Array(WorkerMergeRepositoryV2Schema), resolutionCases: Type.Optional(Type.Array(Type.Unknown())) }, { additionalProperties: false });
+const WorkerMergeApplyDetailsSchema = Type.Object({ preparedId: Type.String(), status: Type.Union([Type.Literal("completed"), Type.Literal("partial"), Type.Literal("failed")]), repositories: Type.Array(Type.Unknown()), error: Type.Optional(Type.String()) }, { additionalProperties: false });
+
 export const RetainedToolOutputSchemas = {
   shell_start: finalResultSchema(ShellStartDetailsSchema),
   shell_status: finalResultSchema(ShellStatusDetailsSchema),
@@ -764,12 +788,17 @@ export const RetainedToolOutputSchemas = {
   searxng_search: finalResultSchema(SearxngSearchDetailsSchema),
   web_fetch_many: finalResultSchema(WebFetchManyDetailsSchema),
   document_parse: finalResultSchema(DocumentParseDetailsSchema),
-  worker_run: finalResultSchema(WorkerRunDetailsSchema),
+  worker_run: finalResultSchema(WorkerRunV2DetailsSchema),
+  worker_control: finalResultSchema(WorkerControlV2DetailsSchema),
+  worker_merge_test: finalResultSchema(WorkerMergeTestDetailsSchema),
+  worker_merge_apply: finalResultSchema(WorkerMergeApplyDetailsSchema)
+} satisfies Record<string, TSchema>;
+
+export const LegacyWorkerOutputSchemas = {
   worker_review: finalResultSchema(WorkerReviewDetailsSchema),
-  worker_control: finalResultSchema(WorkerControlDetailsSchema),
   worker_fold_prepare: finalResultSchema(WorkerFoldPrepareDetailsSchema),
   worker_fold_resolve: finalResultSchema(WorkerFoldResolveDetailsSchema),
   worker_fold_promote: finalResultSchema(WorkerFoldPromoteDetailsSchema)
-} satisfies Record<string, TSchema>;
+};
 
 export type RetainedToolName = keyof typeof RetainedToolOutputSchemas;

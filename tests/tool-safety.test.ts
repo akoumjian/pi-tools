@@ -21,7 +21,7 @@ import toolSafetyExtension, {
   evaluatePathReads,
   evaluateWebFetchMany,
   evaluateWorkerControl,
-  evaluateWorkerReview,
+  evaluateWorkerMergeTool,
   parseApprovalModelPreference,
   parseToolSafetyReviewCriteria,
   resolveApprovalModelPreference,
@@ -987,11 +987,11 @@ test("worker_control allows every valid exact-session lifecycle action without s
   const workerId = "worker_20260910190000_12345678";
   const criteria = ["conservative", "production-or-unapproved-environment"] as const;
   const validInputs: unknown[] = [
-    { action: "status" },
-    { action: "status", workerId },
-    { action: "result", workerId },
+    { action: "list" },
+    { action: "runs", workerId },
+    { action: "get", workerId, runId: "run_20260910193000_87654321" },
     { action: "cancel", workerId },
-    { action: "discard", workerId, confirm: true }
+    { action: "discard", workerId }
   ];
 
   for (const input of validInputs) {
@@ -1006,7 +1006,7 @@ test("worker_control allows every valid exact-session lifecycle action without s
     }
   }
 
-  const discard = evaluateWorkerControl({ action: "discard", workerId, confirm: true });
+  const discard = evaluateWorkerControl({ action: "discard", workerId });
   assert.equal(discard.risk, "medium");
   assert.equal(discard.ruleId, "worker-control-discard");
 
@@ -1019,7 +1019,6 @@ test("worker_control allows every valid exact-session lifecycle action without s
     { action: "result", workerId, confirm: true },
     { action: "cancel" },
     { action: "discard", workerId, confirm: false },
-    { action: "discard", workerId },
     { action: "discard", workerId: "wrong", confirm: true }
   ];
   for (const input of malformedInputs) {
@@ -1035,31 +1034,11 @@ test("worker_control allows every valid exact-session lifecycle action without s
   }
 });
 
-test("worker_review allows exact read-only review shapes and keeps malformed calls reviewed", () => {
-  const valid = {
-    workerId: "worker_20260910190000_12345678",
-    runId: "run_20260910193000_87654321",
-    workspaceRepo: "repos/project",
-    focus: "Check lifecycle races."
-  };
-  for (const reviewCriteria of ["conservative", "production-or-unapproved-environment"] as const) {
-    assert.equal(
-      applyReviewCriteria(toolCall("worker_review", valid), evaluateWorkerReview(valid), reviewCriteria).action,
-      "allow"
-    );
-    for (const malformed of [
-      { ...valid, workspaceRepo: "../outside" },
-      { ...valid, workspaceRepo: "repos/../outside" },
-      { ...valid, unexpected: true }
-    ]) {
-      assert.equal(
-        applyReviewCriteria(toolCall("worker_review", malformed), evaluateWorkerReview(malformed), reviewCriteria).action,
-        "review"
-      );
-    }
-  }
+test("worker merge tools allow valid exact shapes and review malformed calls", () => {
+  assert.equal(evaluateWorkerMergeTool("worker_merge_test", { repositories: [{ id: "repo" }] }).action, "allow");
+  assert.equal(evaluateWorkerMergeTool("worker_merge_apply", { preparedId: `prepared_${"a".repeat(24)}` }).action, "allow");
+  assert.equal(evaluateWorkerMergeTool("worker_merge_apply", { preparedId: "wrong" }).action, "review");
 });
-
 
 test("document_parse is treated as project-local read access", () => {
   const decision = evaluateDocumentParse(

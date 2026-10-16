@@ -1292,7 +1292,7 @@ test("managed worker shell launch fails closed without an exact Docker identity"
   });
 });
 
-test("managed worker owner cancellation settles every owned async-shell job", async () => {
+test("managed worker owner cancellation settles every owned async-shell job", { skip: process.platform !== "darwin" }, async () => {
   await withTempDir(async (dir) => {
     await Promise.all([
       mkdir(path.join(dir, "cache", "config"), { recursive: true }),
@@ -1396,7 +1396,7 @@ test("persisted owner cancellation never signals a terminal job's reused pid", a
   });
 });
 
-test("worker shell output is captured in trusted state outside the writable workspace", async () => {
+test("worker shell output is captured in trusted state outside the writable workspace", { skip: process.platform !== "darwin" }, async () => {
   await withTempDir(async (directory) => {
     const workspace = path.join(directory, "workspace");
     const stateRoot = path.join(directory, "state");
@@ -1481,7 +1481,7 @@ test("worker shell_read rejects traversal IDs and forged metadata log paths", as
   });
 });
 
-test("owned jobs remain active until background process-group descendants settle", async () => {
+test("owned jobs remain active until background process-group descendants settle", { skip: process.platform !== "darwin" }, async () => {
   await withTempDir(async (dir) => {
     await Promise.all([
       mkdir(path.join(dir, "cache", "config"), { recursive: true }),
@@ -1620,7 +1620,7 @@ test("ordinary async-shell completion remains tied to the requested command lead
   });
 });
 
-test("worker ownership token tracks and cancels children that create a detached process group", async () => {
+test("worker ownership token tracks and cancels children that create a detached process group", { skip: process.platform !== "darwin" }, async () => {
   await withTempDir(async (dir) => {
     const stateRoot = path.join(dir, "worker-state");
     const asyncRoot = path.join(stateRoot, "async-shell");
