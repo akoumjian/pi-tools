@@ -11,7 +11,8 @@ export function validateAdditionalInputs(input: {
   values?: string[]; existing?: RetainedInput[]; role: WorkerRole; workspaceRoot: string; runtimeRoot: string;
 }): RetainedInput[] {
   const existing = [...(input.existing ?? [])];
-  const sensitive = [input.runtimeRoot, path.join(homedir(), ".pi"), path.join(homedir(), ".ssh"), process.env.BEADS_DIR, input.workspaceRoot]
+  const home = homedir();
+  const sensitive = [input.runtimeRoot, path.join(home, ".pi"), path.join(home, ".ssh"), path.join(home, ".aws"), path.join(home, ".gnupg"), path.join(home, ".config"), path.join(home, ".docker"), path.join(home, ".kube"), path.join(home, ".netrc"), path.join(home, ".git-credentials"), path.join(home, ".npmrc"), path.join(home, ".local", "share", "agent"), process.env.XDG_CONFIG_HOME, process.env.AWS_SHARED_CREDENTIALS_FILE, process.env.AWS_CONFIG_FILE, process.env.KUBECONFIG, process.env.DOCKER_CONFIG, process.env.NPM_CONFIG_USERCONFIG, process.env.BEADS_DIR, input.workspaceRoot]
     .filter((value): value is string => typeof value === "string" && value.length > 0)
     .flatMap((value) => { try { return [realpathSync(path.resolve(value))]; } catch { return []; } });
   const allSources = new Set(existing.map((item) => item.source));

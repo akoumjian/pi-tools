@@ -60,7 +60,7 @@ Cancel only active work. Discard an idle worker only when no further review, res
 
 ## Invariants
 
-- Only a worker’s latest completed run may be reviewed or used as a repository candidate.
+- Only a worker’s latest completed run may be reviewed. Repository candidates may intentionally name any retained exact safely reachable commit; historical provenance, staleness, and run outcome are advisory warnings.
 - Workers may update only assigned Beads tasks and never close them.
 - Review outcomes are advisory and never authorize repository application.
 - Workers never modify authoritative repositories, push, publish, release, or write parent grounding.

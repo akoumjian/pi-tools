@@ -187,6 +187,7 @@ CREATE TABLE IF NOT EXISTS prepared_sets (
   status TEXT NOT NULL,
   order_json TEXT NOT NULL,
   warnings_json TEXT NOT NULL DEFAULT '[]',
+  apply_nonce TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 ) STRICT;
@@ -471,7 +472,7 @@ function decodeDelivery(row: DeliveryRow): WorkerDeliveryRecord {
 }
 
 export function leaseWorkerForReview(registry: WorkerRegistry, subjectWorkerId: string, reviewerWorkerId: string, now: string): void {
-  transaction(registry, () => { const result = registry.database.prepare("UPDATE workers SET reviewed_by_worker_id=?,version=version+1,updated_at=? WHERE worker_id=? AND status='idle' AND reviewed_by_worker_id IS NULL").run(reviewerWorkerId, now, subjectWorkerId); if (Number(result.changes) !== 1) throw new Error(`Worker ${subjectWorkerId} is not available for review.`); });
+  transaction(registry, () => { const result = registry.database.prepare("UPDATE workers SET reviewed_by_worker_id=?,version=version+1,updated_at=? WHERE worker_id=? AND status='idle' AND (reviewed_by_worker_id IS NULL OR reviewed_by_worker_id=?)").run(reviewerWorkerId, now, subjectWorkerId, reviewerWorkerId); if (Number(result.changes) !== 1) throw new Error(`Worker ${subjectWorkerId} is not available for review.`); });
 }
 export function releaseWorkerReviewLease(registry: WorkerRegistry, subjectWorkerId: string, reviewerWorkerId: string, now: string): void {
   transaction(registry, () => { registry.database.prepare("UPDATE workers SET reviewed_by_worker_id=NULL,version=version+1,updated_at=? WHERE worker_id=? AND reviewed_by_worker_id=?").run(now, subjectWorkerId, reviewerWorkerId); });
@@ -502,10 +503,46 @@ export function storePreparedSet(registry: WorkerRegistry, input: { preparedId: 
   });
 }
 
+export type TrustedPreparedSetRecord = { version: 1; preparedId: string; parentSessionFile: string; status: "ready" | "resolution_required" | "consumed" | "completed" | "partial" | "failed" | "superseded"; order: string[]; repositories: Array<{ id: string } & Record<string, any>>; createdAt: string };
+
+export function readPreparedSetRecord(registry: WorkerRegistry, parentSessionFile: string, preparedId: string): TrustedPreparedSetRecord {
+  return transaction(registry, () => {
+    const set = registry.database.prepare("SELECT prepared_id,parent_session_file,status,order_json,created_at FROM prepared_sets WHERE prepared_id=? AND parent_session_file=?").get(preparedId, parentSessionFile) as { prepared_id: string; parent_session_file: string; status: TrustedPreparedSetRecord["status"]; order_json: string; created_at: string } | undefined;
+    if (!set) throw new Error(`Unknown prepared set ${preparedId}.`);
+    const rows = registry.database.prepare("SELECT record_json FROM prepared_repositories WHERE prepared_id=? ORDER BY repository_id").all(preparedId) as Array<{ record_json: string }>;
+    return { version: 1, preparedId: set.prepared_id, parentSessionFile: set.parent_session_file, status: set.status, order: parseJson<string[]>(set.order_json), repositories: rows.map((row) => parseJson<any>(row.record_json)), createdAt: set.created_at };
+  });
+}
+
+export function claimPreparedSetApply(registry: WorkerRegistry, preparedId: string, parentSessionFile: string, nonce: string, now: string): boolean {
+  return transaction(registry, () => Number(registry.database.prepare("UPDATE prepared_sets SET apply_nonce=?,updated_at=? WHERE prepared_id=? AND parent_session_file=? AND apply_nonce IS NULL AND status IN ('ready','partial','failed')").run(nonce, now, preparedId, parentSessionFile).changes) === 1);
+}
+
+export function finishPreparedSetApply(registry: WorkerRegistry, preparedId: string, parentSessionFile: string, nonce: string, status: "completed" | "partial" | "failed", now: string): void {
+  transaction(registry, () => { const result = registry.database.prepare("UPDATE prepared_sets SET status=?,apply_nonce=NULL,updated_at=? WHERE prepared_id=? AND parent_session_file=? AND apply_nonce=?").run(status, now, preparedId, parentSessionFile, nonce); if (Number(result.changes) !== 1) throw new Error(`Prepared set ${preparedId} apply authority changed.`); });
+}
+
+export function releasePreparedSetApply(registry: WorkerRegistry, preparedId: string, parentSessionFile: string, nonce: string, now: string): void {
+  transaction(registry, () => { registry.database.prepare("UPDATE prepared_sets SET apply_nonce=NULL,updated_at=? WHERE prepared_id=? AND parent_session_file=? AND apply_nonce=?").run(now, preparedId, parentSessionFile, nonce); });
+}
+
 export function updatePreparedSetStatus(registry: WorkerRegistry, preparedId: string, parentSessionFile: string, status: string, now: string): void {
   transaction(registry, () => {
-    const result = registry.database.prepare("UPDATE prepared_sets SET status=?,updated_at=? WHERE prepared_id=? AND parent_session_file=?").run(status, now, preparedId, parentSessionFile);
+    const result = registry.database.prepare("UPDATE prepared_sets SET status=?,updated_at=? WHERE prepared_id=? AND parent_session_file=? AND apply_nonce IS NULL").run(status, now, preparedId, parentSessionFile);
     if (Number(result.changes) !== 1) throw new Error(`Unknown prepared set ${preparedId}.`);
+  });
+}
+
+export function recoverInterruptedClaimsForParent(registry: WorkerRegistry, parentSessionFile: string, runtimeGeneration: number, now: string): void {
+  transaction(registry, () => {
+    const currentPrefix = `${runtimeGeneration}-%`;
+    const claimed = registry.database.prepare(`SELECT w.worker_id,w.active_run_id,r.claim_kind,r.claim_nonce FROM workers w JOIN runs r ON r.run_id=w.active_run_id WHERE w.parent_session_file=? AND r.claim_kind IS NOT NULL AND (r.claim_nonce IS NULL OR r.claim_nonce NOT LIKE ?)`).all(parentSessionFile, currentPrefix) as Array<{ worker_id: string; active_run_id: string; claim_kind: string; claim_nonce?: string }>;
+    for (const item of claimed) {
+      registry.database.prepare("UPDATE runs SET claim_kind=NULL,claim_nonce=NULL WHERE run_id=? AND worker_id=? AND claim_kind=? AND claim_nonce IS ?").run(item.active_run_id, item.worker_id, item.claim_kind, item.claim_nonce ?? null);
+      if (item.claim_kind === "cancellation") registry.database.prepare("UPDATE workers SET recovery_error=?,version=version+1,updated_at=? WHERE worker_id=?").run("Interrupted cancellation claim is ready for an exact cancellation retry.", now, item.worker_id);
+    }
+    registry.database.prepare("UPDATE workers SET operation_kind=NULL,operation_nonce=NULL,recovery_error=COALESCE(recovery_error,'Interrupted discard claim is ready for an exact discard retry.'),version=version+1,updated_at=? WHERE parent_session_file=? AND operation_kind='discard' AND (operation_nonce IS NULL OR operation_nonce NOT LIKE ?)").run(now, parentSessionFile, currentPrefix);
+    registry.database.prepare("UPDATE prepared_sets SET apply_nonce=NULL,updated_at=? WHERE parent_session_file=? AND apply_nonce IS NOT NULL AND apply_nonce NOT LIKE ?").run(now, parentSessionFile, currentPrefix);
   });
 }
 
@@ -533,8 +570,8 @@ export function createWorkerRunBatch(registry: WorkerRegistry, input: {
   transaction(registry, () => {
     for (const lease of input.reviewLeases ?? []) {
       const result = registry.database.prepare(`UPDATE workers SET reviewed_by_worker_id=?,version=version+1,updated_at=?
-        WHERE worker_id=? AND status='idle' AND reviewed_by_worker_id IS NULL AND latest_run_id=? AND role IN ('work','integration')`)
-        .run(lease.reviewerWorkerId, input.now, lease.subjectWorkerId, lease.reviewedRunId);
+        WHERE worker_id=? AND status='idle' AND (reviewed_by_worker_id IS NULL OR reviewed_by_worker_id=?) AND latest_run_id=? AND role IN ('work','integration')`)
+        .run(lease.reviewerWorkerId, input.now, lease.subjectWorkerId, lease.reviewerWorkerId, lease.reviewedRunId);
       if (Number(result.changes) !== 1) throw new Error(`Worker ${lease.subjectWorkerId} is not available for review of ${lease.reviewedRunId}.`);
     }
     for (const prepared of input.consumedPrepared ?? []) {
@@ -612,18 +649,6 @@ export function finalizeClaimedWorkerRun(registry: WorkerRegistry, input: {
   });
 }
 
-export function updateWorkerAndRunRuntime(registry: WorkerRegistry, input: { workerId: string; runId: string; workerRuntime?: Record<string, unknown>; runRuntime?: Record<string, unknown>; now: string }): void {
-  transaction(registry, () => {
-    if (input.workerRuntime) {
-      const result = registry.database.prepare("UPDATE workers SET runtime_json=?,version=version+1,updated_at=? WHERE worker_id=? AND active_run_id=?").run(json(input.workerRuntime), input.now, input.workerId, input.runId);
-      if (Number(result.changes) !== 1) throw staleRun(input.workerId, input.runId);
-    }
-    if (input.runRuntime) {
-      const result = registry.database.prepare("UPDATE runs SET runtime_json=? WHERE worker_id=? AND run_id=? AND status!='settled'").run(json(input.runRuntime), input.workerId, input.runId);
-      if (Number(result.changes) !== 1) throw staleRun(input.workerId, input.runId);
-    }
-  });
-}
 
 export function claimWorkerDiscard(registry: WorkerRegistry, workerId: string, expectedVersion: number, nonce: string, now: string): WorkerRunRecord | undefined {
   return transaction(registry, () => {
@@ -684,7 +709,7 @@ export function claimWorkerCancellation(registry: WorkerRegistry, workerId: stri
     const worker = registry.database.prepare("SELECT recovery_error FROM workers WHERE worker_id=? AND active_run_id=? AND status IN ('queued','running')").get(workerId, runId) as { recovery_error: string | null } | undefined;
     if (!worker) return false;
     const result = worker.recovery_error
-      ? registry.database.prepare("UPDATE runs SET claim_kind='cancellation',claim_nonce=? WHERE worker_id=? AND run_id=? AND status IN ('queued','running') AND (claim_kind IS NULL OR claim_kind='settlement')").run(nonce, workerId, runId)
+      ? registry.database.prepare("UPDATE runs SET claim_kind='cancellation',claim_nonce=? WHERE worker_id=? AND run_id=? AND status IN ('queued','running')").run(nonce, workerId, runId)
       : registry.database.prepare("UPDATE runs SET claim_kind='cancellation',claim_nonce=? WHERE worker_id=? AND run_id=? AND status IN ('queued','running') AND (claim_kind IS NULL OR claim_kind='launch')").run(nonce, workerId, runId);
     if (Number(result.changes) === 1) registry.database.prepare("UPDATE workers SET updated_at=? WHERE worker_id=?").run(now, workerId);
     return Number(result.changes) === 1;

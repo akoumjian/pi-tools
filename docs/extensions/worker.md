@@ -48,13 +48,15 @@ Supported rootful Docker environments use a local-driver OverlayFS view with one
 
 The tool never mutates targets. Historical managed-worker candidates are allowed and produce provenance warnings. Every call creates a new `preparedId`. Any target movement requires a fresh test. A complete conflicted set can be atomically moved into one integration worker workspace, consuming that prepared set.
 
+Prepared-set lifecycle and repository records in the SQLite registry are authoritative. `prepared.json` is a rendered inspection/context artifact only; integration and apply never trust worker-writable copies as authority.
+
 After parent review and validation, `worker_merge_apply({preparedId})` globally preflights every exact clean target. It then applies dependency order using `git merge --ff-only` for checked-out refs or compare-and-swap `git update-ref --no-deref` otherwise. Earlier updates remain after a later operational failure; retrying the same prepared ID skips exact already-applied commits.
 
-Trusted Git disables hooks, signing, credentials, global/system configuration, replace/graft overlays, and hostile merge configuration. Application performs no model call, conflict resolution, testing, push, release, grounding, or Beads mutation.
+Trusted Git disables hooks, signing, credentials, global/system configuration, replace/graft overlays, and hostile merge configuration; linked worktrees, per-worktree configuration, nested Git metadata, and gitlinks/submodules are rejected. Application performs no model call, conflict resolution, testing, push, release, grounding, or Beads mutation.
 
 ## Cancellation and retention
 
-Forced cancellation atomically revokes run authority, aborts provider/supervisor work, and uses one exact `docker rm --force <container-id>` as the agent and shell-process boundary. Host-side job records are reconciled afterward. Cleanup uncertainty becomes recovery-required rather than a false cancellation.
+Forced cancellation atomically revokes run authority, waits out admitted host mutations, proves the exact supervisor process group terminal, and uses one exact `docker rm --force <container-id>` as the agent and shell-process boundary. Result submission and Beads mutation recheck durable authorization immediately before mutation. Host-side job records are reconciled afterward. Cleanup uncertainty becomes recovery-required rather than a false cancellation.
 
 Cancellation preserves workspace/session/evidence. Resume after cancellation includes a warning to inspect interrupted Git operations and never removes locks automatically. `discard` is idle-only, permanent, and never auto-cancels. There is no automatic garbage collection.
 

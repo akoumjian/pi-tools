@@ -19,8 +19,10 @@ async function fixture(role: "work" | "review" | "integration", run: (root: stri
     PI_WORKER_ID: "worker_20260101000000_aaaaaaaa", PI_WORKER_RUN_ID: "run_20260101000000_aaaaaaaa", PI_WORKER_ROLE: role,
     PI_WORKER_RESULT_FILE: path.join(root, "state", "result.json"), PI_WORKER_WORKSPACE_ROOT: root,
     PI_WORKER_STATE_ROOT: path.join(root, "state"), PI_WORKER_ASYNC_JOB_ROOT: path.join(root, "state", "async-shell"),
-    PI_WORKER_TASK_IDS: JSON.stringify(["personal-test"])
+    PI_WORKER_TASK_IDS: JSON.stringify(["personal-test"]), PI_WORKER_AUTHORIZATION_FILE: path.join(root, "state", "host-authorization.json"),
+    PI_WORKER_PROCESS_NONCE: "test-nonce", PI_WORKER_PARENT_PID: String(process.pid)
   };
+  await writeFile(values.PI_WORKER_AUTHORIZATION_FILE!, JSON.stringify({ version: 1, workerId: values.PI_WORKER_ID, runId: values.PI_WORKER_RUN_ID, parentPid: process.pid, processNonce: values.PI_WORKER_PROCESS_NONCE }));
   const old = new Map(Object.keys(values).map((key) => [key, process.env[key]])); Object.assign(process.env, values);
   try { const api = fakeApi(); workerRuntimeExtension(api); await run(root, api); }
   finally { for (const [key, value] of old) value === undefined ? delete process.env[key] : process.env[key] = value; await rm(root, { recursive: true, force: true }); }
@@ -96,6 +98,17 @@ test("runtime rejects a result-file parent that resolves outside trusted state",
       await assert.rejects(() => tool.execute!("call", { outcome: "completed", summary: "probe" }, undefined, undefined, undefined as never), /state paths must remain beneath/);
       assert.equal(existsSync(path.join(outside, "result.json")), false);
     } finally { if (prior === undefined) delete process.env.PI_WORKER_RESULT_FILE; else process.env.PI_WORKER_RESULT_FILE = prior; await rm(outside, { recursive: true, force: true }); }
+  });
+});
+
+test("durable authorization revocation blocks result submission and Beads calls", async () => {
+  await fixture("work", async (root, api) => {
+    await rm(process.env.PI_WORKER_AUTHORIZATION_FILE!, { force: true });
+    const result = api.tools.find((candidate) => candidate.name === "worker_result_submit")!;
+    await assert.rejects(() => result.execute!("call", { outcome: "completed", summary: "late" }, undefined, undefined, undefined as never), /revoked/);
+    const beads = api.tools.find((candidate) => candidate.name === "worker_beads_tasks")!;
+    await assert.rejects(() => beads.execute!("call", { action: "assigned" }, undefined, undefined, undefined as never), /revoked/);
+    assert.equal(existsSync(path.join(root, "state", "result.json")), false);
   });
 });
 

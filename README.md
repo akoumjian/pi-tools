@@ -139,19 +139,15 @@ Each extension below documents what it does, what it provides, and how to set it
 
 ### worker
 
-**Purpose.** Run durable sandboxed work, review, and conflict-integration agents while the parent retains grounding, acceptance, validation, authoritative mutation, publication, and task closure.
+[Full docs](docs/extensions/worker.md).
 
-**Provides.** Parent tools `worker_run`, `worker_control`, `worker_merge_test`, and `worker_merge_apply`; worker-only `worker_result_submit` and `worker_beads_tasks`; `/worker:list`, `/worker:show`, `/worker:logs`, `/worker:cancel`, and `/worker:discard`; one parent skill plus verified plain role instructions under `worker-roles/`.
+**Purpose.** Run durable sandboxed work, independent review, and conflict integration while the parent retains grounding, acceptance, validation, authoritative mutation, publication, and task closure.
 
-Worker and immutable run metadata lives in an owner-only local SQLite registry under `~/.local/share/agent/worker-runtime/`. Trusted host processes use short transactions directly; containers never receive database access. Sessions, logs, workspaces, Git repositories, and artifacts remain retained files. Completion delivery uses stable registry entries and reload-safe runtime generations without becoming a resume gate.
+**Provides.** `worker_run`, `worker_control`, `worker_merge_test`, `worker_merge_apply`; worker-only `worker_result_submit` and `worker_beads_tasks`; `/worker:list`, `/worker:show`, `/worker:logs`, `/worker:cancel`, and `/worker:discard`.
 
-`worker_run` starts `work`, `review`, or `integration` roles and resumes an exact retained worker. Work starts may override one exact `modelSelection`; otherwise role-specific `modelPreferences` are tried only before worker-visible effects. Selected models remain fixed across resume, and `max` thinking and Claude Fable are rejected. Review and integration starts receive bounded context files and read-only additional inputs. Worker results use role-specific outcomes and workspace-contained repository/artifact paths.
+**Setup.** Node 22.19+, Pi, Docker Desktop or a rootful Docker Engine, the pinned worker image, central `bd`, and role model preferences in `config/worker-settings.json`.
 
-`worker_merge_test` accepts arbitrary local candidate repositories/revisions and exact target refs, creates ordinary isolated prepared Git repositories, and returns ready commits or ordinary conflict state. A conflicted complete set may move into one integration workspace. `worker_merge_apply` globally preflights exact targets and then performs dependency-ordered ff-only merge or ref CAS. Application is retry-safe but intentionally not atomic across repositories, and it never validates, pushes, publishes, or closes tasks.
-
-**Setup.** Node 22.19+, Pi, Docker Desktop or a rootful Docker Engine, the pinned worker image, central `bd`, and `config/worker-settings.json` with `modelPreferences` for all roles. Review overlays require supported rootful Linux/Docker behavior; unsupported environments fail rather than copying the authoritative subject. Existing sessions require `/reload` or restart after installation changes.
-
-See [`docs/extensions/worker.md`](docs/extensions/worker.md).
+---
 
 ### completion-notifications
 

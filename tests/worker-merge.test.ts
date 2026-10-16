@@ -110,3 +110,23 @@ test("merge preparation rejects replace refs and graft metadata", () => {
     assert.throws(() => prepareWorkerMerges("/parent.jsonl", [{ id: "graft", candidateRepo: f.candidate, targetRepo: f.target, targetRef: "refs/heads/main", method: "merge", commitMessage: "no" }], { preparedRoot: f.preparedRoot, targetRoot: f.targets, randomHex: () => "4".repeat(24) }), /grafts/);
   } finally { f.close(); }
 });
+
+test("partial application records exact progress and retries remaining atomic ref updates", () => {
+  const f = fixture();
+  try {
+    const target2 = path.join(f.targets, "target2"); const candidate2 = path.join(f.root, "candidate2");
+    execFileSync("git", ["clone", "-q", "--no-hardlinks", f.target, target2]); execFileSync("git", ["clone", "-q", "--no-hardlinks", target2, candidate2]);
+    commit(f.candidate, "one.txt", "one\n", "one"); commit(candidate2, "two.txt", "two\n", "two"); git(f.target, ["checkout", "--detach"]); git(target2, ["checkout", "--detach"]);
+    const set = prepareWorkerMerges("/parent.jsonl", [
+      { id: "two", candidateRepo: candidate2, targetRepo: target2, targetRef: "refs/heads/main", method: "merge", commitMessage: "two", dependsOn: ["one"] },
+      { id: "one", candidateRepo: f.candidate, targetRepo: f.target, targetRef: "refs/heads/main", method: "merge", commitMessage: "one" },
+    ], { preparedRoot: f.preparedRoot, targetRoot: f.targets, randomHex: () => "5".repeat(24) });
+    assert.deepEqual(set.order, ["one", "two"]);
+    const lock = path.join(target2, ".git", "refs", "heads", "main.lock");
+    const partial = applyPreparedWorkerMerges("/parent.jsonl", set.preparedId, { preparedRoot: f.preparedRoot, targetRoot: f.targets, sourceForCandidate: (repo) => { if (repo === candidate2) writeFileSync(lock, "locked\n"); return {}; } });
+    assert.equal(partial.status, "partial"); assert.equal(partial.repositories[0]?.status, "applied"); assert.equal(partial.repositories[1]?.status, "failed");
+    assert.equal(git(f.target, ["rev-parse", "refs/heads/main"]), set.repositories[0]!.desiredCommit); assert.equal(git(target2, ["rev-parse", "refs/heads/main"]), set.repositories[1]!.expectedCommit);
+    rmSync(lock); const retried = applyPreparedWorkerMerges("/parent.jsonl", set.preparedId, { preparedRoot: f.preparedRoot, targetRoot: f.targets });
+    assert.equal(retried.status, "completed"); assert.equal(git(target2, ["rev-parse", "refs/heads/main"]), set.repositories[1]!.desiredCommit);
+  } finally { f.close(); }
+});

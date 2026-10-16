@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { Type, validateToolArguments, type Tool, type ToolCall } from "@earendil-works/pi-ai";
+import { validateToolArguments, type Tool, type ToolCall } from "@earendil-works/pi-ai";
 import { defineTool, type AgentToolResult, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { activeAsyncShellJobsForOwner, cancelAsyncShellJobsForOwner, cancelPersistedAsyncShellJobsForOwner, unsettledPersistedAsyncShellJobsForOwner, type AsyncShellJobOwner } from "../async-shell/index.js";
 import { createWorkerCacheLineageRuntime, registerWorkerCacheLineageRuntimeHooks, validateWorkerCacheLineageRecord, type WorkerCacheLineageRecord } from "./cache-lineage.js";
@@ -10,7 +10,7 @@ import { WorkerBeadsTasksParams, WorkerBeadsTasksReadParams, WorkerResultSubmitP
 import type { WorkerRole } from "./registry.js";
 import { inputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 import { trustedGit } from "./trusted-git.js";
-import { MAX_WORKER_TASK_IDS, workerResultAdmissionPath } from "../_shared/worker-contract.js";
+import { MAX_WORKER_TASK_IDS, workerMutationAdmissionPath, workerResultAdmissionPath } from "../_shared/worker-contract.js";
 
 export type AcceptedWorkerResult = { version: 2; workerId: string; runId: string; acceptedAt: string; result: WorkerResultSubmitInput & { repositories?: string[]; artifacts?: string[] } };
 export type WorkerTaskUpdate = { taskId: string; note: string; status?: "in_progress" | "blocked" };
@@ -69,6 +69,7 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
     parameters: WorkerResultSubmitParams, executionMode: "sequential",
     async execute(_id, params): Promise<AgentToolResult<WorkerResultDetails>> {
       const identity = workerRuntimeIdentity();
+      assertRuntimeAuthorization(identity, "worker_result_submit");
       if (existsSync(identity.resultFile)) throw new Error(`Worker result was already accepted for ${identity.workerId}/${identity.runId}.`);
       const errors: WorkerResultError[] = [];
       let repositories: string[] = []; let artifacts: string[] = [];
@@ -87,6 +88,7 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
         await cancelPersistedAsyncShellJobsForOwner(identity.asyncJobRoot, identity.owner, 2_000);
         const active = [...activeAsyncShellJobsForOwner(identity.owner), ...unsettledPersistedAsyncShellJobsForOwner(identity.asyncJobRoot, identity.owner)].filter((job) => job.status === "running" || job.status === "unknown");
         if (active.length) return rejectedResult([{ code: "unsupported_path_type", path: "run", message: `Owned asynchronous work could not be reconciled: ${[...new Set(active.map((job) => job.jobId))].sort().join(", ")}.` }]);
+        assertRuntimeAuthorization(identity, "worker_result_submit");
         const accepted: AcceptedWorkerResult = { version: 2, workerId: identity.workerId, runId: identity.runId, acceptedAt: new Date().toISOString(), result: { ...params, ...(repositories.length ? { repositories } : {}), ...(artifacts.length ? { artifacts } : {}) } };
         writeAtomicJson(identity.resultFile, accepted);
         const details = { status: "accepted" as const, outcome: params.outcome };
@@ -121,7 +123,7 @@ function validateBeadsAction(params: any): void {
   if (params.action === "update" && (!params.taskId || !params.note?.trim())) throw new Error("worker_beads_tasks update requires taskId and note.");
 }
 
-function assertRuntimeOpen(tool: string): void { if (existsSync(workerRuntimeIdentity().resultFile)) throw new Error(`${tool} is sealed after worker_result_submit acceptance.`); }
+function assertRuntimeOpen(tool: string): void { const identity = workerRuntimeIdentity(); assertRuntimeAuthorization(identity, tool); if (existsSync(identity.resultFile)) throw new Error(`${tool} is sealed after worker_result_submit acceptance.`); }
 function workerRuntimeRole(): WorkerRole { const value = requiredEnvironment("PI_WORKER_ROLE"); if (value !== "work" && value !== "review" && value !== "integration") throw new Error(`Invalid PI_WORKER_ROLE: ${value}.`); return value; }
 function resultPathMetadata(value: string): { exists: boolean; directory: boolean; file: boolean; repository: boolean } {
   if (!existsSync(value)) return { exists: false, directory: false, file: false, repository: false };
@@ -155,8 +157,10 @@ async function executeTaskUpdate(params: WorkerTaskUpdate): Promise<AgentToolRes
   const runtime = workerTaskRuntime(); if (!runtime.taskIds.has(params.taskId)) throw new Error(`Worker ${runtime.workerId} is not authorized to mutate Beads task ${params.taskId}.`);
   verifyPersonalBeadsRoute(runtime);
   const args = ["update", params.taskId, `--append-notes=${params.note.trim()}`]; if (params.status) args.push("--status", params.status); args.push("--actor", `worker:${runtime.workerId}`, "--json");
-  try { execFileSync(runtime.bdPath, args, { cwd: runtime.workspaceRoot, env: process.env, encoding: "utf8", maxBuffer: MAX_WORKER_BEADS_OUTPUT_BYTES, timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] }); }
-  catch { throw new Error(`worker_beads_tasks could not record an update for ${params.taskId}.`); }
+  const identity = workerRuntimeIdentity(); const admissionFile = beginWorkerMutationAdmission(identity);
+  try { assertRuntimeAuthorization(identity, "worker_beads_tasks"); execFileSync(runtime.bdPath, args, { cwd: runtime.workspaceRoot, env: process.env, encoding: "utf8", maxBuffer: MAX_WORKER_BEADS_OUTPUT_BYTES, timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] }); }
+  catch (error) { if (error instanceof Error && error.message.includes("revoked")) throw error; throw new Error(`worker_beads_tasks could not record an update for ${params.taskId}.`); }
+  finally { rmSync(admissionFile, { force: true }); }
   return { content: [{ type: "text", text: `Recorded a durable worker note on ${params.taskId}${params.status ? ` and set status ${params.status}` : ""}.` }], details: { taskId: params.taskId, status: params.status, recorded: true } };
 }
 
@@ -344,6 +348,9 @@ function workerRuntimeIdentity(): {
   resultFile: string;
   workspaceRoot: string;
   asyncJobRoot: string;
+  authorizationFile: string;
+  processNonce: string;
+  parentPid: number;
   owner: AsyncShellJobOwner;
 } {
   const workerId = requiredEnvironment("PI_WORKER_ID");
@@ -352,10 +359,28 @@ function workerRuntimeIdentity(): {
   const workspaceRoot = realpathSync(path.resolve(requiredEnvironment("PI_WORKER_WORKSPACE_ROOT")));
   const asyncJobRoot = realpathSync(path.resolve(requiredEnvironment("PI_WORKER_ASYNC_JOB_ROOT")));
   const requestedResult = path.resolve(requiredEnvironment("PI_WORKER_RESULT_FILE"));
+  const authorizationFile = path.resolve(requiredEnvironment("PI_WORKER_AUTHORIZATION_FILE"));
+  const processNonce = requiredEnvironment("PI_WORKER_PROCESS_NONCE");
+  const parentPid = Number(requiredEnvironment("PI_WORKER_PARENT_PID"));
   if (existsSync(requestedResult) && lstatSync(requestedResult).isSymbolicLink()) throw new Error("PI_WORKER_RESULT_FILE may not be a symbolic link.");
   const resultFile = path.join(realpathSync(path.dirname(requestedResult)), path.basename(requestedResult));
   if (!pathWithin(stateRoot, resultFile) || !pathWithin(stateRoot, asyncJobRoot)) throw new Error("Worker runtime state paths must remain beneath PI_WORKER_STATE_ROOT.");
-  return { workerId, runId, resultFile, workspaceRoot, asyncJobRoot, owner: { kind: "worker-run", workerId, runId } };
+  if (!pathWithin(stateRoot, authorizationFile) || !Number.isSafeInteger(parentPid) || parentPid <= 0) throw new Error("Worker runtime authorization identity is invalid.");
+  return { workerId, runId, resultFile, workspaceRoot, asyncJobRoot, authorizationFile, processNonce, parentPid, owner: { kind: "worker-run", workerId, runId } };
+}
+
+function assertRuntimeAuthorization(identity: ReturnType<typeof workerRuntimeIdentity>, tool: string): void {
+  let value: any;
+  try { value = JSON.parse(readFileSync(identity.authorizationFile, "utf8")); } catch { throw new Error(`${tool} is revoked for ${identity.workerId}/${identity.runId}.`); }
+  if (value?.version !== 1 || value.workerId !== identity.workerId || value.runId !== identity.runId || value.processNonce !== identity.processNonce || value.parentPid !== identity.parentPid) throw new Error(`${tool} is revoked for ${identity.workerId}/${identity.runId}.`);
+  try { process.kill(identity.parentPid, 0); } catch { throw new Error(`${tool} is revoked because its parent runtime exited.`); }
+}
+
+function beginWorkerMutationAdmission(identity: ReturnType<typeof workerRuntimeIdentity>): string {
+  const file = workerMutationAdmissionPath(identity.authorizationFile);
+  try { writeFileSync(file, `${JSON.stringify({ version: 1, workerId: identity.workerId, runId: identity.runId, pid: process.pid, startedAt: new Date().toISOString() })}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 }); }
+  catch (cause) { if ((cause as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`Worker mutation admission is already active for ${identity.workerId}/${identity.runId}.`); throw cause; }
+  return file;
 }
 
 function beginWorkerResultAdmission(identity: ReturnType<typeof workerRuntimeIdentity>): string {
@@ -538,44 +563,4 @@ function boundedUtf8(value: string, maximumBytes: number): { text: string; trunc
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function workerTaskReadOutputSchema() {
-  const textContent = Type.Object({ type: Type.Literal("text"), text: Type.String() }, { additionalProperties: false });
-  return Type.Object({
-    content: Type.Array(textContent, { minItems: 1, maxItems: 1 }),
-    details: Type.Object({
-      scope: Type.Union([Type.Literal("assigned"), Type.Literal("requested"), Type.Literal("search")]),
-      offset: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_WORKER_TASK_IDS - 1 })),
-      limit: Type.Integer({ minimum: 1, maximum: MAX_WORKER_TASK_READ_LIMIT }),
-      totalAssigned: Type.Integer({ minimum: 1, maximum: MAX_WORKER_TASK_IDS }),
-      returned: Type.Integer({ minimum: 0, maximum: MAX_WORKER_TASK_READ_LIMIT }),
-      nextOffset: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_WORKER_TASK_IDS - 1 })),
-      contentBytes: Type.Integer({ minimum: 1, maximum: MAX_WORKER_TASK_READ_CONTENT_BYTES }),
-      truncated: Type.Boolean()
-    }, { additionalProperties: false })
-  }, { additionalProperties: false });
-}
-
-function workerTaskUpdateOutputSchema() {
-  const textContent = Type.Object({ type: Type.Literal("text"), text: Type.String() }, { additionalProperties: false });
-  return Type.Object({
-    content: Type.Array(textContent, { minItems: 1, maxItems: 1 }),
-    details: Type.Object({
-      taskId: Type.String({ minLength: 1 }),
-      status: Type.Optional(Type.String({ minLength: 1 })),
-      recorded: Type.Literal(true)
-    }, { additionalProperties: false })
-  }, { additionalProperties: false });
-}
-
-function workerResultOutputSchema() {
-  const textContent = Type.Object({ type: Type.Literal("text"), text: Type.String() }, { additionalProperties: false });
-  return Type.Object({
-    content: Type.Array(textContent, { minItems: 1, maxItems: 1 }),
-    details: Type.Union([
-      Type.Object({ accepted: Type.Literal(true), resultFile: Type.String({ minLength: 1 }) }, { additionalProperties: false }),
-      Type.Object({ accepted: Type.Literal(false), activeJobIds: Type.Array(Type.String({ minLength: 1 })) }, { additionalProperties: false })
-    ])
-  }, { additionalProperties: false });
 }

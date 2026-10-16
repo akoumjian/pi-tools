@@ -4,12 +4,14 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import {
+  claimPreparedSetApply,
   claimWorkerCancellation,
   claimWorkerDelivery,
   createWorkerAndRun,
   createWorkerRunBatch,
   discardWorkerRegistryRecord,
   finalizeClaimedWorkerRun,
+  finishPreparedSetApply,
   getWorker,
   getWorkerRun,
   leaseWorkerForReview,
@@ -20,12 +22,12 @@ import {
   openWorkerRegistry,
   pendingWorkerDeliveries,
   reconcileWorkerDeliveries,
+  recoverInterruptedClaimsForParent,
   registerParentRuntime,
   releaseWorkerReviewLease,
   releaseWorkerDeliveryClaim,
   settleWorkerRun,
   storePreparedSet,
-  updatePreparedSetStatus,
   workerRegistryDataVersion,
   type WorkerRunRecord
 } from "../extensions/worker/registry.js";
@@ -113,10 +115,13 @@ test("direct connections observe data versions and stale discard fails closed", 
 test("registry stores prepared set metadata and status transitions", () => {
   const f = fixture();
   try {
-    storePreparedSet(f.registry, { preparedId: `prepared_${"d".repeat(24)}`, parentSessionFile: "/sessions/parent.jsonl", status: "ready", order: ["repo"], repositories: [{ id: "repo", desiredCommit: "a".repeat(40) }], createdAt: "2026-01-01T00:00:00.000Z" });
-    updatePreparedSetStatus(f.registry, `prepared_${"d".repeat(24)}`, "/sessions/parent.jsonl", "completed", "2026-01-01T00:00:01.000Z");
-    const row = f.registry.database.prepare("SELECT status FROM prepared_sets WHERE prepared_id=?").get(`prepared_${"d".repeat(24)}`) as { status: string };
-    assert.equal(row.status, "completed");
+    const preparedId = `prepared_${"d".repeat(24)}`; const parent = "/sessions/parent.jsonl";
+    storePreparedSet(f.registry, { preparedId, parentSessionFile: parent, status: "ready", order: ["repo"], repositories: [{ id: "repo", desiredCommit: "a".repeat(40) }], createdAt: "2026-01-01T00:00:00.000Z" });
+    assert.equal(claimPreparedSetApply(f.registry, preparedId, parent, "1-apply", "2026-01-01T00:00:01.000Z"), true); assert.equal(claimPreparedSetApply(f.registry, preparedId, parent, "1-other", "2026-01-01T00:00:01.000Z"), false);
+    recoverInterruptedClaimsForParent(f.registry, parent, 1, "2026-01-01T00:00:02.000Z"); assert.equal(claimPreparedSetApply(f.registry, preparedId, parent, "1-other", "2026-01-01T00:00:02.000Z"), false);
+    recoverInterruptedClaimsForParent(f.registry, parent, 2, "2026-01-01T00:00:03.000Z"); assert.equal(claimPreparedSetApply(f.registry, preparedId, parent, "2-apply", "2026-01-01T00:00:03.000Z"), true);
+    finishPreparedSetApply(f.registry, preparedId, parent, "2-apply", "completed", "2026-01-01T00:00:04.000Z");
+    const row = f.registry.database.prepare("SELECT status,apply_nonce FROM prepared_sets WHERE prepared_id=?").get(preparedId) as { status: string; apply_nonce: string | null }; assert.equal(row.status, "completed"); assert.equal(row.apply_nonce, null);
   } finally { f.close(); }
 });
 
@@ -135,6 +140,21 @@ test("review leases block subject reuse until exact reviewer release", () => {
   } finally { f.close(); }
 });
 
+
+test("runtime generations recover only stale lifecycle claims for deterministic retry", () => {
+  const f = fixture(); try {
+    const workerId = "worker_20260101000000_recover1"; const runId = "run_20260101000000_recover1"; const parent = "/sessions/parent.jsonl";
+    createWorkerAndRun(f.registry, { workerId, parentSessionFile: parent, role: "work", status: "queued", activeRunId: runId, taskIds: ["personal-test"], workspaceRoot: "/workspace/recover", createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }, queuedRun(workerId, runId));
+    f.registry.database.prepare("UPDATE runs SET claim_kind='launch',claim_nonce='1-old' WHERE run_id=?").run(runId);
+    recoverInterruptedClaimsForParent(f.registry, parent, 1, "2026-01-01T00:00:01.000Z"); assert.equal(getWorkerRun(f.registry, workerId, runId)?.claimKind, "launch");
+    recoverInterruptedClaimsForParent(f.registry, parent, 2, "2026-01-01T00:00:02.000Z"); assert.equal(getWorkerRun(f.registry, workerId, runId)?.claimKind, undefined);
+    f.registry.database.prepare("UPDATE runs SET claim_kind='cancellation',claim_nonce='2-old' WHERE run_id=?").run(runId);
+    recoverInterruptedClaimsForParent(f.registry, parent, 3, "2026-01-01T00:00:03.000Z");
+    assert.equal(getWorkerRun(f.registry, workerId, runId)?.claimKind, undefined); assert.match(getWorker(f.registry, workerId)?.recoveryError ?? "", /cancellation retry/);
+    f.registry.database.prepare("UPDATE workers SET status='idle',active_run_id=NULL,operation_kind='discard',operation_nonce='2-old' WHERE worker_id=?").run(workerId);
+    recoverInterruptedClaimsForParent(f.registry, parent, 3, "2026-01-01T00:00:04.000Z"); assert.equal(getWorker(f.registry, workerId)?.operationKind, undefined);
+  } finally { f.close(); }
+});
 
 test("delivery reconciliation marks session-observed IDs and requeues uncertain claims", () => {
   const f = fixture();

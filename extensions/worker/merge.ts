@@ -58,6 +58,7 @@ export type MergeRuntimeOptions = {
   now?: () => Date;
   randomHex?: () => string;
   sourceForCandidate?: (candidateRepo: string, candidateCommit: string) => { source?: ManagedCandidateSource; warnings?: string[] };
+  trustedSet?: PreparedMergeSet;
 };
 
 export function defaultPreparedMergeRoot(home = homedir()): string {
@@ -95,8 +96,7 @@ export function prepareWorkerMerges(parentSessionFile: string, inputs: WorkerMer
 
 export function readPreparedMergeSet(parentSessionFile: string, preparedId: string, options: MergeRuntimeOptions = {}): PreparedMergeSet {
   if (!/^prepared_[0-9a-f]{24}$/.test(preparedId)) throw new Error(`Invalid preparedId: ${preparedId}.`);
-  const file = path.join(path.resolve(options.preparedRoot ?? defaultPreparedMergeRoot()), preparedId, "prepared.json");
-  const parsed = JSON.parse(readFileSync(file, "utf8")) as PreparedMergeSet;
+  const parsed = options.trustedSet ?? JSON.parse(readFileSync(path.join(path.resolve(options.preparedRoot ?? defaultPreparedMergeRoot()), preparedId, "prepared.json"), "utf8")) as PreparedMergeSet;
   if (parsed.version !== 1 || parsed.preparedId !== preparedId) throw new Error(`Prepared set ${preparedId} has an unsupported format.`);
   if (path.resolve(parsed.parentSessionFile) !== path.resolve(parentSessionFile)) throw new Error(`Prepared set ${preparedId} belongs to another parent session.`);
   return parsed;
@@ -129,8 +129,8 @@ export function restoreConsumedPreparedMergeSet(parentSessionFile: string, prepa
   if (!existsSync(source)) return;
   if (existsSync(destination)) throw new Error(`Cannot roll back consumed prepared set because destination exists: ${destination}.`);
   mkdirSync(root, { recursive: true, mode: 0o700 });
-  const set = JSON.parse(readFileSync(path.join(source, "prepared.json"), "utf8")) as PreparedMergeSet;
-  if (path.resolve(set.parentSessionFile) !== path.resolve(parentSessionFile)) throw new Error(`Prepared set ${preparedId} rollback parent mismatch.`);
+  const set = options.trustedSet ?? JSON.parse(readFileSync(path.join(source, "prepared.json"), "utf8")) as PreparedMergeSet;
+  if (set.preparedId !== preparedId || path.resolve(set.parentSessionFile) !== path.resolve(parentSessionFile)) throw new Error(`Prepared set ${preparedId} rollback parent mismatch.`);
   const restored = { ...set, repositories: set.repositories.map((item) => ({ ...item, preparedPath: path.join(destination, item.id) })) };
   delete restored.consumedByWorkerId;
   writeJson(path.join(source, "prepared.json"), restored);
@@ -139,7 +139,7 @@ export function restoreConsumedPreparedMergeSet(parentSessionFile: string, prepa
 
 export function applyPreparedWorkerMerges(parentSessionFile: string, preparedId: string, options: MergeRuntimeOptions = {}): WorkerMergeApplyResult {
   const set = readPreparedMergeSet(parentSessionFile, preparedId, options);
-  if (set.status !== "ready") throw new Error(`Prepared set ${preparedId} is not ready.`);
+  if (!["ready", "partial", "failed"].includes(set.status)) throw new Error(`Prepared set ${preparedId} is not ready.`);
   const byId = new Map(set.repositories.map((item) => [item.id, item]));
   const ordered = set.order.map((id) => byId.get(id)!);
   for (const repository of ordered) {

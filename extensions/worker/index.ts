@@ -2,7 +2,6 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSy
 import { homedir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { fileURLToPath } from "node:url";
 import { Text } from "@earendil-works/pi-tui";
 import { defineTool, type AgentToolResult, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveExtensionModel, assertChildAgentRouteAllowed, parseModelThinkingPair } from "../_shared/model-spec.js";
@@ -11,15 +10,17 @@ import { createAsyncJobId, isAsyncJobProcessGroupAlive, signalAsyncJobProcessGro
 import { handleAsyncShellViewerCommand, unsettledPersistedAsyncShellJobsForOwner, type JobMeta, type ManagedAsyncJobHandle } from "../async-shell/index.js";
 import { createWorkerContainer, planWorkerContainer, resolveDockerPath, settleWorkerContainer, type WorkerContainerReference } from "../_shared/worker-container.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
+import { workerMutationAdmissionPath, workerResultAdmissionPath } from "../_shared/worker-contract.js";
+import { workerRoleInstructions } from "../_shared/role-instructions.js";
 import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
 import { WorkerControlParamsV2, WorkerMergeApplyParams, WorkerMergeTestParams, WorkerRunParamsV2, type WorkerControlInputV2, type WorkerRunInputV2 } from "./contract.js";
 import { applyPreparedWorkerMerges, consumePreparedMergeSet, defaultPreparedMergeRoot, prepareWorkerMerges, readPreparedMergeSet, restoreConsumedPreparedMergeSet } from "./merge.js";
 import {
-  abandonWorkerDiscard, activeRunsForParent, claimWorkerCancellation, claimWorkerDiscard, claimWorkerDelivery, claimWorkerRun,
-  countWorkers, createWorkerRunBatch, finalizeClaimedWorkerRun, finalizeWorkerDiscard, finalizeWorkerRunLaunch, findWorkerRunById,
+  abandonWorkerDiscard, activeRunsForParent, claimPreparedSetApply, claimWorkerCancellation, claimWorkerDiscard, claimWorkerDelivery, claimWorkerRun,
+  countWorkers, createWorkerRunBatch, finalizeClaimedWorkerRun, finalizeWorkerDiscard, finalizeWorkerRunLaunch, findWorkerRunById, finishPreparedSetApply,
   getWorker, getWorkerRun, listWorkerRuns, listWorkers, markWorkerDeliveryDelivered, openWorkerRegistry, pendingWorkerDeliveries,
-  reconcileWorkerDeliveries, registerParentRuntime, releaseWorkerDeliveryClaim, setWorkerRecoveryError, storePreparedSet,
-  updatePreparedSetStatus, updateWorkerAndRunRuntime, workerRegistryDataVersion,
+  readPreparedSetRecord, recoverInterruptedClaimsForParent, reconcileWorkerDeliveries, registerParentRuntime, releasePreparedSetApply, releaseWorkerDeliveryClaim, setWorkerRecoveryError, storePreparedSet,
+  updatePreparedSetStatus, workerRegistryDataVersion,
   type WorkerBatchCreateItem, type WorkerRegistry, type WorkerRegistryRecord, type WorkerRepositoryResult, type WorkerRole, type WorkerRunRecord
 } from "./registry.js";
 import { readWorkerRuntimeResult } from "./runtime.js";
@@ -37,9 +38,10 @@ export { WorkerRunParamsV2 as WorkerRunParams, WorkerControlParamsV2 as WorkerCo
 export type WorkerRunInput = WorkerRunInputV2;
 export type WorkerControlInput = WorkerControlInputV2;
 
+type ReviewOverlayPlan = Omit<Parameters<typeof createReviewOverlay>[0], "dockerPath">;
 type RunRuntime = {
   version: 2; prompt: string; runDir: string; resultFile: string; settledFile: string; processFile: string; processNonce: string;
-  container: WorkerContainerReference; overlay?: ReviewOverlayRecord; contextFile?: string; inputs: RetainedInput[];
+  container: WorkerContainerReference; overlay?: ReviewOverlayRecord; reviewOverlayPlan?: ReviewOverlayPlan; contextFile?: string; inputs: RetainedInput[];
   repositoryBefore: RepositorySnapshot[];
 };
 type WorkerRuntime = { version: 2; inputs: RetainedInput[]; repositoryBaselines?: Array<{ path: string; resolvedCommit: string }> };
@@ -56,6 +58,7 @@ export type WorkerExtensionDependencies = {
   removeContainer?: (dockerPath: string, reference: WorkerContainerReference) => void;
   launch?: (api: ExtensionAPI, context: ExtensionContext, input: { record: WorkerLaunchRecord; runtime: RunRuntime }) => ManagedAsyncJobHandle;
   createOverlay?: typeof createReviewOverlay; cleanupOverlay?: typeof cleanupReviewOverlay;
+  waitForHostIdentity?: (runtime: RunRuntime, workerId: string, runId: string) => Promise<void>;
 };
 
 export default function workerExtension(api: ExtensionAPI): void { registerWorkerExtension(api); }
@@ -71,6 +74,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   const createContainer = overrides.createContainer ?? (testLaunch ? ((_docker, reference) => ({ ...reference, containerId: "f".repeat(64) })) : createWorkerContainer);
   const removeContainer = overrides.removeContainer ?? (testLaunch ? (() => {}) : settleWorkerContainer);
   const createOverlay = overrides.createOverlay ?? createReviewOverlay;
+  const verifyHostIdentity = overrides.waitForHostIdentity ?? waitForWorkerHostIdentity;
   const cleanupOverlay = overrides.cleanupOverlay ?? cleanupReviewOverlay;
   let registry: WorkerRegistry | undefined;
   let runtimeGeneration = 0;
@@ -95,8 +99,10 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     currentContext = context;
     const parent = context.sessionManager.getSessionFile(); if (!parent) return;
     const exactParent = realpathOrResolve(parent);
-    reconcileWorkerDeliveries(getRegistry(), exactParent, sessionDeliveryIds(context));
     runtimeGeneration = registerParentRuntime(getRegistry(), exactParent, randomUUID(), now().toISOString());
+    recoverInterruptedDiscardFiles(exactParent, runtimeGeneration);
+    recoverInterruptedClaimsForParent(getRegistry(), exactParent, runtimeGeneration, now().toISOString());
+    reconcileWorkerDeliveries(getRegistry(), exactParent, sessionDeliveryIds(context));
     deliveredRecovery.clear();
     observedDataVersion = workerRegistryDataVersion(getRegistry());
     deliverPendingCompletions(api, getRegistry(), exactParent, runtimeGeneration);
@@ -155,7 +161,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       const planned = preflightBatch(params, context, parentSessionFile);
       const timestamp = now().toISOString();
       try {
-        for (const plan of planned) if (plan.role === "integration" && plan.consumedPrepared && plan.runRuntime.contextFile) assertIntegrationTargetsCurrent(plan.runRuntime.contextFile);
+        for (const plan of planned) if (plan.role === "integration" && plan.consumedPrepared && plan.preparedId) assertIntegrationTargetsCurrent(trustedPreparedSet(getRegistry(), parentSessionFile, plan.preparedId));
         const items: WorkerBatchCreateItem[] = planned.map((plan) => {
           const session = sessionIdentity(plan.paths);
           const hostLogDir = path.join(path.resolve(context.cwd), ".pi", "async-shell", "jobs", plan.jobId);
@@ -170,7 +176,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         });
         createWorkerRunBatch(getRegistry(), {
           items,
-          reviewLeases: planned.filter((plan) => plan.role === "review").flatMap((plan) => { const subjectWorkerId = (plan.binding as any).reviewedWorkerId as string; const subject = getWorker(getRegistry(), subjectWorkerId); return subject?.reviewedByWorkerId ? [] : [{ subjectWorkerId, reviewerWorkerId: plan.workerId, reviewedRunId: plan.reviewedRunId! }]; }),
+          reviewLeases: planned.filter((plan) => plan.role === "review").map((plan) => ({ subjectWorkerId: (plan.binding as any).reviewedWorkerId as string, reviewerWorkerId: plan.workerId, reviewedRunId: plan.reviewedRunId! })),
           consumedPrepared: planned.filter((plan) => plan.consumedPrepared).map((plan) => ({ preparedId: plan.preparedId!, parentSessionFile })),
           now: timestamp
         });
@@ -179,7 +185,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       const details = { runs: planned.map((plan) => ({ action: plan.request.action, role: plan.role, workerId: plan.workerId, runId: plan.runId, status: "queued", taskIds: plan.taskIds,
         completionDelivery: plan.request.completionDelivery ?? "steer", modelSelection: plan.modelSelection, ...(plan.reviewedRunId ? { reviewedRunId: plan.reviewedRunId } : {}), ...(plan.preparedId ? { preparedId: plan.preparedId } : {}) })) };
       const text = details.runs.map((item) => `queued · ${item.role} · ${item.workerId.slice(-8)}`).join("\n");
-      onUpdate?.({ content: [{ type: "text", text }], details }); return resultText(text, details);
+      onUpdate?.(resultText(text, details)); return resultText(text, details);
     }
   });
   api.registerTool(workerRunTool as any);
@@ -229,7 +235,12 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     promptGuidelines: [inputJsonSchemaGuideline("worker_merge_apply", WorkerMergeApplyParams), outputJsonSchemaGuideline("worker_merge_apply", RetainedToolOutputSchemas.worker_merge_apply), "worker_merge_apply use: Apply only after parent inspection and validation of every exact prepared repository.", "worker_merge_apply constraints: Only result content is provider-visible; details remain internal."],
     parameters: WorkerMergeApplyParams, executionMode: "sequential",
     renderCall: (args, theme) => compactCall(theme, `applying · ${(args as any).preparedId?.slice(-8)}`), renderResult: (result, _options, theme) => compactResult(theme, result as any, "merge apply"),
-    async execute(_id, params, signal, _update, context) { throwIfAborted(signal); const parent = requireParentSession(context); const result = applyPreparedWorkerMerges(parent, params.preparedId, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, sourceForCandidate: managedCandidateWarnings() }); updatePreparedSetStatus(getRegistry(), params.preparedId, parent, result.status, now().toISOString()); return resultText(`${result.status} · ${result.repositories.filter((item) => item.status === "applied").length} applied`, result); }
+    async execute(_id, params, signal, _update, context) {
+      throwIfAborted(signal); const parent = requireParentSession(context); const trustedSet = trustedPreparedSet(getRegistry(), parent, params.preparedId); if (!["ready", "partial", "failed"].includes(trustedSet.status)) throw new Error(`Prepared set ${params.preparedId} is not ready.`);
+      const nonce = claimNonce(); if (!claimPreparedSetApply(getRegistry(), params.preparedId, parent, nonce, now().toISOString())) throw new Error(`Prepared set ${params.preparedId} is already being applied or changed state.`);
+      try { const result = applyPreparedWorkerMerges(parent, params.preparedId, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, sourceForCandidate: managedCandidateWarnings(), trustedSet }); finishPreparedSetApply(getRegistry(), params.preparedId, parent, nonce, result.status, now().toISOString()); return resultText(`${result.status} · ${result.repositories.filter((item) => item.status === "applied").length} applied`, result); }
+      catch (error) { releasePreparedSetApply(getRegistry(), params.preparedId, parent, nonce, now().toISOString()); throw error; }
+    }
   }));
 
   registerCommands();
@@ -241,10 +252,9 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
 
   function cleanupSupersededPreparedSets(current: ReturnType<typeof prepareWorkerMerges>): void {
     const root = path.resolve(overrides.preparedRoot ?? defaultPreparedMergeRoot()); const currentTargets = current.repositories.map((item) => `${item.targetRepo}\0${item.targetRef}`).sort().join("\n");
-    if (!existsSync(root)) return;
-    for (const entry of readdirSync(root, { withFileTypes: true })) {
-      if (!entry.isDirectory() || entry.name === current.preparedId || !/^prepared_[0-9a-f]{24}$/.test(entry.name)) continue;
-      const directory = path.join(root, entry.name); try { const prior = JSON.parse(readFileSync(path.join(directory, "prepared.json"), "utf8")) as any; const targets = prior.repositories.map((item: any) => `${item.targetRepo}\0${item.targetRef}`).sort().join("\n"); if (path.resolve(prior.parentSessionFile) !== path.resolve(current.parentSessionFile) || targets !== currentTargets) continue; rmSync(directory, { recursive: true, force: true }); try { updatePreparedSetStatus(getRegistry(), prior.preparedId, current.parentSessionFile, "superseded", now().toISOString()); } catch {} } catch {}
+    const rows = getRegistry().database.prepare("SELECT prepared_id FROM prepared_sets WHERE parent_session_file=? AND prepared_id<>? AND status IN ('ready','resolution_required','partial','failed')").all(current.parentSessionFile, current.preparedId) as Array<{ prepared_id: string }>;
+    for (const row of rows) {
+      try { const prior = readPreparedSetRecord(getRegistry(), current.parentSessionFile, row.prepared_id); const targets = prior.repositories.map((item) => `${item.targetRepo}\0${item.targetRef}`).sort().join("\n"); if (targets !== currentTargets) continue; updatePreparedSetStatus(getRegistry(), row.prepared_id, current.parentSessionFile, "superseded", now().toISOString()); rmSync(path.join(root, row.prepared_id), { recursive: true, force: true }); } catch {}
     }
   }
 
@@ -263,53 +273,51 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
           const latest = worker.latestRunId ? getWorkerRun(getRegistry(), worker.workerId, worker.latestRunId) : undefined;
           const binding = latest?.binding; const paths = workerPaths(roots, worker.workerId); provisionWorkerPaths(paths);
           const role = worker.role; const inputs = validateAdditionalInputs({ values: request.additionalInputs, existing: runtimeInputs(worker), role, workspaceRoot: paths.workspaceRoot, runtimeRoot });
-          let overlay: ReviewOverlayRecord | undefined; let contextFile: string | undefined; let reviewedRunId: string | undefined; let preparedId: string | undefined;
+          let reviewOverlayPlan: ReviewOverlayPlan | undefined; let contextFile: string | undefined; let reviewedRunId: string | undefined; let preparedId: string | undefined; const reservedRunId = role === "review" ? createWorkerRunId(now(), random()) : undefined;
           const mounts = inputMounts(inputs);
           if (role === "review") {
             if (!binding || !("reviewedRunId" in binding)) throw new Error(`Review worker ${worker.workerId} lost its reviewed-run binding.`);
             const subject = reviewSubject(binding.reviewedRunId, parentSessionFile, worker.workerId); reviewedRunId = binding.reviewedRunId;
-            contextFile = writeReviewContext(paths, request.workerId, createWorkerRunId(now(), random()), subject.worker, subject.run, inputs);
-            overlay = createOverlaySafely({ dockerPath: docker(), workerId: worker.workerId, runId: path.basename(contextFile, ".json"), subjectWorkspace: subject.worker.workspaceRoot, reviewerWorkspace: paths.workspaceRoot, contextFile, reviewedSessionFile: subject.worker.sessionFile!, additionalInputs: inputs.map((item) => ({ source: item.source, target: item.target })) });
-            mounts.splice(0, mounts.length, ...overlay.mounts);
+            contextFile = writeReviewContext(paths, request.workerId, reservedRunId!, subject.worker, subject.run, inputs);
+            reviewOverlayPlan = { workerId: worker.workerId, runId: reservedRunId!, subjectWorkspace: subject.worker.workspaceRoot, reviewerWorkspace: paths.workspaceRoot, contextFile, reviewedSessionFile: subject.worker.sessionFile!, additionalInputs: inputs.map((item) => ({ source: item.source, target: item.target })) };
           } else if (role === "integration") {
             if (!binding || !("preparedId" in binding)) throw new Error(`Integration worker ${worker.workerId} lost its prepared-set binding.`); preparedId = binding.preparedId;
-            contextFile = writeIntegrationContext(paths, preparedId, inputs, true); mounts.push({ kind: "bind", source: paths.workspaceRoot, target: "/workspace" }, { kind: "bind", source: contextFile, target: "/integration/context.json", readOnly: true });
+            contextFile = writeIntegrationContext(paths, trustedPreparedSet(getRegistry(), parentSessionFile, preparedId, paths.workspaceRoot), inputs, true); mounts.push({ kind: "bind", source: paths.workspaceRoot, target: "/workspace" }, { kind: "bind", source: contextFile, target: "/integration/context.json", readOnly: true });
           }
-          const plan = finishPlanSafely({ request, role, workerId: worker.workerId, paths, taskIds: unique([...worker.taskIds, ...(request.additionalTaskIds ?? [])]), modelSelection: worker.modelSelection!, binding, workerRuntime: { version: 2, inputs, ...baselineRuntime(worker) }, newWorker: false, expectedVersion: worker.version, overlay, contextFile, reviewedRunId, preparedId, mounts, parentSessionFile, context });
+          const plan = finishPlanSafely({ request, role, workerId: worker.workerId, ...(reservedRunId ? { runId: reservedRunId } : {}), paths, taskIds: unique([...worker.taskIds, ...(request.additionalTaskIds ?? [])]), modelSelection: worker.modelSelection!, binding, workerRuntime: { version: 2, inputs, ...baselineRuntime(worker) }, newWorker: false, expectedVersion: worker.version, reviewOverlayPlan, contextFile, reviewedRunId, preparedId, mounts, parentSessionFile, context });
           plans.push(plan); continue;
         }
         const role = request.role;
         const modelSelection = resolveModel(role, role === "work" ? request.modelSelection : undefined, context);
-        const workerId = createWorkerId(now(), random()); const paths = workerPaths(roots, workerId);
+        const workerId = createWorkerId(now(), random()); const paths = workerPaths(roots, workerId); const reservedRunId = role === "review" ? createWorkerRunId(now(), random()) : undefined;
         const taskIds = role === "review" ? [] : unique(request.taskIds);
         let subject: ReturnType<typeof reviewSubject> | undefined;
         let repositoryBaselines: Array<{ path: string; resolvedCommit: string }> | undefined;
         let inputs: RetainedInput[] = [];
         if (role === "work") repositoryBaselines = (request.repositoryBaselines ?? []).map((item) => { const repo = canonicalRepository(item.path); return { path: repo, resolvedCommit: trustedGit(repo, ["rev-parse", `${item.revision ?? "HEAD"}^{commit}`]).trim() }; });
         else if (role === "review") { subject = reviewSubject(request.reviewedRunId, parentSessionFile); inputs = validateAdditionalInputs({ values: request.additionalInputs, role, workspaceRoot: paths.workspaceRoot, runtimeRoot }); }
-        else { readPreparedMergeSet(parentSessionFile, request.preparedId, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot }); inputs = validateAdditionalInputs({ values: request.additionalInputs, role, workspaceRoot: paths.workspaceRoot, runtimeRoot }); }
+        else { trustedPreparedSet(getRegistry(), parentSessionFile, request.preparedId); inputs = validateAdditionalInputs({ values: request.additionalInputs, role, workspaceRoot: paths.workspaceRoot, runtimeRoot }); }
         provisionWorkerPaths(paths);
         let binding: WorkerRunRecord["binding"]; let reviewedRunId: string | undefined; let preparedId: string | undefined; let consumedPrepared = false;
-        let overlay: ReviewOverlayRecord | undefined; let contextFile: string | undefined; let mounts: any[] = [];
+        let reviewOverlayPlan: ReviewOverlayPlan | undefined; let contextFile: string | undefined; let mounts: any[] = [];
         try {
           if (role === "work") {
             forkWorkerSession({ parentSessionFile, workspaceRoot: paths.workspaceRoot, sessionDir: paths.sessionDir, sessionId: randomUUID() });
           } else if (role === "review") {
             reviewedRunId = request.reviewedRunId; binding = { reviewedWorkerId: subject!.worker.workerId, reviewedRunId };
             createWorkerSession({ workspaceRoot: paths.workspaceRoot, sessionDir: paths.sessionDir, sessionId: randomUUID() });
-            contextFile = writeReviewContext(paths, workerId, createWorkerRunId(now(), random()), subject!.worker, subject!.run, inputs);
-            overlay = createOverlaySafely({ dockerPath: docker(), workerId, runId: path.basename(contextFile, ".json"), subjectWorkspace: subject!.worker.workspaceRoot, reviewerWorkspace: paths.workspaceRoot, contextFile, reviewedSessionFile: subject!.worker.sessionFile!, additionalInputs: inputs.map((item) => ({ source: item.source, target: item.target })) }); mounts = overlay.mounts;
+            contextFile = writeReviewContext(paths, workerId, reservedRunId!, subject!.worker, subject!.run, inputs);
+            reviewOverlayPlan = { workerId, runId: reservedRunId!, subjectWorkspace: subject!.worker.workspaceRoot, reviewerWorkspace: paths.workspaceRoot, contextFile, reviewedSessionFile: subject!.worker.sessionFile!, additionalInputs: inputs.map((item) => ({ source: item.source, target: item.target })) };
           } else if (role === "integration") {
-            preparedId = request.preparedId; const moved = consumePreparedMergeSet(parentSessionFile, preparedId, workerId, paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot }); consumedPrepared = true; binding = { preparedId };
+            preparedId = request.preparedId; const trustedSet = trustedPreparedSet(getRegistry(), parentSessionFile, preparedId); const moved = consumePreparedMergeSet(parentSessionFile, preparedId, workerId, paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, trustedSet }); consumedPrepared = true; binding = { preparedId };
             createWorkerSession({ workspaceRoot: paths.workspaceRoot, sessionDir: paths.sessionDir, sessionId: randomUUID() });
-            contextFile = writeIntegrationContext(paths, preparedId, inputs, false, moved); mounts = [...inputMounts(inputs), { kind: "bind", source: paths.workspaceRoot, target: "/workspace" }, { kind: "bind", source: contextFile, target: "/integration/context.json", readOnly: true }];
+            contextFile = writeIntegrationContext(paths, moved, inputs, false); mounts = [...inputMounts(inputs), { kind: "bind", source: paths.workspaceRoot, target: "/workspace" }, { kind: "bind", source: contextFile, target: "/integration/context.json", readOnly: true }];
           }
-          const plan = finishPlan({ request, role, workerId, paths, taskIds: role === "review" ? subject!.run.taskIds : taskIds, modelSelection, binding,
-            workerRuntime: { version: 2, inputs, ...(repositoryBaselines ? { repositoryBaselines } : {}) }, newWorker: true, overlay, contextFile, reviewedRunId, preparedId, consumedPrepared, mounts, parentSessionFile, context });
+          const plan = finishPlan({ request, role, workerId, ...(reservedRunId ? { runId: reservedRunId } : {}), paths, taskIds: role === "review" ? subject!.run.taskIds : taskIds, modelSelection, binding,
+            workerRuntime: { version: 2, inputs, ...(repositoryBaselines ? { repositoryBaselines } : {}) }, newWorker: true, reviewOverlayPlan, contextFile, reviewedRunId, preparedId, consumedPrepared, mounts, parentSessionFile, context });
           plans.push(plan);
         } catch (error) {
-          if (overlay) { try { cleanupOverlay(docker(), overlay); } catch {} }
-          if (consumedPrepared && preparedId) { try { restoreConsumedPreparedMergeSet(parentSessionFile, preparedId, paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot }); } catch {} }
+          if (consumedPrepared && preparedId) { try { restoreConsumedPreparedMergeSet(parentSessionFile, preparedId, paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, trustedSet: trustedPreparedSet(getRegistry(), parentSessionFile, preparedId) }); } catch {} }
           rmSync(paths.stateDir, { recursive: true, force: true });
           throw error;
         }
@@ -318,22 +326,20 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     } catch (error) { rollbackPlans(plans, parentSessionFile); throw error; }
   }
 
-  function finishPlanSafely(input: Omit<PlannedRun, "runId" | "jobId" | "runRuntime"> & { overlay?: ReviewOverlayRecord; contextFile?: string; mounts: any[]; parentSessionFile: string; context: ExtensionContext }): PlannedRun {
+  function finishPlanSafely(input: Omit<PlannedRun, "runId" | "jobId" | "runRuntime"> & { runId?: string; reviewOverlayPlan?: ReviewOverlayPlan; contextFile?: string; mounts: any[]; parentSessionFile: string; context: ExtensionContext }): PlannedRun {
     try { return finishPlan(input); } catch (error) {
-      if (input.overlay) { try { cleanupOverlay(docker(), input.overlay); } catch {} }
-      if (input.consumedPrepared && input.preparedId) { try { restoreConsumedPreparedMergeSet(input.parentSessionFile, input.preparedId, input.paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot }); } catch {} }
+      if (input.consumedPrepared && input.preparedId) { try { restoreConsumedPreparedMergeSet(input.parentSessionFile, input.preparedId, input.paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, trustedSet: trustedPreparedSet(getRegistry(), input.parentSessionFile, input.preparedId) }); } catch {} }
       if (input.newWorker) rmSync(input.paths.stateDir, { recursive: true, force: true }); else if (input.contextFile) rmSync(input.contextFile, { force: true });
       throw error;
     }
   }
 
-  function finishPlan(input: Omit<PlannedRun, "runId" | "jobId" | "runRuntime"> & { overlay?: ReviewOverlayRecord; contextFile?: string; mounts: any[]; parentSessionFile: string; context: ExtensionContext }): PlannedRun {
-    const runId = createWorkerRunId(now(), random()); const jobId = createAsyncJobId(now(), random());
+  function finishPlan(input: Omit<PlannedRun, "runId" | "jobId" | "runRuntime"> & { runId?: string; reviewOverlayPlan?: ReviewOverlayPlan; contextFile?: string; mounts: any[]; parentSessionFile: string; context: ExtensionContext }): PlannedRun {
+    const runId = input.runId ?? createWorkerRunId(now(), random()); const jobId = createAsyncJobId(now(), random());
     const runDir = path.join(input.paths.stateDir, "runs", runId); mkdirSync(runDir, { recursive: true, mode: 0o700 });
     const nonce = randomUUID();
     const codeRoot = overrides.codeRoot ?? (testLaunch ? input.context.cwd : path.join(homedir(), "Code"));
     const reference = planWorkerContainer({ workerId: input.workerId, runId, nonce, workspaceRoot: input.paths.workspaceRoot, codeRoot, mounts: input.mounts });
-    const container = createContainer(docker(), reference);
     const roleInstructions = roleInstructionsFor(input.role);
     const request = input.request;
     const prompt = renderWorkerRuntimePrompt(input.role, { workerId: input.workerId, runId, workspaceRoot: input.role === "review" || input.role === "integration" ? "/workspace" : input.paths.workspaceRoot,
@@ -342,7 +348,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       reviewSubjectPath: "/review/subject", reviewContextPath: "/review/context.json", integrationContextPath: "/integration/context.json", resumed: !input.newWorker,
       cancelledPreviously: !input.newWorker && getWorkerRun(getRegistry(), input.workerId, getWorker(getRegistry(), input.workerId)?.latestRunId ?? "")?.outcome === "cancelled" });
     const runRuntime: RunRuntime = { version: 2, prompt, runDir, resultFile: path.join(runDir, "result.json"), settledFile: path.join(runDir, "settled.json"), processFile: path.join(runDir, "host-process.json"), processNonce: nonce,
-      container, ...(input.overlay ? { overlay: input.overlay } : {}), ...(input.contextFile ? { contextFile: input.contextFile } : {}), inputs: input.workerRuntime.inputs,
+      container: reference, ...(input.reviewOverlayPlan ? { reviewOverlayPlan: input.reviewOverlayPlan } : {}), ...(input.contextFile ? { contextFile: input.contextFile } : {}), inputs: input.workerRuntime.inputs,
       repositoryBefore: snapshotWorkerRepositories(input.paths.workspaceRoot) };
     return { request, role: input.role, workerId: input.workerId, runId, jobId, paths: input.paths, taskIds: input.taskIds, modelSelection: input.modelSelection, ...(input.binding ? { binding: input.binding } : {}), workerRuntime: input.workerRuntime, runRuntime,
       newWorker: input.newWorker, ...(input.expectedVersion === undefined ? {} : { expectedVersion: input.expectedVersion }), ...(input.reviewedRunId ? { reviewedRunId: input.reviewedRunId } : {}), ...(input.preparedId ? { preparedId: input.preparedId } : {}), ...(input.consumedPrepared ? { consumedPrepared: true } : {}) };
@@ -350,17 +356,15 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
 
   function rollbackPlans(plans: PlannedRun[], parentSessionFile: string): void {
     for (const plan of [...plans].reverse()) {
-      try { removeContainer(docker(), plan.runRuntime.container); } catch {}
-      if (plan.runRuntime.overlay) { try { cleanupOverlay(docker(), plan.runRuntime.overlay); } catch {} }
-      if (plan.consumedPrepared && plan.preparedId) { try { restoreConsumedPreparedMergeSet(parentSessionFile, plan.preparedId, plan.paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot }); } catch {} }
+      if (plan.consumedPrepared && plan.preparedId) { try { restoreConsumedPreparedMergeSet(parentSessionFile, plan.preparedId, plan.paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, trustedSet: trustedPreparedSet(getRegistry(), parentSessionFile, plan.preparedId) }); } catch {} }
       if (plan.newWorker) rmSync(plan.paths.stateDir, { recursive: true, force: true });
       else { rmSync(plan.runRuntime.runDir, { recursive: true, force: true }); if (plan.runRuntime.contextFile) rmSync(plan.runRuntime.contextFile, { force: true }); }
     }
   }
 
   async function startPreparedRun(context: ExtensionContext, item: PendingRun): Promise<void> {
-    const nonce = randomUUID(); if (!claimWorkerRun(getRegistry(), item.workerId, item.runId, "launch", nonce, ["queued"])) return;
-    let handle: ManagedAsyncJobHandle | undefined;
+    const nonce = claimNonce(); if (!claimWorkerRun(getRegistry(), item.workerId, item.runId, "launch", nonce, ["queued"])) return;
+    let handle: ManagedAsyncJobHandle | undefined; let launchAdmission: string | undefined;
     try {
       const worker = getWorker(getRegistry(), item.workerId)!; const run = getWorkerRun(getRegistry(), item.workerId, item.runId)!; const paths = workerPaths(roots, item.workerId);
       const sessionId = worker.sessionId; const sessionFile = worker.sessionFile;
@@ -368,19 +372,45 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       if (worker.role === "work") verifyWorkerSession({ sessionFile, sessionId, workspaceRoot: worker.workspaceRoot, parentSessionFile: worker.parentSessionFile });
       const sessionStartLine = countLines(sessionFile) + 1;
       const record: WorkerLaunchRecord = { workerId: worker.workerId, runId: run.runId, jobId: run.jobId!, sessionId, sessionFile, workspaceRoot: worker.workspaceRoot, taskIds: run.taskIds, role: worker.role, modelSelection: worker.modelSelection! };
-      handle = launch(context, record, item.runtime); const snapshot = handle.snapshot();
+      assertRunClaim(item.workerId, item.runId, "launch", nonce);
+      if (item.runtime.reviewOverlayPlan) {
+        item.runtime.overlay = createOverlaySafely({ dockerPath: docker(), ...item.runtime.reviewOverlayPlan });
+        item.runtime.container = planWorkerContainer({ workerId: worker.workerId, runId: run.runId, nonce: item.runtime.processNonce, workspaceRoot: worker.workspaceRoot, codeRoot: item.runtime.container.codeRoot, mounts: item.runtime.overlay.mounts });
+        assertRunClaim(item.workerId, item.runId, "launch", nonce);
+      }
+      item.runtime.container = createContainer(docker(), item.runtime.container);
+      launchAdmission = path.join(item.runtime.runDir, "launch-admitting.json"); writeFileSync(launchAdmission, `${JSON.stringify({ version: 1, workerId: item.workerId, runId: item.runId, pid: process.pid, startedAt: now().toISOString() })}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+      assertRunClaim(item.workerId, item.runId, "launch", nonce);
+      handle = launch(context, record, item.runtime); await verifyHostIdentity(item.runtime, item.workerId, item.runId); assertRunClaim(item.workerId, item.runId, "launch", nonce); const snapshot = handle.snapshot();
       finalizeWorkerRunLaunch(getRegistry(), { workerId: worker.workerId, runId: run.runId, claimNonce: nonce, modelSelection: worker.modelSelection!, sessionId, sessionFile, sessionStartLine, jobId: snapshot.jobId,
         stdoutLog: snapshot.stdoutLog, stderrLog: snapshot.stderrLog, runtime: item.runtime, startedAt: now().toISOString() });
-      active.set(worker.workerId, { runId: run.runId, handle });
+      active.set(worker.workerId, { runId: run.runId, handle }); rmSync(launchAdmission, { force: true }); launchAdmission = undefined;
       void handle.completion.then((job) => settleCompletedRun(worker.workerId, run.runId, job)).catch((error) => recordRecovery(worker.workerId, run.runId, error)).finally(() => { if (active.get(worker.workerId)?.runId === run.runId) active.delete(worker.workerId); });
     } catch (error) {
-      if (handle) { try { handle.cancel("SIGTERM"); } catch {} }
+      if (handle) {
+        try { handle.cancel("SIGTERM"); } catch {}
+        const terminal = await Promise.race([handle.completion.then((job) => job.status !== "running" && job.status !== "unknown"), delay(5_000).then(() => false)]);
+        if (!terminal && launchAdmission) { const marker = launchAdmission; void handle.completion.finally(() => rmSync(marker, { force: true })); launchAdmission = undefined; }
+      }
+      if (launchAdmission) rmSync(launchAdmission, { force: true });
+      const claimed = getWorkerRun(getRegistry(), item.workerId, item.runId);
+      if (claimed?.claimKind !== "launch" || claimed.claimNonce !== nonce) { try { removeContainer(docker(), item.runtime.container); } catch {} if (item.runtime.overlay) { try { cleanupOverlay(docker(), item.runtime.overlay); } catch {} } }
       await failClaimedRun(item.workerId, item.runId, "launch", nonce, error);
     }
   }
 
+  async function waitForWorkerHostIdentity(runtime: RunRuntime, workerId: string, runId: string): Promise<void> {
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      if (existsSync(runtime.processFile)) { const record = readWorkerHostProcess(runtime.processFile); if (record.workerId !== workerId || record.runId !== runId || record.nonce !== runtime.processNonce || !isAsyncJobProcessGroupAlive(record.pid)) throw new Error("Worker host process identity was invalid during launch."); return; }
+      await delay(25);
+    }
+    throw new Error(`Worker ${workerId}/${runId} did not publish its host process identity.`);
+  }
+
+  function assertRunClaim(workerId: string, runId: string, kind: "launch" | "settlement" | "cancellation", nonce: string): void { const run = getWorkerRun(getRegistry(), workerId, runId); if (run?.claimKind !== kind || run.claimNonce !== nonce) throw new Error(`Worker ${workerId}/${runId} ${kind} authority was revoked.`); }
+
   async function settleCompletedRun(workerId: string, runId: string, job: Pick<JobMeta, "status" | "exitCode" | "error">): Promise<void> {
-    const nonce = randomUUID(); if (!claimWorkerRun(getRegistry(), workerId, runId, "settlement", nonce, ["running"])) return;
+    const nonce = claimNonce(); if (!claimWorkerRun(getRegistry(), workerId, runId, "settlement", nonce, ["running"])) return;
     const worker = getWorker(getRegistry(), workerId)!; const run = getWorkerRun(getRegistry(), workerId, runId)!; const runtime = run.runtime as RunRuntime;
     let outcome: any = "failed"; let outcomeSource: "worker" | "system" = "system"; let summary = "Worker run failed before accepting a result."; let question: string | undefined;
     let reported: string[] = []; let artifacts: string[] = []; const errors: Array<{ scope: "run" | "repositories" | "artifacts"; message: string }> = [];
@@ -407,32 +437,77 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   }
 
   async function cancelWorker(worker: WorkerRegistryRecord): Promise<"cancelled" | "not_active"> {
-    if (!worker.activeRunId) return "not_active"; const runId = worker.activeRunId; const nonce = randomUUID();
+    if (!worker.activeRunId) return "not_active"; const runId = worker.activeRunId; const nonce = claimNonce();
     if (!claimWorkerCancellation(getRegistry(), worker.workerId, runId, nonce, now().toISOString())) return "not_active";
     pending.delete(runId); const run = getWorkerRun(getRegistry(), worker.workerId, runId)!; const runtime = run.runtime as RunRuntime;
     try {
-      rmSync(path.join(runtime.runDir, "host-authorization.json"), { force: true });
+      const authorizationFile = path.join(runtime.runDir, "host-authorization.json"); rmSync(authorizationFile, { force: true });
+      await waitForRuntimeAdmissions(runtime, authorizationFile);
       const attached = active.get(worker.workerId); if (attached?.runId === runId) { attached.handle.cancel("SIGTERM"); }
       else if (existsSync(runtime.processFile)) { const process = readWorkerHostProcess(runtime.processFile); if (process.workerId !== worker.workerId || process.runId !== runId || process.nonce !== runtime.processNonce) throw new Error("Worker host process identity mismatch during cancellation."); if (isAsyncJobProcessGroupAlive(process.pid)) signalAsyncJobProcessGroup(process.pid, "SIGTERM"); }
       removeContainer(docker(), runtime.container);
-      if (attached?.runId === runId) await Promise.race([attached.handle.completion, delay(5_000)]);
+      if (attached?.runId === runId) { const terminal = await Promise.race([attached.handle.completion.then((job) => job.status !== "running" && job.status !== "unknown"), delay(5_000).then(() => false)]); if (!terminal) throw new Error("Worker host job did not reach a terminal state during cancellation."); }
+      await proveWorkerHostExited(runtime, worker.workerId, runId);
       if (runtime.overlay) cleanupOverlay(docker(), runtime.overlay);
-      const survivors = unsettledPersistedAsyncShellJobsForOwner(path.join(workerPaths(roots, worker.workerId).stateDir, "async-shell"), { kind: "worker-run", workerId: worker.workerId, runId }).filter((job) => job.status === "running" || job.status === "unknown");
+      const survivors = await waitForWorkerShellRecords(worker.workerId, runId);
       if (survivors.length) throw new Error(`Worker-owned process records remain active after container removal: ${survivors.map((job) => job.jobId).join(", ")}.`);
       finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId: worker.workerId, runId, claimKind: "cancellation", claimNonce: nonce, outcome: "cancelled", outcomeSource: "system", summary: "Worker run was cancelled by its parent.", sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile) : undefined, settledAt: now().toISOString() });
       active.delete(worker.workerId); deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration); return "cancelled";
-    } catch (error) { recordRecovery(worker.workerId, runId, error); return "not_active"; }
+    } catch (error) { recordRecovery(worker.workerId, runId, error); throw new Error(`Worker ${worker.workerId}/${runId} cancellation requires recovery: ${sanitizeError(error)}`); }
+  }
+
+  async function waitForRuntimeAdmissions(runtime: RunRuntime, authorizationFile: string): Promise<void> {
+    const files = [workerResultAdmissionPath(runtime.resultFile), workerMutationAdmissionPath(authorizationFile), path.join(runtime.runDir, "launch-admitting.json")];
+    for (let attempt = 0; attempt < 480 && files.some(runtimeAdmissionActive); attempt += 1) await delay(25);
+    const activeFiles = files.filter(runtimeAdmissionActive); if (activeFiles.length) throw new Error(`Worker runtime mutation admission did not settle after revocation: ${activeFiles.join(", ")}.`);
+  }
+  function runtimeAdmissionActive(file: string): boolean {
+    if (!existsSync(file)) return false; try { const record = JSON.parse(readFileSync(file, "utf8")) as { pid?: number }; if (Number.isSafeInteger(record.pid) && record.pid! > 0) { try { process.kill(record.pid!, 0); return true; } catch { rmSync(file, { force: true }); return false; } } } catch {} return true;
+  }
+
+  async function waitForWorkerShellRecords(workerId: string, runId: string): Promise<ReturnType<typeof unsettledPersistedAsyncShellJobsForOwner>> {
+    const root = path.join(workerPaths(roots, workerId).stateDir, "async-shell"); const owner = { kind: "worker-run" as const, workerId, runId };
+    let jobs = unsettledPersistedAsyncShellJobsForOwner(root, owner).filter((job) => job.status === "running" || job.status === "unknown");
+    for (let attempt = 0; attempt < 80 && jobs.length; attempt += 1) { await delay(25); jobs = unsettledPersistedAsyncShellJobsForOwner(root, owner).filter((job) => job.status === "running" || job.status === "unknown"); }
+    return jobs;
+  }
+
+  async function proveWorkerHostExited(runtime: RunRuntime, workerId: string, runId: string): Promise<void> {
+    if (!existsSync(runtime.processFile)) return;
+    const processRecord = readWorkerHostProcess(runtime.processFile);
+    if (processRecord.workerId !== workerId || processRecord.runId !== runId || processRecord.nonce !== runtime.processNonce) throw new Error("Worker host process identity mismatch during cancellation proof.");
+    for (let attempt = 0; attempt < 50 && isAsyncJobProcessGroupAlive(processRecord.pid); attempt += 1) await delay(100);
+    if (isAsyncJobProcessGroupAlive(processRecord.pid)) { signalAsyncJobProcessGroup(processRecord.pid, "SIGKILL"); for (let attempt = 0; attempt < 30 && isAsyncJobProcessGroupAlive(processRecord.pid); attempt += 1) await delay(100); }
+    if (isAsyncJobProcessGroupAlive(processRecord.pid)) throw new Error(`Worker host process group ${processRecord.pid} remained alive after cancellation.`);
+  }
+
+  function recoverInterruptedDiscardFiles(parentSessionFile: string, generation: number): void {
+    const rows = getRegistry().database.prepare("SELECT worker_id,workspace_root,operation_nonce FROM workers WHERE parent_session_file=? AND operation_kind='discard' AND operation_nonce IS NOT NULL").all(parentSessionFile) as Array<{ worker_id: string; workspace_root: string; operation_nonce: string }>;
+    for (const row of rows) {
+      if (row.operation_nonce.startsWith(`${generation}-`)) continue;
+      const paths = workerPaths(roots, row.worker_id); const stateTrash = `${paths.stateDir}.discard-${row.operation_nonce}`;
+      const separateWorkspace = path.resolve(row.workspace_root).startsWith(`${path.resolve(paths.stateDir)}${path.sep}`) ? undefined : `${row.workspace_root}.discard-${row.operation_nonce}`;
+      const irreversible = (!existsSync(paths.stateDir) && !existsSync(stateTrash)) || Boolean(separateWorkspace && !existsSync(row.workspace_root) && !existsSync(separateWorkspace));
+      if (irreversible) { rmSync(paths.stateDir, { recursive: true, force: true }); rmSync(stateTrash, { recursive: true, force: true }); if (separateWorkspace) { rmSync(row.workspace_root, { recursive: true, force: true }); rmSync(separateWorkspace, { recursive: true, force: true }); } finalizeWorkerDiscard(getRegistry(), row.worker_id, row.operation_nonce); continue; }
+      restoreDiscardPath(stateTrash, paths.stateDir); if (separateWorkspace) restoreDiscardPath(separateWorkspace, row.workspace_root);
+    }
+  }
+  function restoreDiscardPath(trash: string, destination: string): void {
+    if (!existsSync(trash)) return;
+    if (existsSync(destination)) { rmSync(trash, { recursive: true, force: true }); return; }
+    renameSync(trash, destination);
   }
 
   async function discardWorker(worker: WorkerRegistryRecord): Promise<void> {
-    const nonce = randomUUID(); claimWorkerDiscard(getRegistry(), worker.workerId, worker.version, nonce, now().toISOString());
+    const nonce = claimNonce(); claimWorkerDiscard(getRegistry(), worker.workerId, worker.version, nonce, now().toISOString());
     const paths = workerPaths(roots, worker.workerId); const stateTrash = `${paths.stateDir}.discard-${nonce}`; const separateWorkspace = path.resolve(paths.workspaceRoot).startsWith(`${path.resolve(paths.stateDir)}${path.sep}`) ? undefined : `${paths.workspaceRoot}.discard-${nonce}`;
     try {
       if (existsSync(paths.stateDir)) renameSync(paths.stateDir, stateTrash); if (separateWorkspace && existsSync(paths.workspaceRoot)) renameSync(paths.workspaceRoot, separateWorkspace);
-      finalizeWorkerDiscard(getRegistry(), worker.workerId, nonce); rmSync(stateTrash, { recursive: true, force: true }); if (separateWorkspace) rmSync(separateWorkspace, { recursive: true, force: true });
+      rmSync(stateTrash, { recursive: true, force: true }); if (separateWorkspace) rmSync(separateWorkspace, { recursive: true, force: true }); finalizeWorkerDiscard(getRegistry(), worker.workerId, nonce);
     } catch (error) {
-      try { if (existsSync(stateTrash) && !existsSync(paths.stateDir)) renameSync(stateTrash, paths.stateDir); if (separateWorkspace && existsSync(separateWorkspace) && !existsSync(paths.workspaceRoot)) renameSync(separateWorkspace, paths.workspaceRoot); } catch {}
-      abandonWorkerDiscard(getRegistry(), worker.workerId, nonce, sanitizeError(error), now().toISOString()); throw error;
+      const irreversible = (!existsSync(paths.stateDir) && !existsSync(stateTrash)) || Boolean(separateWorkspace && !existsSync(paths.workspaceRoot) && !existsSync(separateWorkspace));
+      if (!irreversible) { try { if (existsSync(stateTrash) && !existsSync(paths.stateDir)) renameSync(stateTrash, paths.stateDir); if (separateWorkspace && existsSync(separateWorkspace) && !existsSync(paths.workspaceRoot)) renameSync(separateWorkspace, paths.workspaceRoot); } catch {} abandonWorkerDiscard(getRegistry(), worker.workerId, nonce, sanitizeError(error), now().toISOString()); }
+      throw error;
     }
   }
 
@@ -455,13 +530,23 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       if (worker.recoveryError) { deliverRecovery(worker, run, worker.recoveryError); continue; }
       const runtime = run.runtime as RunRuntime; if (!runtime || runtime.version !== 2 || run.claimKind) continue;
       if (run.status === "queued") {
+        if (existsSync(runtime.processFile)) {
+          try {
+            const processRecord = readWorkerHostProcess(runtime.processFile);
+            if (processRecord.workerId === worker.workerId && processRecord.runId === run.runId && processRecord.nonce === runtime.processNonce && isAsyncJobProcessGroupAlive(processRecord.pid)) {
+              const nonce = claimNonce();
+              if (claimWorkerRun(getRegistry(), worker.workerId, run.runId, "launch", nonce, ["queued"])) finalizeWorkerRunLaunch(getRegistry(), { workerId: worker.workerId, runId: run.runId, claimNonce: nonce, modelSelection: worker.modelSelection!, sessionId: worker.sessionId!, sessionFile: worker.sessionFile!, sessionStartLine: run.sessionStartLine ?? countLines(worker.sessionFile!) + 1, jobId: run.jobId!, stdoutLog: run.stdoutLog!, stderrLog: run.stderrLog!, runtime, startedAt: run.startedAt ?? now().toISOString() });
+              continue;
+            }
+          } catch {}
+        }
         if (!pending.has(run.runId)) { const item = { workerId: worker.workerId, runId: run.runId, parentSessionFile, parentSessionId: context.sessionManager.getSessionId(), runtime }; pending.set(run.runId, item); pending.delete(run.runId); await startPreparedRun(context, item); }
         continue;
       }
       if (active.get(worker.workerId)?.runId === run.runId) continue;
       if (existsSync(runtime.settledFile) && existsSync(runtime.resultFile)) { await settleCompletedRun(worker.workerId, run.runId, { status: "exited", exitCode: 0 }); continue; }
       if (existsSync(runtime.processFile)) { try { const process = readWorkerHostProcess(runtime.processFile); if (process.workerId === worker.workerId && process.runId === run.runId && process.nonce === runtime.processNonce && isAsyncJobProcessGroupAlive(process.pid)) continue; } catch {} }
-      const nonce = randomUUID(); if (claimWorkerRun(getRegistry(), worker.workerId, run.runId, "settlement", nonce, ["running"])) await failClaimedRun(worker.workerId, run.runId, "settlement", nonce, new Error("Worker supervisor exited without a verified result settlement."));
+      const nonce = claimNonce(); if (claimWorkerRun(getRegistry(), worker.workerId, run.runId, "settlement", nonce, ["running"])) await failClaimedRun(worker.workerId, run.runId, "settlement", nonce, new Error("Worker supervisor exited without a verified result settlement."));
     }
   }
 
@@ -481,9 +566,10 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   }
   function resolveCandidate(candidateId: string, parent: string): { repo: string; commit: string } {
     const rows = getRegistry().database.prepare("SELECT r.worker_id,r.run_id,r.repositories_json,w.workspace_root,w.parent_session_file FROM runs r JOIN workers w ON w.worker_id=r.worker_id WHERE r.status='settled'").all() as Array<any>;
-    for (const row of rows) { if (row.parent_session_file !== parent) continue; const item = (JSON.parse(row.repositories_json) as WorkerRepositoryResult[]).find((candidate) => candidate.candidateId === candidateId); if (!item) continue; if (!item.eligible) throw new Error(`Candidate ${candidateId} is not eligible for merge testing.`); const repo = canonicalPathWithin(row.workspace_root, path.join(row.workspace_root, item.path)); if (trustedGit(repo, ["rev-parse", "HEAD"]).trim() !== item.commit) throw new Error(`Candidate ${candidateId} changed after settlement.`); return { repo, commit: item.commit }; }
+    for (const row of rows) { if (row.parent_session_file !== parent) continue; const item = (JSON.parse(row.repositories_json) as WorkerRepositoryResult[]).find((candidate) => candidate.candidateId === candidateId); if (!item) continue; if (!item.eligible) throw new Error(`Candidate ${candidateId} is not eligible for merge testing.`); const repo = canonicalPathWithin(row.workspace_root, path.join(row.workspace_root, item.path)); let reachable: string; try { reachable = trustedGit(repo, ["rev-parse", `${item.commit}^{commit}`]).trim(); } catch { throw new Error(`Candidate ${candidateId} commit is no longer reachable in its retained repository.`); } if (reachable !== item.commit) throw new Error(`Candidate ${candidateId} commit identity is invalid.`); return { repo, commit: item.commit }; }
     throw new Error(`Unknown candidate ${candidateId} for this parent session.`);
   }
+  function claimNonce(): string { return `${runtimeGeneration}-${randomUUID()}`; }
   function managedCandidateWarnings() { return (candidateRepo: string, candidateCommit: string) => {
     const rows = getRegistry().database.prepare("SELECT r.run_id,r.repositories_json,w.worker_id,w.latest_run_id,w.status,w.workspace_root FROM runs r JOIN workers w ON w.worker_id=r.worker_id WHERE r.status='settled'").all() as Array<any>;
     for (const row of rows) { const item = (JSON.parse(row.repositories_json) as WorkerRepositoryResult[]).find((candidate) => path.resolve(row.workspace_root, candidate.path) === path.resolve(candidateRepo) && candidate.commit === candidateCommit); if (!item) continue; const latest = row.run_id === row.latest_run_id; const warnings = [...(!latest ? [`Candidate belongs to historical run ${row.run_id}; latest is ${row.latest_run_id}.`] : []), ...(row.status !== "idle" ? ["Source worker has a newer active run that may supersede this candidate."] : [])]; return { source: { workerId: row.worker_id, runId: row.run_id, latest }, ...(warnings.length ? { warnings } : {}) }; } return {}; } }
@@ -496,11 +582,16 @@ function writeReviewContext(paths: WorkerPaths, reviewerWorkerId: string, contex
   const value = { version: 2, reviewerWorkerId, reviewedWorkerId: subjectWorker.workerId, reviewedRunId: subjectRun.runId, subjectWorkspace: "/review/subject", session: { path: "/review/session.jsonl", range: { startLine: subjectRun.sessionStartLine, endLine: subjectRun.sessionEndLine } }, repositories: subjectRun.repositories, artifacts: subjectRun.artifacts, candidates: subjectRun.repositories.map(({ candidateId, path, reported, changed, dirty, eligible, issues }) => ({ candidateId, path, reported, changed, dirty, eligible, ...(issues ? { issues } : {}) })), additionalInputs: contextInputs(inputs) };
   writeReadonlyJson(file, value); return file;
 }
-function assertIntegrationTargetsCurrent(contextFile: string): void { const context = JSON.parse(readFileSync(contextFile, "utf8")) as any; for (const repository of context.repositories ?? []) { const current = trustedGit(repository.target.repo, ["rev-parse", repository.target.ref]).trim(); if (current !== repository.target.commit) throw new Error(`Target ${repository.id} moved from ${repository.target.commit} to ${current}; run worker_merge_test again before integration.`); } }
-function writeIntegrationContext(paths: WorkerPaths, preparedId: string, inputs: RetainedInput[], resumed: boolean, supplied?: ReturnType<typeof readPreparedMergeSet>): string {
+function trustedPreparedSet(registry: WorkerRegistry, parentSessionFile: string, preparedId: string, consumedWorkspace?: string): ReturnType<typeof readPreparedMergeSet> {
+  const record = readPreparedSetRecord(registry, parentSessionFile, preparedId);
+  const repositories = consumedWorkspace && record.status === "consumed" ? record.repositories.map((item: any) => ({ ...item, preparedPath: path.join(consumedWorkspace, "prepared", preparedId, item.id) })) : record.repositories;
+  return { version: 1, preparedId: record.preparedId, parentSessionFile: record.parentSessionFile, status: (["ready", "partial", "failed"] as string[]).includes(record.status) ? "ready" : "resolution_required", order: record.order, repositories: repositories as any, createdAt: record.createdAt };
+}
+function assertIntegrationTargetsCurrent(set: ReturnType<typeof readPreparedMergeSet>): void { for (const repository of set.repositories) { const current = trustedGit(repository.targetRepo, ["rev-parse", repository.targetRef]).trim(); if (current !== repository.expectedCommit) throw new Error(`Target ${repository.id} moved from ${repository.expectedCommit} to ${current}; run worker_merge_test again before integration.`); } }
+function writeIntegrationContext(paths: WorkerPaths, set: ReturnType<typeof readPreparedMergeSet>, inputs: RetainedInput[], resumed: boolean): string {
   const directory = path.join(paths.stateDir, "contexts"); mkdirSync(directory, { recursive: true, mode: 0o700 }); const file = path.join(directory, `integration-${Date.now()}-${randomUUID().slice(0, 8)}.json`);
-  let set = supplied; if (!set) { const local = path.join(paths.workspaceRoot, "prepared", preparedId, "prepared.json"); set = JSON.parse(readFileSync(local, "utf8")); }
-  const value = { version: 2, preparedId, status: set!.status, order: set!.order, resumed, repositories: set!.repositories.map((item: any) => ({ id: item.id, path: path.relative(paths.workspaceRoot, item.preparedPath).split(path.sep).join("/"), method: item.method, status: item.status, dependsOn: item.dependsOn, target: { repo: item.targetRepo, ref: item.targetRef, commit: item.expectedCommit, privateRef: item.targetPrivateRef }, candidate: { repo: item.candidateRepo, commit: item.candidateCommit, privateRef: item.candidatePrivateRef }, mergeBase: item.mergeBase, conflicts: item.conflicts ?? [], mergeMessages: item.mergeMessages ?? [], overlapCount: item.overlapCount })), additionalInputs: contextInputs(inputs) };
+  const preparedId = set.preparedId;
+  const value = { version: 2, preparedId, status: set.status, order: set.order, resumed, repositories: set.repositories.map((item: any) => ({ id: item.id, path: path.relative(paths.workspaceRoot, item.preparedPath).split(path.sep).join("/"), method: item.method, status: item.status, dependsOn: item.dependsOn, target: { repo: item.targetRepo, ref: item.targetRef, commit: item.expectedCommit, privateRef: item.targetPrivateRef }, candidate: { repo: item.candidateRepo, commit: item.candidateCommit, privateRef: item.candidatePrivateRef }, mergeBase: item.mergeBase, conflicts: item.conflicts ?? [], mergeMessages: item.mergeMessages ?? [], overlapCount: item.overlapCount })), additionalInputs: contextInputs(inputs) };
   writeReadonlyJson(file, value); return file;
 }
 function writeReadonlyJson(file: string, value: unknown): void { if (existsSync(file)) chmodSync(file, 0o600); writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 }); chmodSync(file, 0o400); }
@@ -508,7 +599,7 @@ function sessionIdentity(paths: WorkerPaths): { sessionId: string; sessionFile: 
 function verifyRetainedSession(worker: WorkerRegistryRecord): void { if (worker.role === "work") verifyWorkerSession({ sessionFile: worker.sessionFile!, sessionId: worker.sessionId!, workspaceRoot: worker.workspaceRoot, parentSessionFile: worker.parentSessionFile }); else { const first = JSON.parse(readFileSync(worker.sessionFile!, "utf8").split("\n")[0]!); if (first.id !== worker.sessionId || path.resolve(first.cwd) !== path.resolve(worker.workspaceRoot) || first.parentSession) throw new Error(`Worker ${worker.workerId} retained independent session is invalid.`); } }
 function runtimeInputs(worker: WorkerRegistryRecord): RetainedInput[] { const value = worker.runtime?.inputs; return Array.isArray(value) ? value as RetainedInput[] : []; }
 function baselineRuntime(worker: WorkerRegistryRecord): Partial<WorkerRuntime> { const value = worker.runtime?.repositoryBaselines; return Array.isArray(value) ? { repositoryBaselines: value as any } : {}; }
-function roleInstructionsFor(role: WorkerRole): string { return readFileSync(fileURLToPath(new URL(`../../worker-roles/${role}.md`, import.meta.url)), "utf8").trimEnd(); }
+function roleInstructionsFor(role: WorkerRole): string { return workerRoleInstructions(role).text; }
 function resolveModel(role: WorkerRole, explicit: string | undefined, context: ExtensionContext): string { const errors: string[] = []; for (const requested of preferredWorkerModel(role, explicit)) { try { const parsed = parseModelThinkingPair(requested); const resolved = resolveExtensionModel({ registry: context.modelRegistry, requested, fallbackThinkingLevel: parsed.thinkingLevel, label: `${role} worker`, noModelMessage: `No configured ${role} model is available.` }); assertChildAgentRouteAllowed(resolved.model, resolved.thinkingLevel, `${role} worker`); if (`${resolved.model.provider}/${resolved.model.id}:${resolved.thinkingLevel}` !== requested) throw new Error(`Selection ${requested} could not be honored exactly.`); return requested; } catch (error) { errors.push(sanitizeError(error)); } } throw new Error(`No configured ${role} model selection is available before launch. ${errors.join(" ")}`); }
 function requireParentSession(context: ExtensionContext): string { const file = context.sessionManager.getSessionFile(); if (!file) throw new Error("Managed workers require a persisted parent session."); return realpathOrResolve(file); }
 function realpathOrResolve(value: string): string { try { return realpathSync(value); } catch { return path.resolve(value); } }
@@ -527,15 +618,25 @@ function validateRunRequestBounds(request: WorkerRunInputV2["runs"][number]): vo
 function unique(values: string[]): string[] { const result = [...new Set(values.map((value) => value.trim()).filter(Boolean))]; if (result.length !== values.length) throw new Error("Worker task IDs and batch identities must be unique."); return result; }
 function sanitizeError(error: unknown): string { return String(error instanceof Error ? error.message : error).replaceAll(/[\r\n\t]+/g, " ").slice(0, 2048); }
 function delay(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)); }
-function resultText(text: string, details: any): AgentToolResult<any> { return { content: [{ type: "text", text }], details }; }
+function resultText(_text: string, details: any): AgentToolResult<any> { return { content: [{ type: "text", text: JSON.stringify(details) }], details }; }
 function slimRun(run: WorkerRunRecord) { return { runId: run.runId, status: run.status, ...(run.outcome ? { outcome: run.outcome, outcomeSource: run.outcomeSource } : {}), createdAt: run.createdAt, ...(run.startedAt ? { startedAt: run.startedAt } : {}), ...(run.settledAt ? { settledAt: run.settledAt } : {}) }; }
 function workerListItem(worker: WorkerRegistryRecord) { return { workerId: worker.workerId, role: worker.role, status: worker.status, ...(worker.activeRunId ? { activeRunId: worker.activeRunId } : {}), taskIds: worker.taskIds, ...(worker.modelSelection ? { modelSelection: worker.modelSelection } : {}), ...(worker.recoveryError ? { recoveryRequired: true } : {}), lastActivityAt: worker.updatedAt }; }
-function exactRun(worker: WorkerRegistryRecord, run: WorkerRunRecord) { return { workerId: worker.workerId, role: worker.role, runId: run.runId, status: run.status, taskIds: run.taskIds, ...(run.modelSelection ? { modelSelection: run.modelSelection } : {}), createdAt: run.createdAt, ...(run.startedAt ? { startedAt: run.startedAt } : {}), ...(run.settledAt ? { settledAt: run.settledAt } : {}), ...(run.jobId ? { jobId: run.jobId } : {}), ...(run.stdoutLog ? { stdoutLog: run.stdoutLog } : {}), ...(run.stderrLog ? { stderrLog: run.stderrLog } : {}), ...(worker.sessionId ? { sessionId: worker.sessionId } : {}), ...(worker.sessionFile ? { sessionFile: worker.sessionFile } : {}), sessionRange: { ...(run.sessionStartLine === undefined ? {} : { startLine: run.sessionStartLine }), ...(run.sessionEndLine === undefined ? {} : { endLine: run.sessionEndLine }) }, workspaceRoot: worker.workspaceRoot, ...(run.binding ? { binding: run.binding } : {}), ...(worker.recoveryError ? { recoveryError: worker.recoveryError } : {}), ...(run.status === "settled" ? { outcome: run.outcome, outcomeSource: run.outcomeSource, ...(run.summary ? { summary: run.summary } : {}), ...(run.question ? { question: run.question } : {}), repositories: run.repositories.map(({ commit: _commit, ...repository }) => repository), artifacts: run.artifacts, errors: run.errors } : {}) }; }
+function exactRun(worker: WorkerRegistryRecord, run: WorkerRunRecord) { return { workerId: worker.workerId, role: worker.role, runId: run.runId, status: run.status, taskIds: run.taskIds, ...(run.modelSelection ? { modelSelection: run.modelSelection } : {}), createdAt: run.createdAt, ...(run.startedAt ? { startedAt: run.startedAt } : {}), ...(run.settledAt ? { settledAt: run.settledAt } : {}), ...(run.jobId ? { jobId: run.jobId } : {}), ...(run.stdoutLog ? { stdoutLog: run.stdoutLog } : {}), ...(run.stderrLog ? { stderrLog: run.stderrLog } : {}), ...(worker.sessionId ? { sessionId: worker.sessionId } : {}), ...(worker.sessionFile ? { sessionFile: worker.sessionFile } : {}), sessionRange: { ...(run.sessionStartLine === undefined ? {} : { startLine: run.sessionStartLine }), ...(run.sessionEndLine === undefined ? {} : { endLine: run.sessionEndLine }) }, workspaceRoot: worker.workspaceRoot, ...(run.binding ? { binding: run.binding } : {}), ...(worker.recoveryError ? { recoveryError: worker.recoveryError } : {}), ...(run.status === "settled" ? { outcome: run.outcome, outcomeSource: run.outcomeSource, ...(run.summary ? { summary: run.summary } : {}), ...(run.question ? { question: run.question } : {}), repositories: run.repositories, artifacts: run.artifacts, errors: run.errors } : {}) }; }
 function formatExactRun(value: any): string { return `${value.outcome ?? value.status} · ${value.role} · ${value.workerId}\nrun ${value.runId}\n${value.taskIds?.length ?? 0} tasks · ${value.repositories?.length ?? 0} repositories · ${value.artifacts?.length ?? 0} artifacts${value.recoveryError ? `\nrecovery: ${value.recoveryError}` : ""}`; }
 function compactCall(theme: any, text: string): Text { return new Text(theme.fg("toolTitle", theme.bold(text.slice(0, 80))), 0, 0); }
-function compactResult(theme: any, result: AgentToolResult<any>, fallback: string): Text { const item = result.content?.find((candidate) => candidate.type === "text"); return new Text(theme.fg("success", item?.type === "text" ? item.text.split("\n")[0]!.slice(0, 120) : fallback), 0, 0); }
+function compactResult(theme: any, result: AgentToolResult<any>, fallback: string): Text { return new Text(theme.fg("success", compactResultSummary((result as any).details, fallback).slice(0, 120)), 0, 0); }
+function compactResultSummary(details: any, fallback: string): string {
+  if (Array.isArray(details?.runs) && details.runs.some((run: any) => run?.action)) return `${details.runs.length} worker run${details.runs.length === 1 ? "" : "s"} queued`;
+  if (typeof details?.preparedId === "string") return `${details.status ?? fallback} · ${details.repositories?.length ?? 0} repositories`;
+  if (Array.isArray(details?.workers)) return `${details.total ?? details.workers.length} workers`;
+  if (Array.isArray(details?.runs)) return `${details.total ?? details.runs.length} retained runs`;
+  if (typeof details?.cancellation === "string") return details.cancellation.replace("_", " ");
+  if (details?.discarded) return "worker discarded";
+  if (typeof details?.workerId === "string" && typeof details?.runId === "string") return `${details.outcome ?? details.status ?? fallback} · ${details.role ?? "worker"}`;
+  return fallback;
+}
 function runCallHint(input: WorkerRunInputV2): string { const first = input.runs[0]; if (!first) return "Run Workers"; const hint = first.action === "resume" ? first.workerId.slice(-8) : first.role === "work" ? first.taskIds[0] : first.role === "review" ? `run ${first.reviewedRunId.slice(-8)}` : first.preparedId.slice(-8); const label = first.action === "start" && first.role === "review" ? "Review Worker Output" : first.action === "start" && first.role === "integration" ? "Resolve Repository Conflicts" : "Run Workers"; return `${label} · ${hint}${input.runs.length > 1 ? ` +${input.runs.length - 1}` : ""}`; }
 function mergeHint(action: string, repositories: any[]): string { const first = repositories?.[0]; return first ? `${action} · ${String(first.candidateId).slice(-8)} → ${String(first.targetRef).replace("refs/heads/", "")} · ${first.method}${repositories.length > 1 ? ` +${repositories.length - 1}` : ""}` : `${action} merge`; }
 function publicPreparedSet(set: any) { return { preparedId: set.preparedId, status: set.status, order: set.order, repositories: set.repositories.map((item: any) => ({ id: item.id, candidateRepo: item.candidateRepo, candidateCommit: item.candidateCommit, targetRepo: item.targetRepo, targetRef: item.targetRef, method: item.method, status: item.status, expectedCommit: item.expectedCommit, ...(item.desiredCommit ? { desiredCommit: item.desiredCommit } : {}), preparedPath: item.preparedPath, overlapCount: item.overlapCount, dependsOn: item.dependsOn, ...(item.source ? { source: item.source } : {}), ...(item.warnings ? { warnings: item.warnings } : {}) })), ...(set.resolutionCases ? { resolutionCases: set.resolutionCases } : {}) }; }
 function sessionDeliveryIds(context: ExtensionContext): string[] { const ids = new Set<string>(); const visit = (value: unknown): void => { if (!value || typeof value !== "object") return; const record = value as Record<string, unknown>; if (typeof record.deliveryId === "string" && record.deliveryId.startsWith("worker-run:")) ids.add(record.deliveryId); for (const child of Object.values(record)) Array.isArray(child) ? child.forEach(visit) : visit(child); }; try { for (const entry of context.sessionManager.getEntries()) visit(entry); } catch {} return [...ids]; }
-function deliverPendingCompletions(api: ExtensionAPI, registry: WorkerRegistry, parent: string, generation: number): void { for (const delivery of pendingWorkerDeliveries(registry, parent)) { if (!claimWorkerDelivery(registry, delivery.deliveryId, parent, generation)) continue; const worker = getWorker(registry, delivery.workerId); const run = getWorkerRun(registry, delivery.workerId, delivery.runId); if (!worker || !run?.outcome || !run.outcomeSource) { releaseWorkerDeliveryClaim(registry, delivery.deliveryId, generation); continue; } const event = { event: "worker_settled", workerId: worker.workerId, runId: run.runId, role: worker.role, outcome: run.outcome, outcomeSource: run.outcomeSource, ...(run.summary ? { summary: run.summary } : {}), ...(run.question ? { question: run.question } : {}), repositoryCount: run.repositories.length, artifactCount: run.artifacts.length, ...(run.errors.length ? { errors: run.errors } : {}) }; try { api.sendMessage({ customType: "worker-run", content: JSON.stringify(event), display: true, details: { ...event, deliveryId: delivery.deliveryId } }, { triggerTurn: true, deliverAs: delivery.completionDelivery }); } catch { releaseWorkerDeliveryClaim(registry, delivery.deliveryId, generation); } } }
+function deliverPendingCompletions(api: ExtensionAPI, registry: WorkerRegistry, parent: string, generation: number): void { for (const delivery of pendingWorkerDeliveries(registry, parent)) { if (!claimWorkerDelivery(registry, delivery.deliveryId, parent, generation)) continue; const worker = getWorker(registry, delivery.workerId); const run = getWorkerRun(registry, delivery.workerId, delivery.runId); if (!worker || !run?.outcome || !run.outcomeSource) { releaseWorkerDeliveryClaim(registry, delivery.deliveryId, generation); continue; } const event = { event: "worker_settled", workerId: worker.workerId, runId: run.runId, role: worker.role, outcome: run.outcome, outcomeSource: run.outcomeSource, ...(run.summary ? { summary: run.summary } : {}), ...(run.question ? { question: run.question } : {}), repositoryCount: run.repositories.length, artifactCount: run.artifacts.length, repositories: run.repositories, artifacts: run.artifacts, workspaceRoot: worker.workspaceRoot, ...(run.stdoutLog ? { stdoutLog: run.stdoutLog } : {}), ...(run.stderrLog ? { stderrLog: run.stderrLog } : {}), ...(run.errors.length ? { errors: run.errors } : {}) }; try { api.sendMessage({ customType: "worker-run", content: JSON.stringify(event), display: true, details: { ...event, deliveryId: delivery.deliveryId } }, { triggerTurn: true, deliverAs: delivery.completionDelivery }); } catch { releaseWorkerDeliveryClaim(registry, delivery.deliveryId, generation); } } }

@@ -27,3 +27,27 @@ test("additional inputs reject sensitive roots, aliases, duplicates, and overlap
     const retained = validateAdditionalInputs({ values: [path.join(data, "a.txt")], role: "integration", workspaceRoot: workspace, runtimeRoot: runtime }); assert.equal(retained[0]?.target, "/integration/inputs/01-a.txt"); assert.equal(inputMounts(retained)[0]?.readOnly, true);
     const more = path.join(root, "more.txt"); writeFileSync(more, "more"); const resumed = validateAdditionalInputs({ values: [more], existing: retained, role: "integration", workspaceRoot: workspace, runtimeRoot: runtime }); assert.deepEqual(resumed.map((item) => item.target), ["/integration/inputs/01-a.txt", "/integration/inputs/02-more.txt"]);
   } finally { rmSync(root, { recursive: true, force: true }); } });
+
+test("trusted Git rejects linked worktrees, nested repositories, gitlinks, and worktree configuration", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "trusted-git-structure-"));
+  try {
+    const worktreeSource = repository(path.join(root, "worktree-source"));
+    const linked = path.join(root, "linked");
+    execFileSync("git", ["-C", worktreeSource, "worktree", "add", "-q", "-b", "linked", linked]);
+    assert.throws(() => assertTrustedGitPolicy(linked), /worktrees/);
+
+    const configured = repository(path.join(root, "configured"));
+    execFileSync("git", ["-C", configured, "config", "extensions.worktreeConfig", "true"]);
+    assert.throws(() => assertTrustedGitPolicy(configured), /extensions.worktreeconfig/);
+
+    const outer = repository(path.join(root, "outer"));
+    repository(path.join(outer, "vendor"));
+    assert.throws(() => assertTrustedGitPolicy(outer), /nested Git metadata/);
+
+    const child = repository(path.join(root, "child"));
+    const parent = repository(path.join(root, "parent"));
+    execFileSync("git", ["-c", "protocol.file.allow=always", "-C", parent, "submodule", "add", "-q", child, "dependency"]);
+    execFileSync("git", ["-C", parent, "commit", "-qm", "submodule"]);
+    assert.throws(() => assertTrustedGitPolicy(parent), /gitlinks|nested Git metadata|submodule/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

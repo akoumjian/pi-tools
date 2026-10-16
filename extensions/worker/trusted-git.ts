@@ -1,12 +1,12 @@
 import { execFileSync, type ExecFileSyncOptionsWithStringEncoding } from "node:child_process";
-import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 
 const TRUSTED_CONFIG: Array<[string, string]> = [
   ["core.fsmonitor", "false"], ["core.hooksPath", "/dev/null"], ["core.sshCommand", "/usr/bin/false"],
   ["core.attributesFile", "/dev/null"], ["core.excludesFile", "/dev/null"], ["credential.helper", ""],
   ["commit.gpgSign", "false"], ["tag.gpgSign", "false"], ["merge.verifySignatures", "false"],
-  ["merge.autoStash", "false"], ["diff.external", ""], ["protocol.file.allow", "always"]
+  ["merge.autoStash", "false"], ["diff.external", ""], ["extensions.worktreeConfig", "false"], ["submodule.recurse", "false"], ["fetch.recurseSubmodules", "false"], ["protocol.file.allow", "always"]
 ];
 
 export function trustedGitEnvironment(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
@@ -47,23 +47,40 @@ export function canonicalRepository(value: string, checkPolicy = true): string {
 
 export function assertTrustedGitPolicy(repository: string): void {
   const exact = realpathSync(repository);
-  const keys = runTrustedGit(["-C", exact, "config", "--local", "--name-only", "--null", "--list"])
+  const keys = runTrustedGit(["-C", exact, "config", "--local", "--no-includes", "--name-only", "--null", "--list"])
     .split("\0").filter(Boolean).map((key) => key.toLocaleLowerCase("en-US"));
   const unsafe = keys.filter(unsafeConfigKey);
   if (unsafe.length) throw new Error(`Repository has prohibited executable or ambient Git configuration: ${[...new Set(unsafe)].sort().join(", ")}.`);
   const common = runTrustedGit(["-C", exact, "rev-parse", "--path-format=absolute", "--git-common-dir"]).trim();
   const commonExact = realpathSync(common);
+  const gitDir = realpathSync(runTrustedGit(["-C", exact, "rev-parse", "--path-format=absolute", "--git-dir"]).trim());
+  if (gitDir !== commonExact) throw new Error("Linked Git worktrees and per-worktree configuration are unsupported.");
+  assertNoNestedGitRepositories(exact);
   for (const relative of ["info/grafts", "shallow"]) {
     const candidate = path.join(commonExact, relative);
     if (existsSync(candidate) && lstatSync(candidate).isFile()) throw new Error(`Repository uses unsupported Git history metadata: ${relative}.`);
   }
+  if (runTrustedGit(["-C", exact, "ls-files", "--stage"]).split("\n").some((line) => line.startsWith("160000 "))) throw new Error("Repository contains unsupported gitlinks/submodules.");
   if (runTrustedGit(["-C", exact, "for-each-ref", "--format=%(refname)", "refs/replace"]).trim()) {
     throw new Error("Repository contains prohibited replace refs.");
   }
 }
 
+function assertNoNestedGitRepositories(repository: string): void {
+  const queue = [repository]; let inspected = 0;
+  while (queue.length) {
+    const directory = queue.shift()!;
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      if (++inspected > 100_000) throw new Error("Repository tree is too large to verify nested Git repository policy.");
+      if (entry.name === ".git") { if (directory !== repository) throw new Error(`Repository contains unsupported nested Git metadata at ${path.relative(repository, directory)}.`); continue; }
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+      queue.push(path.join(directory, entry.name));
+    }
+  }
+}
+
 function unsafeConfigKey(key: string): boolean {
-  return key === "core.fsmonitor" || key === "core.hookspath" || key === "core.sshcommand" || key === "core.gitproxy" ||
+  return key === "extensions.worktreeconfig" || key === "core.worktree" || key.startsWith("extensions.") || key === "core.fsmonitor" || key === "core.hookspath" || key === "core.sshcommand" || key === "core.gitproxy" ||
     key === "core.attributesfile" || key === "core.excludesfile" || key === "diff.external" || key === "gpg.program" ||
     key.startsWith("include.") || key.startsWith("includeif.") || key.startsWith("filter.") || key.startsWith("credential.") ||
     /^diff\..+\.(command|textconv)$/.test(key) || /^merge\..+\.driver$/.test(key) || /^remote\..+\.(uploadpack|receivepack|proxy)$/.test(key) ||

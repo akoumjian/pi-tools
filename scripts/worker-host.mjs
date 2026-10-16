@@ -43,6 +43,9 @@ const client = new RpcClient({
     PI_WORKER_TASK_IDS: JSON.stringify(config.taskIds),
     PI_WORKER_BD_PATH: config.bdPath,
     PI_WORKER_BEADS_ROUTE: JSON.stringify(config.beadsRoute),
+    PI_WORKER_AUTHORIZATION_FILE: config.authorizationFile,
+    PI_WORKER_PROCESS_NONCE: config.processNonce,
+    PI_WORKER_PARENT_PID: String(config.parentPid),
     GIT_OPTIONAL_LOCKS: "0",
     ...(config.shellExecution.kind === "docker"
       ? {

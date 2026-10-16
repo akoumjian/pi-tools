@@ -28,7 +28,7 @@ export function inventoryWorkerRepositories(input: {
     try {
       const exact = canonicalRepository(absolute);
       commit = trustedGit(exact, ["rev-parse", "HEAD"]).trim();
-      dirty = trustedGit(exact, ["status", "--porcelain=v1", "--untracked-files=all"]).trim() !== "";
+      dirty = trustedGit(exact, ["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=all"]).trim() !== "";
       try { source = trustedGit(exact, ["remote", "get-url", "origin"]).trim() || undefined; } catch {}
     } catch (error) { issues.push(error instanceof Error ? error.message.slice(0, 512) : String(error).slice(0, 512)); }
     const previous = before.get(relative);
@@ -67,6 +67,6 @@ function discoverWorkerRepositories(workspaceRoot: string): Array<{ absolute: st
 }
 
 function inspect(absolute: string, relative: string): RepositorySnapshot {
-  try { return { path: relative, commit: trustedGit(absolute, ["rev-parse", "HEAD"]).trim(), dirty: trustedGit(absolute, ["status", "--porcelain=v1", "--untracked-files=all"]).trim() !== "" }; }
+  try { return { path: relative, commit: trustedGit(absolute, ["rev-parse", "HEAD"]).trim(), dirty: trustedGit(absolute, ["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=all"]).trim() !== "" }; }
   catch { return { path: relative, commit: "unknown", dirty: true }; }
 }
