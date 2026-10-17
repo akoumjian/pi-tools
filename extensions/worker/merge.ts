@@ -147,7 +147,8 @@ export function applyPreparedWorkerMerges(parentSessionFile: string, preparedId:
   for (const repository of ordered) {
     if (!repository.desiredCommit) throw new Error(`Prepared repository ${repository.id} has no desired commit.`);
     assertTrustedGitPolicy(repository.targetRepo, operation);
-    assertTargetClean(targetCheckoutPath(repository.targetRepo, repository.targetRef) ?? repository.targetRepo);
+    const targetCheckout = targetCheckoutPath(repository.targetRepo, repository.targetRef);
+    if (targetCheckout) assertTargetClean(targetCheckout);
     const current = git(repository.targetRepo, ["rev-parse", repository.targetRef]);
     if (current !== repository.expectedCommit && current !== repository.desiredCommit) {
       throw new Error(`Target ${repository.id} moved from ${repository.expectedCommit} to ${current}; run worker_merge_test again.`);

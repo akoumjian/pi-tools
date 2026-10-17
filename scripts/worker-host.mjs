@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { RpcClient } from "@earendil-works/pi-coding-agent";
 import { readStrictWorkerJobMeta, workerJobIsSettled } from "../extensions/_shared/worker-job-settlement.js";
+import { captureAsyncJobProcessIdentity } from "../extensions/_shared/async-job-process.js";
 
 const configFile = process.argv[2];
 if (!configFile) throw new Error("Usage: worker-host.mjs <host-config.json>");
@@ -19,11 +20,12 @@ if (config.shellExecution?.kind !== "docker" && config.shellExecution?.kind !== 
 if (config.timeoutMs !== undefined && (!Number.isSafeInteger(config.timeoutMs) || config.timeoutMs <= 0)) {
   throw new Error("Worker host timeoutMs must be a positive safe integer when explicitly configured.");
 }
+const processIdentity = captureAsyncJobProcessIdentity(process.pid, process.env.PI_WORKER_JOB_TOKEN);
 writeAtomicJson(config.processFile, {
-  version: 1,
+  version: 2,
   workerId: config.workerId,
   runId: config.runId,
-  pid: process.pid,
+  ...processIdentity,
   nonce: config.processNonce,
   hostConfigFile: config.hostConfigFile,
   startedAt: new Date().toISOString()
@@ -164,17 +166,26 @@ function waitForResultSettlement(rpcClient, resultFile, timeoutMs) {
     const reconcileSettledTurn = async () => {
       if (checking || finished) return;
       checking = true;
+      let quiescentSince; let observedOwnedShellWork = false; let requestedSettledFollowUp = false;
       try {
-        const deadline = Date.now() + 5_000;
-        while (!finished && Date.now() < deadline) {
+        while (!finished) {
           if (existsSync(resultFile)) return finish();
-          if (hasUnsettledOwnedShellJobs()) return;
+          const ownedShellState = ownedShellJobState();
+          const ownedShellActive = ownedShellState.unsettled;
+          if (ownedShellState.seen) observedOwnedShellWork = true;
           const state = await rpcClient.getState();
-          if (state.isStreaming || state.isCompacting || state.pendingMessageCount !== 0) return;
+          const rpcActive = state.isStreaming || state.isCompacting || state.pendingMessageCount !== 0;
+          if (!ownedShellActive && !rpcActive && observedOwnedShellWork && !requestedSettledFollowUp) {
+            requestedSettledFollowUp = true; quiescentSince = undefined;
+            await rpcClient.prompt("Owned asynchronous work has settled. Inspect its retained completion notification and continue the assignment; submit worker_result_submit only when the run is ready to return control.");
+            await delay(50); continue;
+          }
+          if (ownedShellActive || rpcActive) quiescentSince = undefined;
+          else {
+            quiescentSince ??= Date.now();
+            if (Date.now() - quiescentSince >= 5_000) return finish(new Error("Worker reached a settled quiescent turn without the required typed worker_result_submit."));
+          }
           await delay(50);
-        }
-        if (!finished && !existsSync(resultFile) && !hasUnsettledOwnedShellJobs()) {
-          finish(new Error("Worker reached a settled quiescent turn without the required typed worker_result_submit."));
         }
       } catch (error) {
         finish(error instanceof Error ? error : new Error("Worker async-shell settlement could not be verified."));
@@ -189,16 +200,19 @@ function waitForResultSettlement(rpcClient, resultFile, timeoutMs) {
   });
 }
 
-function hasUnsettledOwnedShellJobs() {
+function hasUnsettledOwnedShellJobs() { return ownedShellJobState().unsettled; }
+
+function ownedShellJobState() {
   const jobsDirectory = path.join(config.asyncJobRoot, "jobs");
-  if (!existsSync(jobsDirectory)) return false;
+  if (!existsSync(jobsDirectory)) return { seen: false, unsettled: false };
+  let seen = false;
   for (const entry of readdirSync(jobsDirectory, { withFileTypes: true })) {
     if (!entry.isDirectory() || !/^job_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(entry.name)) continue;
     const meta = readStrictWorkerJobMeta(jobsDirectory, entry.name);
     if (meta.owner.workerId !== config.workerId || meta.owner.runId !== config.runId) continue;
-    if (!workerJobIsSettled(meta)) return true;
+    seen = true; if (!workerJobIsSettled(meta)) return { seen: true, unsettled: true };
   }
-  return false;
+  return { seen, unsettled: false };
 }
 
 function writeAtomicJson(target, value) {

@@ -167,7 +167,7 @@ test("worker host completes an exact-fork fake-provider run while ignoring works
   });
 });
 
-test("worker host waits for the settled follow-up turn after asynchronous shell completion", { skip: process.platform !== "darwin" }, async () => {
+test("worker host waits for the settled follow-up turn after asynchronous shell completion", async () => {
   await withTempDir(async (directory) => {
     const parentCwd = path.join(directory, "parent");
     const workspaceRoot = path.join(directory, "workspace");
@@ -221,7 +221,7 @@ test("worker host waits for the settled follow-up turn after asynchronous shell 
     });
     const keepAlive = setInterval(() => {}, 100);
     const job = await launched.handle.completion.finally(() => clearInterval(keepAlive));
-    assert.equal(job.status, "exited", await readFile(job.stderrLog, "utf8"));
+    assert.equal(job.status, "exited", `${await readFile(job.stderrLog, "utf8")}\nSTDOUT:\n${await readFile(job.stdoutLog, "utf8")}`);
     assert.equal(job.exitCode, 0);
     assert.equal(readWorkerRuntimeResult(resultFile).result.outcome, "completed");
     assert.ok(existsSync(path.join(runDir, "settled.json")));
@@ -283,7 +283,7 @@ test("worker host fails promptly when a quiescent worker settles without typed r
   });
 });
 
-test("cancelling a worker host leaves no worker-owned async-shell process alive", { skip: process.platform !== "darwin" }, async () => {
+test("cancelling a worker host leaves no worker-owned async-shell process alive", async () => {
   await withTempDir(async (directory) => {
     const parentCwd = path.join(directory, "parent");
     const workspaceRoot = path.join(directory, "workspace");

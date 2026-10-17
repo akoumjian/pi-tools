@@ -1532,4 +1532,8 @@ function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function canonicalLineagePath(value: string): string { try { return realpathSync(path.resolve(value)); } catch { return path.resolve(value); } }
+function canonicalLineagePath(value: string): string {
+  const resolved = path.resolve(value); const suffix: string[] = []; let cursor = resolved;
+  while (!existsSync(cursor)) { const parent = path.dirname(cursor); if (parent === cursor) return resolved; suffix.unshift(path.basename(cursor)); cursor = parent; }
+  try { return path.join(realpathSync(cursor), ...suffix); } catch { return resolved; }
+}

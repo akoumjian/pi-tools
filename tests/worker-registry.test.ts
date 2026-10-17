@@ -200,15 +200,23 @@ function awaitableClaim(registry: ReturnType<typeof openWorkerRegistry>, workerI
   return Number(result.changes) === 1;
 }
 
-test("registry migrates known schema versions without source-text fingerprint gating", () => {
+test("registry applies an ordered idempotent v2 migration while mixed live openers ignore diagnostic fingerprints", () => {
   const root = mkdtempSync(path.join(tmpdir(), "pi-worker-registry-migration-"));
+  let oldOpener: ReturnType<typeof openWorkerRegistry> | undefined; let migrated: ReturnType<typeof openWorkerRegistry> | undefined;
   try {
-    const first = openWorkerRegistry(root);
-    first.database.prepare("UPDATE registry_meta SET value='2' WHERE key='schema_version'").run();
-    first.database.prepare("UPDATE registry_meta SET value='stale-source-fingerprint' WHERE key='schema_hash'").run();
-    first.close();
-    const migrated = openWorkerRegistry(root);
+    oldOpener = openWorkerRegistry(root);
+    oldOpener.database.exec("ALTER TABLE prepared_sets DROP COLUMN apply_nonce");
+    oldOpener.database.prepare("UPDATE registry_meta SET value='2' WHERE key='schema_version'").run();
+    oldOpener.database.prepare("UPDATE registry_meta SET value='old-live-build-fingerprint' WHERE key='schema_hash'").run();
+    migrated = openWorkerRegistry(root);
     const version = migrated.database.prepare("SELECT value FROM registry_meta WHERE key='schema_version'").get() as { value: string };
-    assert.equal(version.value, "3"); migrated.close();
-  } finally { rmSync(root, { recursive: true, force: true }); }
+    const columns = migrated.database.prepare("PRAGMA table_info(prepared_sets)").all() as Array<{ name: string }>;
+    assert.equal(version.value, "3"); assert.equal(columns.some((column) => column.name === "apply_nonce"), true);
+    const legacyHash = migrated.database.prepare("SELECT value FROM registry_meta WHERE key='schema_hash'").get() as { value: string };
+    assert.equal(legacyHash.value, "old-live-build-fingerprint", "migration must not overwrite another live build's diagnostic hash");
+    oldOpener.database.prepare("UPDATE registry_meta SET value='old-opener-still-live' WHERE key='schema_hash'").run();
+    assert.equal(registerParentRuntime(migrated, "/sessions/mixed.jsonl", "new", "2026-01-01T00:00:00.000Z"), 1);
+    assert.equal(registerParentRuntime(oldOpener, "/sessions/mixed.jsonl", "old", "2026-01-01T00:00:01.000Z"), 2);
+    migrated.close(); migrated = openWorkerRegistry(root); assert.equal(registerParentRuntime(migrated, "/sessions/mixed.jsonl", "again", "2026-01-01T00:00:02.000Z"), 3);
+  } finally { migrated?.close(); oldOpener?.close(); rmSync(root, { recursive: true, force: true }); }
 });

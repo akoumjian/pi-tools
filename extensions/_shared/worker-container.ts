@@ -17,7 +17,7 @@ const CONTAINER_BOOTSTRAP = [
   "apk add --no-cache bash bind-tools build-base ca-certificates coreutils curl file findutils git iproute2 jq nodejs npm openssh-client patch procps py3-pip python3 ripgrep tar util-linux zip >/var/log/pi-worker-apk.log 2>&1",
   "mkdir -p /run/pi-jobs",
   "rm -rf /run/pi-jobs/*",
-  "chmod 1777 /run/pi-jobs",
+  "chmod 700 /run/pi-jobs",
   `cut -d ' ' -f 22 /proc/1/stat > ${WORKER_CONTAINER_READY_FILE}`,
   "on_term() { trap '' TERM INT; sleep 30; }",
   "trap on_term TERM INT",
@@ -263,6 +263,15 @@ export function settleWorkerContainer(dockerPath: string, reference: WorkerConta
   }
 }
 
+export async function settleWorkerContainerAsync(dockerPath: string, reference: WorkerContainerReference): Promise<void> {
+  reference = portableWorkerContainerReference(reference);
+  assertWorkerContainerReference(reference);
+  assertExecutable(dockerPath, "Docker CLI");
+  if (!await inspectWorkerContainerAsync(dockerPath, reference)) return;
+  await execDockerAsync(dockerPath, ["rm", "--force", reference.containerId ?? reference.name]);
+  if (await inspectWorkerContainerAsync(dockerPath, reference)) throw new Error(`Docker worker container ${reference.name} still exists after removal.`);
+}
+
 export function prepareWorkerContainerProcess(input: {
   dockerPath: string;
   container: WorkerContainerReference;
@@ -286,7 +295,7 @@ export function prepareWorkerContainerProcess(input: {
     cwd,
     executable: input.executable,
     args: [...input.args],
-    env: buildWorkerContainerEnvironment(input.env, input.container.workspaceRoot)
+    env: buildWorkerContainerEnvironment(input.env, input.container.workspaceRoot, input.container.hostUid, input.container.hostGid)
   };
   return {
     executable: process.execPath,
@@ -325,13 +334,17 @@ export function signalWorkerContainerJob(
 
 export function buildWorkerContainerEnvironment(
   source: NodeJS.ProcessEnv,
-  workspaceRoot: string
+  workspaceRoot: string,
+  hostUid = process.getuid?.() ?? 0,
+  hostGid = process.getgid?.() ?? 0
 ): NodeJS.ProcessEnv {
   const root = path.resolve(workspaceRoot);
   const env: NodeJS.ProcessEnv = {
     HOME: root,
-    USER: "root",
-    LOGNAME: "root",
+    USER: String(hostUid),
+    LOGNAME: String(hostUid),
+    PI_WORKER_HOST_UID: String(hostUid),
+    PI_WORKER_HOST_GID: String(hostGid),
     PATH: CONTAINER_PATH,
     SHELL: "/bin/bash",
     TMPDIR: path.join(root, "tmp"),

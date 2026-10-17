@@ -159,3 +159,27 @@ test("application updates a target ref through its exact linked worktree", () =>
     assert.equal(readFileSync(path.join(linked, "release.txt"), "utf8"), "release\n");
   } finally { f.close(); }
 });
+
+test("apply checks only the exact checked-out target worktree and treats untracked nested repositories as dirty", () => {
+  const f = fixture();
+  try {
+    commit(f.candidate, "candidate.txt", "candidate\n", "candidate");
+    const set = prepareWorkerMerges("/parent.jsonl", [{ id: "source", candidateRepo: f.candidate, targetRepo: f.target, targetRef: "refs/heads/main", method: "merge", commitMessage: "candidate" }], { preparedRoot: f.preparedRoot, targetRoot: f.targets, randomHex: () => "a1".repeat(12) });
+    const nested = path.join(f.target, "untracked-nested"); execFileSync("git", ["init", "-q", nested]);
+    assert.throws(() => applyPreparedWorkerMerges("/parent.jsonl", set.preparedId, { preparedRoot: f.preparedRoot, targetRoot: f.targets }), /Target repository is dirty/);
+    rmSync(nested, { recursive: true, force: true });
+    writeFileSync(path.join(f.target, ".git", "info", "exclude"), "ignored-nested/\n"); const ignored = path.join(f.target, "ignored-nested"); execFileSync("git", ["init", "-q", ignored]);
+    assert.equal(applyPreparedWorkerMerges("/parent.jsonl", set.preparedId, { preparedRoot: f.preparedRoot, targetRoot: f.targets }).status, "completed");
+  } finally { f.close(); }
+});
+
+test("apply does not reject an unrelated dirty worktree when the target ref is not checked out", () => {
+  const f = fixture();
+  try {
+    git(f.target, ["branch", "release"]); const candidate = path.join(f.root, "release-detached-candidate"); execFileSync("git", ["clone", "-q", "--no-hardlinks", f.target, candidate]); git(candidate, ["checkout", "release"]); commit(candidate, "release.txt", "release\n", "release");
+    const set = prepareWorkerMerges("/parent.jsonl", [{ id: "release", candidateRepo: candidate, targetRepo: f.target, targetRef: "refs/heads/release", method: "merge", commitMessage: "release" }], { preparedRoot: f.preparedRoot, targetRoot: f.targets, randomHex: () => "b2".repeat(12) });
+    writeFileSync(path.join(f.target, "unrelated-untracked.txt"), "dirty\n");
+    assert.equal(applyPreparedWorkerMerges("/parent.jsonl", set.preparedId, { preparedRoot: f.preparedRoot, targetRoot: f.targets }).status, "completed");
+    assert.equal(git(f.target, ["rev-parse", "refs/heads/release"]), set.repositories[0]!.desiredCommit);
+  } finally { f.close(); }
+});

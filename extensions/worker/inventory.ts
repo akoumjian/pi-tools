@@ -5,9 +5,10 @@ import type { WorkerRepositoryResult } from "./registry.js";
 import { canonicalPathWithin, canonicalRepository, createTrustedGitOperation, trustedGit, type TrustedGitOperation } from "./trusted-git.js";
 
 export type RepositorySnapshot = { path: string; commit: string; dirty: boolean };
+export type DiscoveredWorkerRepository = { absolute: string; relative: string; issues?: string[] };
 
 export function snapshotWorkerRepositories(workspaceRoot: string): RepositorySnapshot[] {
-  const operation = createTrustedGitOperation(); return discoverWorkerRepositories(workspaceRoot, operation).map((item) => inspect(item.absolute, item.relative, operation));
+  const operation = createTrustedGitOperation(); return discoverWorkerRepositories(workspaceRoot, operation).map((item) => inspect(item.absolute, item.relative, operation, item.issues));
 }
 
 export function inventoryWorkerRepositories(input: {
@@ -23,15 +24,16 @@ export function inventoryWorkerRepositories(input: {
     } catch (error) { errors.push(error instanceof Error ? error.message : String(error)); }
   }
   const before = new Map((input.before ?? []).map((item) => [item.path, item]));
-  const repositories = discoverWorkerRepositories(input.workspaceRoot, operation).map(({ absolute, relative }): WorkerRepositoryResult => {
-    const issues: string[] = [];
+  const repositories = discoverWorkerRepositories(input.workspaceRoot, operation).map(({ absolute, relative, issues: discoveryIssues }): WorkerRepositoryResult => {
+    const issues: string[] = [...(discoveryIssues ?? [])];
     let commit = ""; let dirty = true; let source: string | undefined;
     try {
+      if (discoveryIssues?.length) throw new Error("Repository policy/path validation failed during discovery.");
       const exact = canonicalRepository(absolute, true, operation);
       commit = trustedGit(exact, ["rev-parse", "HEAD"], { operation }).trim();
       dirty = trustedGit(exact, ["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=all"], { operation }).trim() !== "";
       try { source = trustedGit(exact, ["remote", "get-url", "origin"], { operation }).trim() || undefined; } catch {}
-    } catch (error) { issues.push(error instanceof Error ? error.message.slice(0, 512) : String(error).slice(0, 512)); }
+    } catch (error) { const message = error instanceof Error ? error.message.slice(0, 512) : String(error).slice(0, 512); if (!issues.includes(message)) issues.push(message); }
     const previous = before.get(relative);
     const changed = previous === undefined || previous.commit !== commit || previous.dirty !== dirty;
     const wasReported = reported.has(relative);
@@ -44,19 +46,27 @@ export function inventoryWorkerRepositories(input: {
   return { repositories, errors };
 }
 
-export function discoverWorkerRepositories(workspaceRoot: string, operation: TrustedGitOperation = createTrustedGitOperation()): Array<{ absolute: string; relative: string }> {
+export function discoverWorkerRepositories(workspaceRoot: string, operation: TrustedGitOperation = createTrustedGitOperation()): DiscoveredWorkerRepository[] {
   const root = realpathSync(workspaceRoot);
   if (!statSync(root).isDirectory() || lstatSync(root).isSymbolicLink()) return [];
-  const found: Array<{ absolute: string; relative: string }> = []; const queue: Array<{ directory: string; depth: number }> = [{ directory: root, depth: 0 }];
+  const found: DiscoveredWorkerRepository[] = []; const queue: Array<{ directory: string; depth: number }> = [{ directory: root, depth: 0 }];
   while (queue.length && found.length < 128) {
     const current = queue.shift()!; if (current.depth > 8) continue;
     let entries; try { entries = readdirSync(current.directory, { withFileTypes: true }); } catch { continue; }
     if (current.depth > 0 && entries.some((entry) => entry.name === ".git" && !entry.isSymbolicLink())) {
+      const relative = path.relative(root, current.directory).split(path.sep).join("/");
       try {
-        const absolute = canonicalRepository(current.directory, true, operation);
-        canonicalPathWithin(root, absolute);
-        found.push({ absolute, relative: path.relative(root, absolute).split(path.sep).join("/") });
-      } catch {}
+        const raw = canonicalPathWithin(root, current.directory);
+        try {
+          const absolute = canonicalRepository(raw, true, operation);
+          canonicalPathWithin(root, absolute);
+          found.push({ absolute, relative });
+        } catch (error) {
+          found.push({ absolute: raw, relative, issues: [`Repository policy validation failed: ${error instanceof Error ? error.message.slice(0, 448) : String(error).slice(0, 448)}`] });
+        }
+      } catch (error) {
+        found.push({ absolute: current.directory, relative, issues: [`Repository path validation failed: ${error instanceof Error ? error.message.slice(0, 448) : String(error).slice(0, 448)}`] });
+      }
       continue;
     }
     for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
@@ -70,6 +80,7 @@ export function discoverWorkerRepositories(workspaceRoot: string, operation: Tru
 export function inspectInterruptedGitState(workspaceRoot: string): string[] {
   const warnings: string[] = []; const operation = createTrustedGitOperation();
   for (const repository of discoverWorkerRepositories(workspaceRoot, operation)) {
+    if (repository.issues?.length) { warnings.push(...repository.issues.map((issue) => `${repository.relative}: ${issue}`)); continue; }
     try {
       const status = trustedGit(repository.absolute, ["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=all"], { operation }).trim();
       const gitDir = trustedGit(repository.absolute, ["rev-parse", "--path-format=absolute", "--git-dir"], { operation }).trim();
@@ -86,7 +97,8 @@ export function inspectInterruptedGitState(workspaceRoot: string): string[] {
   return warnings.slice(0, 64);
 }
 
-function inspect(absolute: string, relative: string, operation: TrustedGitOperation): RepositorySnapshot {
+function inspect(absolute: string, relative: string, operation: TrustedGitOperation, issues?: string[]): RepositorySnapshot {
+  if (issues?.length) return { path: relative, commit: "unknown", dirty: true };
   try { return { path: relative, commit: trustedGit(absolute, ["rev-parse", "HEAD"], { operation }).trim(), dirty: trustedGit(absolute, ["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=all"], { operation }).trim() !== "" }; }
   catch { return { path: relative, commit: "unknown", dirty: true }; }
 }

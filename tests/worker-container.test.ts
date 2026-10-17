@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, chown, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { execFileSync, spawnSync } from "node:child_process";
 import path from "node:path";
 import test from "node:test";
 import {
@@ -34,6 +35,8 @@ test("worker container environment excludes host credentials and routes mutable 
     PI_WORKER_JOB_TOKEN: "host-only-token"
   }, workspace);
   assert.equal(env.HOME, workspace);
+  assert.equal(env.USER, String(process.getuid?.() ?? 0));
+  assert.equal(env.PI_WORKER_HOST_UID, String(process.getuid?.() ?? 0));
   assert.equal(env.PATH, "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
   assert.equal(env.XDG_CACHE_HOME, path.join(workspace, "cache"));
   assert.equal(env.GIT_OPTIONAL_LOCKS, "0");
@@ -157,4 +160,24 @@ process.stderr.write("unsupported fake docker call: " + JSON.stringify(args) + "
     assert.ok(calls.some((args) => args[0] === "wait" && args.includes(created.containerId)));
     assert.ok(calls.some((args) => args[0] === "rm" && args.includes(created.containerId)));
   });
+});
+
+
+test("root bootstrap privilege drop creates host-owned repositories and supports host-side Git, result, and discard", { skip: process.platform !== "linux" || process.getuid?.() !== 0 }, async () => {
+  // Use the container-native filesystem: Docker Desktop bind mounts intentionally
+  // virtualize ownership and mode checks, so they cannot prove UID isolation.
+  const directory = await mkdtemp("/tmp/pi-worker-privilege-");
+  try {
+    await chmod(directory, 0o755);
+    const uid = 65534; const gid = 65534; const workspace = path.join(directory, "workspace"); await mkdir(workspace); await chown(workspace, uid, gid);
+    const script = `const fs=require("node:fs"),cp=require("node:child_process"),p=require("node:path"); const repo=p.join(process.env.HOME,"repos","project"); fs.mkdirSync(repo,{recursive:true}); cp.execFileSync("git",["init","-q","-b","main",repo]); cp.execFileSync("git",["-C",repo,"config","user.name","Worker"]); cp.execFileSync("git",["-C",repo,"config","user.email","worker@example.invalid"]); fs.writeFileSync(p.join(repo,"owned.txt"),process.getuid()+":"+process.getgid()); cp.execFileSync("git",["-C",repo,"add","."]); cp.execFileSync("git",["-C",repo,"commit","-qm","owned"]); fs.writeFileSync(p.join(process.env.HOME,"result.json"),JSON.stringify({uid:process.getuid(),gid:process.getgid()}));`;
+    const args = ["--reuid", String(uid), "--regid", String(gid), "--clear-groups", "--", "env", "-i", `HOME=${workspace}`, `PATH=${process.env.PATH}`, process.execPath, "-e", script];
+    const launched = spawnSync("setpriv", args, { encoding: "utf8" }); assert.equal(launched.status, 0, launched.stderr);
+    const result = JSON.parse(await readFile(path.join(workspace, "result.json"), "utf8")); assert.deepEqual(result, { uid, gid });
+    assert.equal((await stat(path.join(workspace, "repos", "project", "owned.txt"))).uid, uid);
+    assert.equal(execFileSync("setpriv", ["--reuid", String(uid), "--regid", String(gid), "--clear-groups", "--", "git", "-C", path.join(workspace, "repos", "project"), "status", "--porcelain"], { encoding: "utf8" }), "");
+    const discarded = spawnSync("setpriv", ["--reuid", String(uid), "--regid", String(gid), "--clear-groups", "--", "rm", "-rf", path.join(workspace, "repos", "project")]); assert.equal(discarded.status, 0); await assert.rejects(stat(path.join(workspace, "repos", "project")));
+    const control = path.join(directory, "root-control"); await mkdir(control, { mode: 0o700 }); const forged = spawnSync("setpriv", ["--reuid", String(uid), "--regid", String(gid), "--clear-groups", "--", "touch", path.join(control, "forged")]); assert.notEqual(forged.status, 0, "worker UID must not forge root launch-control files");
+    const hostSource = await readFile(path.resolve("scripts/worker-shell-host.mjs"), "utf8"); assert.match(hostSource, /setpriv --reuid .* --regid .* --clear-groups -- env -i/); assert.doesNotMatch(hostSource, /"--user"/);
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });

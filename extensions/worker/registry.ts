@@ -215,19 +215,24 @@ export function openWorkerRegistry(runtimeRoot = DEFAULT_WORKER_RUNTIME_ROOT): W
   database.exec("PRAGMA busy_timeout = 5000");
   database.exec("BEGIN IMMEDIATE");
   try {
-    database.exec(SCHEMA);
+    database.exec("CREATE TABLE IF NOT EXISTS registry_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT");
     const row = database.prepare("SELECT value FROM registry_meta WHERE key = 'schema_version'").get() as { value?: string } | undefined;
-    const fingerprint = database.prepare("SELECT value FROM registry_meta WHERE key = 'schema_hash'").get() as { value?: string } | undefined;
     if (row === undefined) {
+      database.exec(SCHEMA);
       database.prepare("INSERT INTO registry_meta(key,value) VALUES('schema_version',?)").run(String(WORKER_REGISTRY_SCHEMA_VERSION));
       database.prepare("INSERT INTO registry_meta(key,value) VALUES('schema_hash',?)").run(WORKER_REGISTRY_SCHEMA_HASH);
+      database.prepare("INSERT INTO registry_meta(key,value) VALUES(?,?)").run(`schema_hash_v${WORKER_REGISTRY_SCHEMA_VERSION}`, WORKER_REGISTRY_SCHEMA_HASH);
     } else {
       const version = Number(row.value);
       if (!Number.isSafeInteger(version) || version < 2 || version > WORKER_REGISTRY_SCHEMA_VERSION) throw new Error(`Unsupported worker registry schema ${row.value ?? "missing"}.`);
       migrateWorkerRegistry(database, version);
+      database.exec(SCHEMA);
       database.prepare("UPDATE registry_meta SET value=? WHERE key='schema_version'").run(String(WORKER_REGISTRY_SCHEMA_VERSION));
-      if (fingerprint === undefined) database.prepare("INSERT INTO registry_meta(key,value) VALUES('schema_hash',?)").run(WORKER_REGISTRY_SCHEMA_HASH);
-      else database.prepare("UPDATE registry_meta SET value=? WHERE key='schema_hash'").run(WORKER_REGISTRY_SCHEMA_HASH);
+      // Preserve the legacy hash so another compatible live build never fails merely
+      // because this opener was compiled from different source text. Per-version
+      // diagnostics are append-only and have no lifecycle authority.
+      database.prepare("INSERT OR IGNORE INTO registry_meta(key,value) VALUES('schema_hash',?)").run(WORKER_REGISTRY_SCHEMA_HASH);
+      database.prepare("INSERT OR IGNORE INTO registry_meta(key,value) VALUES(?,?)").run(`schema_hash_v${WORKER_REGISTRY_SCHEMA_VERSION}`, WORKER_REGISTRY_SCHEMA_HASH);
     }
     database.exec(`PRAGMA user_version = ${WORKER_REGISTRY_SCHEMA_VERSION}`);
     database.exec("COMMIT");
@@ -240,9 +245,28 @@ export function openWorkerRegistry(runtimeRoot = DEFAULT_WORKER_RUNTIME_ROOT): W
 }
 
 function migrateWorkerRegistry(database: SQLiteDatabaseSync, fromVersion: number): void {
-  // v3 replaces source-text fingerprint gating with explicit numbered migration authority.
-  // v2 already has the complete v3 table shape, so this migration is intentionally data-only.
-  if (fromVersion <= 2) return;
+  const migrations: Record<number, () => void> = {
+    2: () => {
+      addColumnIfMissing(database, "workers", "runtime_json", "TEXT NOT NULL DEFAULT '{}'");
+      addColumnIfMissing(database, "workers", "operation_kind", "TEXT");
+      addColumnIfMissing(database, "workers", "operation_nonce", "TEXT");
+      addColumnIfMissing(database, "runs", "runtime_json", "TEXT NOT NULL DEFAULT '{}'");
+      addColumnIfMissing(database, "runs", "claim_kind", "TEXT");
+      addColumnIfMissing(database, "runs", "claim_nonce", "TEXT");
+      addColumnIfMissing(database, "prepared_sets", "warnings_json", "TEXT NOT NULL DEFAULT '[]'");
+      addColumnIfMissing(database, "prepared_sets", "apply_nonce", "TEXT");
+    }
+  };
+  for (let version = fromVersion; version < WORKER_REGISTRY_SCHEMA_VERSION; version += 1) {
+    const migrate = migrations[version];
+    if (!migrate) throw new Error(`No managed-worker registry migration is available from schema ${version}.`);
+    migrate();
+  }
+}
+
+function addColumnIfMissing(database: SQLiteDatabaseSync, table: string, column: string, declaration: string): void {
+  const exists = (database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).some((item) => item.name === column);
+  if (!exists) database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${declaration}`);
 }
 
 export function workerRegistryDataVersion(registry: WorkerRegistry): number {
@@ -415,8 +439,8 @@ function transaction<T>(registry: WorkerRegistry, fn: () => T): T {
 
 function assertSchema(registry: WorkerRegistry): void {
   const row = registry.database.prepare("SELECT value FROM registry_meta WHERE key='schema_version'").get() as { value?: string } | undefined;
-  const fingerprint = registry.database.prepare("SELECT value FROM registry_meta WHERE key='schema_hash'").get() as { value?: string } | undefined;
-  if (Number(row?.value) !== WORKER_REGISTRY_SCHEMA_VERSION || fingerprint?.value !== WORKER_REGISTRY_SCHEMA_HASH) throw new Error(`Unsupported worker registry schema ${row?.value ?? "missing"} or schema fingerprint mismatch.`);
+  const version = Number(row?.value);
+  if (!Number.isSafeInteger(version) || version < 2 || version > WORKER_REGISTRY_SCHEMA_VERSION) throw new Error(`Unsupported worker registry schema ${row?.value ?? "missing"}.`);
 }
 
 function boundedPage(value: number | undefined): number {
@@ -426,7 +450,10 @@ function boundedPage(value: number | undefined): number {
 function staleWorker(workerId: string): Error { return new Error(`Worker ${workerId} changed state; inspect it and retry.`); }
 function staleRun(workerId: string, runId: string): Error { return new Error(`Worker ${workerId}/${runId} changed state; inspect it and retry.`); }
 function json(value: unknown): string { return JSON.stringify(value); }
-function canonicalSessionFile(value: string): string { try { return realpathSync(path.resolve(value)); } catch { return path.resolve(value); } }
+function canonicalSessionFile(value: string): string {
+  const resolved = path.resolve(value); const suffix: string[] = []; let cursor = resolved;
+  while (true) { try { return path.join(realpathSync(cursor), ...suffix); } catch { const parent = path.dirname(cursor); if (parent === cursor) return resolved; suffix.unshift(path.basename(cursor)); cursor = parent; } }
+}
 
 function nullable<T extends SQLInputValue>(value: T | undefined): T | null { return value ?? null; }
 function parseJson<T>(text: string): T { return JSON.parse(text) as T; }
@@ -548,6 +575,22 @@ export function updatePreparedSetStatus(registry: WorkerRegistry, preparedId: st
 
 export function clearWorkerRecoveryError(registry: WorkerRegistry, workerId: string, runId: string, now: string): void {
   transaction(registry, () => { registry.database.prepare("UPDATE workers SET recovery_error=NULL,updated_at=? WHERE worker_id=? AND active_run_id=?").run(now, workerId, runId); });
+}
+
+export function recordWorkerSettlementRecovery(registry: WorkerRegistry, input: { workerId: string; runId: string; claimNonce: string; error: string; now: string }): number {
+  return transaction(registry, () => {
+    const row = registry.database.prepare("SELECT runtime_json FROM runs WHERE worker_id=? AND run_id=? AND status='running' AND claim_kind='settlement' AND claim_nonce=?")
+      .get(input.workerId, input.runId, input.claimNonce) as { runtime_json: string } | undefined;
+    if (!row) throw staleRun(input.workerId, input.runId);
+    const runtime = parseJson<Record<string, unknown>>(row.runtime_json);
+    const previous = Number(runtime.settlementRecoveryAttempts ?? 0);
+    const attempts = Number.isSafeInteger(previous) && previous >= 0 ? previous + 1 : 1;
+    registry.database.prepare("UPDATE runs SET runtime_json=? WHERE worker_id=? AND run_id=? AND claim_kind='settlement' AND claim_nonce=?")
+      .run(json({ ...runtime, settlementRecoveryAttempts: attempts, settlementRecoveryError: input.error }), input.workerId, input.runId, input.claimNonce);
+    registry.database.prepare("UPDATE workers SET recovery_error=?,updated_at=? WHERE worker_id=? AND active_run_id=?")
+      .run(input.error, input.now, input.workerId, input.runId);
+    return attempts;
+  });
 }
 
 export function recoverInterruptedClaimsForParent(registry: WorkerRegistry, parentSessionFile: string, runtimeGeneration: number, now: string): void {

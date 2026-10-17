@@ -4,12 +4,16 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import {
   asyncJobTokenProcessIds,
+  asyncJobProcessStartToken,
+  captureAsyncJobProcessIdentity,
+  isAsyncJobProcessIdentityAlive,
   isAsyncJobExecutionAlive,
   isAsyncJobProcessAlive,
   isAsyncJobProcessGroupAlive
 } from "./async-job-process.js";
 
-export { asyncJobTokenProcessIds, isAsyncJobExecutionAlive, isAsyncJobProcessAlive, isAsyncJobProcessGroupAlive };
+export { asyncJobTokenProcessIds, asyncJobProcessStartToken, captureAsyncJobProcessIdentity, isAsyncJobProcessIdentityAlive, isAsyncJobExecutionAlive, isAsyncJobProcessAlive, isAsyncJobProcessGroupAlive };
+export type AsyncJobProcessIdentity = { pid: number; processToken: string; processStartToken: string };
 
 export type SpawnAsyncJobProcessInput = {
   executable: string;
@@ -61,6 +65,13 @@ export function signalAsyncJobProcessGroup(pid: number | undefined, signal: Node
       throw groupError;
     }
   }
+}
+
+
+export function signalAsyncJobProcessIdentity(identity: AsyncJobProcessIdentity, signal: NodeJS.Signals): boolean {
+  if (!isAsyncJobProcessIdentityAlive(identity)) return false;
+  signalAsyncJobProcessGroup(identity.pid, signal);
+  return true;
 }
 
 export function signalAsyncJobExecution(

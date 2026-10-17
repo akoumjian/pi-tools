@@ -80,6 +80,11 @@ export function cleanupReviewOverlay(dockerPath: string, overlay: ReviewOverlayR
   run(["volume", "rm", "--force", overlay.scratchVolume]);
 }
 
+export async function cleanupReviewOverlayAsync(dockerPath: string, overlay: ReviewOverlayRecord, run: AsyncDockerRunner = (args) => dockerAsync(dockerPath, args)): Promise<void> {
+  await run(["volume", "rm", "--force", overlay.mergedVolume]);
+  await run(["volume", "rm", "--force", overlay.scratchVolume]);
+}
+
 function volumeMountpoint(run: DockerRunner, name: string): string {
   const value = run(["volume", "inspect", "--format", "{{.Mountpoint}}", name]).trim();
   if (!value.startsWith("/")) throw new Error(`Docker returned invalid volume mountpoint for ${name}.`);

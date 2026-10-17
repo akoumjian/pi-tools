@@ -5,7 +5,10 @@ import path from "node:path";
 import test from "node:test";
 import {
   asyncJobOutputBytes,
+  captureAsyncJobProcessIdentity,
   createAsyncJobId,
+  isAsyncJobProcessIdentityAlive,
+  signalAsyncJobProcessIdentity,
   signalAsyncJobProcessGroup,
   spawnAsyncJobProcess
 } from "../extensions/_shared/async-job.js";
@@ -55,6 +58,20 @@ test("shared async-job signal terminates the detached process group", async () =
     signalAsyncJobProcessGroup(child.pid, "SIGTERM");
     const result = await processResult(child);
     assert.equal(result.signal, "SIGTERM");
+  });
+});
+
+
+test("exact async-job identity refuses a reused or mismatched process before signalling", async () => {
+  await withTempDir(async (directory) => {
+    const token = "11111111-2222-4333-8444-555555555555";
+    const child = spawnAsyncJobProcess({ executable: process.execPath, args: ["-e", "setInterval(() => {}, 1000)"], cwd: directory, env: { ...process.env, PI_WORKER_JOB_TOKEN: token }, stdoutLog: path.join(directory, "identity.out"), stderrLog: path.join(directory, "identity.err") });
+    assert.ok(child.pid); let identity;
+    for (let attempt = 0; attempt < 100; attempt += 1) { try { identity = captureAsyncJobProcessIdentity(child.pid, token); break; } catch { await new Promise((resolve) => setTimeout(resolve, 10)); } }
+    assert.ok(identity); assert.equal(isAsyncJobProcessIdentityAlive(identity), true);
+    const mismatched = { ...identity, processStartToken: `${identity.processStartToken}-reused` };
+    assert.equal(isAsyncJobProcessIdentityAlive(mismatched), false); assert.equal(signalAsyncJobProcessIdentity(mismatched, "SIGTERM"), false); assert.equal(isAsyncJobProcessIdentityAlive(identity), true);
+    assert.equal(signalAsyncJobProcessIdentity(identity, "SIGTERM"), true); const result = await processResult(child); assert.equal(result.signal, "SIGTERM");
   });
 });
 

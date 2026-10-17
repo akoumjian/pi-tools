@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,7 +25,7 @@ export type WorkerHostConfig = {
   piCliPath: string; bdPath: string; beadsRoute: WorkerBeadsRoute; extensionPaths: string[];
   shellExecution: WorkerShellExecution; rpcArgs: string[]; timeoutMs?: number;
 };
-export type WorkerHostProcess = { version: 1; workerId: string; runId: string; pid: number; nonce: string; hostConfigFile: string; startedAt: string };
+export type WorkerHostProcess = { version: 2; workerId: string; runId: string; pid: number; processToken: string; processStartToken: string; nonce: string; hostConfigFile: string; startedAt: string };
 export type WorkerHostSettlement = { version: 1; workerId: string; runId: string; sessionId: string; resultFile: string; settledAt: string };
 export type LaunchWorkerHostInput = {
   record: WorkerLaunchRecord; prompt: string; resultFile: string; runDir: string; processFile: string; processNonce: string;
@@ -56,21 +57,22 @@ export function launchWorkerHost(api: ExtensionAPI, context: ExtensionContext, i
   config.rpcArgs = buildWorkerRpcArgs(config);
   writeFileSync(authorizationFile, `${JSON.stringify({ version: 1, workerId: config.workerId, runId: config.runId, processNonce: config.processNonce }, null, 2)}\n`, { mode: 0o600 });
   writeFileSync(configFile, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+  const hostProcessToken = randomUUID();
   const handle = startManagedAsyncJob(api, context, {
     jobId: record.jobId, job_name: `worker ${record.workerId}`, command: `Pi worker host ${record.workerId}/${record.runId}`,
     cwd: record.workspaceRoot, executable: process.execPath, args: [resolveWorkerHostScript(), configFile],
-    env: { ...process.env, PI_WORKER_ID: record.workerId, PI_WORKER_RUN_ID: record.runId, PI_WORKER_RESULT_FILE: input.resultFile,
+    env: { ...process.env, PI_WORKER_JOB_TOKEN: hostProcessToken, PI_WORKER_ID: record.workerId, PI_WORKER_RUN_ID: record.runId, PI_WORKER_RESULT_FILE: input.resultFile,
       PI_WORKER_WORKSPACE_ROOT: record.workspaceRoot, PI_WORKER_STATE_ROOT: config.stateRoot, PI_WORKER_ASYNC_JOB_ROOT: config.asyncJobRoot,
       PI_WORKER_TASK_IDS: JSON.stringify(record.taskIds), PI_WORKER_ROLE: config.role, PI_WORKER_BD_PATH: config.bdPath,
       PI_WORKER_BEADS_ROUTE: JSON.stringify(config.beadsRoute), ...(config.cacheLineage ? { PI_WORKER_CACHE_LINEAGE: JSON.stringify(config.cacheLineage) } : {}), ...workerShellEnvironment(config.shellExecution) },
-    notifyOnExit: false, settleProcessGroup: true
+    notifyOnExit: false, settleProcessGroup: true, processToken: hostProcessToken
   });
   return { handle, config, configFile };
 }
 
 export function readWorkerHostProcess(processFile: string): WorkerHostProcess {
   const value = JSON.parse(readFileSync(processFile, "utf8")) as Partial<WorkerHostProcess>;
-  if (value.version !== 1 || typeof value.workerId !== "string" || typeof value.runId !== "string" || !Number.isInteger(value.pid) || typeof value.nonce !== "string" || typeof value.hostConfigFile !== "string" || typeof value.startedAt !== "string") throw new Error(`Invalid worker host process marker: ${processFile}`);
+  if (value.version !== 2 || typeof value.workerId !== "string" || typeof value.runId !== "string" || !Number.isInteger(value.pid) || typeof value.processToken !== "string" || typeof value.processStartToken !== "string" || typeof value.nonce !== "string" || typeof value.hostConfigFile !== "string" || typeof value.startedAt !== "string") throw new Error(`Invalid worker host process marker: ${processFile}`);
   return value as WorkerHostProcess;
 }
 export function readWorkerHostSettlement(settledFile: string): WorkerHostSettlement {

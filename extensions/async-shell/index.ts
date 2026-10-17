@@ -20,7 +20,7 @@ import {
   type CompletionDelivery
 } from "../_shared/completion-delivery.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
-import { prepareWorkspaceSandboxProcess } from "../_shared/workspace-sandbox.js";
+import { buildWorkspaceSandboxEnvironment, prepareWorkspaceSandboxProcess } from "../_shared/workspace-sandbox.js";
 import { prepareWorkerContainerProcess, signalWorkerContainerJob, workerContainerFromEnvironment } from "../_shared/worker-container.js";
 import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
@@ -90,6 +90,8 @@ export type StartManagedAsyncJobInput = {
   notifyOnExit?: boolean;
   settleProcessGroup?: boolean;
   persistSpawnedMetadata?: (job: JobMeta) => void;
+  /** Trusted callers may bind an exact externally persisted process identity. */
+  processToken?: string;
 };
 
 export type ManagedAsyncJobHandle = {
@@ -637,7 +639,8 @@ function startJob(
   assertValidAsyncJobId(jobId);
   const root = jobsRoot(context.cwd);
   const logDir = path.join(root, "jobs", jobId);
-  const processToken = owner ? randomUUID() : undefined;
+  const processToken = input.processToken ?? (owner ? randomUUID() : undefined);
+  if (processToken !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(processToken)) throw new Error("Managed async job processToken must be a UUID.");
   const executable = input.executable ?? shell;
   const args = input.args ?? (owner ? managedWorkerShellArgs(executable, input.command) : ["-lc", input.command]);
   const processEnvironment = processToken
@@ -2313,12 +2316,10 @@ function prepareManagedWorkerProcess(input: {
     };
   }
   if (process.env.PI_WORKER_NATIVE_TEST_SHELL === "1") {
-    return prepareWorkspaceSandboxProcess({
-      executable: input.executable,
-      args: input.args,
-      env: input.env,
-      workspaceRoot: input.workspaceRoot
-    });
+    if (process.platform === "darwin") return prepareWorkspaceSandboxProcess({ executable: input.executable, args: input.args, env: input.env, workspaceRoot: input.workspaceRoot });
+    // Explicit test-only backend: preserve ownership metadata and process-group
+    // behavior on non-macOS CI without claiming production confinement.
+    return { executable: input.executable, args: input.args, env: buildWorkspaceSandboxEnvironment(input.env, input.workspaceRoot) };
   }
   throw new Error("Managed worker shell execution requires an exact Docker container identity.");
 }

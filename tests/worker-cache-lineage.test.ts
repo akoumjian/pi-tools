@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { zstdDecompressSync } from "node:zlib";
@@ -1625,4 +1625,19 @@ test("capture holder generations invalidate templates owned by an obsolete exten
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("parent cache capture canonicalizes a symlinked session ancestor before the session file exists", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-session-alias-"));
+  try {
+    const realSessions = path.join(root, "real-sessions"); const aliasSessions = path.join(root, "alias-sessions"); mkdirSync(realSessions); symlinkSync(realSessions, aliasSessions, "dir");
+    const aliasFile = path.join(aliasSessions, "parent.jsonl"); const realFile = path.join(realSessions, "parent.jsonl"); const sessionId = "alias-parent-session";
+    const handlers = new Map<string, Function>(); const api = { on(name: string, handler: Function) { handlers.set(name, handler); } } as unknown as ExtensionAPI;
+    registerParentCacheLineageCapture(api, path.join(root, "state"), () => new Date("2026-09-24T12:00:00.000Z"));
+    const context = codexContext({ sessionManager: { getSessionFile: () => aliasFile, getSessionId: () => sessionId } });
+    handlers.get("before_provider_headers")!({ headers: { "session-id": inheritedAffinity } }, context); handlers.get("before_provider_request")!({ payload: parentPayload() }, context);
+    writeFileSync(realFile, "{}\n");
+    const record = prepareWorkerCacheLineage({ stateRoot: path.join(root, "state"), workerStateDir: path.join(root, "worker"), parentSessionFile: realFile, parentSessionId: sessionId, route, marker: forkMarker, now: new Date("2026-09-24T12:00:01.000Z") });
+    assert.equal(record.mode, "eligible", record.mode === "fresh" ? record.reason : undefined);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

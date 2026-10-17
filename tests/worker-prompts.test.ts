@@ -26,10 +26,10 @@ Do the role.
 Assignment:
 Do the assignment.
 
-Repository baselines:
-- /code/project at abc
+Provenance-only repository baselines:
+- parent-observed /code/project at abc
 
-These baselines identify exact source revisions relevant to the assignment. They do not populate the workspace.`);
+These entries are provenance only. Their paths are not mounted into the worker and may be unreachable here; they do not populate the workspace.`);
 });
 
 test("work resume prompt retains exact session semantics and lists additional inputs", () => {

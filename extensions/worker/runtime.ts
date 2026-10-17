@@ -11,6 +11,7 @@ import type { WorkerRole } from "./registry.js";
 import { inputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 import { trustedGit } from "./trusted-git.js";
 import { MAX_WORKER_TASK_IDS, workerMutationAdmissionPath, workerResultAdmissionPath } from "../_shared/worker-contract.js";
+import { asyncJobProcessStartToken } from "../_shared/async-job.js";
 
 export type AcceptedWorkerResult = { version: 2; workerId: string; runId: string; acceptedAt: string; result: WorkerResultSubmitInput & { repositories?: string[]; artifacts?: string[] } };
 export type WorkerTaskUpdate = { taskId: string; note: string; status?: "in_progress" | "blocked" };
@@ -378,7 +379,7 @@ function assertRuntimeAuthorization(identity: ReturnType<typeof workerRuntimeIde
 
 function beginWorkerMutationAdmission(identity: ReturnType<typeof workerRuntimeIdentity>): string {
   const file = workerMutationAdmissionPath(identity.authorizationFile);
-  try { writeFileSync(file, `${JSON.stringify({ version: 1, workerId: identity.workerId, runId: identity.runId, pid: process.pid, startedAt: new Date().toISOString() })}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 }); }
+  try { writeFileSync(file, `${JSON.stringify({ version: 2, workerId: identity.workerId, runId: identity.runId, pid: process.pid, processStartToken: asyncJobProcessStartToken(process.pid), startedAt: new Date().toISOString() })}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 }); }
   catch (cause) { if ((cause as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`Worker mutation admission is already active for ${identity.workerId}/${identity.runId}.`); throw cause; }
   return file;
 }
@@ -388,10 +389,11 @@ function beginWorkerResultAdmission(identity: ReturnType<typeof workerRuntimeIde
   const admissionFile = workerResultAdmissionPath(identity.resultFile);
   try {
     writeFileSync(admissionFile, `${JSON.stringify({
-      version: 1,
+      version: 2,
       workerId: identity.workerId,
       runId: identity.runId,
       pid: process.pid,
+      processStartToken: asyncJobProcessStartToken(process.pid),
       startedAt: new Date().toISOString()
     })}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
   } catch (cause) {

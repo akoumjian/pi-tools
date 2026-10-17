@@ -34,13 +34,13 @@ Completion settlement inserts a stable delivery record in the same transaction. 
 
 Role instructions are verified regular UTF-8 files under `worker-roles/`. Ambient/project skill discovery remains disabled. The package exposes only `skills/managed-worker-parent/SKILL.md` to parents.
 
-Repository paths must identify contained Git repositories. Artifact paths may identify contained regular files or directories. These are live workspace pointers, not immutable artifact snapshots. Reviews therefore start only for the latest completed idle subject run.
+Repository paths must identify contained Git repositories. Artifact paths may identify contained regular files or directories. Work-start repository baselines are parent-validated provenance only: their exact paths and commits are recorded in the prompt but are not mounted and may be unreachable from the worker. These are live workspace pointers, not immutable artifact snapshots. Reviews therefore start only for the latest completed idle subject run.
 
 ## Review
 
 A review receives the exact subject run/session metadata, repository/artifact entry points, and additional-input mapping in `/review/context.json`. `/review/subject` is a disposable writable view of the complete unchanged subject workspace; reviewer reports belong under `/workspace`. The reviewed worker is leased against resume while review runs. Review workers have no credentials, Beads mutation, fix implementation, push, target mutation, or acceptance authority.
 
-Supported rootful Docker environments use a local-driver OverlayFS view with one Docker-managed scratch volume containing sibling upper/work directories. Unsupported/rootless environments fail preflight. Writes to the subject view are deleted after settlement; reviewer session/workspace/reports remain retained.
+Container bootstrap, root-only launch-control setup, and OverlayFS setup retain root only for required setup. The worker cannot write the root launch-control directory. Every worker command is launched through audited `setpriv` UID/GID and cleared-group dropping to the host owner, so worker repositories, results, and discardable workspace files remain host-owned. Supported rootful Docker environments use a local-driver OverlayFS view with one Docker-managed scratch volume containing sibling upper/work directories. Unsupported/rootless environments fail preflight. Writes to the subject view are deleted after settlement; reviewer session/workspace/reports remain retained.
 
 ## Merge testing and application
 
@@ -52,11 +52,11 @@ Prepared-set lifecycle and repository records in the SQLite registry are authori
 
 After parent review and validation, `worker_merge_apply({preparedId})` globally preflights every exact clean target. It then applies dependency order using `git merge --ff-only` for checked-out refs or compare-and-swap `git update-ref --no-deref` otherwise. Earlier updates remain after a later operational failure; retrying the same prepared ID skips exact already-applied commits.
 
-Trusted Git disables hooks, signing, credentials, global/system configuration, replace/graft overlays, and hostile merge configuration; linked candidate worktrees, per-worktree configuration, and gitlinks/submodules are rejected. Ignored or untracked nested repositories are inert and do not invalidate an authoritative target; active target refs checked out in another worktree are updated through that exact clean worktree. Application performs no model call, conflict resolution, testing, push, release, grounding, or Beads mutation.
+Trusted Git disables hooks, signing, credentials, global/system configuration, replace/graft overlays, and hostile merge configuration; linked candidate worktrees, per-worktree configuration, and gitlinks/submodules are rejected. Ignored or untracked nested repositories are inert for trusted-Git policy validation. Apply cleanliness is separate: an ignored nested repository remains clean, while an untracked nested repository makes the exact worktree that checks out the target ref dirty. Refs not checked out anywhere are compare-and-swap updated without inspecting an unrelated worktree; active target refs checked out in another worktree are updated through that exact clean worktree. Application performs no model call, conflict resolution, testing, push, release, grounding, or Beads mutation.
 
 ## Cancellation and retention
 
-Forced cancellation atomically revokes run authority, waits out admitted host mutations, proves the exact supervisor process group terminal, and uses one exact `docker rm --force <container-id>` as the agent and shell-process boundary. Result submission and Beads mutation recheck durable authorization immediately before mutation. Host-side job records are reconciled afterward. Cleanup uncertainty becomes recovery-required rather than a false cancellation.
+Forced cancellation atomically revokes run authority, waits out admitted host mutations, proves the exact supervisor process group terminal, and uses one exact `docker rm --force <container-id>` as the agent and shell-process boundary. Result submission and Beads mutation recheck durable authorization immediately before mutation. Host-side job records are reconciled afterward. Supervisor liveness and signalling require the persisted OS start token plus a unique command-environment token; an unverifiable or reused PID is never signalled. Cleanup uncertainty becomes recovery-required rather than a false cancellation. Accepted-result settlement retries at most three times; persistent cleanup or inventory failure system-settles `failed` while retaining the accepted result and scoped evidence, never converting it to `cancelled`.
 
 Cancellation preserves workspace/session/evidence. Resume after cancellation includes a warning to inspect interrupted Git operations and never removes locks automatically. `discard` is idle-only, permanent, and never auto-cancels. There is no automatic garbage collection.
 

@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { assertTrustedGitPolicy, runTrustedGit, trustedGit } from "../extensions/worker/trusted-git.js";
 import { inputMounts, validateAdditionalInputs } from "../extensions/worker/inputs.js";
+import { inspectInterruptedGitState, inventoryWorkerRepositories } from "../extensions/worker/inventory.js";
 
 function repository(root: string): string { const repo = path.join(root, "repo"); execFileSync("git", ["init", "-q", "-b", "main", repo]); execFileSync("git", ["-C", repo, "config", "user.name", "Test"]); execFileSync("git", ["-C", repo, "config", "user.email", "test@example.invalid"]); writeFileSync(path.join(repo, "file.txt"), "one\n"); execFileSync("git", ["-C", repo, "add", "."]); execFileSync("git", ["-C", repo, "commit", "-qm", "one"]); return repo; }
 
@@ -52,5 +53,19 @@ test("trusted Git rejects linked candidate worktrees and gitlinks while acceptin
     execFileSync("git", ["-c", "protocol.file.allow=always", "-C", parent, "submodule", "add", "-q", child, "dependency"]);
     execFileSync("git", ["-C", parent, "commit", "-qm", "submodule"]);
     assert.throws(() => assertTrustedGitPolicy(parent), /gitlinks|nested Git metadata|submodule/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+
+test("inventory retains structured repository policy failures and interrupted-state evidence", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-inventory-policy-"));
+  try {
+    const workspace = path.join(root, "workspace"); const repos = path.join(workspace, "repos"); mkdirSync(repos, { recursive: true });
+    const child = repository(path.join(root, "child")); const parent = repository(path.join(repos, "parent"));
+    execFileSync("git", ["-c", "protocol.file.allow=always", "-C", parent, "submodule", "add", "-q", child, "dependency"]); execFileSync("git", ["-C", parent, "commit", "-qm", "submodule"]);
+    const inventory = inventoryWorkerRepositories({ workspaceRoot: workspace, workerId: "worker_policy", runId: "run_policy", reported: ["repos/parent/repo"] });
+    assert.equal(inventory.repositories.length, 1); assert.equal(inventory.repositories[0]!.path, "repos/parent/repo"); assert.equal(inventory.repositories[0]!.eligible, false); assert.match(inventory.repositories[0]!.issues?.join(" ") ?? "", /policy validation failed.*(?:gitlinks|submodule)|(?:gitlinks|submodule).*policy validation failed/i);
+    assert.doesNotMatch(inventory.errors.join(" "), /not found by independent workspace scan/);
+    assert.match(inspectInterruptedGitState(workspace).join(" "), /repos\/parent\/repo: Repository policy validation failed/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

@@ -54,7 +54,6 @@ const observerScript = [
 ].join("\n");
 const dockerArgs = [
   "exec",
-  "--user", `${config.container.hostUid}:${config.container.hostGid}`,
   config.container.containerId,
   "/bin/sh", "-c", observerScript, "pi-worker-client", controlDirectory,
   Buffer.from(launchScript).toString("base64")
@@ -93,7 +92,7 @@ function buildLaunchScript() {
     `  touch ${shellQuote(`${controlDirectory}/done`)}`,
     "  exit 0",
     "fi",
-    `setsid env -i ${environment} ${command} > ${shellQuote(`${controlDirectory}/stdout`)} 2> ${shellQuote(`${controlDirectory}/stderr`)} &`,
+    `setsid setpriv --reuid ${config.container.hostUid} --regid ${config.container.hostGid} --clear-groups -- env -i ${environment} ${command} > ${shellQuote(`${controlDirectory}/stdout`)} 2> ${shellQuote(`${controlDirectory}/stderr`)} &`,
     "pgid=$!",
     `printf '%s\\n' \"$pgid\" > ${shellQuote(`${controlDirectory}/pgid`)}`,
     "wait \"$pgid\"",

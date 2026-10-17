@@ -6,9 +6,9 @@ import { Text } from "@earendil-works/pi-tui";
 import { defineTool, type AgentToolResult, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveExtensionModel, assertChildAgentRouteAllowed, parseModelThinkingPair } from "../_shared/model-spec.js";
 import { throwIfAborted } from "../_shared/cancellation.js";
-import { createAsyncJobId, isAsyncJobProcessGroupAlive, signalAsyncJobProcessGroup } from "../_shared/async-job.js";
+import { asyncJobProcessStartToken, createAsyncJobId, isAsyncJobProcessIdentityAlive, signalAsyncJobProcessIdentity } from "../_shared/async-job.js";
 import { handleAsyncShellViewerCommand, reconcileTerminatedPersistedAsyncShellJobsForOwner, unsettledPersistedAsyncShellJobsForOwner, type JobMeta, type ManagedAsyncJobHandle } from "../async-shell/index.js";
-import { createWorkerContainerAsync, planWorkerContainer, resolveDockerPath, settleWorkerContainer, type WorkerContainerReference } from "../_shared/worker-container.js";
+import { createWorkerContainerAsync, planWorkerContainer, resolveDockerPath, settleWorkerContainerAsync, type WorkerContainerReference } from "../_shared/worker-container.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 import { workerMutationAdmissionPath, workerResultAdmissionPath } from "../_shared/worker-contract.js";
 import { workerRoleInstructions } from "../_shared/role-instructions.js";
@@ -19,12 +19,12 @@ import {
   abandonWorkerDiscard, activeRunsForParent, claimPreparedSetApply, clearWorkerRecoveryError, claimWorkerCancellation, claimWorkerDiscard, claimWorkerDelivery, claimWorkerRun,
   countWorkers, createWorkerRunBatch, finalizeClaimedWorkerRun, finalizeWorkerDiscard, finalizeWorkerRunLaunch, findWorkerRunById, finishPreparedSetApply,
   getWorker, getWorkerRun, listWorkerRuns, listWorkers, markWorkerDeliveryDelivered, openWorkerRegistry, pendingWorkerDeliveries,
-  readPreparedSetRecord, recoverInterruptedClaimsForParent, reconcileWorkerDeliveries, registerParentRuntime, releasePreparedSetApply, releaseWorkerDeliveryClaim, releaseWorkerRunClaim, setWorkerRecoveryError, storePreparedSet,
+  readPreparedSetRecord, recordWorkerSettlementRecovery, recoverInterruptedClaimsForParent, reconcileWorkerDeliveries, registerParentRuntime, releasePreparedSetApply, releaseWorkerDeliveryClaim, releaseWorkerRunClaim, setWorkerRecoveryError, storePreparedSet,
   updatePreparedSetStatus, updateWorkerRuntimeMetadata, workerRegistryDataVersion,
   type WorkerBatchCreateItem, type WorkerRegistry, type WorkerRegistryRecord, type WorkerRepositoryResult, type WorkerRole, type WorkerRunRecord
 } from "./registry.js";
 import { readWorkerRuntimeResult } from "./runtime.js";
-import { cleanupReviewOverlay, createReviewOverlayAsync, type ReviewOverlayRecord } from "./review-workspace.js";
+import { cleanupReviewOverlayAsync, createReviewOverlayAsync, type ReviewOverlayRecord } from "./review-workspace.js";
 import { preferredWorkerModel } from "./settings.js";
 import { createWorkerId, createWorkerRunId, defaultWorkerRoots, provisionWorkerPaths, workerPaths, type WorkerPaths, type WorkerRoots } from "./identity.js";
 import { createWorkerSession, forkWorkerSession, verifyWorkerSession } from "./session.js";
@@ -56,9 +56,9 @@ type PlannedRun = {
 export type WorkerExtensionDependencies = {
   runtimeRoot?: string; roots?: WorkerRoots; codeRoot?: string; preparedRoot?: string; targetRoot?: string; now?: () => Date; random?: () => string; dockerPath?: string;
   createContainer?: (dockerPath: string, reference: WorkerContainerReference) => WorkerContainerReference | Promise<WorkerContainerReference>;
-  removeContainer?: (dockerPath: string, reference: WorkerContainerReference) => void;
+  removeContainer?: (dockerPath: string, reference: WorkerContainerReference) => void | Promise<void>;
   launch?: (api: ExtensionAPI, context: ExtensionContext, input: { record: WorkerLaunchRecord; runtime: RunRuntime }) => ManagedAsyncJobHandle;
-  createOverlay?: (input: Parameters<typeof createReviewOverlayAsync>[0]) => ReviewOverlayRecord | Promise<ReviewOverlayRecord>; cleanupOverlay?: typeof cleanupReviewOverlay;
+  createOverlay?: (input: Parameters<typeof createReviewOverlayAsync>[0]) => ReviewOverlayRecord | Promise<ReviewOverlayRecord>; cleanupOverlay?: (dockerPath: string, overlay: ReviewOverlayRecord) => void | Promise<void>;
   waitForHostIdentity?: (runtime: RunRuntime, workerId: string, runId: string) => Promise<void>;
 };
 
@@ -73,10 +73,10 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   let configuredDockerPath = overrides.dockerPath ?? (testLaunch ? "/test/docker" : undefined);
   const docker = () => configuredDockerPath ??= resolveDockerPath();
   const createContainer = overrides.createContainer ?? (testLaunch ? ((_docker, reference) => ({ ...reference, containerId: "f".repeat(64) })) : createWorkerContainerAsync);
-  const removeContainer = overrides.removeContainer ?? (testLaunch ? (() => {}) : settleWorkerContainer);
+  const removeContainer = overrides.removeContainer ?? (testLaunch ? (() => {}) : settleWorkerContainerAsync);
   const createOverlay = overrides.createOverlay ?? createReviewOverlayAsync;
   const verifyHostIdentity = overrides.waitForHostIdentity ?? waitForWorkerHostIdentity;
-  const cleanupOverlay = overrides.cleanupOverlay ?? cleanupReviewOverlay;
+  const cleanupOverlay = overrides.cleanupOverlay ?? cleanupReviewOverlayAsync;
   let registry: WorkerRegistry | undefined;
   let runtimeGeneration = 0;
   let deliveryTimer: NodeJS.Timeout | undefined;
@@ -98,7 +98,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     return launchWorkerHost(api, context, { record, prompt: runtime.prompt, resultFile: runtime.resultFile, runDir: runtime.runDir, processFile: runtime.processFile, processNonce: runtime.processNonce, shellExecution: { kind: "docker", dockerPath: docker(), container: runtime.container } }).handle;
   };
 
-  api.on("session_start", async (_event, context) => {
+  api.on("session_start", (_event, context) => {
     currentContext = context;
     const parent = context.sessionManager.getSessionFile(); if (!parent) return;
     const exactParent = realpathOrResolve(parent);
@@ -109,7 +109,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     deliveredRecovery.clear();
     observedDataVersion = workerRegistryDataVersion(getRegistry());
     deliverPendingCompletions(api, getRegistry(), exactParent, runtimeGeneration);
-    await reconcileActiveRuns(context, exactParent);
+    void Promise.resolve().then(() => reconcileActiveRuns(context, exactParent));
     if (deliveryTimer) clearInterval(deliveryTimer);
     deliveryTimer = setInterval(() => {
       try {
@@ -126,13 +126,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const parent = realpathOrResolve(parentFile); const parentSessionId = context.sessionManager.getSessionId();
     const launches = [...pending.values()].filter((item) => item.parentSessionFile === parent && item.parentSessionId === parentSessionId);
     for (const item of launches) pending.delete(item.runId);
-    const completions = launches.map((item) => {
-      const completion = startPreparedRun(context, item);
-      starting.set(item.workerId, { runId: item.runId, completion });
-      void completion.finally(() => { if (starting.get(item.workerId)?.runId === item.runId) starting.delete(item.workerId); });
-      return completion;
-    });
-    void Promise.allSettled(completions);
+    for (const item of launches) beginPreparedRun(context, item);
   });
   api.on("message_end", (event, context) => {
     const deliveryId = (event.message as any)?.details?.deliveryId;
@@ -147,9 +141,9 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   });
 
   api.registerMessageRenderer("worker-run", (message, _options, theme) => {
-    const d = message.details as any; const outcome = String(d?.outcome ?? "completed").replaceAll("_", " "); const role = d?.role ?? "work";
-    const counts = `${Number(d?.repositoryCount ?? 0)} repos · ${Number(d?.artifactCount ?? 0)} artifacts`;
-    return new Text(theme.fg(d?.outcome === "failed" ? "error" : d?.outcome === "cancelled" ? "warning" : "success", `${outcome} · ${role} · ${String(d?.workerId ?? "worker").slice(-8)} · ${counts}`), 0, 0);
+    const d = message.details as any; const recovery = d?.event === "worker_recovery_required"; const outcome = recovery ? "recovery required" : String(d?.outcome ?? "completed").replaceAll("_", " "); const role = d?.role ?? "work";
+    const counts = recovery ? String(d?.status ?? "running") : `${Number(d?.repositoryCount ?? 0)} repos · ${Number(d?.artifactCount ?? 0)} artifacts`;
+    return new Text(theme.fg(recovery || d?.outcome === "failed" ? "error" : d?.outcome === "cancelled" ? "warning" : "success", `${outcome} · ${role} · ${String(d?.workerId ?? "worker").slice(-8)} · ${counts}`), 0, 0);
   });
 
   const workerRunTool = defineTool({
@@ -220,7 +214,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
 
   api.registerTool(defineTool({
     name: "worker_merge_test", label: "Test Repository Merges",
-    description: "Test one or more local Git repository candidates against explicit target branches without modifying them. The tool revalidates candidate and target identity, constructs the requested merges or squashes in disposable views, detects conflicts and cross-repository overlap, and returns exact prepared results for validation or integration. This tool does not run project tests or promote target refs.",
+    description: "Test one or more local Git repository candidates against explicit target branches without modifying them. The tool revalidates candidate and target identity, constructs the requested merges or squashes in disposable views, detects ordinary Git conflicts, and returns exact prepared results for validation or integration. This tool does not run project tests or promote target refs.",
     promptSnippet: "Test repository candidates against target branches and prepare exact disposable merge results without promotion.",
     promptGuidelines: [inputJsonSchemaGuideline("worker_merge_test", WorkerMergeTestParams), outputJsonSchemaGuideline("worker_merge_test", RetainedToolOutputSchemas.worker_merge_test), "worker_merge_test use: Prepare exact merges, validate every prepared view separately, and apply only through an explicit worker_merge_apply call.", "worker_merge_test constraints: Only result content is provider-visible; details remain internal."],
     parameters: WorkerMergeTestParams, executionMode: "sequential",
@@ -354,14 +348,15 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const reference = planWorkerContainer({ workerId: input.workerId, runId, nonce, workspaceRoot: input.paths.workspaceRoot, codeRoot, mounts: input.mounts });
     const roleInstructions = roleInstructionsFor(input.role);
     const request = input.request;
-    const cancelledPreviously = !input.newWorker && getWorkerRun(getRegistry(), input.workerId, getWorker(getRegistry(), input.workerId)?.latestRunId ?? "")?.outcome === "cancelled";
-    const interruptionWarnings = cancelledPreviously ? inspectInterruptedGitState(input.paths.workspaceRoot) : [];
+    const previousRun = !input.newWorker ? getWorkerRun(getRegistry(), input.workerId, getWorker(getRegistry(), input.workerId)?.latestRunId ?? "") : undefined;
+    const interruptedPreviously = previousRun?.outcome === "cancelled" || (previousRun?.outcome === "failed" && previousRun.outcomeSource === "system");
+    const interruptionWarnings = interruptedPreviously ? inspectInterruptedGitState(input.paths.workspaceRoot) : [];
     const prompt = renderWorkerRuntimePrompt(input.role, { workerId: input.workerId, runId, workspaceRoot: input.role === "review" || input.role === "integration" ? "/workspace" : input.paths.workspaceRoot,
       codeRoot, taskIds: input.taskIds, roleInstructions,
       instructions: request.instructions, repositoryBaselines: input.workerRuntime.repositoryBaselines, additionalInputs: contextInputs(input.workerRuntime.inputs),
       reviewSubjectPath: "/review/subject", reviewContextPath: "/review/context.json", integrationContextPath: "/integration/context.json", resumed: !input.newWorker,
       cacheLineageMarker: input.workerRuntime.cacheLineage?.mode === "eligible" ? input.workerRuntime.cacheLineage.marker : undefined, initialSession: Boolean(input.pendingWorkSessionId),
-      cancelledPreviously, interruptionWarnings });
+      cancelledPreviously: interruptedPreviously, interruptionWarnings });
     const runRuntime: RunRuntime = { version: 2, prompt, runDir, resultFile: path.join(runDir, "result.json"), settledFile: path.join(runDir, "settled.json"), processFile: path.join(runDir, "host-process.json"), processNonce: nonce,
       container: reference, ...(input.reviewOverlayPlan ? { reviewOverlayPlan: input.reviewOverlayPlan } : {}), ...(input.contextFile ? { contextFile: input.contextFile } : {}), inputs: input.workerRuntime.inputs,
       repositoryBefore: snapshotWorkerRepositories(input.paths.workspaceRoot), ...(input.pendingWorkSessionId ? { pendingWorkSessionId: input.pendingWorkSessionId } : {}), ...(interruptionWarnings.length ? { interruptionWarnings } : {}) };
@@ -375,6 +370,16 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       if (plan.newWorker) rmSync(plan.paths.stateDir, { recursive: true, force: true });
       else { rmSync(plan.runRuntime.runDir, { recursive: true, force: true }); if (plan.runRuntime.contextFile) rmSync(plan.runRuntime.contextFile, { force: true }); }
     }
+  }
+
+  function beginPreparedRun(context: ExtensionContext, item: PendingRun): void {
+    if (starting.get(item.workerId)?.runId === item.runId) return;
+    // Calling an async function executes synchronously until its first await. Put the
+    // whole launch path behind a microtask so turn_end/session_start never perform
+    // the session fork, OverlayFS setup, Docker work, or host launch inline.
+    const completion = Promise.resolve().then(() => startPreparedRun(context, item));
+    starting.set(item.workerId, { runId: item.runId, completion });
+    void completion.finally(() => { if (starting.get(item.workerId)?.runId === item.runId) starting.delete(item.workerId); });
   }
 
   async function startPreparedRun(context: ExtensionContext, item: PendingRun): Promise<void> {
@@ -400,7 +405,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         assertRunClaim(item.workerId, item.runId, "launch", nonce);
       }
       item.runtime.container = await createContainer(docker(), item.runtime.container);
-      launchAdmission = path.join(item.runtime.runDir, "launch-admitting.json"); writeFileSync(launchAdmission, `${JSON.stringify({ version: 1, workerId: item.workerId, runId: item.runId, pid: process.pid, startedAt: now().toISOString() })}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+      launchAdmission = path.join(item.runtime.runDir, "launch-admitting.json"); writeFileSync(launchAdmission, `${JSON.stringify({ version: 2, workerId: item.workerId, runId: item.runId, pid: process.pid, processStartToken: asyncJobProcessStartToken(process.pid), startedAt: now().toISOString() })}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
       assertRunClaim(item.workerId, item.runId, "launch", nonce);
       handle = launch(context, record, item.runtime); await verifyHostIdentity(item.runtime, item.workerId, item.runId); assertRunClaim(item.workerId, item.runId, "launch", nonce); const snapshot = handle.snapshot();
       finalizeWorkerRunLaunch(getRegistry(), { workerId: worker.workerId, runId: run.runId, claimNonce: nonce, modelSelection: worker.modelSelection!, sessionId, sessionFile, sessionStartLine, jobId: snapshot.jobId,
@@ -415,14 +420,14 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       }
       if (launchAdmission) rmSync(launchAdmission, { force: true });
       const claimed = getWorkerRun(getRegistry(), item.workerId, item.runId);
-      if (claimed?.claimKind !== "launch" || claimed.claimNonce !== nonce) { try { removeContainer(docker(), item.runtime.container); } catch {} if (item.runtime.overlay) { try { cleanupOverlay(docker(), item.runtime.overlay); } catch {} } }
+      if (claimed?.claimKind !== "launch" || claimed.claimNonce !== nonce) { try { await removeContainer(docker(), item.runtime.container); } catch {} if (item.runtime.overlay) { try { await cleanupOverlay(docker(), item.runtime.overlay); } catch {} } }
       await failClaimedRun(item.workerId, item.runId, "launch", nonce, error);
     }
   }
 
   async function waitForWorkerHostIdentity(runtime: RunRuntime, workerId: string, runId: string): Promise<void> {
     for (let attempt = 0; attempt < 200; attempt += 1) {
-      if (existsSync(runtime.processFile)) { const record = readWorkerHostProcess(runtime.processFile); if (record.workerId !== workerId || record.runId !== runId || record.nonce !== runtime.processNonce || !isAsyncJobProcessGroupAlive(record.pid)) throw new Error("Worker host process identity was invalid during launch."); return; }
+      if (existsSync(runtime.processFile)) { const record = readWorkerHostProcess(runtime.processFile); if (record.workerId !== workerId || record.runId !== runId || record.nonce !== runtime.processNonce || !isAsyncJobProcessIdentityAlive(record)) throw new Error("Worker host process identity was invalid during launch."); return; }
       await delay(25);
     }
     throw new Error(`Worker ${workerId}/${runId} did not publish its host process identity.`);
@@ -441,18 +446,37 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         const accepted = readWorkerRuntimeResult(runtime.resultFile); if (accepted.workerId !== workerId || accepted.runId !== runId) throw new Error("Worker result identity mismatch.");
         outcome = accepted.result.outcome; outcomeSource = "worker"; summary = accepted.result.summary; question = accepted.result.question; reported = accepted.result.repositories ?? []; artifacts = accepted.result.artifacts ?? [];
       } else errors.push({ scope: "run", message: sanitizeError(job.error ?? `Worker host exited with status ${job.status}${job.exitCode === undefined ? "" : ` (${job.exitCode})`}.`) });
-      removeContainer(docker(), runtime.container);
-      if (runtime.overlay) cleanupOverlay(docker(), runtime.overlay);
+      await removeContainer(docker(), runtime.container);
+      if (runtime.overlay) await cleanupOverlay(docker(), runtime.overlay);
       const inventory = inventoryWorkerRepositories({ workspaceRoot: worker.workspaceRoot, workerId, runId, reported, before: runtime.repositoryBefore });
       errors.push(...inventory.errors.map((message) => ({ scope: "repositories" as const, message: sanitizeError(message) })));
       finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind: "settlement", claimNonce: nonce, outcome, outcomeSource, summary: summary.slice(0, 2048), ...(question ? { question } : {}), repositories: inventory.repositories, artifacts, errors, sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile) : undefined, settledAt: now().toISOString() });
       if (currentContext?.sessionManager.getSessionFile() && realpathOrResolve(currentContext.sessionManager.getSessionFile()!) === worker.parentSessionFile) deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration);
-    } catch (error) { recordRecovery(workerId, runId, error); releaseWorkerRunClaim(getRegistry(), workerId, runId, "settlement", nonce); }
+    } catch (error) {
+      const message = sanitizeError(error);
+      const attempts = recordWorkerSettlementRecovery(getRegistry(), { workerId, runId, claimNonce: nonce, error: message, now: now().toISOString() });
+      let accepted: ReturnType<typeof readWorkerRuntimeResult> | undefined;
+      try { if (existsSync(runtime.resultFile)) accepted = readWorkerRuntimeResult(runtime.resultFile); } catch {}
+      if (attempts >= 3) {
+        const retained = accepted ? ` Accepted result ${accepted.result.outcome} remains retained at ${runtime.resultFile}.` : ` Settlement evidence remains retained beneath ${runtime.runDir}.`;
+        finalizeClaimedWorkerRun(getRegistry(), {
+          parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind: "settlement", claimNonce: nonce,
+          outcome: "failed", outcomeSource: "system", summary: `Worker result settlement failed after ${attempts} deterministic attempts.`,
+          artifacts: accepted?.result.artifacts ?? [], errors: [{ scope: "run", message: `${message}${retained}` }],
+          sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile) : undefined, settledAt: now().toISOString()
+        });
+        if (currentContext?.sessionManager.getSessionFile() && realpathOrResolve(currentContext.sessionManager.getSessionFile()!) === worker.parentSessionFile) deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration);
+      } else {
+        releaseWorkerRunClaim(getRegistry(), workerId, runId, "settlement", nonce);
+        const current = getWorker(getRegistry(), workerId); const currentRun = current && getWorkerRun(getRegistry(), workerId, runId);
+        if (current && currentRun) deliverRecovery(current, currentRun, `${message} (settlement attempt ${attempts}/3)`);
+      }
+    }
   }
 
   async function failClaimedRun(workerId: string, runId: string, claimKind: "launch" | "settlement", claimNonce: string, error: unknown): Promise<void> {
     const worker = getWorker(getRegistry(), workerId); const run = worker && getWorkerRun(getRegistry(), workerId, runId); if (!worker || !run || run.claimKind !== claimKind || run.claimNonce !== claimNonce) return; const runtime = run.runtime as RunRuntime;
-    try { removeContainer(docker(), runtime.container); if (runtime.overlay) cleanupOverlay(docker(), runtime.overlay);
+    try { await removeContainer(docker(), runtime.container); if (runtime.overlay) await cleanupOverlay(docker(), runtime.overlay);
       finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind, claimNonce, outcome: "failed", outcomeSource: "system", summary: "Worker run failed before accepting a result.", errors: [{ scope: "run", message: sanitizeError(error) }], sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile) : undefined, settledAt: now().toISOString() });
     } catch (cleanupError) { recordRecovery(workerId, runId, cleanupError); }
   }
@@ -473,11 +497,11 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       await waitForRuntimeAdmissions(runtime, authorizationFile);
       const launching = starting.get(worker.workerId); if (launching?.runId === runId) await launching.completion;
       const attached = active.get(worker.workerId); if (attached?.runId === runId) { attached.handle.cancel("SIGTERM"); }
-      else if (existsSync(runtime.processFile)) { const process = readWorkerHostProcess(runtime.processFile); if (process.workerId !== worker.workerId || process.runId !== runId || process.nonce !== runtime.processNonce) throw new Error("Worker host process identity mismatch during cancellation."); if (isAsyncJobProcessGroupAlive(process.pid)) signalAsyncJobProcessGroup(process.pid, "SIGTERM"); }
-      removeContainer(docker(), runtime.container);
+      else if (existsSync(runtime.processFile)) { const process = readWorkerHostProcess(runtime.processFile); if (process.workerId !== worker.workerId || process.runId !== runId || process.nonce !== runtime.processNonce) throw new Error("Worker host process identity mismatch during cancellation."); if (isAsyncJobProcessIdentityAlive(process)) signalAsyncJobProcessIdentity(process, "SIGTERM"); }
+      await removeContainer(docker(), runtime.container);
       if (attached?.runId === runId) { const terminal = await Promise.race([attached.handle.completion.then((job) => job.status !== "running" && job.status !== "unknown"), delay(5_000).then(() => false)]); if (!terminal) throw new Error("Worker host job did not reach a terminal state during cancellation."); }
       await proveWorkerHostExited(runtime, worker.workerId, runId);
-      if (runtime.overlay) cleanupOverlay(docker(), runtime.overlay);
+      if (runtime.overlay) await cleanupOverlay(docker(), runtime.overlay);
       await reconcileTerminatedPersistedAsyncShellJobsForOwner(path.join(workerPaths(roots, worker.workerId).stateDir, "async-shell"), { kind: "worker-run", workerId: worker.workerId, runId }, 250);
       const survivors = await waitForWorkerShellRecords(worker.workerId, runId);
       if (survivors.length) throw new Error(`Worker-owned process records remain active after container removal: ${survivors.map((job) => job.jobId).join(", ")}.`);
@@ -492,7 +516,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const activeFiles = files.filter(runtimeAdmissionActive); if (activeFiles.length) throw new Error(`Worker runtime mutation admission did not settle after revocation: ${activeFiles.join(", ")}.`);
   }
   function runtimeAdmissionActive(file: string): boolean {
-    if (!existsSync(file)) return false; try { const record = JSON.parse(readFileSync(file, "utf8")) as { pid?: number }; if (Number.isSafeInteger(record.pid) && record.pid! > 0) { try { process.kill(record.pid!, 0); return true; } catch { rmSync(file, { force: true }); return false; } } } catch {} return true;
+    if (!existsSync(file)) return false; try { const record = JSON.parse(readFileSync(file, "utf8")) as { pid?: number; processStartToken?: string }; if (Number.isSafeInteger(record.pid) && record.pid! > 0 && typeof record.processStartToken === "string") { if (asyncJobProcessStartToken(record.pid!) === record.processStartToken) return true; rmSync(file, { force: true }); return false; } } catch {} return true;
   }
 
   async function waitForWorkerShellRecords(workerId: string, runId: string): Promise<ReturnType<typeof unsettledPersistedAsyncShellJobsForOwner>> {
@@ -506,9 +530,9 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     if (!existsSync(runtime.processFile)) return;
     const processRecord = readWorkerHostProcess(runtime.processFile);
     if (processRecord.workerId !== workerId || processRecord.runId !== runId || processRecord.nonce !== runtime.processNonce) throw new Error("Worker host process identity mismatch during cancellation proof.");
-    for (let attempt = 0; attempt < 50 && isAsyncJobProcessGroupAlive(processRecord.pid); attempt += 1) await delay(100);
-    if (isAsyncJobProcessGroupAlive(processRecord.pid)) { signalAsyncJobProcessGroup(processRecord.pid, "SIGKILL"); for (let attempt = 0; attempt < 30 && isAsyncJobProcessGroupAlive(processRecord.pid); attempt += 1) await delay(100); }
-    if (isAsyncJobProcessGroupAlive(processRecord.pid)) throw new Error(`Worker host process group ${processRecord.pid} remained alive after cancellation.`);
+    for (let attempt = 0; attempt < 50 && isAsyncJobProcessIdentityAlive(processRecord); attempt += 1) await delay(100);
+    if (isAsyncJobProcessIdentityAlive(processRecord)) { signalAsyncJobProcessIdentity(processRecord, "SIGKILL"); for (let attempt = 0; attempt < 30 && isAsyncJobProcessIdentityAlive(processRecord); attempt += 1) await delay(100); }
+    if (isAsyncJobProcessIdentityAlive(processRecord)) throw new Error(`Worker host process group ${processRecord.pid} remained alive after cancellation.`);
   }
 
   function recoverInterruptedDiscardFiles(parentSessionFile: string, generation: number): void {
@@ -555,7 +579,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     await discardWorker(worker); return resultText(`discarded · ${worker.role} · ${worker.workerId.slice(-8)}`, { workerId: worker.workerId, discarded: true });
   }
 
-  async function reconcileActiveRuns(context: ExtensionContext, parentSessionFile: string): Promise<void> {
+  function reconcileActiveRuns(context: ExtensionContext, parentSessionFile: string): void {
     for (const { worker, run } of activeRunsForParent(getRegistry(), parentSessionFile)) {
       const runtime = run.runtime as RunRuntime; if (!runtime || runtime.version !== 2 || run.claimKind) { if (worker.recoveryError) deliverRecovery(worker, run, worker.recoveryError); continue; }
       if (worker.recoveryError) {
@@ -567,20 +591,20 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         if (existsSync(runtime.processFile)) {
           try {
             const processRecord = readWorkerHostProcess(runtime.processFile);
-            if (processRecord.workerId === worker.workerId && processRecord.runId === run.runId && processRecord.nonce === runtime.processNonce && isAsyncJobProcessGroupAlive(processRecord.pid)) {
+            if (processRecord.workerId === worker.workerId && processRecord.runId === run.runId && processRecord.nonce === runtime.processNonce && isAsyncJobProcessIdentityAlive(processRecord)) {
               const nonce = claimNonce();
               if (claimWorkerRun(getRegistry(), worker.workerId, run.runId, "launch", nonce, ["queued"])) finalizeWorkerRunLaunch(getRegistry(), { workerId: worker.workerId, runId: run.runId, claimNonce: nonce, modelSelection: worker.modelSelection!, sessionId: worker.sessionId!, sessionFile: worker.sessionFile!, sessionStartLine: run.sessionStartLine ?? countLines(worker.sessionFile!) + 1, jobId: run.jobId!, stdoutLog: run.stdoutLog!, stderrLog: run.stderrLog!, runtime, startedAt: run.startedAt ?? now().toISOString() });
               continue;
             }
           } catch {}
         }
-        if (!pending.has(run.runId)) { const item = { workerId: worker.workerId, runId: run.runId, parentSessionFile, parentSessionId: context.sessionManager.getSessionId(), runtime }; pending.set(run.runId, item); pending.delete(run.runId); await startPreparedRun(context, item); }
+        if (!pending.has(run.runId) && !starting.has(worker.workerId)) { const item = { workerId: worker.workerId, runId: run.runId, parentSessionFile, parentSessionId: context.sessionManager.getSessionId(), runtime }; beginPreparedRun(context, item); }
         continue;
       }
       if (active.get(worker.workerId)?.runId === run.runId) continue;
-      if (existsSync(runtime.settledFile) && existsSync(runtime.resultFile)) { await settleCompletedRun(worker.workerId, run.runId, { status: "exited", exitCode: 0 }); continue; }
-      if (existsSync(runtime.processFile)) { try { const process = readWorkerHostProcess(runtime.processFile); if (process.workerId === worker.workerId && process.runId === run.runId && process.nonce === runtime.processNonce && isAsyncJobProcessGroupAlive(process.pid)) continue; } catch {} }
-      const nonce = claimNonce(); if (claimWorkerRun(getRegistry(), worker.workerId, run.runId, "settlement", nonce, ["running"])) await failClaimedRun(worker.workerId, run.runId, "settlement", nonce, new Error("Worker supervisor exited without a verified result settlement."));
+      if (existsSync(runtime.settledFile) && existsSync(runtime.resultFile)) { void settleCompletedRun(worker.workerId, run.runId, { status: "exited", exitCode: 0 }); continue; }
+      if (existsSync(runtime.processFile)) { try { const process = readWorkerHostProcess(runtime.processFile); if (process.workerId === worker.workerId && process.runId === run.runId && process.nonce === runtime.processNonce && isAsyncJobProcessIdentityAlive(process)) continue; } catch {} }
+      const nonce = claimNonce(); if (claimWorkerRun(getRegistry(), worker.workerId, run.runId, "settlement", nonce, ["running"])) void failClaimedRun(worker.workerId, run.runId, "settlement", nonce, new Error("Worker supervisor exited without a verified result settlement."));
     }
   }
 
