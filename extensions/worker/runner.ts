@@ -8,19 +8,19 @@ import { resolveExecutable } from "../_shared/executable.js";
 import { assertSubagentRouteAllowed } from "../_shared/model-spec.js";
 import type { WorkerRole } from "./registry.js";
 import type { WorkerContainerReference } from "../_shared/worker-container.js";
-import { MANAGED_WORKER_TOOL_NAMES } from "./cache-lineage.js";
+import { MANAGED_WORKER_TOOL_NAMES, type WorkerCacheLineageRecord } from "./cache-lineage.js";
 
 export type WorkerBeadsRoute = { prefix: "personal"; path: string; databasePath: string };
 export type WorkerShellExecution = { kind: "docker"; dockerPath: string; container: WorkerContainerReference } | { kind: "native-test" };
 export type WorkerLaunchRecord = {
   workerId: string; runId: string; jobId: string; sessionId: string; sessionFile: string; workspaceRoot: string;
-  taskIds: string[]; role: WorkerRole; modelSelection: string;
+  taskIds: string[]; role: WorkerRole; modelSelection: string; cacheLineage?: WorkerCacheLineageRecord;
 };
 export type WorkerHostConfig = {
   version: 1; workerId: string; runId: string; sessionId: string; sessionFile: string; sessionDir: string;
-  workspaceRoot: string; stateRoot: string; asyncJobRoot: string; taskIds: string[]; role: WorkerRole;
+  workspaceRoot: string; stateRoot: string; asyncJobRoot: string; taskIds: string[]; role: WorkerRole; cacheLineage?: WorkerCacheLineageRecord;
   resultFile: string; settledFile: string; processFile: string; processNonce: string; hostConfigFile: string;
-  authorizationFile: string; parentPid: number; prompt: string; provider: string; model: string; thinkingLevel: string;
+  authorizationFile: string; prompt: string; provider: string; model: string; thinkingLevel: string;
   piCliPath: string; bdPath: string; beadsRoute: WorkerBeadsRoute; extensionPaths: string[];
   shellExecution: WorkerShellExecution; rpcArgs: string[]; timeoutMs?: number;
 };
@@ -45,16 +45,16 @@ export function launchWorkerHost(api: ExtensionAPI, context: ExtensionContext, i
   const config: WorkerHostConfig = {
     version: 1, workerId: record.workerId, runId: record.runId, sessionId: record.sessionId,
     sessionFile: record.sessionFile, sessionDir: path.dirname(record.sessionFile), workspaceRoot: record.workspaceRoot,
-    stateRoot, asyncJobRoot: path.join(stateRoot, "async-shell"), taskIds: [...record.taskIds], role: record.role,
+    stateRoot, asyncJobRoot: path.join(stateRoot, "async-shell"), taskIds: [...record.taskIds], role: record.role, ...(record.cacheLineage ? { cacheLineage: record.cacheLineage } : {}),
     resultFile: input.resultFile, settledFile: path.join(input.runDir, "settled.json"), processFile: input.processFile,
-    processNonce: input.processNonce, hostConfigFile: configFile, authorizationFile, parentPid: process.pid, prompt: input.prompt,
+    processNonce: input.processNonce, hostConfigFile: configFile, authorizationFile, prompt: input.prompt,
     provider: route.provider, model: route.model, thinkingLevel: route.thinkingLevel,
     piCliPath: input.piCliPath ?? resolvePiCliPath(), bdPath, beadsRoute: input.beadsRoute ?? resolveBeadsRoute(bdPath, context.cwd),
     extensionPaths: input.extensionPaths ?? defaultWorkerExtensionPaths(), shellExecution: input.shellExecution, rpcArgs: [],
     ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs })
   };
   config.rpcArgs = buildWorkerRpcArgs(config);
-  writeFileSync(authorizationFile, `${JSON.stringify({ version: 1, workerId: config.workerId, runId: config.runId, parentPid: config.parentPid, processNonce: config.processNonce }, null, 2)}\n`, { mode: 0o600 });
+  writeFileSync(authorizationFile, `${JSON.stringify({ version: 1, workerId: config.workerId, runId: config.runId, processNonce: config.processNonce }, null, 2)}\n`, { mode: 0o600 });
   writeFileSync(configFile, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
   const handle = startManagedAsyncJob(api, context, {
     jobId: record.jobId, job_name: `worker ${record.workerId}`, command: `Pi worker host ${record.workerId}/${record.runId}`,
@@ -62,7 +62,7 @@ export function launchWorkerHost(api: ExtensionAPI, context: ExtensionContext, i
     env: { ...process.env, PI_WORKER_ID: record.workerId, PI_WORKER_RUN_ID: record.runId, PI_WORKER_RESULT_FILE: input.resultFile,
       PI_WORKER_WORKSPACE_ROOT: record.workspaceRoot, PI_WORKER_STATE_ROOT: config.stateRoot, PI_WORKER_ASYNC_JOB_ROOT: config.asyncJobRoot,
       PI_WORKER_TASK_IDS: JSON.stringify(record.taskIds), PI_WORKER_ROLE: config.role, PI_WORKER_BD_PATH: config.bdPath,
-      PI_WORKER_BEADS_ROUTE: JSON.stringify(config.beadsRoute), ...workerShellEnvironment(config.shellExecution) },
+      PI_WORKER_BEADS_ROUTE: JSON.stringify(config.beadsRoute), ...(config.cacheLineage ? { PI_WORKER_CACHE_LINEAGE: JSON.stringify(config.cacheLineage) } : {}), ...workerShellEnvironment(config.shellExecution) },
     notifyOnExit: false, settleProcessGroup: true
   });
   return { handle, config, configFile };

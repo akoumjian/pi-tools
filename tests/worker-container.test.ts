@@ -148,6 +148,8 @@ process.stderr.write("unsupported fake docker call: " + JSON.stringify(args) + "
     assert.ok(create.includes(`pi.worker=${planned.workerId}`));
     assert.ok(create.includes(`pi.run=${planned.runId}`));
     assert.ok(create.includes(`pi.nonce=${planned.nonce}`));
+    assert.equal(create.includes("--platform"), false);
+    assert.equal(planned.hostUid, process.getuid?.() ?? 0); assert.equal(planned.hostGid, process.getgid?.() ?? 0);
     assert.ok(create.includes(`type=bind,src=${planned.codeRoot},dst=${planned.codeRoot},readonly,bind-propagation=rprivate`));
     assert.ok(create.includes(`type=bind,src=${planned.workspaceRoot},dst=${planned.workspaceRoot},bind-propagation=rprivate`));
     assert.ok(calls.some((args) => args[0] === "exec" && args.includes("SIGKILL") && args.some((value) => value.includes("kill"))));

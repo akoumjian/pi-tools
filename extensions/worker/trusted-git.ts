@@ -1,5 +1,5 @@
 import { execFileSync, type ExecFileSyncOptionsWithStringEncoding } from "node:child_process";
-import { existsSync, lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 
 const TRUSTED_CONFIG: Array<[string, string]> = [
@@ -32,21 +32,29 @@ export function runTrustedGit(args: readonly string[], options: { cwd?: string; 
   return execFileSync("git", trustedGitArgs(args), execOptions);
 }
 
-export function trustedGit(repo: string, args: readonly string[], options: { checkPolicy?: boolean; maxBuffer?: number } = {}): string {
-  const exact = canonicalRepository(repo, options.checkPolicy !== false);
+export type TrustedGitOperation = { readonly checkedRepositories: Set<string> };
+
+/** Cache policy validation only for the bounded operation that owns this value. */
+export function createTrustedGitOperation(): TrustedGitOperation {
+  return { checkedRepositories: new Set<string>() };
+}
+
+export function trustedGit(repo: string, args: readonly string[], options: { checkPolicy?: boolean; maxBuffer?: number; operation?: TrustedGitOperation } = {}): string {
+  const exact = canonicalRepository(repo, options.checkPolicy !== false, options.operation);
   return runTrustedGit(["-C", exact, ...args], { maxBuffer: options.maxBuffer });
 }
 
-export function canonicalRepository(value: string, checkPolicy = true): string {
+export function canonicalRepository(value: string, checkPolicy = true, operation?: TrustedGitOperation): string {
   const exact = realpathSync(path.resolve(value));
   if (!statSync(exact).isDirectory()) throw new Error(`Git repository is not a directory: ${value}.`);
   runTrustedGit(["-C", exact, "rev-parse", "--git-dir"]);
-  if (checkPolicy) assertTrustedGitPolicy(exact);
+  if (checkPolicy) assertTrustedGitPolicy(exact, operation);
   return exact;
 }
 
-export function assertTrustedGitPolicy(repository: string): void {
+export function assertTrustedGitPolicy(repository: string, operation?: TrustedGitOperation): void {
   const exact = realpathSync(repository);
+  if (operation?.checkedRepositories.has(exact)) return;
   const keys = runTrustedGit(["-C", exact, "config", "--local", "--no-includes", "--name-only", "--null", "--list"])
     .split("\0").filter(Boolean).map((key) => key.toLocaleLowerCase("en-US"));
   const unsafe = keys.filter(unsafeConfigKey);
@@ -55,7 +63,6 @@ export function assertTrustedGitPolicy(repository: string): void {
   const commonExact = realpathSync(common);
   const gitDir = realpathSync(runTrustedGit(["-C", exact, "rev-parse", "--path-format=absolute", "--git-dir"]).trim());
   if (gitDir !== commonExact) throw new Error("Linked Git worktrees and per-worktree configuration are unsupported.");
-  assertNoNestedGitRepositories(exact);
   for (const relative of ["info/grafts", "shallow"]) {
     const candidate = path.join(commonExact, relative);
     if (existsSync(candidate) && lstatSync(candidate).isFile()) throw new Error(`Repository uses unsupported Git history metadata: ${relative}.`);
@@ -64,19 +71,7 @@ export function assertTrustedGitPolicy(repository: string): void {
   if (runTrustedGit(["-C", exact, "for-each-ref", "--format=%(refname)", "refs/replace"]).trim()) {
     throw new Error("Repository contains prohibited replace refs.");
   }
-}
-
-function assertNoNestedGitRepositories(repository: string): void {
-  const queue = [repository]; let inspected = 0;
-  while (queue.length) {
-    const directory = queue.shift()!;
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      if (++inspected > 100_000) throw new Error("Repository tree is too large to verify nested Git repository policy.");
-      if (entry.name === ".git") { if (directory !== repository) throw new Error(`Repository contains unsupported nested Git metadata at ${path.relative(repository, directory)}.`); continue; }
-      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
-      queue.push(path.join(directory, entry.name));
-    }
-  }
+  operation?.checkedRepositories.add(exact);
 }
 
 function unsafeConfigKey(key: string): boolean {

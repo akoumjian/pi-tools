@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -17,6 +17,7 @@ const CONTAINER_BOOTSTRAP = [
   "apk add --no-cache bash bind-tools build-base ca-certificates coreutils curl file findutils git iproute2 jq nodejs npm openssh-client patch procps py3-pip python3 ripgrep tar util-linux zip >/var/log/pi-worker-apk.log 2>&1",
   "mkdir -p /run/pi-jobs",
   "rm -rf /run/pi-jobs/*",
+  "chmod 1777 /run/pi-jobs",
   `cut -d ' ' -f 22 /proc/1/stat > ${WORKER_CONTAINER_READY_FILE}`,
   "on_term() { trap '' TERM INT; sleep 30; }",
   "trap on_term TERM INT",
@@ -44,6 +45,8 @@ export type WorkerContainerReference = {
   workspaceRoot: string;
   mounts?: WorkerContainerMount[];
   containerId?: string;
+  hostUid?: number;
+  hostGid?: number;
 };
 
 export type WorkerContainerProcess = {
@@ -71,6 +74,8 @@ export function planWorkerContainer(input: {
     image: WORKER_CONTAINER_IMAGE,
     codeRoot,
     workspaceRoot,
+    hostUid: process.getuid?.() ?? 0,
+    hostGid: process.getgid?.() ?? 0,
     ...(input.mounts?.length ? { mounts: input.mounts.map((mount) => ({ ...mount })) } : {})
   };
 }
@@ -79,6 +84,7 @@ export function createWorkerContainer(
   dockerPath: string,
   reference: WorkerContainerReference
 ): WorkerContainerReference & { containerId: string } {
+  reference = portableWorkerContainerReference(reference);
   assertWorkerContainerReference(reference);
   assertExecutable(dockerPath, "Docker CLI");
   const existing = inspectWorkerContainer(dockerPath, reference);
@@ -97,7 +103,6 @@ export function createWorkerContainer(
   try {
     containerId = execDocker(dockerPath, [
       "create",
-      "--platform", "linux/arm64",
       "--name", reference.name,
       "--hostname", reference.workerId,
       "--label", `pi.worker=${reference.workerId}`,
@@ -129,6 +134,58 @@ export function createWorkerContainer(
     throw new Error(
       `Unable to start Docker worker container ${reference.name}: ${cause instanceof Error ? cause.message : String(cause)}`
     );
+  }
+}
+
+
+/** Non-blocking launch path used by the parent extension. */
+export async function createWorkerContainerAsync(
+  dockerPath: string,
+  reference: WorkerContainerReference
+): Promise<WorkerContainerReference & { containerId: string }> {
+  reference = portableWorkerContainerReference(reference);
+  assertWorkerContainerReference(reference);
+  assertExecutable(dockerPath, "Docker CLI");
+  const existing = await inspectWorkerContainerAsync(dockerPath, reference);
+  if (existing) {
+    if (!existing.state.Running) await execDockerAsync(dockerPath, ["start", existing.id]);
+    await waitForWorkerContainerReadyAsync(dockerPath, existing.id, reference);
+    return { ...reference, containerId: existing.id };
+  }
+  if (reference.containerId) throw new Error(`Docker worker container ${reference.name} disappeared; refusing to replace its exact persisted identity.`);
+  try { await execDockerAsync(dockerPath, ["image", "inspect", reference.image]); }
+  catch { throw new Error(`Required worker image is unavailable for the native Docker platform. Run: docker pull ${reference.image}`); }
+  let containerId: string | undefined;
+  try {
+    containerId = (await execDockerAsync(dockerPath, [
+      "create",
+      "--name", reference.name,
+      "--hostname", reference.workerId,
+      "--label", `pi.worker=${reference.workerId}`,
+      "--label", `pi.run=${reference.runId}`,
+      "--label", `pi.nonce=${reference.nonce}`,
+      "--mount", bindMount(reference.codeRoot, true),
+      "--mount", bindMount(reference.workspaceRoot, false),
+      ...containerMountArgs(reference.mounts ?? []),
+      "--workdir", reference.workspaceRoot,
+      "--network", "bridge",
+      "--restart", "no",
+      "--init",
+      "--stop-signal", "SIGTERM",
+      "--stop-timeout", String(WORKER_CONTAINER_STOP_TIMEOUT_SECONDS),
+      "--pids-limit", "4096",
+      "--security-opt", "no-new-privileges=true",
+      "--entrypoint", "/bin/sh",
+      reference.image,
+      "-c", CONTAINER_BOOTSTRAP
+    ])).trim();
+    if (!/^[a-f0-9]{64}$/.test(containerId)) throw new Error(`Docker returned an invalid worker container id: ${containerId || "(empty)"}.`);
+    await execDockerAsync(dockerPath, ["start", containerId]);
+    await waitForWorkerContainerReadyAsync(dockerPath, containerId, reference);
+    return { ...reference, containerId };
+  } catch (cause) {
+    if (containerId) { try { await execDockerAsync(dockerPath, ["rm", "--force", containerId]); } catch {} }
+    throw new Error(`Unable to start Docker worker container ${reference.name}: ${cause instanceof Error ? cause.message : String(cause)}`);
   }
 }
 
@@ -329,7 +386,7 @@ function assertWorkerContainerImageAvailable(dockerPath: string, image: string):
   try {
     execDocker(dockerPath, ["image", "inspect", image]);
   } catch {
-    throw new Error(`Required worker image is unavailable. Run: docker pull --platform linux/arm64 ${image}`);
+    throw new Error(`Required worker image is unavailable for the native Docker platform. Run: docker pull ${image}`);
   }
 }
 
@@ -358,6 +415,38 @@ function waitForWorkerContainerReady(
   throw new Error(`Docker worker container ${reference.name} did not become ready within ${WORKER_CONTAINER_START_TIMEOUT_MS}ms.`);
 }
 
+
+async function waitForWorkerContainerReadyAsync(dockerPath: string, containerId: string, reference: WorkerContainerReference): Promise<void> {
+  const deadline = Date.now() + WORKER_CONTAINER_START_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const inspected = await inspectWorkerContainerAsync(dockerPath, { ...reference, containerId });
+    if (!inspected) throw new Error(`Docker worker container ${reference.name} disappeared during startup.`);
+    if (!inspected.state.Running) {
+      let logs = ""; try { logs = (await execDockerAsync(dockerPath, ["logs", "--tail", "80", containerId])).trim(); } catch {}
+      throw new Error(`Docker worker container exited during startup (${inspected.state.ExitCode ?? "unknown"}).${logs ? `\n${logs}` : ""}`);
+    }
+    try {
+      await execDockerAsync(dockerPath, ["exec", containerId, "/bin/sh", "-c", `test "$(cat ${WORKER_CONTAINER_READY_FILE} 2>/dev/null)" = "$(cut -d ' ' -f 22 /proc/1/stat)"`]);
+      return;
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`Docker worker container ${reference.name} did not become ready within ${WORKER_CONTAINER_START_TIMEOUT_MS}ms.`);
+}
+
+async function inspectWorkerContainerAsync(dockerPath: string, reference: WorkerContainerReference): Promise<ReturnType<typeof parseWorkerContainerInspection> | undefined> {
+  const target = reference.containerId ?? reference.name;
+  try { return parseWorkerContainerInspection(await execDockerAsync(dockerPath, ["container", "inspect", target]), reference); }
+  catch (cause) { if (isNoSuchDockerObject(cause)) return undefined; throw cause; }
+}
+
+function execDockerAsync(dockerPath: string, args: string[], timeout = 30_000): Promise<string> {
+  return new Promise((resolve, reject) => execFile(dockerPath, args, { encoding: "utf8", env: process.env, maxBuffer: 16 * 1024 * 1024, timeout }, (error, stdout, stderr) => {
+    if (error) { (error as NodeJS.ErrnoException & { stderr?: string }).stderr = String(stderr ?? ""); reject(error); }
+    else resolve(String(stdout));
+  }));
+}
+
 function inspectWorkerContainer(
   dockerPath: string,
   reference: WorkerContainerReference
@@ -370,6 +459,10 @@ function inspectWorkerContainer(
     if (isNoSuchDockerObject(cause)) return undefined;
     throw cause;
   }
+  return parseWorkerContainerInspection(output, reference);
+}
+
+function parseWorkerContainerInspection(output: string, reference: WorkerContainerReference) {
   const values = JSON.parse(output) as Array<{
     Id?: unknown;
     State?: { Running?: unknown; ExitCode?: unknown; Status?: unknown; StartedAt?: unknown; FinishedAt?: unknown; OOMKilled?: unknown; Error?: unknown };
@@ -414,6 +507,10 @@ function inspectWorkerContainer(
   };
 }
 
+function portableWorkerContainerReference(reference: WorkerContainerReference): WorkerContainerReference & { hostUid: number; hostGid: number } {
+  return { ...reference, hostUid: reference.hostUid ?? process.getuid?.() ?? 0, hostGid: reference.hostGid ?? process.getgid?.() ?? 0 };
+}
+
 function assertWorkerContainerReference(value: unknown): asserts value is WorkerContainerReference {
   const candidate = value as Partial<WorkerContainerReference> | undefined;
   const mountsValid = candidate?.mounts === undefined || (Array.isArray(candidate.mounts) && candidate.mounts.length <= 32 && candidate.mounts.every((mount) =>
@@ -428,6 +525,8 @@ function assertWorkerContainerReference(value: unknown): asserts value is Worker
     typeof candidate.runId !== "string" || !candidate.runId ||
     typeof candidate.name !== "string" || !candidate.name ||
     typeof candidate.nonce !== "string" || !candidate.nonce ||
+    (candidate.hostUid !== undefined && (!Number.isSafeInteger(candidate.hostUid) || candidate.hostUid < 0)) ||
+    (candidate.hostGid !== undefined && (!Number.isSafeInteger(candidate.hostGid) || candidate.hostGid < 0)) ||
     typeof candidate.image !== "string" || !candidate.image ||
     typeof candidate.codeRoot !== "string" || !path.isAbsolute(candidate.codeRoot) ||
     typeof candidate.workspaceRoot !== "string" || !path.isAbsolute(candidate.workspaceRoot) ||

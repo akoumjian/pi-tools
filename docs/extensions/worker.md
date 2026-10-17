@@ -24,7 +24,7 @@ Human commands are `/worker:list [status] [role]`, `/worker:show <workerId> [run
 
 A `workerId` is reusable. Every execution has an immutable `runId`; task/model snapshots, logs, session ranges, result, repositories, artifacts, errors, and timestamps belong to that run.
 
-Trusted host processes open one owner-only SQLite database at `~/.local/share/agent/worker-runtime/registry.sqlite`. SQLite transactions serialize lifecycle changes. Containers and model code never access the registry. Large files stay beneath `worker-runtime/workers/<workerId>/`. v2 does not import or mutate legacy worker/fold state.
+Trusted host processes open one owner-only SQLite database at `~/.local/share/agent/worker-runtime/registry.sqlite`. SQLite transactions serialize lifecycle changes. Numbered schema migrations run transactionally; schema-source fingerprints are diagnostic rather than an availability gate. Containers and model code never access the registry. Large files stay beneath `worker-runtime/workers/<workerId>/`. v2 does not import or mutate legacy worker/fold state.
 
 Completion settlement inserts a stable delivery record in the same transaction. The newest runtime generation for the exact parent session claims pending delivery; `PRAGMA data_version` plus an unreferenced one-second check makes reload delivery durable. Delivery state is transport bookkeeping and never gates resume.
 
@@ -44,15 +44,15 @@ Supported rootful Docker environments use a local-driver OverlayFS view with one
 
 ## Merge testing and application
 
-`worker_merge_test` accepts 1–16 trusted `candidateId` values, target repositories/branch refs, merge or squash methods, commit messages, and a candidate-ID dependency DAG. It resolves exact commits and creates ordinary isolated prepared repositories containing target and candidate history. Ready repositories contain exact commits; conflicts retain ordinary Git index/worktree state.
+`worker_merge_test` accepts 1–16 request-local IDs, local candidate repositories and optional exact refs (default `HEAD`), target repositories/branch refs, merge or squash methods, commit messages, and a request-local dependency DAG. It resolves exact commits and creates ordinary isolated prepared repositories containing target and candidate history. Ready repositories contain exact commits; conflicts retain ordinary Git index/worktree state.
 
-The tool never mutates targets. Historical managed-worker candidates are allowed and produce provenance warnings. Every call creates a new `preparedId`. Any target movement requires a fresh test. A complete conflicted set can be atomically moved into one integration worker workspace, consuming that prepared set.
+The tool never mutates targets. Managed and historical candidates are discovered by path and exact commit and produce advisory provenance warnings; arbitrary local Git candidates and parent-resolved prepared repositories are also accepted. Every call creates a new `preparedId`. Any target movement requires a fresh test. A complete conflicted set can be atomically moved into one integration worker workspace, consuming that prepared set.
 
 Prepared-set lifecycle and repository records in the SQLite registry are authoritative. `prepared.json` is a rendered inspection/context artifact only; integration and apply never trust worker-writable copies as authority.
 
 After parent review and validation, `worker_merge_apply({preparedId})` globally preflights every exact clean target. It then applies dependency order using `git merge --ff-only` for checked-out refs or compare-and-swap `git update-ref --no-deref` otherwise. Earlier updates remain after a later operational failure; retrying the same prepared ID skips exact already-applied commits.
 
-Trusted Git disables hooks, signing, credentials, global/system configuration, replace/graft overlays, and hostile merge configuration; linked worktrees, per-worktree configuration, nested Git metadata, and gitlinks/submodules are rejected. Application performs no model call, conflict resolution, testing, push, release, grounding, or Beads mutation.
+Trusted Git disables hooks, signing, credentials, global/system configuration, replace/graft overlays, and hostile merge configuration; linked candidate worktrees, per-worktree configuration, and gitlinks/submodules are rejected. Ignored or untracked nested repositories are inert and do not invalidate an authoritative target; active target refs checked out in another worktree are updated through that exact clean worktree. Application performs no model call, conflict resolution, testing, push, release, grounding, or Beads mutation.
 
 ## Cancellation and retention
 

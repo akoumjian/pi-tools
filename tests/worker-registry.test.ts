@@ -199,3 +199,16 @@ function awaitableClaim(registry: ReturnType<typeof openWorkerRegistry>, workerI
   const result = registry.database.prepare("UPDATE runs SET claim_kind='launch',claim_nonce=? WHERE worker_id=? AND run_id=? AND claim_kind IS NULL").run(nonce, workerId, runId);
   return Number(result.changes) === 1;
 }
+
+test("registry migrates known schema versions without source-text fingerprint gating", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "pi-worker-registry-migration-"));
+  try {
+    const first = openWorkerRegistry(root);
+    first.database.prepare("UPDATE registry_meta SET value='2' WHERE key='schema_version'").run();
+    first.database.prepare("UPDATE registry_meta SET value='stale-source-fingerprint' WHERE key='schema_hash'").run();
+    first.close();
+    const migrated = openWorkerRegistry(root);
+    const version = migrated.database.prepare("SELECT value FROM registry_meta WHERE key='schema_version'").get() as { value: string };
+    assert.equal(version.value, "3"); migrated.close();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

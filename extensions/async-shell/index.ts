@@ -843,7 +843,7 @@ export async function cancelPersistedAsyncShellJobsForOwner(
     throw new Error(`Worker-owned async-shell process groups survived cancellation: ${survivors.map((job) => job.jobId).join(", ")}.`);
   }
   const endedAt = new Date().toISOString();
-  for (const job of owned) {
+  for (const job of candidates) {
     const updated: JobMeta = {
       ...job,
       status: "cancelled",
@@ -856,7 +856,33 @@ export async function cancelPersistedAsyncShellJobsForOwner(
     };
     writeFileSync(path.join(updated.logDir, "meta.json"), `${JSON.stringify(publicJob(updated), null, 2)}\n`);
   }
-  return owned.map((job) => ({ ...job, status: "cancelled", endedAt, notifyOnExit: false, completionNotified: true }));
+  return candidates.map((job) => ({ ...job, status: "cancelled", endedAt, notifyOnExit: false, completionNotified: true }));
+}
+
+
+export async function reconcileTerminatedPersistedAsyncShellJobsForOwner(
+  asyncJobRoot: string,
+  owner: AsyncShellJobOwner,
+  graceMs = 2_000
+): Promise<JobMeta[]> {
+  const jobsDirectory = path.join(path.resolve(asyncJobRoot), "jobs");
+  if (!existsSync(jobsDirectory)) return [];
+  const candidates = readdirSync(jobsDirectory, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && isValidAsyncJobId(entry.name))
+    .map((entry) => readMetaFile(path.join(jobsDirectory, entry.name, "meta.json"), jobsDirectory, entry.name))
+    .filter((job): job is JobMeta => job !== undefined && sameJobOwner(job.owner, owner))
+    .filter((job) => !isTerminal(job.status));
+  const unverifiable = candidates.filter((job) => !job.processToken);
+  if (unverifiable.length) throw new Error(`Worker-owned async-shell jobs lack ownership tokens: ${unverifiable.map((job) => job.jobId).join(", ")}.`);
+  await waitForPersistedJobGroups(candidates, graceMs);
+  const survivors = candidates.filter((job) => isAsyncJobExecutionAlive(job.pid, job.processToken));
+  if (survivors.length) throw new Error(`Worker-owned async-shell process groups remain alive after the worker boundary exited: ${survivors.map((job) => job.jobId).join(", ")}.`);
+  const endedAt = new Date().toISOString();
+  for (const job of candidates) {
+    const updated: JobMeta = { ...job, status: "cancelled", endedAt, durationMs: Date.parse(endedAt) - Date.parse(job.startedAt), notifyOnExit: false, completionNotified: true, outputBytes: asyncJobOutputBytes(job.stdoutLog, job.stderrLog) };
+    writeFileSync(path.join(updated.logDir, "meta.json"), `${JSON.stringify(publicJob(updated), null, 2)}\n`);
+  }
+  return candidates.map((job) => ({ ...job, status: "cancelled", endedAt, notifyOnExit: false, completionNotified: true }));
 }
 
 function signalPersistedJob(job: JobMeta, signal: NodeJS.Signals): void {

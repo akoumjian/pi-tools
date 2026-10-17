@@ -6,6 +6,7 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  realpathSync,
   rmSync,
   writeFileSync
 } from "node:fs";
@@ -163,7 +164,7 @@ export function registerParentCacheLineageCapture(
     const sessionFile = context.sessionManager.getSessionFile();
     const model = context.model;
     if (!sessionFile) return;
-    const resolvedSessionFile = path.resolve(sessionFile);
+    const resolvedSessionFile = canonicalLineagePath(sessionFile);
     holder.pendingHeadersBySessionFile.delete(resolvedSessionFile);
     holder.latestBySessionFile.delete(resolvedSessionFile);
     if (
@@ -200,7 +201,7 @@ export function registerParentCacheLineageCapture(
     const sessionFile = context.sessionManager.getSessionFile();
     const model = context.model;
     if (!sessionFile) return;
-    const resolvedSessionFile = path.resolve(sessionFile);
+    const resolvedSessionFile = canonicalLineagePath(sessionFile);
     const pending = holder.pendingHeadersBySessionFile.get(resolvedSessionFile);
     holder.pendingHeadersBySessionFile.delete(resolvedSessionFile);
     if (!pending && holder.latestFailureBySessionFile.get(resolvedSessionFile)?.generation === generation) return;
@@ -268,7 +269,7 @@ export function prepareWorkerCacheLineage(input: {
 }): WorkerCacheLineageRecord {
   const unsupportedReason = cacheLineageRouteReason(input.route);
   if (unsupportedReason) return freshLineage(unsupportedReason);
-  const resolvedParentSessionFile = path.resolve(input.parentSessionFile);
+  const resolvedParentSessionFile = canonicalLineagePath(input.parentSessionFile);
   const holder = captureHolder();
   const heldCapture = holder.latestBySessionFile.get(resolvedParentSessionFile);
   if (!heldCapture || heldCapture.generation !== holder.generation) {
@@ -1530,3 +1531,5 @@ function sha256(value: string | Uint8Array): string {
 function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+
+function canonicalLineagePath(value: string): string { try { return realpathSync(path.resolve(value)); } catch { return path.resolve(value); } }

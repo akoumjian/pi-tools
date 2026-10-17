@@ -2,18 +2,19 @@ import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import type { WorkerRepositoryResult } from "./registry.js";
-import { canonicalPathWithin, canonicalRepository, trustedGit } from "./trusted-git.js";
+import { canonicalPathWithin, canonicalRepository, createTrustedGitOperation, trustedGit, type TrustedGitOperation } from "./trusted-git.js";
 
 export type RepositorySnapshot = { path: string; commit: string; dirty: boolean };
 
 export function snapshotWorkerRepositories(workspaceRoot: string): RepositorySnapshot[] {
-  return discoverWorkerRepositories(workspaceRoot).map((item) => inspect(item.absolute, item.relative));
+  const operation = createTrustedGitOperation(); return discoverWorkerRepositories(workspaceRoot, operation).map((item) => inspect(item.absolute, item.relative, operation));
 }
 
 export function inventoryWorkerRepositories(input: {
   workspaceRoot: string; workerId: string; runId: string; reported: string[]; before?: RepositorySnapshot[];
 }): { repositories: WorkerRepositoryResult[]; errors: string[] } {
   const errors: string[] = [];
+  const operation = createTrustedGitOperation();
   const reported = new Set<string>();
   for (const value of input.reported) {
     try {
@@ -22,14 +23,14 @@ export function inventoryWorkerRepositories(input: {
     } catch (error) { errors.push(error instanceof Error ? error.message : String(error)); }
   }
   const before = new Map((input.before ?? []).map((item) => [item.path, item]));
-  const repositories = discoverWorkerRepositories(input.workspaceRoot).map(({ absolute, relative }): WorkerRepositoryResult => {
+  const repositories = discoverWorkerRepositories(input.workspaceRoot, operation).map(({ absolute, relative }): WorkerRepositoryResult => {
     const issues: string[] = [];
     let commit = ""; let dirty = true; let source: string | undefined;
     try {
-      const exact = canonicalRepository(absolute);
-      commit = trustedGit(exact, ["rev-parse", "HEAD"]).trim();
-      dirty = trustedGit(exact, ["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=all"]).trim() !== "";
-      try { source = trustedGit(exact, ["remote", "get-url", "origin"]).trim() || undefined; } catch {}
+      const exact = canonicalRepository(absolute, true, operation);
+      commit = trustedGit(exact, ["rev-parse", "HEAD"], { operation }).trim();
+      dirty = trustedGit(exact, ["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=all"], { operation }).trim() !== "";
+      try { source = trustedGit(exact, ["remote", "get-url", "origin"], { operation }).trim() || undefined; } catch {}
     } catch (error) { issues.push(error instanceof Error ? error.message.slice(0, 512) : String(error).slice(0, 512)); }
     const previous = before.get(relative);
     const changed = previous === undefined || previous.commit !== commit || previous.dirty !== dirty;
@@ -43,7 +44,7 @@ export function inventoryWorkerRepositories(input: {
   return { repositories, errors };
 }
 
-function discoverWorkerRepositories(workspaceRoot: string): Array<{ absolute: string; relative: string }> {
+export function discoverWorkerRepositories(workspaceRoot: string, operation: TrustedGitOperation = createTrustedGitOperation()): Array<{ absolute: string; relative: string }> {
   const root = realpathSync(workspaceRoot);
   if (!statSync(root).isDirectory() || lstatSync(root).isSymbolicLink()) return [];
   const found: Array<{ absolute: string; relative: string }> = []; const queue: Array<{ directory: string; depth: number }> = [{ directory: root, depth: 0 }];
@@ -52,7 +53,7 @@ function discoverWorkerRepositories(workspaceRoot: string): Array<{ absolute: st
     let entries; try { entries = readdirSync(current.directory, { withFileTypes: true }); } catch { continue; }
     if (current.depth > 0 && entries.some((entry) => entry.name === ".git" && !entry.isSymbolicLink())) {
       try {
-        const absolute = canonicalRepository(current.directory);
+        const absolute = canonicalRepository(current.directory, true, operation);
         canonicalPathWithin(root, absolute);
         found.push({ absolute, relative: path.relative(root, absolute).split(path.sep).join("/") });
       } catch {}
@@ -66,7 +67,26 @@ function discoverWorkerRepositories(workspaceRoot: string): Array<{ absolute: st
   return found.sort((a, b) => a.relative.localeCompare(b.relative));
 }
 
-function inspect(absolute: string, relative: string): RepositorySnapshot {
-  try { return { path: relative, commit: trustedGit(absolute, ["rev-parse", "HEAD"]).trim(), dirty: trustedGit(absolute, ["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=all"]).trim() !== "" }; }
+export function inspectInterruptedGitState(workspaceRoot: string): string[] {
+  const warnings: string[] = []; const operation = createTrustedGitOperation();
+  for (const repository of discoverWorkerRepositories(workspaceRoot, operation)) {
+    try {
+      const status = trustedGit(repository.absolute, ["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=all"], { operation }).trim();
+      const gitDir = trustedGit(repository.absolute, ["rev-parse", "--path-format=absolute", "--git-dir"], { operation }).trim();
+      const commonDir = trustedGit(repository.absolute, ["rev-parse", "--path-format=absolute", "--git-common-dir"], { operation }).trim();
+      const states = ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG", "rebase-apply", "rebase-merge"]
+        .filter((name) => existsSync(path.join(gitDir, name)));
+      const locks = [path.join(gitDir, "index.lock"), path.join(commonDir, "packed-refs.lock"), path.join(commonDir, "config.lock")]
+        .filter(existsSync).map((file) => path.basename(file));
+      if (status) warnings.push(`${repository.relative}: retained working tree or index changes require inspection.`);
+      if (states.length) warnings.push(`${repository.relative}: interrupted Git state is present (${states.join(", ")}).`);
+      if (locks.length) warnings.push(`${repository.relative}: retained Git lock files require ownership verification (${locks.join(", ")}).`);
+    } catch (error) { warnings.push(`${repository.relative}: interrupted Git state inspection failed: ${error instanceof Error ? error.message.slice(0, 256) : String(error).slice(0, 256)}`); }
+  }
+  return warnings.slice(0, 64);
+}
+
+function inspect(absolute: string, relative: string, operation: TrustedGitOperation): RepositorySnapshot {
+  try { return { path: relative, commit: trustedGit(absolute, ["rev-parse", "HEAD"], { operation }).trim(), dirty: trustedGit(absolute, ["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=all"], { operation }).trim() !== "" }; }
   catch { return { path: relative, commit: "unknown", dirty: true }; }
 }

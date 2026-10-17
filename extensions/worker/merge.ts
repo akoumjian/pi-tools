@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, 
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
-import { assertTrustedGitPolicy, canonicalRepository as trustedCanonicalRepository, runTrustedGit } from "./trusted-git.js";
+import { assertTrustedGitPolicy, canonicalRepository as trustedCanonicalRepository, createTrustedGitOperation, runTrustedGit, type TrustedGitOperation } from "./trusted-git.js";
 
 export type WorkerMergeMethod = "merge" | "squash";
 export type WorkerMergeTestRepositoryInput = {
@@ -66,7 +66,8 @@ export function defaultPreparedMergeRoot(home = homedir()): string {
 }
 
 export function prepareWorkerMerges(parentSessionFile: string, inputs: WorkerMergeTestRepositoryInput[], options: MergeRuntimeOptions = {}): PreparedMergeSet {
-  const normalized = validateMergeInputs(inputs, options.targetRoot ?? path.join(homedir(), "Code"));
+  const operation = createTrustedGitOperation();
+  const normalized = validateMergeInputs(inputs, options.targetRoot ?? path.join(homedir(), "Code"), operation);
   const order = topologicalOrder(normalized);
   const preparedId = `prepared_${(options.randomHex?.() ?? randomBytes(12).toString("hex")).slice(0, 24)}`;
   const root = path.resolve(options.preparedRoot ?? defaultPreparedMergeRoot());
@@ -77,7 +78,7 @@ export function prepareWorkerMerges(parentSessionFile: string, inputs: WorkerMer
   try {
     for (const id of order) {
       const input = normalized.find((item) => item.id === id)!;
-      repositories.push(prepareOne(input, path.join(setRoot, id), options.sourceForCandidate));
+      repositories.push(prepareOne(input, path.join(setRoot, id), options.sourceForCandidate, operation));
     }
     const resolutionCases = repositories.filter((item) => item.status === "resolution_required").map((item) => ({ id: item.id, summary: `${item.overlapCount} unmerged path${item.overlapCount === 1 ? "" : "s"} require resolution.` }));
     const result: PreparedMergeSet = {
@@ -140,11 +141,13 @@ export function restoreConsumedPreparedMergeSet(parentSessionFile: string, prepa
 export function applyPreparedWorkerMerges(parentSessionFile: string, preparedId: string, options: MergeRuntimeOptions = {}): WorkerMergeApplyResult {
   const set = readPreparedMergeSet(parentSessionFile, preparedId, options);
   if (!["ready", "partial", "failed"].includes(set.status)) throw new Error(`Prepared set ${preparedId} is not ready.`);
+  const operation = createTrustedGitOperation();
   const byId = new Map(set.repositories.map((item) => [item.id, item]));
   const ordered = set.order.map((id) => byId.get(id)!);
   for (const repository of ordered) {
     if (!repository.desiredCommit) throw new Error(`Prepared repository ${repository.id} has no desired commit.`);
-    assertTargetClean(repository.targetRepo);
+    assertTrustedGitPolicy(repository.targetRepo, operation);
+    assertTargetClean(targetCheckoutPath(repository.targetRepo, repository.targetRef) ?? repository.targetRepo);
     const current = git(repository.targetRepo, ["rev-parse", repository.targetRef]);
     if (current !== repository.expectedCommit && current !== repository.desiredCommit) {
       throw new Error(`Target ${repository.id} moved from ${repository.expectedCommit} to ${current}; run worker_merge_test again.`);
@@ -162,8 +165,8 @@ export function applyPreparedWorkerMerges(parentSessionFile: string, preparedId:
       const current = git(repository.targetRepo, ["rev-parse", repository.targetRef]);
       if (current !== repository.desiredCommit) {
         git(repository.targetRepo, ["fetch", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", repository.preparedPath, repository.desiredCommit!]);
-        const checkedOut = currentBranchRef(repository.targetRepo) === repository.targetRef;
-        if (checkedOut) git(repository.targetRepo, ["-c", `branch.${repository.targetRef.slice("refs/heads/".length)}.mergeOptions=`, "merge", "--ff-only", repository.desiredCommit!]);
+        const checkout = targetCheckoutPath(repository.targetRepo, repository.targetRef);
+        if (checkout) git(checkout, ["-c", `branch.${repository.targetRef.slice("refs/heads/".length)}.mergeOptions=`, "merge", "--ff-only", repository.desiredCommit!]);
         else git(repository.targetRepo, ["update-ref", "--no-deref", repository.targetRef, repository.desiredCommit!, repository.expectedCommit]);
       }
       output.status = "applied";
@@ -178,9 +181,9 @@ export function applyPreparedWorkerMerges(parentSessionFile: string, preparedId:
   return { preparedId, status: "completed", repositories: results };
 }
 
-function prepareOne(input: Required<Pick<WorkerMergeTestRepositoryInput, "id" | "candidateRepo" | "candidateRef" | "targetRepo" | "targetRef" | "method" | "commitMessage">> & { dependsOn: string[] }, preparedPath: string, sourceResolver?: MergeRuntimeOptions["sourceForCandidate"]): PreparedMergeRepository {
+function prepareOne(input: Required<Pick<WorkerMergeTestRepositoryInput, "id" | "candidateRepo" | "candidateRef" | "targetRepo" | "targetRef" | "method" | "commitMessage">> & { dependsOn: string[] }, preparedPath: string, sourceResolver: MergeRuntimeOptions["sourceForCandidate"] | undefined, operation: TrustedGitOperation): PreparedMergeRepository {
   const branch = input.targetRef.slice("refs/heads/".length);
-  assertTrustedGitPolicy(input.targetRepo); assertTrustedGitPolicy(input.candidateRepo);
+  assertTrustedGitPolicy(input.targetRepo, operation); assertTrustedGitPolicy(input.candidateRepo, operation);
   runGit(["clone", "--no-local", "--no-tags", "--single-branch", "--branch", branch, input.targetRepo, preparedPath]);
   const expectedCommit = git(preparedPath, ["rev-parse", "HEAD"]);
   const targetPrivateRef = "refs/worker/target"; const candidatePrivateRef = "refs/worker/candidate";
@@ -196,21 +199,18 @@ function prepareOne(input: Required<Pick<WorkerMergeTestRepositoryInput, "id" | 
   const mergeBase = git(preparedPath, ["merge-base", targetPrivateRef, candidatePrivateRef]);
   let status: PreparedMergeRepository["status"] = "ready";
   let desiredCommit: string | undefined;
-  const targetIsAncestor = gitSucceeds(preparedPath, ["merge-base", "--is-ancestor", targetPrivateRef, candidatePrivateRef]);
-  if (input.method === "merge" && targetIsAncestor) {
-    desiredCommit = candidateCommit;
-    git(preparedPath, ["checkout", "--detach", candidatePrivateRef]);
-  } else {
+  const identity = commitIdentity(preparedPath, expectedCommit);
+  {
     try {
-      if (input.method === "merge") runGitIn(preparedPath, ["-c", "user.name=Managed Worker", "-c", "user.email=worker@localhost", "merge", "--no-edit", "--no-ff", "--no-commit", candidatePrivateRef]);
-      else runGitIn(preparedPath, ["-c", "user.name=Managed Worker", "-c", "user.email=worker@localhost", "merge", "--squash", candidatePrivateRef]);
+      if (input.method === "merge") runGitIn(preparedPath, ["-c", `user.name=${identity.name}`, "-c", `user.email=${identity.email}`, "merge", "--no-edit", "--no-ff", "--no-commit", candidatePrivateRef]);
+      else runGitIn(preparedPath, ["-c", `user.name=${identity.name}`, "-c", `user.email=${identity.email}`, "merge", "--squash", candidatePrivateRef]);
     } catch {
       if (unmergedCount(preparedPath) === 0) throw new Error(`Git ${input.method} failed for ${input.id} without conflict state.`);
       status = "resolution_required";
     }
     if (status === "ready") {
       if (hasIndexChanges(preparedPath)) {
-        runGitIn(preparedPath, ["-c", "user.name=Managed Worker", "-c", "user.email=worker@localhost", "commit", "--no-verify", "-m", input.commitMessage]);
+        runGitIn(preparedPath, ["-c", `user.name=${identity.name}`, "-c", `user.email=${identity.email}`, "commit", "--no-verify", "-m", input.commitMessage]);
         desiredCommit = git(preparedPath, ["rev-parse", "HEAD"]);
       } else desiredCommit = expectedCommit;
     }
@@ -226,7 +226,7 @@ function prepareOne(input: Required<Pick<WorkerMergeTestRepositoryInput, "id" | 
     ...(provenance.source ? { source: provenance.source } : {}), ...(provenance.warnings?.length ? { warnings: provenance.warnings } : {})
   };
 }
-function validateMergeInputs(inputs: WorkerMergeTestRepositoryInput[], targetRoot: string) {
+function validateMergeInputs(inputs: WorkerMergeTestRepositoryInput[], targetRoot: string, operation: TrustedGitOperation) {
   if (inputs.length < 1 || inputs.length > 16) throw new Error("worker_merge_test requires 1 to 16 repositories.");
   const ids = new Set<string>();
   const targets = new Set<string>();
@@ -238,8 +238,8 @@ function validateMergeInputs(inputs: WorkerMergeTestRepositoryInput[], targetRoo
     if (!item.commitMessage || item.commitMessage.includes("\0") || Buffer.byteLength(item.commitMessage) > 16 * 1024) throw new Error(`Invalid commitMessage for ${item.id}.`);
     const dependsOn = item.dependsOn ?? [];
     if (new Set(dependsOn).size !== dependsOn.length) throw new Error(`Duplicate dependency for ${item.id}.`);
-    const candidateRepo = canonicalRepository(item.candidateRepo, "candidateRepo", item.id);
-    const targetRepo = canonicalRepository(item.targetRepo, "targetRepo", item.id);
+    const candidateRepo = canonicalRepository(item.candidateRepo, "candidateRepo", item.id, operation);
+    const targetRepo = canonicalRepository(item.targetRepo, "targetRepo", item.id, operation);
     if (!strictlyWithin(root, targetRepo)) throw new Error(`Target repository ${targetRepo} is outside ${root}.`);
     const targetIdentity = realpathSync(git(targetRepo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]));
     if (targets.has(targetIdentity)) throw new Error(`Physical target repository is duplicated: ${targetRepo}.`);
@@ -273,15 +273,28 @@ function assertSafeGitTree(repo: string, commit: string, id: string, label: stri
     if (file.split("/").some((part) => part === ".git" || part === ".." || part === "")) throw new Error(`${label} tree for ${id} contains an unsafe path: ${file}.`);
   }
 }
-function canonicalRepository(value: string, field: string, id: string): string {
+function canonicalRepository(value: string, field: string, id: string, operation: TrustedGitOperation): string {
   if (!value || Buffer.byteLength(value) > 4096) throw new Error(`${field} for ${id} is invalid.`);
-  return trustedCanonicalRepository(value);
+  return trustedCanonicalRepository(value, true, operation);
 }
 function assertTargetClean(repo: string): void {
   if (git(repo, ["status", "--porcelain=v1", "--untracked-files=all"]) !== "") throw new Error(`Target repository is dirty: ${repo}.`);
 }
-function currentBranchRef(repo: string): string | undefined {
-  try { return `refs/heads/${git(repo, ["symbolic-ref", "--short", "HEAD"])}`; } catch { return undefined; }
+function targetCheckoutPath(repo: string, targetRef: string): string | undefined {
+  const records = runGit(["-C", repo, "worktree", "list", "--porcelain", "-z"]).split("\0");
+  let worktree: string | undefined;
+  for (const record of records) {
+    if (record.startsWith("worktree ")) worktree = record.slice("worktree ".length);
+    else if (record === `branch ${targetRef}` && worktree) return realpathSync(worktree);
+    else if (record === "") worktree = undefined;
+  }
+  return undefined;
+}
+function commitIdentity(repo: string, commit: string): { name: string; email: string } {
+  const value = runGit(["-C", repo, "show", "-s", "--format=%cn%x00%ce", commit]).trim();
+  const [name, email] = value.split("\0");
+  if (!name || !email || /[\r\n]/.test(name) || /[\r\n]/.test(email)) throw new Error("Target commit has no safe committer identity for prepared history.");
+  return { name, email };
 }
 function unmergedCount(repo: string): number { return git(repo, ["diff", "--name-only", "--diff-filter=U"]).split("\n").filter(Boolean).length; }
 function hasIndexChanges(repo: string): boolean {

@@ -7,7 +7,6 @@ import type { WorkerOutcome, WorkerRole } from "./registry.js";
 const TaskId = Type.String({ minLength: 1, maxLength: 128, pattern: "^personal-[a-zA-Z0-9]+(?:\\.[a-zA-Z0-9]+)*$" });
 const WorkerId = Type.String({ minLength: 30, maxLength: 128, pattern: WORKER_ID_PATTERN, description: "Worker identity returned by worker_run or worker_control list. It must belong to the current parent session." });
 const RunId = Type.String({ minLength: 1, maxLength: 128, pattern: "^run_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$", description: "Exact run identity returned by worker_run, worker_control runs, or a completion notification." });
-const CandidateId = Type.String({ pattern: "^candidate_[0-9a-f]{24}$", description: "Trusted repository candidate identity returned by worker_control get." });
 const PreparedId = Type.String({ pattern: "^prepared_[0-9a-f]{24}$", description: "Prepared repository-set identity returned by worker_merge_test." });
 const CompletionDelivery = Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("followUp")], { default: "steer", description: "When to deliver the asynchronous result. Use `steer` as soon as it is ready. Use `followUp` for lower-priority work that can wait until the current agent run would otherwise stop. Defaults to `steer`." }));
 const RepositoryBaseline = Type.Object({
@@ -77,25 +76,37 @@ export const WorkerControlParamsV2 = Type.Unsafe<Static<typeof WorkerControlStri
 });
 export type WorkerControlInputV2 = Static<typeof WorkerControlStrict>;
 
+const MergeRepositoryId = Type.String({ minLength: 1, maxLength: 64, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", description: "Request-local repository identity. Dependencies refer to these IDs." });
 const MergeRepository = Type.Object({
-  candidateId: CandidateId,
+  id: MergeRepositoryId,
+  candidateRepo: Type.String({ minLength: 1, maxLength: 4096, description: "Absolute local Git repository containing the candidate revision. Managed, historical, prepared, and other local candidates are accepted after exact Git validation." }),
+  candidateRef: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "Candidate Git revision to resolve exactly; defaults to HEAD." })),
   targetRepo: Type.String({ minLength: 1, maxLength: 4096, description: "Absolute authoritative local Git repository." }),
   targetRef: Type.String({ pattern: "^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,239}$", description: "Canonical target branch reference." }),
   method: Type.Union([Type.Literal("merge"), Type.Literal("squash")], { description: "Required preparation method." }),
   commitMessage: Type.String({ minLength: 1, maxLength: 16 * 1024, description: "Non-empty prepared commit message, at most 16 KiB UTF-8 and containing no NUL." }),
-  dependsOn: Type.Optional(Type.Array(CandidateId, { maxItems: 15, uniqueItems: true, description: "Unique candidate IDs selected by this call that must be prepared first." }))
+  dependsOn: Type.Optional(Type.Array(MergeRepositoryId, { maxItems: 15, uniqueItems: true, description: "Unique request-local repository IDs that must be prepared first." }))
 }, { additionalProperties: false });
 export const WorkerMergeTestParams = Type.Object({ repositories: Type.Array(MergeRepository, { minItems: 1, maxItems: 16, description: "Repository candidates and explicit targets to prepare as one logical set." }) }, { additionalProperties: false });
 export const WorkerMergeApplyParams = Type.Object({ preparedId: PreparedId }, { additionalProperties: false });
 
-const ResultOutcome = Type.Union([Type.Literal("completed"), Type.Literal("needs_input"), Type.Literal("blocked"), Type.Literal("approve"), Type.Literal("request_changes")], { description: "Why the current run is ending. Available values depend on the worker role." });
-export const WorkerResultSubmitParams = Type.Object({
-  outcome: ResultOutcome,
-  summary: Type.String({ minLength: 1, maxLength: 2048, description: "Concise account of the result, useful progress, remaining risk, or reason the work could not continue." }),
-  question: Type.Optional(Type.String({ minLength: 1, maxLength: 2048, description: "Specific question the parent must answer before work can continue. Required for needs_input and not allowed for other outcomes." })),
+const ResultSummary = Type.String({ minLength: 1, maxLength: 2048, description: "Concise account of the result, useful progress, remaining risk, or reason the work could not continue." });
+const ResultQuestion = Type.Optional(Type.String({ minLength: 1, maxLength: 2048, description: "Specific question the parent must answer before work can continue. Required for needs_input and not allowed for other outcomes." }));
+const ResultArtifacts = Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), { maxItems: 32, description: "Files or directories that are useful result entry points. Paths may be absolute within the worker workspace or relative to the workspace; the tool stores normalized relative paths." }));
+export const WorkerWorkResultSubmitParams = Type.Object({
+  outcome: Type.Union([Type.Literal("completed"), Type.Literal("needs_input"), Type.Literal("blocked")], { description: "Why this work or integration run is ending." }),
+  summary: ResultSummary,
+  question: ResultQuestion,
   repositories: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), { maxItems: 16, description: "Git repository directories produced or changed by the worker. Paths may be absolute within the worker workspace or relative to the workspace; the tool stores normalized relative paths." })),
-  artifacts: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), { maxItems: 32, description: "Files or directories that are useful result entry points. Paths may be absolute within the worker workspace or relative to the workspace; the tool stores normalized relative paths." }))
+  artifacts: ResultArtifacts
 }, { additionalProperties: false });
+export const WorkerReviewResultSubmitParams = Type.Object({
+  outcome: Type.Union([Type.Literal("approve"), Type.Literal("request_changes"), Type.Literal("needs_input"), Type.Literal("blocked")], { description: "Why this review run is ending." }),
+  summary: ResultSummary,
+  question: ResultQuestion,
+  artifacts: ResultArtifacts
+}, { additionalProperties: false });
+export const WorkerResultSubmitParams = Type.Union([WorkerWorkResultSubmitParams, WorkerReviewResultSubmitParams]);
 export type WorkerResultSubmitInput = Static<typeof WorkerResultSubmitParams>;
 
 const BeadsAssigned = Type.Object({ action: Type.Literal("assigned", { description: "Read this worker’s assigned tasks." }), offset: Type.Optional(Type.Integer({ minimum: 0, maximum: 31, default: 0, description: "Zero-based offset into assigned task IDs." })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 4, default: 4, description: "Maximum tasks to return; defaults to four and cannot exceed four." })) }, { additionalProperties: false });
@@ -117,7 +128,7 @@ export const WorkerBeadsTasksReadParams = Type.Unsafe<Static<typeof WorkerBeadsT
 export const WorkerBeadsTasksParams = Type.Unsafe<Static<typeof WorkerBeadsTasksStrict>>({ ...WorkerBeadsTasksStrict, type: "object", required: ["action"], additionalProperties: false, properties: BeadsProviderProperties });
 
 export type ValidatedWorkerResult = { outcome: WorkerOutcome; summary: string; question?: string; repositories: string[]; artifacts: string[] };
-export type ResultPathErrorCode = "invalid_outcome" | "invalid_summary" | "question_required" | "question_not_allowed" | "path_not_found" | "path_outside_workspace" | "unsupported_path_type" | "not_repository" | "duplicate_path" | "artifact_required";
+export type ResultPathErrorCode = "invalid_outcome" | "invalid_summary" | "question_required" | "question_not_allowed" | "path_not_found" | "path_outside_workspace" | "unsupported_path_type" | "not_repository" | "duplicate_path" | "artifact_required" | "run_not_quiescent" | "authorization_revoked" | "operational_failure";
 export class WorkerResultValidationError extends Error { constructor(readonly code: ResultPathErrorCode, readonly fieldPath: string, message: string) { super(message); } }
 
 export function validateWorkerResultInput(role: WorkerRole, input: WorkerResultSubmitInput): Omit<ValidatedWorkerResult, "repositories" | "artifacts"> {
@@ -129,7 +140,7 @@ export function validateWorkerResultInput(role: WorkerRole, input: WorkerResultS
   if (question !== undefined && Buffer.byteLength(question) > 2048) throw new WorkerResultValidationError("question_required", "question", "question must be at most 2048 UTF-8 bytes.");
   if (input.outcome === "needs_input" && !question) throw new WorkerResultValidationError("question_required", "question", "needs_input requires one focused question.");
   if (input.outcome !== "needs_input" && question !== undefined) throw new WorkerResultValidationError("question_not_allowed", "question", "question is allowed only for needs_input.");
-  if (role === "review" && input.repositories !== undefined) throw new WorkerResultValidationError("invalid_outcome", "repositories", "Review workers cannot report repositories.");
+  if (role === "review" && "repositories" in input && input.repositories !== undefined) throw new WorkerResultValidationError("invalid_outcome", "repositories", "Review workers cannot report repositories.");
   if (role === "review" && (input.outcome === "approve" || input.outcome === "request_changes") && (input.artifacts?.length ?? 0) === 0) throw new WorkerResultValidationError("artifact_required", "artifacts", `${input.outcome} requires at least one detailed review artifact.`);
   return { outcome: input.outcome, summary, ...(question ? { question } : {}) };
 }

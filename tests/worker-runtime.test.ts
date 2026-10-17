@@ -22,7 +22,7 @@ async function fixture(role: "work" | "review" | "integration", run: (root: stri
     PI_WORKER_TASK_IDS: JSON.stringify(["personal-test"]), PI_WORKER_AUTHORIZATION_FILE: path.join(root, "state", "host-authorization.json"),
     PI_WORKER_PROCESS_NONCE: "test-nonce", PI_WORKER_PARENT_PID: String(process.pid)
   };
-  await writeFile(values.PI_WORKER_AUTHORIZATION_FILE!, JSON.stringify({ version: 1, workerId: values.PI_WORKER_ID, runId: values.PI_WORKER_RUN_ID, parentPid: process.pid, processNonce: values.PI_WORKER_PROCESS_NONCE }));
+  await writeFile(values.PI_WORKER_AUTHORIZATION_FILE!, JSON.stringify({ version: 1, workerId: values.PI_WORKER_ID, runId: values.PI_WORKER_RUN_ID, processNonce: values.PI_WORKER_PROCESS_NONCE }));
   const old = new Map(Object.keys(values).map((key) => [key, process.env[key]])); Object.assign(process.env, values);
   try { const api = fakeApi(); workerRuntimeExtension(api); await run(root, api); }
   finally { for (const [key, value] of old) value === undefined ? delete process.env[key] : process.env[key] = value; await rm(root, { recursive: true, force: true }); }
@@ -47,6 +47,17 @@ test("work result submission validates and persists normalized repository and ar
   });
 });
 
+
+test("durable authorization remains valid after the creating parent PID is gone", async () => {
+  await fixture("work", async (root, api) => {
+    const authorization = path.join(root, "state", "host-authorization.json");
+    const value = JSON.parse(await readFile(authorization, "utf8")); await writeFile(authorization, JSON.stringify({ ...value, parentPid: 2_147_000_000 }));
+    const tool = api.tools.find((candidate) => candidate.name === "worker_result_submit")!;
+    const result = await tool.execute!("call", { outcome: "completed", summary: "Detached host settled." }, undefined, undefined, undefined as never);
+    assert.equal((result.details as { status: string }).status, "accepted");
+  });
+});
+
 test("review decisions require a retained report and cannot report repositories", async () => {
   await fixture("review", async (root, api) => {
     const tool = api.tools.find((candidate) => candidate.name === "worker_result_submit")!;
@@ -62,7 +73,7 @@ test("worker RPC arguments use plain role instructions rather than injected skil
   const config = {
     version: 1, workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_aaaaaaaa", sessionId: "session", sessionFile: "/tmp/session.jsonl", sessionDir: "/tmp",
     workspaceRoot: "/tmp/workspace", stateRoot: "/tmp/state", asyncJobRoot: "/tmp/jobs", taskIds: ["personal-test"], role: "work", resultFile: "/tmp/result", settledFile: "/tmp/settled",
-    processFile: "/tmp/process", processNonce: "nonce", hostConfigFile: "/tmp/host", authorizationFile: "/tmp/auth", parentPid: process.pid, prompt: "prompt",
+    processFile: "/tmp/process", processNonce: "nonce", hostConfigFile: "/tmp/host", authorizationFile: "/tmp/auth", prompt: "prompt",
     provider: "openai-codex", model: "gpt", thinkingLevel: "xhigh", piCliPath: "/bin/pi", bdPath: "/bin/bd", beadsRoute: { prefix: "personal", path: "/beads", databasePath: "/beads/db" },
     extensionPaths: ["/worker/runtime.js"], shellExecution: { kind: "native-test" }, rpcArgs: []
   } satisfies WorkerHostConfig;

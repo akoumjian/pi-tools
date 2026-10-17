@@ -41,11 +41,11 @@ Use review instructions only for emphasis, questions, acceptance criteria, or fo
 
 After review and parent acceptance:
 
-1. Read eligible repository candidate IDs from `worker_control get`.
+1. Read each accepted repository path and exact commit from `worker_control get`; choose a request-local ID for each repository.
 2. Group only repositories that must move together.
-3. Call `worker_merge_test` with explicit targets, methods, commit messages, and dependencies.
+3. Call `worker_merge_test` with each local `candidateRepo`, exact `candidateRef`, explicit target, method, commit message, and request-local dependencies.
 4. If conflicts are reported:
-   - resolve them directly in the prepared repositories and have merge testing revalidate the result; or
+   - resolve and commit them directly in the prepared repositories, then call merge testing again with each resolved `preparedPath` as `candidateRepo`; or
    - start an integration worker, review its completed result, and test the complete repository set again.
 5. When the complete set is `ready`, inspect every final diff and run the required checks from each `preparedPath`.
 6. Call `worker_merge_apply` only after every prepared repository passes validation.

@@ -28,7 +28,7 @@ test("additional inputs reject sensitive roots, aliases, duplicates, and overlap
     const more = path.join(root, "more.txt"); writeFileSync(more, "more"); const resumed = validateAdditionalInputs({ values: [more], existing: retained, role: "integration", workspaceRoot: workspace, runtimeRoot: runtime }); assert.deepEqual(resumed.map((item) => item.target), ["/integration/inputs/01-a.txt", "/integration/inputs/02-more.txt"]);
   } finally { rmSync(root, { recursive: true, force: true }); } });
 
-test("trusted Git rejects linked worktrees, nested repositories, gitlinks, and worktree configuration", () => {
+test("trusted Git rejects linked candidate worktrees and gitlinks while accepting inert nested content", () => {
   const root = mkdtempSync(path.join(tmpdir(), "trusted-git-structure-"));
   try {
     const worktreeSource = repository(path.join(root, "worktree-source"));
@@ -40,9 +40,12 @@ test("trusted Git rejects linked worktrees, nested repositories, gitlinks, and w
     execFileSync("git", ["-C", configured, "config", "extensions.worktreeConfig", "true"]);
     assert.throws(() => assertTrustedGitPolicy(configured), /extensions.worktreeconfig/);
 
+    assert.doesNotThrow(() => assertTrustedGitPolicy(worktreeSource));
     const outer = repository(path.join(root, "outer"));
-    repository(path.join(outer, "vendor"));
-    assert.throws(() => assertTrustedGitPolicy(outer), /nested Git metadata/);
+    const ignored = path.join(outer, "ignored"); repository(path.join(ignored, "vendor"));
+    writeFileSync(path.join(outer, ".gitignore"), "ignored/\nlarge/\n");
+    const large = path.join(outer, "large"); mkdirSync(large); for (let index = 0; index < 2_000; index += 1) writeFileSync(path.join(large, `entry-${index}`), "x");
+    assert.doesNotThrow(() => assertTrustedGitPolicy(outer));
 
     const child = repository(path.join(root, "child"));
     const parent = repository(path.join(root, "parent"));

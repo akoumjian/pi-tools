@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { reconcileTerminatedPersistedAsyncShellJobsForOwner } from "../extensions/async-shell/index.js";
 import { readStrictWorkerJobMeta, workerJobIsSettled } from "../extensions/_shared/worker-job-settlement.js";
 
 async function withTempDir(run: (directory: string) => Promise<void>): Promise<void> {
@@ -74,5 +75,18 @@ test("shared worker job settlement validation is strict for admission and host s
     assert.equal(workerJobIsSettled(readStrictWorkerJobMeta(jobsDirectory, jobId)), false);
     await writeMeta(jobsDirectory, jobId, { ...base, status: "unknown" });
     assert.equal(workerJobIsSettled(readStrictWorkerJobMeta(jobsDirectory, jobId)), false);
+  });
+});
+
+
+test("persisted worker job reconciliation terminalizes records whose exact process is gone", async () => {
+  await withTempDir(async (directory) => {
+    const jobsDirectory = path.join(directory, "jobs"); const jobId = "job_20260922150000_stale01";
+    const meta = { ...validMeta(jobsDirectory, jobId), status: "running", endedAt: undefined, notifyOnExit: true, completionNotified: false };
+    await writeMeta(jobsDirectory, jobId, meta);
+    const reconciled = await reconcileTerminatedPersistedAsyncShellJobsForOwner(directory, { kind: "worker-run", workerId: "worker-test", runId: "run-test" }, 25);
+    assert.equal(reconciled[0]?.status, "cancelled");
+    const persisted = JSON.parse(await readFile(path.join(jobsDirectory, jobId, "meta.json"), "utf8"));
+    assert.equal(persisted.status, "cancelled"); assert.equal(persisted.completionNotified, true);
   });
 });

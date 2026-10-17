@@ -10,7 +10,7 @@ if (!configFile) throw new Error("Usage: worker-host.mjs <host-config.json>");
 const config = JSON.parse(readFileSync(configFile, "utf8"));
 if (config.version !== 1) throw new Error(`Unsupported worker host config version: ${config.version}`);
 if (!Array.isArray(config.rpcArgs) || config.rpcArgs.length === 0) throw new Error("Worker host config requires trusted RPC arguments.");
-if (typeof config.authorizationFile !== "string" || !path.isAbsolute(config.authorizationFile) || !Number.isInteger(config.parentPid)) {
+if (typeof config.authorizationFile !== "string" || !path.isAbsolute(config.authorizationFile)) {
   throw new Error("Worker host config requires exact launch authorization.");
 }
 if (config.shellExecution?.kind !== "docker" && config.shellExecution?.kind !== "native-test") {
@@ -43,9 +43,9 @@ const client = new RpcClient({
     PI_WORKER_TASK_IDS: JSON.stringify(config.taskIds),
     PI_WORKER_BD_PATH: config.bdPath,
     PI_WORKER_BEADS_ROUTE: JSON.stringify(config.beadsRoute),
+    ...(config.cacheLineage ? { PI_WORKER_CACHE_LINEAGE: JSON.stringify(config.cacheLineage) } : {}),
     PI_WORKER_AUTHORIZATION_FILE: config.authorizationFile,
     PI_WORKER_PROCESS_NONCE: config.processNonce,
-    PI_WORKER_PARENT_PID: String(config.parentPid),
     GIT_OPTIONAL_LOCKS: "0",
     ...(config.shellExecution.kind === "docker"
       ? {
@@ -137,21 +137,9 @@ function assertLaunchAuthorization() {
     value?.version !== 1 ||
     value.workerId !== config.workerId ||
     value.runId !== config.runId ||
-    value.parentPid !== config.parentPid ||
-    value.processNonce !== config.processNonce ||
-    !isProcessAlive(config.parentPid)
+    value.processNonce !== config.processNonce
   ) {
     throw new Error(`Worker host launch authorization is no longer valid for ${config.workerId}/${config.runId}.`);
-  }
-}
-
-function isProcessAlive(pid) {
-  if (!Number.isInteger(pid)) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
   }
 }
 

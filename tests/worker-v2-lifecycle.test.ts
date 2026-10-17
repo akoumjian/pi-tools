@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -18,19 +18,19 @@ const model = (provider: string, id: string) => ({ id, name: id, provider, api: 
 type Launch = { record: any; runtime: any; resolve(job: JobMeta): void; handle: ManagedAsyncJobHandle };
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
-async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolean } = {}) {
+async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolean; removeThrowsOnce?: boolean; deferContainer?: boolean } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "pi-worker-v2-lifecycle-"));
   const runtimeRoot = path.join(root, "runtime"); const workersRoot = path.join(runtimeRoot, "workers"); mkdirSync(workersRoot, { recursive: true });
   const session = SessionManager.create(root, path.join(root, "parent-session"), { id: `parent-${Date.now()}` }); writeFileSync(session.getSessionFile()!, `${JSON.stringify(session.getHeader())}\n`, { mode: 0o600 });
-  const tools: ToolDefinition[] = []; const handlers = new Map<string, Function[]>(); const messages: any[] = [];
+  const tools: ToolDefinition[] = []; const handlers = new Map<string, Function[]>(); const commands = new Map<string, any>(); const messages: any[] = []; const notifications: string[] = [];
   const launches: Launch[] = []; const created: string[] = []; const removed: string[] = []; const overlays: ReviewOverlayRecord[] = []; const cleaned: ReviewOverlayRecord[] = [];
-  let counter = 0; const random = () => `${(++counter).toString(16).padStart(8, "0")}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`;
-  const api = { registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, sendMessage(message: any) { messages.push(message); } } as unknown as ExtensionAPI;
-  const context = { cwd: root, hasUI: false, mode: "rpc", sessionManager: session, modelRegistry: { hasConfiguredAuth: () => true, getAll: () => [model("openai-codex", "gpt-5.6-sol"), model("anthropic", "claude-opus-5-5")] }, thinkingLevel: "xhigh", isIdle: () => true, hasPendingMessages: () => false, ui: { notify() {} } } as unknown as ExtensionContext;
+  let releaseContainer = () => {}; const containerGate = options.deferContainer ? new Promise<void>((resolve) => { releaseContainer = resolve; }) : undefined; let removeFailures = 0; let counter = 0; const random = () => `${(++counter).toString(16).padStart(8, "0")}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`;
+  const api = { registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand(name: string, command: any) { commands.set(name, command); }, registerMessageRenderer() {}, on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, sendMessage(message: any) { messages.push(message); } } as unknown as ExtensionAPI;
+  const context = { cwd: root, hasUI: false, mode: "rpc", sessionManager: session, modelRegistry: { hasConfiguredAuth: () => true, getAll: () => [model("openai-codex", "gpt-5.6-sol"), model("anthropic", "claude-opus-5-5")] }, thinkingLevel: "xhigh", isIdle: () => true, hasPendingMessages: () => false, ui: { notify(message: string) { notifications.push(message); } } } as unknown as ExtensionContext;
   registerWorkerExtension(api, {
     runtimeRoot, roots: { stateRoot: workersRoot, workspaceRoot: workersRoot }, codeRoot: root, preparedRoot: path.join(runtimeRoot, "prepared"), targetRoot: root, dockerPath: "/fake/docker", random, now: () => new Date(`2026-01-01T00:00:${String(counter).padStart(2, "0")}.000Z`),
     waitForHostIdentity: async () => {},
-    createContainer: (_docker, reference) => { created.push(reference.runId); return { ...reference, containerId: (++counter).toString(16).padStart(64, "0") }; }, removeContainer: (_docker, reference) => { removed.push(reference.runId); },
+    createContainer: async (_docker, reference) => { created.push(reference.runId); if (containerGate) await containerGate; return { ...reference, containerId: (++counter).toString(16).padStart(64, "0") }; }, removeContainer: (_docker, reference) => { removed.push(reference.runId); if (options.removeThrowsOnce && removeFailures++ === 0) throw new Error("transient container cleanup failure"); },
     createOverlay: (input) => { if (options.overlayThrows) throw new Error("overlay probe failure"); const value: ReviewOverlayRecord = { version: 2, mergedVolume: `merged-${input.workerId}-${input.runId}`, scratchVolume: `scratch-${input.workerId}-${input.runId}`, mounts: [
       { kind: "volume", source: `merged-${input.workerId}-${input.runId}`, target: "/review/subject" }, { kind: "bind", source: input.reviewerWorkspace, target: "/workspace" },
       { kind: "bind", source: input.contextFile, target: "/review/context.json", readOnly: true }, { kind: "bind", source: input.reviewedSessionFile, target: "/review/session.jsonl", readOnly: true },
@@ -41,9 +41,9 @@ async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolea
   });
   for (const handler of handlers.get("session_start") ?? []) await handler({}, context);
   const call = async (name: string, params: any) => { const tool = tools.find((candidate) => candidate.name === name)!; return tool.execute!("test", params, new AbortController().signal, undefined, context); };
-  const event = async (name: string) => { for (const handler of handlers.get(name) ?? []) await handler({}, context); };
   const registry = () => openWorkerRegistry(runtimeRoot);
-  return { root, runtimeRoot, workersRoot, session, tools, handlers, messages, launches, created, removed, overlays, cleaned, context, call, event, registry, async close() { try { await event("session_shutdown"); } catch {} rmSync(root, { recursive: true, force: true }); } };
+  const event = async (name: string) => { for (const handler of handlers.get(name) ?? []) await handler({}, context); if (name === "turn_end") await waitFor(() => { const db = registry(); const queued = Number((db.database.prepare("SELECT COUNT(*) AS count FROM runs WHERE status='queued'").get() as any).count); db.close(); return queued === 0; }); };
+  return { root, runtimeRoot, workersRoot, session, tools, handlers, commands, messages, notifications, launches, releaseContainer, created, removed, overlays, cleaned, context, call, event, registry, async close() { try { await event("session_shutdown"); } catch {} rmSync(root, { recursive: true, force: true }); } };
 }
 
 function job(jobId: string, status: JobMeta["status"], exitCode = status === "exited" ? 0 : undefined): JobMeta { return { jobId, command: "worker", cwd: "/tmp", status, durationMs: 1, exitCode, signal: null, notifyOnExit: false, completionNotified: true, logDir: "/tmp", stdoutLog: `/tmp/${jobId}.out`, stderrLog: `/tmp/${jobId}.err`, outputBytes: { stdout: 0, stderr: 0 } } as JobMeta; }
@@ -66,8 +66,34 @@ test("worker_run returns complete provider-visible identities and defers Docker 
     assert.equal(f.created.length, 0); assert.equal(f.launches.length, 0);
     const visible: any = JSON.parse((result.content[0] as any).text);
     assert.match(visible.runs[0].workerId, /^worker_/); assert.match(visible.runs[0].runId, /^run_/); assert.deepEqual(visible, result.details);
-    await f.event("turn_end"); assert.equal(f.created.length, 1); assert.equal(f.launches.length, 1);
+    writeFileSync(f.session.getSessionFile()!, `${JSON.stringify({ type: "message", id: "completed-parent-turn", parentId: null, timestamp: new Date().toISOString(), message: { role: "assistant", content: [{ type: "text", text: "PARENT_TURN_DURABLE" }] } })}\n`, { flag: "a" });
+    await f.event("turn_end"); assert.equal(f.created.length, 1); assert.equal(f.launches.length, 1); assert.equal(f.launches[0]!.record.cacheLineage?.mode, "fresh");
+    const db = f.registry(); const worker = getWorker(db, (visible as any).runs[0].workerId)!; assert.match(readFileSync(worker.sessionFile!, "utf8"), /PARENT_TURN_DURABLE/); db.close();
   } finally { await f.close(); }
+});
+
+
+test("turn_end returns without awaiting deferred container readiness", async () => {
+  const f = await fixture({ deferContainer: true }); try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "async launch" }] }));
+    const handler = f.handlers.get("turn_end")![0]!; const returned = handler({}, f.context); assert.equal(returned, undefined);
+    await waitFor(() => f.created.length === 1); assert.equal(f.launches.length, 0);
+    let db = f.registry(); assert.equal(getWorkerRun(db, started.workerId, started.runId)!.status, "queued"); db.close();
+    f.releaseContainer(); await waitFor(() => f.launches.length === 1); db = f.registry(); await waitFor(() => { const current = getWorkerRun(db, started.workerId, started.runId); return current?.status === "running"; }); db.close();
+    await f.call("worker_control", { action: "cancel", workerId: started.workerId });
+  } finally { f.releaseContainer(); await f.close(); }
+});
+
+
+test("cancellation waits for a deferred launch boundary before proving termination", async () => {
+  const f = await fixture({ deferContainer: true }); try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "cancel during readiness" }] }));
+    const handler = f.handlers.get("turn_end")![0]!; handler({}, f.context); await waitFor(() => f.created.length === 1);
+    let resolved = false; const cancelling = f.call("worker_control", { action: "cancel", workerId: started.workerId }).then((value) => { resolved = true; return value; });
+    await new Promise((resolve) => setTimeout(resolve, 20)); assert.equal(resolved, false); f.releaseContainer(); await cancelling;
+    const db = f.registry(); const worker = getWorker(db, started.workerId)!; const run = getWorkerRun(db, started.workerId, started.runId)!; db.close();
+    assert.equal(worker.status, "idle"); assert.equal(run.outcome, "cancelled"); assert.equal(f.launches.length, 0);
+  } finally { f.releaseContainer(); await f.close(); }
 });
 
 test("worker_control get content exposes complete settled candidates and artifact paths", async () => {
@@ -93,14 +119,14 @@ test("queued cancellation system-settles once, never launches, then discards wit
   } finally { await f.close(); }
 });
 
-test("cancelling an initial queued work run preserves its exact fork for resume", async () => {
+test("cancelling an initial queued work run defers its exact fork until a resumed turn", async () => {
   const f = await fixture(); try {
     const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "probe" }] }));
     await f.call("worker_control", { action: "cancel", workerId: started.workerId });
-    let db = f.registry(); const worker = getWorker(db, started.workerId)!; assert.ok(worker.sessionId); assert.ok(worker.sessionFile); const header = JSON.parse(readFileSync(worker.sessionFile!, "utf8").split("\n")[0]!); assert.equal(header.parentSession, path.resolve(f.session.getSessionFile()!)); db.close();
+    let db = f.registry(); let worker = getWorker(db, started.workerId)!; assert.equal(worker.sessionId, undefined); assert.equal(worker.sessionFile, undefined); db.close();
     const resumed = receipt(await f.call("worker_run", { runs: [{ action: "resume", workerId: started.workerId, instructions: "continue" }] }));
-    assert.equal(resumed.workerId, started.workerId); await f.call("worker_control", { action: "cancel", workerId: resumed.workerId });
-    db = f.registry(); assert.equal(getWorkerRun(db, resumed.workerId, resumed.runId)!.outcome, "cancelled"); db.close();
+    assert.equal(resumed.workerId, started.workerId); await f.event("turn_end"); db = f.registry(); worker = getWorker(db, resumed.workerId)!; const header = JSON.parse(readFileSync(worker.sessionFile!, "utf8").split("\n")[0]!); assert.equal(realpathSync(header.parentSession), realpathSync(f.session.getSessionFile()!)); db.close();
+    await f.call("worker_control", { action: "cancel", workerId: resumed.workerId }); db = f.registry(); assert.equal(getWorkerRun(db, resumed.workerId, resumed.runId)!.outcome, "cancelled"); db.close();
   } finally { await f.close(); }
 });
 
@@ -152,23 +178,24 @@ test("review starts fresh, mounts exact subject session range, cancellation rele
     const context = JSON.parse(readFileSync(runtime.contextFile, "utf8")); const subjectRun = getWorkerRun(db, subject.workerId, subject.runId)!; assert.deepEqual(context.session.range, { startLine: subjectRun.sessionStartLine, endLine: subjectRun.sessionEndLine }); assert.match(runtime.contextFile, new RegExp(review.runId)); db.close();
     await f.call("worker_control", { action: "cancel", workerId: review.workerId }); db = f.registry(); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, undefined); db.close();
     const resumed = receipt(await f.call("worker_run", { runs: [{ action: "resume", workerId: review.workerId, instructions: "continue" }] })); await f.event("turn_end"); db = f.registry(); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, review.workerId); const resumedRuntime = getWorkerRun(db, review.workerId, resumed.runId)!.runtime as any; assert.notEqual(resumedRuntime.overlay.mergedVolume, runtime.overlay.mergedVolume); assert.equal((getWorker(db, review.workerId)!.runtime?.inputs as any[]).length, 1); db.close();
+    await f.call("worker_control", { action: "cancel", workerId: review.workerId }); await f.call("worker_control", { action: "discard", workerId: review.workerId }); db = f.registry(); assert.equal(getWorker(db, review.workerId), undefined); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, undefined); db.close();
   } finally { await f.close(); }
 });
 
 
-test("historical candidate IDs remain usable when their exact commits stay reachable", async () => {
+test("historical managed commits remain usable through Git-native candidate inputs", async () => {
   const f = await fixture(); try {
     const first = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "candidate" }] })); await f.event("turn_end");
     let db = f.registry(); const workspace = getWorker(db, first.workerId)!.workspaceRoot; db.close(); const repo = path.join(workspace, "repos", "project"); gitInit(repo); writeFileSync(path.join(repo, "one.txt"), "one\n"); git(repo, "add", "."); git(repo, "commit", "-m", "one");
     await complete(f, first, { outcome: "completed", summary: "first", repositories: ["repos/project"] });
-    const firstGet: any = (await f.call("worker_control", { action: "get", workerId: first.workerId, runId: first.runId })).details; const candidateId = firstGet.repositories[0].candidateId;
+    const firstGet: any = (await f.call("worker_control", { action: "get", workerId: first.workerId, runId: first.runId })).details; const candidate = firstGet.repositories[0];
     const target = path.join(f.root, "targets", "historical"); mkdirSync(path.dirname(target), { recursive: true }); execFileSync("git", ["clone", "-q", "--no-hardlinks", repo, target]);
     const second = receipt(await f.call("worker_run", { runs: [{ action: "resume", workerId: first.workerId, instructions: "newer candidate" }] })); await f.event("turn_end"); writeFileSync(path.join(repo, "two.txt"), "two\n"); git(repo, "add", "."); git(repo, "commit", "-m", "two"); await complete(f, second, { outcome: "completed", summary: "second", repositories: ["repos/project"] });
     await assert.rejects(f.call("worker_run", { runs: [{ action: "start", role: "review", reviewedRunId: first.runId }] }), /latest completed run/);
-    const merged = await f.call("worker_merge_test", { repositories: [{ candidateId, targetRepo: target, targetRef: "refs/heads/main", method: "merge", commitMessage: "historical" }] }); const visible: any = JSON.parse((merged.content[0] as any).text);
+    const merged = await f.call("worker_merge_test", { repositories: [{ id: "historical", candidateRepo: path.join(workspace, candidate.path), candidateRef: candidate.commit, targetRepo: target, targetRef: "refs/heads/main", method: "merge", commitMessage: "historical" }] }); const visible: any = JSON.parse((merged.content[0] as any).text);
     assert.match(visible.repositories[0].warnings.join(" "), /historical run/); assert.equal(visible.repositories[0].source.runId, first.runId);
     writeFileSync(path.join(f.runtimeRoot, "prepared", visible.preparedId, "prepared.json"), JSON.stringify({ version: 1, preparedId: visible.preparedId, parentSessionFile: "/tampered", status: "resolution_required", order: [], repositories: [] }));
-    const applied = await f.call("worker_merge_apply", { preparedId: visible.preparedId }); const applyVisible: any = JSON.parse((applied.content[0] as any).text); assert.equal(applyVisible.status, "completed"); assert.equal(applyVisible.repositories[0].id, candidateId);
+    const applied = await f.call("worker_merge_apply", { preparedId: visible.preparedId }); const applyVisible: any = JSON.parse((applied.content[0] as any).text); assert.equal(applyVisible.status, "completed"); assert.equal(applyVisible.repositories[0].id, "historical");
   } finally { await f.close(); }
 });
 
@@ -203,6 +230,43 @@ test("integration starts in a fresh session, receives full conflict context, and
     const extra = path.join(f.root, "extra.txt"); writeFileSync(extra, "extra\n"); const resumed = receipt(await f.call("worker_run", { runs: [{ action: "resume", workerId: started.workerId, instructions: "continue", additionalInputs: [extra] }] }));
     db = f.registry(); worker = getWorker(db, resumed.workerId)!; run = getWorkerRun(db, resumed.workerId, resumed.runId)!; runtime = run.runtime as any; const updated = JSON.parse(readFileSync(runtime.contextFile, "utf8"));
     assert.equal(updated.additionalInputs.length, 2); assert.equal(existsSync(movedRepo), true); assert.equal(runtime.container.mounts.some((mount: any) => mount.target === "/integration/context.json"), true); assert.equal((worker.runtime?.inputs as any[]).length, 2); db.close();
+    await f.call("worker_control", { action: "cancel", workerId: resumed.workerId }); await f.call("worker_control", { action: "discard", workerId: resumed.workerId }); db = f.registry(); assert.equal(getWorker(db, resumed.workerId), undefined); const retainedPrepared = db.database.prepare("SELECT prepared_id FROM prepared_sets WHERE prepared_id=?").get(prepared.preparedId); assert.equal(retainedPrepared, undefined); db.close();
+  } finally { await f.close(); }
+});
+
+
+test("completion notification uses only the approved compact settlement grammar", async () => {
+  const f = await fixture(); try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "settle" }] })); await f.event("turn_end"); await complete(f, started);
+    const message = [...f.messages].reverse().find((value: any) => value.details?.event === "worker_settled"); assert.ok(message);
+    const visible = JSON.parse(message.content); assert.deepEqual(Object.keys(visible).sort(), ["artifactCount", "event", "outcome", "outcomeSource", "repositoryCount", "role", "runId", "summary", "workerId"].sort());
+    assert.equal(visible.workspaceRoot, undefined); assert.equal(visible.repositories, undefined); assert.equal(visible.stdoutLog, undefined);
+  } finally { await f.close(); }
+});
+
+test("attached running cancellation uses the exact lifecycle claim and returns the worker idle", async () => {
+  const f = await fixture(); try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "run" }] })); await f.event("turn_end");
+    const cancelled = await f.call("worker_control", { action: "cancel", workerId: started.workerId }); assert.equal((cancelled.details as any).cancellation, "cancelled");
+    const db = f.registry(); assert.equal(getWorker(db, started.workerId)!.status, "idle"); assert.equal(getWorkerRun(db, started.workerId, started.runId)!.outcome, "cancelled"); db.close();
+  } finally { await f.close(); }
+});
+
+test("verified accepted result settlement retries after transient cleanup recovery", async () => {
+  const f = await fixture({ removeThrowsOnce: true }); try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "settle" }] })); await f.event("turn_end"); await complete(f, started);
+    const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; assert.equal(run.outcome, "completed"); assert.equal(run.outcomeSource, "worker"); assert.equal(getWorker(db, started.workerId)!.recoveryError, undefined); db.close(); assert.equal(f.removed.length >= 2, true);
+  } finally { await f.close(); }
+});
+
+
+test("worker commands exercise compact list/show and exact cancel/discard lifecycle paths", async () => {
+  const f = await fixture(); try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "command probe" }] }));
+    await f.commands.get("worker:list").handler("", f.context); assert.match(f.notifications.at(-1)!, /queued · work/); assert.doesNotMatch(f.notifications.at(-1)!, /^\{/);
+    await f.commands.get("worker:show").handler(`${started.workerId} ${started.runId}`, f.context); assert.match(f.notifications.at(-1)!, new RegExp(started.runId));
+    await f.commands.get("worker:cancel").handler(started.workerId, f.context); assert.match(f.notifications.at(-1)!, /Cancelled/);
+    await f.commands.get("worker:discard").handler(`${started.workerId} --confirm`, f.context); assert.match(f.notifications.at(-1)!, /Discarded/);
   } finally { await f.close(); }
 });
 

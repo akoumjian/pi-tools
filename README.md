@@ -11,7 +11,7 @@ Reusable extensions for the [Pi coding agent](https://pi.dev/). The package focu
 - provider-safe resend of the current context after any failure or cancellation via `/retry`, plus bounded automatic retry of outage-class errors Pi core does not classify
 - provider-free active-context clipboard snapshots via `/context:copy`
 - robust chunked context compaction via `/compacter`
-- durable Docker-confined managed workers with exact-session lifecycle and deterministic fold preparation
+- durable Docker-confined managed workers with exact-session lifecycle and deterministic merge preparation
 - TUI niceties: tmux/scrollback compatibility, theme preview, compact tool renderers, file-reference picker
 
 Profile-specific assets (personal AGENTS context, auth, model defaults, themes) live in a separate consumer package or local Pi profile, not in this repository.
@@ -59,7 +59,6 @@ Tools (LLM-callable):
 
 - `shell_start`, `shell_status`, `shell_read`, `shell_cancel` — async shell jobs
 - `worker_run` — start or exactly resume durable private-workspace Pi workers
-- `worker_control` — list/status exact-session workers, retrieve and acknowledge typed results, cancel runs, or discard settled workers
 - `worker_control` — list workers/runs, inspect exact results, cancel active work, or discard retained workers
 - `worker_merge_test` — prepare exact isolated merge/squash results or ordinary conflict state
 - `worker_merge_apply` — apply one reviewed and validated ready prepared set to exact local targets
@@ -74,7 +73,7 @@ Commands:
 - `/scrollback:status`, `/tmux-scrollback:status`
 - `/safety:setup`, `/safety:status`, `/safety:model`, `/safety:toggle`
 - `/async:status`, `/async:view [job-id] [--stream both|stdout|stderr] [--tail 1..500] [--follow]`
-- `/worker:status <worker-id>`, `/worker:view <worker-id> [...]`, `/worker:ack <worker-id>`, `/worker:cancel <worker-id>`, `/worker:discard <worker-id> --confirm`
+- `/worker:list [status] [role]`, `/worker:show <worker-id> [run-id]`, `/worker:logs <worker-id> [run-id] [...]`, `/worker:cancel <worker-id>`, `/worker:discard <worker-id> --confirm`
 - `/notify [on|off|status|test]`
 - `/native:status`
 - `/retry`

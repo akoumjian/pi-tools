@@ -1,10 +1,10 @@
-import { chmodSync, mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync, realpathSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { DatabaseSync as SQLiteDatabaseSync, SQLInputValue } from "node:sqlite";
 
-export const WORKER_REGISTRY_SCHEMA_VERSION = 2;
+export const WORKER_REGISTRY_SCHEMA_VERSION = 3;
 export const DEFAULT_WORKER_RUNTIME_ROOT = path.join(homedir(), ".local", "share", "agent", "worker-runtime");
 
 export type WorkerRole = "work" | "review" | "integration";
@@ -221,8 +221,13 @@ export function openWorkerRegistry(runtimeRoot = DEFAULT_WORKER_RUNTIME_ROOT): W
     if (row === undefined) {
       database.prepare("INSERT INTO registry_meta(key,value) VALUES('schema_version',?)").run(String(WORKER_REGISTRY_SCHEMA_VERSION));
       database.prepare("INSERT INTO registry_meta(key,value) VALUES('schema_hash',?)").run(WORKER_REGISTRY_SCHEMA_HASH);
-    } else if (Number(row.value) !== WORKER_REGISTRY_SCHEMA_VERSION || fingerprint?.value !== WORKER_REGISTRY_SCHEMA_HASH) {
-      throw new Error(`Unsupported worker registry schema ${row.value ?? "missing"} or schema fingerprint mismatch.`);
+    } else {
+      const version = Number(row.value);
+      if (!Number.isSafeInteger(version) || version < 2 || version > WORKER_REGISTRY_SCHEMA_VERSION) throw new Error(`Unsupported worker registry schema ${row.value ?? "missing"}.`);
+      migrateWorkerRegistry(database, version);
+      database.prepare("UPDATE registry_meta SET value=? WHERE key='schema_version'").run(String(WORKER_REGISTRY_SCHEMA_VERSION));
+      if (fingerprint === undefined) database.prepare("INSERT INTO registry_meta(key,value) VALUES('schema_hash',?)").run(WORKER_REGISTRY_SCHEMA_HASH);
+      else database.prepare("UPDATE registry_meta SET value=? WHERE key='schema_hash'").run(WORKER_REGISTRY_SCHEMA_HASH);
     }
     database.exec(`PRAGMA user_version = ${WORKER_REGISTRY_SCHEMA_VERSION}`);
     database.exec("COMMIT");
@@ -232,6 +237,12 @@ export function openWorkerRegistry(runtimeRoot = DEFAULT_WORKER_RUNTIME_ROOT): W
     throw error;
   }
   return { database, databasePath, close: () => database.close() };
+}
+
+function migrateWorkerRegistry(database: SQLiteDatabaseSync, fromVersion: number): void {
+  // v3 replaces source-text fingerprint gating with explicit numbered migration authority.
+  // v2 already has the complete v3 table shape, so this migration is intentionally data-only.
+  if (fromVersion <= 2) return;
 }
 
 export function workerRegistryDataVersion(registry: WorkerRegistry): number {
@@ -415,6 +426,8 @@ function boundedPage(value: number | undefined): number {
 function staleWorker(workerId: string): Error { return new Error(`Worker ${workerId} changed state; inspect it and retry.`); }
 function staleRun(workerId: string, runId: string): Error { return new Error(`Worker ${workerId}/${runId} changed state; inspect it and retry.`); }
 function json(value: unknown): string { return JSON.stringify(value); }
+function canonicalSessionFile(value: string): string { try { return realpathSync(path.resolve(value)); } catch { return path.resolve(value); } }
+
 function nullable<T extends SQLInputValue>(value: T | undefined): T | null { return value ?? null; }
 function parseJson<T>(text: string): T { return JSON.parse(text) as T; }
 
@@ -497,7 +510,7 @@ export function updateWorkerRunSessionRange(registry: WorkerRegistry, workerId: 
 export function storePreparedSet(registry: WorkerRegistry, input: { preparedId: string; parentSessionFile: string; status: string; order: string[]; warnings?: string[]; repositories: Array<{ id: string } & Record<string, unknown>>; createdAt: string }): void {
   transaction(registry, () => {
     registry.database.prepare("INSERT INTO prepared_sets(prepared_id,parent_session_file,status,order_json,warnings_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
-      .run(input.preparedId, input.parentSessionFile, input.status, json(input.order), json(input.warnings ?? []), input.createdAt, input.createdAt);
+      .run(input.preparedId, canonicalSessionFile(input.parentSessionFile), input.status, json(input.order), json(input.warnings ?? []), input.createdAt, input.createdAt);
     const insert = registry.database.prepare("INSERT INTO prepared_repositories(prepared_id,repository_id,record_json) VALUES(?,?,?)");
     for (const repository of input.repositories) insert.run(input.preparedId, repository.id, json(repository));
   });
@@ -507,7 +520,7 @@ export type TrustedPreparedSetRecord = { version: 1; preparedId: string; parentS
 
 export function readPreparedSetRecord(registry: WorkerRegistry, parentSessionFile: string, preparedId: string): TrustedPreparedSetRecord {
   return transaction(registry, () => {
-    const set = registry.database.prepare("SELECT prepared_id,parent_session_file,status,order_json,created_at FROM prepared_sets WHERE prepared_id=? AND parent_session_file=?").get(preparedId, parentSessionFile) as { prepared_id: string; parent_session_file: string; status: TrustedPreparedSetRecord["status"]; order_json: string; created_at: string } | undefined;
+    const set = registry.database.prepare("SELECT prepared_id,parent_session_file,status,order_json,created_at FROM prepared_sets WHERE prepared_id=? AND parent_session_file=?").get(preparedId, canonicalSessionFile(parentSessionFile)) as { prepared_id: string; parent_session_file: string; status: TrustedPreparedSetRecord["status"]; order_json: string; created_at: string } | undefined;
     if (!set) throw new Error(`Unknown prepared set ${preparedId}.`);
     const rows = registry.database.prepare("SELECT record_json FROM prepared_repositories WHERE prepared_id=? ORDER BY repository_id").all(preparedId) as Array<{ record_json: string }>;
     return { version: 1, preparedId: set.prepared_id, parentSessionFile: set.parent_session_file, status: set.status, order: parseJson<string[]>(set.order_json), repositories: rows.map((row) => parseJson<any>(row.record_json)), createdAt: set.created_at };
@@ -531,6 +544,10 @@ export function updatePreparedSetStatus(registry: WorkerRegistry, preparedId: st
     const result = registry.database.prepare("UPDATE prepared_sets SET status=?,updated_at=? WHERE prepared_id=? AND parent_session_file=? AND apply_nonce IS NULL").run(status, now, preparedId, parentSessionFile);
     if (Number(result.changes) !== 1) throw new Error(`Unknown prepared set ${preparedId}.`);
   });
+}
+
+export function clearWorkerRecoveryError(registry: WorkerRegistry, workerId: string, runId: string, now: string): void {
+  transaction(registry, () => { registry.database.prepare("UPDATE workers SET recovery_error=NULL,updated_at=? WHERE worker_id=? AND active_run_id=?").run(now, workerId, runId); });
 }
 
 export function recoverInterruptedClaimsForParent(registry: WorkerRegistry, parentSessionFile: string, runtimeGeneration: number, now: string): void {
@@ -700,7 +717,7 @@ export function findWorkerRunById(registry: WorkerRegistry, runId: string): { wo
 function insertWorker(registry: WorkerRegistry, worker: Omit<WorkerRegistryRecord, "version">): void {
   registry.database.prepare(`INSERT INTO workers(worker_id,parent_session_file,role,status,active_run_id,latest_run_id,task_ids_json,model_selection,session_id,session_file,workspace_root,recovery_error,reviewed_by_worker_id,runtime_json,operation_kind,operation_nonce,version,created_at,updated_at)
     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)`).run(
-    worker.workerId, worker.parentSessionFile, worker.role, worker.status, nullable(worker.activeRunId), nullable(worker.latestRunId), json(worker.taskIds), nullable(worker.modelSelection), nullable(worker.sessionId), nullable(worker.sessionFile), worker.workspaceRoot, nullable(worker.recoveryError), nullable(worker.reviewedByWorkerId), json(worker.runtime ?? {}), nullable(worker.operationKind), nullable(worker.operationNonce), worker.createdAt, worker.updatedAt
+    worker.workerId, canonicalSessionFile(worker.parentSessionFile), worker.role, worker.status, nullable(worker.activeRunId), nullable(worker.latestRunId), json(worker.taskIds), nullable(worker.modelSelection), nullable(worker.sessionId), nullable(worker.sessionFile), worker.workspaceRoot, nullable(worker.recoveryError), nullable(worker.reviewedByWorkerId), json(worker.runtime ?? {}), nullable(worker.operationKind), nullable(worker.operationNonce), worker.createdAt, worker.updatedAt
   );
 }
 

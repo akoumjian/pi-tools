@@ -94,11 +94,11 @@ test("merge preparation rejects hostile local Git callbacks before any hook exec
   } finally { f.close(); }
 });
 
-test("merge preparation reuses candidate HEAD when it already contains the exact target", () => {
+test("merge preparation honors merge method and commit message even when target is an ancestor", () => {
   const f = fixture(); try {
     const candidateHead = commit(f.candidate, "candidate.txt", "candidate\n", "candidate");
     const set = prepareWorkerMerges("/parent.jsonl", [{ id: "integrated", candidateRepo: f.candidate, targetRepo: f.target, targetRef: "refs/heads/main", method: "merge", commitMessage: "must not create redundant merge" }], { preparedRoot: f.preparedRoot, targetRoot: f.targets, randomHex: () => "2".repeat(24) });
-    assert.equal(set.repositories[0]?.desiredCommit, candidateHead); assert.equal(git(set.repositories[0]!.preparedPath, ["rev-parse", "refs/worker/candidate"]), candidateHead); assert.equal(git(set.repositories[0]!.preparedPath, ["rev-parse", "HEAD"]), candidateHead);
+    assert.notEqual(set.repositories[0]?.desiredCommit, candidateHead); assert.equal(git(set.repositories[0]!.preparedPath, ["rev-parse", "refs/worker/candidate"]), candidateHead); assert.equal(git(set.repositories[0]!.preparedPath, ["show", "-s", "--format=%s", "HEAD"]), "must not create redundant merge");
   } finally { f.close(); }
 });
 
@@ -123,10 +123,39 @@ test("partial application records exact progress and retries remaining atomic re
     ], { preparedRoot: f.preparedRoot, targetRoot: f.targets, randomHex: () => "5".repeat(24) });
     assert.deepEqual(set.order, ["one", "two"]);
     const lock = path.join(target2, ".git", "refs", "heads", "main.lock");
-    const partial = applyPreparedWorkerMerges("/parent.jsonl", set.preparedId, { preparedRoot: f.preparedRoot, targetRoot: f.targets, sourceForCandidate: (repo) => { if (repo === candidate2) writeFileSync(lock, "locked\n"); return {}; } });
+    const partial = applyPreparedWorkerMerges("/parent.jsonl", set.preparedId, { preparedRoot: f.preparedRoot, targetRoot: f.targets, sourceForCandidate: (repo) => { if (path.basename(repo) === path.basename(candidate2)) writeFileSync(lock, "locked\n"); return {}; } });
     assert.equal(partial.status, "partial"); assert.equal(partial.repositories[0]?.status, "applied"); assert.equal(partial.repositories[1]?.status, "failed");
     assert.equal(git(f.target, ["rev-parse", "refs/heads/main"]), set.repositories[0]!.desiredCommit); assert.equal(git(target2, ["rev-parse", "refs/heads/main"]), set.repositories[1]!.expectedCommit);
     rmSync(lock); const retried = applyPreparedWorkerMerges("/parent.jsonl", set.preparedId, { preparedRoot: f.preparedRoot, targetRoot: f.targets });
     assert.equal(retried.status, "completed"); assert.equal(git(target2, ["rev-parse", "refs/heads/main"]), set.repositories[1]!.desiredCommit);
+  } finally { f.close(); }
+});
+
+test("a parent-resolved prepared repository can be revalidated through Git-native input", () => {
+  const f = fixture();
+  try {
+    commit(f.candidate, "file.txt", "candidate\n", "candidate");
+    commit(f.target, "file.txt", "target\n", "target");
+    const conflicted = prepareWorkerMerges("/parent.jsonl", [{ id: "conflict", candidateRepo: f.candidate, targetRepo: f.target, targetRef: "refs/heads/main", method: "merge", commitMessage: "conflict" }], { preparedRoot: f.preparedRoot, targetRoot: f.targets, randomHex: () => "6".repeat(24) });
+    const preparedPath = conflicted.repositories[0]!.preparedPath;
+    writeFileSync(path.join(preparedPath, "file.txt"), "resolved\n");
+    git(preparedPath, ["add", "file.txt"]); git(preparedPath, ["commit", "--no-verify", "-m", "resolve conflict"]);
+    const revalidated = prepareWorkerMerges("/parent.jsonl", [{ id: "resolved", candidateRepo: preparedPath, candidateRef: "HEAD", targetRepo: f.target, targetRef: "refs/heads/main", method: "merge", commitMessage: "apply resolved conflict" }], { preparedRoot: f.preparedRoot, targetRoot: f.targets, randomHex: () => "7".repeat(24) });
+    assert.equal(revalidated.status, "ready");
+    const applied = applyPreparedWorkerMerges("/parent.jsonl", revalidated.preparedId, { preparedRoot: f.preparedRoot, targetRoot: f.targets });
+    assert.equal(applied.status, "completed"); assert.equal(readFileSync(path.join(f.target, "file.txt"), "utf8"), "resolved\n");
+  } finally { f.close(); }
+});
+
+test("application updates a target ref through its exact linked worktree", () => {
+  const f = fixture();
+  try {
+    git(f.target, ["branch", "release"]);
+    const linked = path.join(f.root, "release-worktree"); execFileSync("git", ["-C", f.target, "worktree", "add", "-q", linked, "release"]);
+    const candidate = path.join(f.root, "release-candidate"); execFileSync("git", ["clone", "-q", "--no-hardlinks", f.target, candidate]); git(candidate, ["checkout", "release"]);
+    commit(candidate, "release.txt", "release\n", "release candidate");
+    const set = prepareWorkerMerges("/parent.jsonl", [{ id: "release", candidateRepo: candidate, targetRepo: f.target, targetRef: "refs/heads/release", method: "merge", commitMessage: "merge release" }], { preparedRoot: f.preparedRoot, targetRoot: f.targets, randomHex: () => "8".repeat(24) });
+    assert.equal(applyPreparedWorkerMerges("/parent.jsonl", set.preparedId, { preparedRoot: f.preparedRoot, targetRoot: f.targets }).status, "completed");
+    assert.equal(readFileSync(path.join(linked, "release.txt"), "utf8"), "release\n");
   } finally { f.close(); }
 });

@@ -54,6 +54,7 @@ const observerScript = [
 ].join("\n");
 const dockerArgs = [
   "exec",
+  "--user", `${config.container.hostUid}:${config.container.hostGid}`,
   config.container.containerId,
   "/bin/sh", "-c", observerScript, "pi-worker-client", controlDirectory,
   Buffer.from(launchScript).toString("base64")
@@ -174,7 +175,9 @@ function validateConfig(value) {
     typeof value.container.containerId !== "string" || !/^[a-f0-9]{64}$/.test(value.container.containerId) ||
     typeof value.container.workerId !== "string" ||
     typeof value.container.runId !== "string" ||
-    typeof value.container.nonce !== "string"
+    typeof value.container.nonce !== "string" ||
+    !Number.isSafeInteger(value.container.hostUid) || value.container.hostUid < 0 ||
+    !Number.isSafeInteger(value.container.hostGid) || value.container.hostGid < 0
   ) {
     throw new Error("Invalid managed worker shell host configuration.");
   }

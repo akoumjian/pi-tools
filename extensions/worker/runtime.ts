@@ -6,7 +6,7 @@ import { validateToolArguments, type Tool, type ToolCall } from "@earendil-works
 import { defineTool, type AgentToolResult, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { activeAsyncShellJobsForOwner, cancelAsyncShellJobsForOwner, cancelPersistedAsyncShellJobsForOwner, unsettledPersistedAsyncShellJobsForOwner, type AsyncShellJobOwner } from "../async-shell/index.js";
 import { createWorkerCacheLineageRuntime, registerWorkerCacheLineageRuntimeHooks, validateWorkerCacheLineageRecord, type WorkerCacheLineageRecord } from "./cache-lineage.js";
-import { WorkerBeadsTasksParams, WorkerBeadsTasksReadParams, WorkerResultSubmitParams, WorkerResultValidationError, normalizeWorkspaceResultPaths, validateWorkerResultInput, type WorkerResultSubmitInput } from "./contract.js";
+import { WorkerBeadsTasksParams, WorkerBeadsTasksReadParams, WorkerResultSubmitParams, WorkerReviewResultSubmitParams, WorkerWorkResultSubmitParams, WorkerResultValidationError, normalizeWorkspaceResultPaths, validateWorkerResultInput, type WorkerResultSubmitInput } from "./contract.js";
 import type { WorkerRole } from "./registry.js";
 import { inputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 import { trustedGit } from "./trusted-git.js";
@@ -63,10 +63,10 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
     promptSnippet: "Submit the current run’s completed work, request for guidance, blocker, or review verdict.",
     promptGuidelines: [
       "Use `worker_result_submit` when the current run should return control to the parent. Use `completed` only when the assigned work is finished, `needs_input` for parent-answerable questions required to continue, and `blocked` when an unavailable prerequisite or required intervention prevents progress. Review workers use `approve` or `request_changes` for completed reviews. Summarize the result and report useful repository and artifact entry points.",
-      inputJsonSchemaGuideline("worker_result_submit", WorkerResultSubmitParams),
+      inputJsonSchemaGuideline("worker_result_submit", workerRuntimeRole() === "review" ? WorkerReviewResultSubmitParams : WorkerWorkResultSubmitParams),
       "worker_result_submit constraints: Rejected semantic results return stable coded field errors and do not seal the run. The runtime canonicalizes every reported path and internally reconciles owned work before acceptance."
     ],
-    parameters: WorkerResultSubmitParams, executionMode: "sequential",
+    parameters: workerRuntimeRole() === "review" ? WorkerReviewResultSubmitParams : WorkerWorkResultSubmitParams, executionMode: "sequential",
     async execute(_id, params): Promise<AgentToolResult<WorkerResultDetails>> {
       const identity = workerRuntimeIdentity();
       assertRuntimeAuthorization(identity, "worker_result_submit");
@@ -75,7 +75,7 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
       let repositories: string[] = []; let artifacts: string[] = [];
       try {
         validateWorkerResultInput(workerRuntimeRole(), params);
-        repositories = normalizeWorkspaceResultPaths(identity.workspaceRoot, params.repositories ?? [], "repository", resultPathMetadata);
+        repositories = normalizeWorkspaceResultPaths(identity.workspaceRoot, ("repositories" in params ? params.repositories : undefined) ?? [], "repository", resultPathMetadata);
         artifacts = normalizeWorkspaceResultPaths(identity.workspaceRoot, params.artifacts ?? [], "artifact", resultPathMetadata);
       } catch (error) {
         const semantic = error instanceof WorkerResultValidationError ? error : undefined;
@@ -87,14 +87,15 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
         await cancelAsyncShellJobsForOwner(identity.owner, "SIGTERM", 2_000);
         await cancelPersistedAsyncShellJobsForOwner(identity.asyncJobRoot, identity.owner, 2_000);
         const active = [...activeAsyncShellJobsForOwner(identity.owner), ...unsettledPersistedAsyncShellJobsForOwner(identity.asyncJobRoot, identity.owner)].filter((job) => job.status === "running" || job.status === "unknown");
-        if (active.length) return rejectedResult([{ code: "unsupported_path_type", path: "run", message: `Owned asynchronous work could not be reconciled: ${[...new Set(active.map((job) => job.jobId))].sort().join(", ")}.` }]);
+        if (active.length) return rejectedResult([{ code: "run_not_quiescent", path: "run", message: `Owned asynchronous work could not be reconciled: ${[...new Set(active.map((job) => job.jobId))].sort().join(", ")}.` }]);
         assertRuntimeAuthorization(identity, "worker_result_submit");
         const accepted: AcceptedWorkerResult = { version: 2, workerId: identity.workerId, runId: identity.runId, acceptedAt: new Date().toISOString(), result: { ...params, ...(repositories.length ? { repositories } : {}), ...(artifacts.length ? { artifacts } : {}) } };
         writeAtomicJson(identity.resultFile, accepted);
         const details = { status: "accepted" as const, outcome: params.outcome };
         return { content: [{ type: "text", text: `Worker result accepted for ${identity.workerId}/${identity.runId}.` }], details };
       } catch (error) {
-        return rejectedResult([{ code: "unsupported_path_type", path: "run", message: error instanceof Error ? error.message : String(error) }]);
+        const message = error instanceof Error ? error.message : String(error);
+        return rejectedResult([{ code: /revoked/.test(message) ? "authorization_revoked" : "operational_failure", path: "run", message }]);
       } finally { rmSync(admissionFile, { force: true }); }
     }
   }));
@@ -350,7 +351,6 @@ function workerRuntimeIdentity(): {
   asyncJobRoot: string;
   authorizationFile: string;
   processNonce: string;
-  parentPid: number;
   owner: AsyncShellJobOwner;
 } {
   const workerId = requiredEnvironment("PI_WORKER_ID");
@@ -359,21 +359,21 @@ function workerRuntimeIdentity(): {
   const workspaceRoot = realpathSync(path.resolve(requiredEnvironment("PI_WORKER_WORKSPACE_ROOT")));
   const asyncJobRoot = realpathSync(path.resolve(requiredEnvironment("PI_WORKER_ASYNC_JOB_ROOT")));
   const requestedResult = path.resolve(requiredEnvironment("PI_WORKER_RESULT_FILE"));
-  const authorizationFile = path.resolve(requiredEnvironment("PI_WORKER_AUTHORIZATION_FILE"));
+  const requestedAuthorization = path.resolve(requiredEnvironment("PI_WORKER_AUTHORIZATION_FILE"));
+  if (existsSync(requestedAuthorization) && lstatSync(requestedAuthorization).isSymbolicLink()) throw new Error("PI_WORKER_AUTHORIZATION_FILE may not be a symbolic link.");
+  const authorizationFile = path.join(realpathSync(path.dirname(requestedAuthorization)), path.basename(requestedAuthorization));
   const processNonce = requiredEnvironment("PI_WORKER_PROCESS_NONCE");
-  const parentPid = Number(requiredEnvironment("PI_WORKER_PARENT_PID"));
   if (existsSync(requestedResult) && lstatSync(requestedResult).isSymbolicLink()) throw new Error("PI_WORKER_RESULT_FILE may not be a symbolic link.");
   const resultFile = path.join(realpathSync(path.dirname(requestedResult)), path.basename(requestedResult));
   if (!pathWithin(stateRoot, resultFile) || !pathWithin(stateRoot, asyncJobRoot)) throw new Error("Worker runtime state paths must remain beneath PI_WORKER_STATE_ROOT.");
-  if (!pathWithin(stateRoot, authorizationFile) || !Number.isSafeInteger(parentPid) || parentPid <= 0) throw new Error("Worker runtime authorization identity is invalid.");
-  return { workerId, runId, resultFile, workspaceRoot, asyncJobRoot, authorizationFile, processNonce, parentPid, owner: { kind: "worker-run", workerId, runId } };
+  if (!pathWithin(stateRoot, authorizationFile)) throw new Error("Worker runtime authorization identity is invalid.");
+  return { workerId, runId, resultFile, workspaceRoot, asyncJobRoot, authorizationFile, processNonce, owner: { kind: "worker-run", workerId, runId } };
 }
 
 function assertRuntimeAuthorization(identity: ReturnType<typeof workerRuntimeIdentity>, tool: string): void {
   let value: any;
   try { value = JSON.parse(readFileSync(identity.authorizationFile, "utf8")); } catch { throw new Error(`${tool} is revoked for ${identity.workerId}/${identity.runId}.`); }
-  if (value?.version !== 1 || value.workerId !== identity.workerId || value.runId !== identity.runId || value.processNonce !== identity.processNonce || value.parentPid !== identity.parentPid) throw new Error(`${tool} is revoked for ${identity.workerId}/${identity.runId}.`);
-  try { process.kill(identity.parentPid, 0); } catch { throw new Error(`${tool} is revoked because its parent runtime exited.`); }
+  if (value?.version !== 1 || value.workerId !== identity.workerId || value.runId !== identity.runId || value.processNonce !== identity.processNonce) throw new Error(`${tool} is revoked for ${identity.workerId}/${identity.runId}.`);
 }
 
 function beginWorkerMutationAdmission(identity: ReturnType<typeof workerRuntimeIdentity>): string {

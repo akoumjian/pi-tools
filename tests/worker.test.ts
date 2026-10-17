@@ -37,7 +37,7 @@ test("worker_run schema exposes orthogonal action and role branches", () => {
 test("worker_control and merge schemas use only v2 actions", () => {
   for (const value of [{ action: "list" }, { action: "runs", workerId: "worker_20260101000000_aaaaaaaa" }, { action: "get", workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_aaaaaaaa" }, { action: "cancel", workerId: "worker_20260101000000_aaaaaaaa" }, { action: "discard", workerId: "worker_20260101000000_aaaaaaaa" }]) assert.equal(Check(WorkerControlParams, value), true);
   assert.equal(Check(WorkerControlParams, { action: "status" }), false);
-  assert.equal(Check(WorkerMergeTestParams, { repositories: [{ candidateId: `candidate_${"a".repeat(24)}`, targetRepo: "/target", targetRef: "refs/heads/main", method: "merge", commitMessage: "Merge" }] }), true);
+  assert.equal(Check(WorkerMergeTestParams, { repositories: [{ id: "repo", candidateRepo: "/candidate", candidateRef: "HEAD", targetRepo: "/target", targetRef: "refs/heads/main", method: "merge", commitMessage: "Merge" }] }), true);
   assert.equal(Check(WorkerMergeApplyParams, { preparedId: `prepared_${"b".repeat(24)}` }), true);
 });
 
@@ -84,11 +84,11 @@ test("worker_run work start persists a v2 registry receipt before deferred launc
     const result = await tool.execute!("call", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "Implement." }] }, new AbortController().signal, undefined, context);
     const receipt = (result.details as { runs: Array<{ workerId: string; runId: string; role: string; status: string }> }).runs[0]!;
     assert.equal(receipt.role, "work"); assert.equal(receipt.status, "queued");
-    assert.equal(Check(RetainedToolOutputSchemas.worker_run, result), true);
+    assert.equal(Check(RetainedToolOutputSchemas.worker_run, result), true, JSON.stringify(result));
     const list = await tools.find((candidate) => candidate.name === "worker_control")!.execute!("list", { action: "list" }, new AbortController().signal, undefined, context);
-    assert.equal(Check(RetainedToolOutputSchemas.worker_control, list), true);
+    assert.equal(Check(RetainedToolOutputSchemas.worker_control, list), true, JSON.stringify(list));
     const exact = await tools.find((candidate) => candidate.name === "worker_control")!.execute!("get", { action: "get", workerId: receipt.workerId, runId: receipt.runId }, new AbortController().signal, undefined, context);
-    assert.equal(Check(RetainedToolOutputSchemas.worker_control, exact), true);
+    assert.equal(Check(RetainedToolOutputSchemas.worker_control, exact), true, JSON.stringify(exact));
     for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, context);
   } finally { await rm(root, { recursive: true, force: true }); }
 });

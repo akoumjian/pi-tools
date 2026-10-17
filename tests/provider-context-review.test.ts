@@ -107,7 +107,7 @@ test("provider context review command renders sanitized prompt, tool declaration
     assert.match(artifact.systemPrompt, /Use `start` with role `work`/);
     assert.match(artifact.systemPrompt, /Do not poll workers; rely on asynchronous completion notifications/);
     assert.match(artifact.systemPrompt, /worker_merge_test use: Prepare exact merges/);
-    assert.match(artifact.systemPrompt, /worker_merge_apply use: Apply only after parent inspection/);
+    assert.match(artifact.systemPrompt, /worker_merge_apply use: Inspect diffs and run checks from every preparedPath/);
     assert.doesNotMatch(artifact.systemPrompt, /Batch-native tool usage:/);
     assert.doesNotMatch(artifact.systemPrompt, /hunk_session/);
 
