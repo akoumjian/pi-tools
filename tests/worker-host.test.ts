@@ -219,7 +219,140 @@ test("worker host fails when the initial prompt is rejected before an agent turn
     const keepAlive = setInterval(() => {}, 100);
     const job = await launched.handle.completion.finally(() => clearInterval(keepAlive));
     assert.equal(job.status, "failed");
-    assert.match(await readFile(job.stderrLog, "utf8"), /prompt was acknowledged but did not begin an agent turn/);
+    assert.match(await readFile(job.stderrLog, "utf8"), /prompt response did not begin an agent turn/);
+    assert.equal(existsSync(resultFile), false);
+  });
+});
+
+test("worker host permits pre-prompt compaction to exceed the prompt-start watchdog", async () => {
+  await withTempDir(async (directory) => {
+    const parentCwd = path.join(directory, "parent");
+    const workspaceRoot = path.join(directory, "workspace");
+    const stateDir = path.join(directory, "state");
+    const sessionDir = path.join(stateDir, "session");
+    const runDir = path.join(stateDir, "runs", "run-preprompt-compaction");
+    const resultFile = path.join(runDir, "result.json");
+    await Promise.all([
+      mkdir(parentCwd, { recursive: true }),
+      mkdir(workspaceRoot, { recursive: true }),
+      mkdir(sessionDir, { recursive: true }),
+      mkdir(path.join(stateDir, "async-shell"), { recursive: true })
+    ]);
+    const parent = SessionManager.create(parentCwd, path.join(directory, "parent-sessions"), { id: "parent-session-preprompt-compaction" });
+    for (let index = 0; index < 8; index += 1) {
+      parent.appendMessage({ role: "user", content: `parent compaction context ${index} ${"x".repeat(20_000)}`, timestamp: Date.now() + index * 2 });
+      parent.appendMessage(assistantMessage(`Parent compaction response ${index}.`));
+    }
+    const highUsage = assistantMessage("The parent context is near the worker model threshold.");
+    parent.appendMessage({
+      ...highUsage,
+      provider: "worker-faux",
+      model: "worker-faux-1",
+      usage: { ...highUsage.usage, input: 120_000, totalTokens: 120_000 }
+    });
+    const parentSessionFile = parent.getSessionFile();
+    assert.ok(parentSessionFile);
+    const forked = forkWorkerSession({ parentSessionFile, workspaceRoot, sessionDir, sessionId: "worker-session-preprompt-compaction" });
+    const record: WorkerRecord = {
+      version: WORKER_RECORD_VERSION,
+      workerId: "worker_20260910200000_compact1",
+      sessionId: forked.sessionId,
+      sessionFile: forked.sessionFile,
+      parentSessionFile,
+      workspaceRoot,
+      taskIds: ["personal-workere2e"],
+      route: { provider: "worker-faux", model: "worker-faux-1", thinkingLevel: "off" },
+      status: "running",
+      activeRun: { runId: "run-preprompt-compaction", jobId: "job_20260910200000_compact1", status: "running" },
+      updatedAt: new Date().toISOString()
+    };
+    const compactionExtension = fileURLToPath(new URL("./fixtures/worker-compaction-faux-provider.js", import.meta.url));
+    const startedAt = Date.now();
+    const launched = launchWorkerHost({ sendMessage(): void {} } as unknown as ExtensionAPI, {
+      cwd: parentCwd,
+      sessionManager: { getSessionId: () => "parent-session-preprompt-compaction" },
+      isIdle: () => true
+    } as ExtensionContext, {
+      record: launchRecord(record),
+      shellExecution: { kind: "native-test" },
+      prompt: "Complete after compacting the inherited parent context.",
+      resultFile,
+      runDir,
+      processFile: path.join(runDir, "host-process.json"),
+      processNonce: "host-process-preprompt-compaction",
+      bdPath: process.execPath,
+      beadsRoute: TEST_BEADS_ROUTE,
+      extensionPaths: [...defaultWorkerExtensionPaths(), compactionExtension]
+    });
+    const keepAlive = setInterval(() => {}, 100);
+    const job = await launched.handle.completion.finally(() => clearInterval(keepAlive));
+    const workerSession = await readFile(forked.sessionFile, "utf8");
+    assert.equal(job.status, "exited", `${await readFile(job.stderrLog, "utf8")}\nSTDOUT:\n${await readFile(job.stdoutLog, "utf8")}\nSESSION TAIL:\n${workerSession.slice(-8_000)}`);
+    assert.equal(job.exitCode, 0);
+    assert.ok(Date.now() - startedAt >= 5_500, "pre-prompt compaction must outlive the five-second post-response watchdog");
+    assert.equal(readWorkerRuntimeResult(resultFile).result.outcome, "completed");
+    assert.match(workerSession, /"type":"compaction"/);
+  });
+});
+
+test("worker host detects an RPC child exit after agent_start without waiting for cancellation", async () => {
+  await withTempDir(async (directory) => {
+    const parentCwd = path.join(directory, "parent");
+    const workspaceRoot = path.join(directory, "workspace");
+    const stateDir = path.join(directory, "state");
+    const sessionDir = path.join(stateDir, "session");
+    const runDir = path.join(stateDir, "runs", "run-rpc-exit");
+    const resultFile = path.join(runDir, "result.json");
+    await Promise.all([
+      mkdir(parentCwd, { recursive: true }),
+      mkdir(workspaceRoot, { recursive: true }),
+      mkdir(sessionDir, { recursive: true }),
+      mkdir(path.join(stateDir, "async-shell"), { recursive: true })
+    ]);
+    const parent = SessionManager.create(parentCwd, path.join(directory, "parent-sessions"), { id: "parent-session-rpc-exit" });
+    parent.appendMessage({ role: "user", content: "parent RPC exit context", timestamp: Date.now() });
+    parent.appendMessage(assistantMessage("Ready for the RPC exit probe."));
+    const parentSessionFile = parent.getSessionFile();
+    assert.ok(parentSessionFile);
+    const forked = forkWorkerSession({ parentSessionFile, workspaceRoot, sessionDir, sessionId: "worker-session-rpc-exit" });
+    const record: WorkerRecord = {
+      version: WORKER_RECORD_VERSION,
+      workerId: "worker_20260910200000_rpcexit1",
+      sessionId: forked.sessionId,
+      sessionFile: forked.sessionFile,
+      parentSessionFile,
+      workspaceRoot,
+      taskIds: ["personal-workere2e"],
+      route: { provider: "worker-faux", model: "worker-faux-1", thinkingLevel: "off" },
+      status: "running",
+      activeRun: { runId: "run-rpc-exit", jobId: "job_20260910200000_rpcexit1", status: "running" },
+      updatedAt: new Date().toISOString()
+    };
+    const exitExtension = fileURLToPath(new URL("./fixtures/worker-rpc-exit-faux-provider.js", import.meta.url));
+    const startedAt = Date.now();
+    const launched = launchWorkerHost({ sendMessage(): void {} } as unknown as ExtensionAPI, {
+      cwd: parentCwd,
+      sessionManager: { getSessionId: () => "parent-session-rpc-exit" },
+      isIdle: () => true
+    } as ExtensionContext, {
+      record: launchRecord(record),
+      shellExecution: { kind: "native-test" },
+      prompt: "Start and then terminate the RPC child.",
+      resultFile,
+      runDir,
+      processFile: path.join(runDir, "host-process.json"),
+      processNonce: "host-process-rpc-exit",
+      bdPath: process.execPath,
+      beadsRoute: TEST_BEADS_ROUTE,
+      timeoutMs: 15_000,
+      extensionPaths: [...defaultWorkerExtensionPaths(), exitExtension]
+    });
+    const keepAlive = setInterval(() => {}, 100);
+    const job = await launched.handle.completion.finally(() => clearInterval(keepAlive));
+    const stderr = await readFile(job.stderrLog, "utf8");
+    assert.equal(job.status, "failed", stderr);
+    assert.match(stderr, /Agent process exited/);
+    assert.ok(Date.now() - startedAt < 5_000, `RPC child exit should fail promptly rather than reaching the explicit backstop:\n${stderr}`);
     assert.equal(existsSync(resultFile), false);
   });
 });

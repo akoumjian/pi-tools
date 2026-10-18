@@ -97,7 +97,15 @@ try {
   const initialState = await client.getState();
   assertSessionIdentity(initialState);
   const resultSettlement = waitForResultSettlement(client, config.resultFile, config.timeoutMs);
-  await Promise.all([client.prompt(config.prompt), waitForPromptStart(client), resultSettlement]);
+  const promptStart = observePromptStart(client);
+  const promptAttempt = client.prompt(config.prompt).then(
+    () => promptStart.acknowledge(),
+    (error) => {
+      if (isPromptResponseTimeout(error) && promptStart.sawCompaction()) return;
+      promptStart.fail(error);
+    }
+  );
+  await Promise.all([promptAttempt, promptStart.promise, resultSettlement]);
   const state = await client.getState();
   assertSessionIdentity(state);
   if (state.isStreaming || state.isCompacting || state.pendingMessageCount !== 0) {
@@ -178,19 +186,50 @@ function assertSessionIdentity(state) {
   }
 }
 
-function waitForPromptStart(rpcClient) {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
+function observePromptStart(rpcClient) {
+  let finish;
+  let finished = false;
+  let promptAcknowledged = false;
+  let compactionObserved = false;
+  let timeout;
+  const promise = new Promise((resolve, reject) => {
+    finish = (error) => {
+      if (finished) return;
+      finished = true;
+      if (timeout !== undefined) clearTimeout(timeout);
       unsubscribe();
-      reject(new Error("Worker RPC prompt was acknowledged but did not begin an agent turn."));
-    }, PROMPT_START_TIMEOUT_MS);
-    const unsubscribe = rpcClient.onEvent((event) => {
-      if (event.type !== "agent_start") return;
-      clearTimeout(timeout);
-      unsubscribe();
-      resolve();
-    });
+      if (error) reject(error); else resolve();
+    };
   });
+  const unsubscribe = rpcClient.onEvent((event) => {
+    if (event.type === "compaction_start") {
+      compactionObserved = true;
+      return;
+    }
+    if (event.type === "response" && event.command === "prompt" && event.success === false) {
+      finish(new Error(typeof event.error === "string" ? event.error : "Worker RPC prompt failed after compaction."));
+      return;
+    }
+    if (event.type === "agent_start") finish();
+  });
+  return {
+    promise,
+    acknowledge() {
+      if (finished || promptAcknowledged) return;
+      promptAcknowledged = true;
+      timeout = setTimeout(() => finish(new Error("Worker RPC prompt response did not begin an agent turn.")), PROMPT_START_TIMEOUT_MS);
+    },
+    fail(error) {
+      finish(error instanceof Error ? error : new Error("Worker RPC prompt failed."));
+    },
+    sawCompaction() {
+      return compactionObserved;
+    }
+  };
+}
+
+function isPromptResponseTimeout(error) {
+  return error instanceof Error && error.message.startsWith("Timeout waiting for response to prompt.");
 }
 
 function waitForResultSettlement(rpcClient, resultFile, timeoutMs) {
@@ -227,14 +266,14 @@ function waitForResultSettlement(rpcClient, resultFile, timeoutMs) {
             quiescentSince ??= Date.now();
             if (Date.now() - quiescentSince >= 5_000) return finish(new Error("Worker reached a settled quiescent turn without the required typed worker_result_submit."));
           }
-          await delay(50);
+          await delay(rpcActive ? 250 : 50);
         }
       } catch (error) {
         finish(error instanceof Error ? error : new Error("Worker async-shell settlement could not be verified."));
       } finally { checking = false; }
     };
     const unsubscribe = rpcClient.onEvent((event) => {
-      if (event.type === "agent_settled") void reconcileSettledTurn();
+      if (event.type === "compaction_start" || event.type === "agent_start" || event.type === "agent_settled") void reconcileSettledTurn();
     });
     if (timeoutMs !== undefined) timeout = setTimeout(() => finish(new Error(`Worker result did not reach a settled turn within the explicit ${timeoutMs}ms timeout.`)), timeoutMs);
   });
