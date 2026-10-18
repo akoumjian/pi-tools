@@ -55,6 +55,10 @@ test("shared worker job settlement validation is strict for admission and host s
     await writeMeta(jobsDirectory, jobId, base);
     assert.equal(workerJobIsSettled(readStrictWorkerJobMeta(jobsDirectory, jobId)), true);
 
+    const failedBeforeSpawn = { ...base, status: "failed", pid: undefined, error: "spawn ENOENT", completionNotified: true };
+    await writeMeta(jobsDirectory, jobId, failedBeforeSpawn);
+    assert.equal(workerJobIsSettled(readStrictWorkerJobMeta(jobsDirectory, jobId)), true);
+
     const invalidCases: Array<[string, Record<string, unknown>]> = [
       ["leading-space owner", { ...base, owner: { kind: "worker-run", workerId: " worker-test", runId: "run-test" } }],
       ["blank run owner", { ...base, owner: { kind: "worker-run", workerId: "worker-test", runId: " " } }],
@@ -62,7 +66,10 @@ test("shared worker job settlement validation is strict for admission and host s
       ["non-UUID token", { ...base, processToken: "dead-token" }],
       ["array log path", { ...base, logDir: [path.join(jobsDirectory, jobId)] }],
       ["noncanonical stdout path", { ...base, stdoutLog: `${path.join(jobsDirectory, jobId)}/./stdout.log` }],
-      ["missing PID", { ...base, pid: undefined }],
+      ["missing PID on running job", { ...base, status: "running", pid: undefined, error: "spawn ENOENT" }],
+      ["missing PID without spawn error", { ...base, status: "failed", pid: undefined, error: undefined }],
+      ["missing PID with blank spawn error", { ...base, status: "failed", pid: undefined, error: " " }],
+      ["missing PID before terminal metadata", { ...base, status: "failed", pid: undefined, error: "spawn ENOENT", endedAt: undefined }],
       ["out-of-range PID", { ...base, pid: 2 ** 40 }],
       ["mismatched job ID", { ...base, jobId: "job_20260922150000_other001" }]
     ];

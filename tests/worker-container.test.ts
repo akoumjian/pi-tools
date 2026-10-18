@@ -46,28 +46,31 @@ test("worker container environment excludes host credentials and routes mutable 
   assert.equal(env.PI_WORKER_JOB_TOKEN, undefined);
 });
 
-test("worker container process uses the trusted host helper and preserves only sanitized container environment", async () => {
+test("worker container process uses a host cwd for container-only working directories", async () => {
   await withTempDir(async (directory) => {
     const codeRoot = path.join(directory, "Code");
     const workspaceRoot = path.join(directory, "workspace");
     await Promise.all([mkdir(codeRoot), mkdir(workspaceRoot)]);
     const container = {
       ...planWorkerContainer({ workerId: "worker_20260917140000_aaaaaaaa", runId: "run_20260917140000_bbbbbbbb", nonce: "nonce", codeRoot, workspaceRoot }),
-      containerId: "a".repeat(64)
+      containerId: "a".repeat(64),
+      mounts: [{ kind: "bind" as const, source: workspaceRoot, target: "/workspace" }]
     };
     const prepared = prepareWorkerContainerProcess({
       dockerPath: process.execPath,
       container,
       jobId: "job_20260917140000_cccccccc",
-      cwd: workspaceRoot,
+      cwd: "/workspace",
       executable: "/bin/bash",
       args: ["--noprofile", "--norc", "-c", "printf ok"],
       env: { ...process.env, ANTHROPIC_API_KEY: "secret", PI_WORKER_JOB_TOKEN: "host-token" }
     });
     assert.equal(prepared.executable, process.execPath);
     assert.ok(prepared.args[0].endsWith("scripts/worker-shell-host.mjs"));
-    const config = JSON.parse(prepared.args[1]) as { env: Record<string, string>; container: { containerId: string }; executable: string };
+    const config = JSON.parse(prepared.args[1]) as { env: Record<string, string>; container: { containerId: string }; executable: string; cwd: string };
+    assert.equal(prepared.hostCwd, container.workspaceRoot);
     assert.equal(config.container.containerId, container.containerId);
+    assert.equal(config.cwd, "/workspace");
     assert.equal(config.executable, "/bin/bash");
     assert.equal(config.env.ANTHROPIC_API_KEY, undefined);
     assert.equal(config.env.PI_WORKER_JOB_TOKEN, undefined);

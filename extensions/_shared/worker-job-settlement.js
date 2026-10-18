@@ -41,12 +41,18 @@ export function readStrictWorkerJobMeta(jobsDirectory, jobId) {
     throw new Error(`Worker async-shell job ${jobId} has unverifiable ownership metadata; handoff cannot verify quiescence.`);
   }
 
+  const hasProcessIdentity = Number.isInteger(meta.pid) && meta.pid > 0 && meta.pid <= 2_147_483_647;
+  const failedBeforeSpawn =
+    meta.pid === undefined &&
+    meta.status === "failed" &&
+    typeof meta.error === "string" && meta.error.trim() !== "" &&
+    typeof meta.endedAt === "string" && meta.endedAt.trim() !== "";
   const valid =
     meta.jobId === jobId &&
     typeof meta.command === "string" && meta.command.trim() !== "" &&
     typeof meta.cwd === "string" && path.isAbsolute(meta.cwd) &&
     typeof meta.shell === "string" && meta.shell.trim() !== "" &&
-    Number.isInteger(meta.pid) && meta.pid > 0 && meta.pid <= 2_147_483_647 &&
+    (hasProcessIdentity || failedBeforeSpawn) &&
     typeof meta.processToken === "string" && PROCESS_TOKEN_PATTERN.test(meta.processToken) &&
     typeof meta.notifyOnExit === "boolean" &&
     typeof meta.completionNotified === "boolean" &&

@@ -651,7 +651,7 @@ function startJob(
   const processEnvironment = processToken
     ? { ...(input.env ?? process.env), PI_WORKER_JOB_TOKEN: processToken }
     : input.env ?? process.env;
-  const processInput: { executable: string; args: string[]; env: NodeJS.ProcessEnv; cancellationEffect?: (signal: NodeJS.Signals) => void } = owner
+  const processInput: { executable: string; args: string[]; env: NodeJS.ProcessEnv; hostCwd?: string; cancellationEffect?: (signal: NodeJS.Signals) => void } = owner
     ? prepareManagedWorkerProcess({
         jobId,
         cwd,
@@ -683,7 +683,7 @@ function startJob(
     child = spawnAsyncJobProcess({
       executable: processInput.executable,
       args: processInput.args,
-      cwd,
+      cwd: processInput.hostCwd ?? cwd,
       env: processInput.env,
       stdoutLog: path.join(pendingLogDir, "stdout.log"),
       stderrLog: path.join(pendingLogDir, "stderr.log")
@@ -2316,7 +2316,7 @@ function prepareManagedWorkerProcess(input: {
   args: string[];
   env: NodeJS.ProcessEnv;
   workspaceRoot: string;
-}): { executable: string; args: string[]; env: NodeJS.ProcessEnv; cancellationEffect?: (signal: NodeJS.Signals) => void } {
+}): { executable: string; args: string[]; env: NodeJS.ProcessEnv; hostCwd?: string; cancellationEffect?: (signal: NodeJS.Signals) => void } {
   const container = workerContainerFromEnvironment();
   if (container) {
     const dockerPath = process.env.PI_WORKER_DOCKER_PATH?.trim();

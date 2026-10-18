@@ -53,6 +53,7 @@ export type WorkerContainerProcess = {
   executable: string;
   args: string[];
   env: NodeJS.ProcessEnv;
+  hostCwd: string;
 };
 
 export function planWorkerContainer(input: {
@@ -300,7 +301,8 @@ export function prepareWorkerContainerProcess(input: {
   return {
     executable: process.execPath,
     args: [resolveWorkerShellHostScript(), JSON.stringify(config)],
-    env: input.env
+    env: input.env,
+    hostCwd: input.container.workspaceRoot
   };
 }
 
