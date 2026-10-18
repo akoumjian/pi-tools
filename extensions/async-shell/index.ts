@@ -1,6 +1,6 @@
 import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { accessSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { Type, type Static } from "@earendil-works/pi-ai";
@@ -153,6 +153,7 @@ type JobRuntime = JobMeta & {
   settleProcessGroup: boolean;
   showInActivity: boolean;
   startupError?: string;
+  pendingLogDir?: string;
   cancellationEffect?: (signal: NodeJS.Signals) => void;
   groupMonitor?: NodeJS.Timeout;
 };
@@ -639,7 +640,10 @@ function startJob(
   const jobId = input.jobId ?? createAsyncJobId();
   assertValidAsyncJobId(jobId);
   const root = jobsRoot(context.cwd);
-  const logDir = path.join(root, "jobs", jobId);
+  const jobsDirectory = path.join(root, "jobs");
+  const logDir = path.join(jobsDirectory, jobId);
+  if (jobs.has(jobId) || existsSync(logDir)) throw new Error(`Async shell job directory already exists: ${jobId}`);
+  const pendingLogDir = path.join(jobsDirectory, `.pending-${jobId}-${randomUUID()}`);
   const processToken = input.processToken ?? (owner ? randomUUID() : undefined);
   if (processToken !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(processToken)) throw new Error("Managed async job processToken must be a UUID.");
   const executable = input.executable ?? shell;
@@ -658,7 +662,7 @@ function startJob(
       })
     : { executable, args, env: processEnvironment };
 
-  mkdirSync(logDir, { recursive: true });
+  mkdirSync(pendingLogDir, { recursive: true });
 
   const startedAtMs = Date.now();
   const job = createJobMeta({
@@ -674,16 +678,20 @@ function startJob(
     processToken
   });
 
-  writeMeta(job);
-
-  const child = spawnAsyncJobProcess({
-    executable: processInput.executable,
-    args: processInput.args,
-    cwd,
-    env: processInput.env,
-    stdoutLog: job.stdoutLog,
-    stderrLog: job.stderrLog
-  });
+  let child: ChildProcess;
+  try {
+    child = spawnAsyncJobProcess({
+      executable: processInput.executable,
+      args: processInput.args,
+      cwd,
+      env: processInput.env,
+      stdoutLog: path.join(pendingLogDir, "stdout.log"),
+      stderrLog: path.join(pendingLogDir, "stderr.log")
+    });
+  } catch (error) {
+    rmSync(pendingLogDir, { recursive: true, force: true });
+    throw error;
+  }
 
   const runtime: JobRuntime = {
     ...job,
@@ -700,6 +708,7 @@ function startJob(
     completionFollowUpQueued: false,
     settleProcessGroup: input.settleProcessGroup ?? false,
     showInActivity: input.showInActivity ?? true,
+    pendingLogDir,
     cancellationEffect: processInput.cancellationEffect,
     pid: child.pid
   };
@@ -711,7 +720,8 @@ function startJob(
     finalizeJobAfterProcessGroupExit(api, runtime, code, signal);
   });
   try {
-    (input.persistSpawnedMetadata ?? writeMeta)(runtime);
+    input.persistSpawnedMetadata?.(runtime);
+    writeMeta(runtime);
   } catch (cause) {
     runtime.startupError = `Unable to persist spawned async job metadata: ${cause instanceof Error ? cause.message : String(cause)}`;
     runtime.notifyOnExit = false;
@@ -1580,7 +1590,16 @@ function assertValidAsyncJobId(jobId: string): void {
 }
 
 function writeMeta(job: JobMeta): void {
-  writeAtomicJson(path.join(job.logDir, "meta.json"), publicJob(job));
+  const pendingLogDir = (job as JobRuntime).pendingLogDir;
+  if (!pendingLogDir) {
+    writeAtomicJson(path.join(job.logDir, "meta.json"), publicJob(job));
+    return;
+  }
+  const outputBytes = asyncJobOutputBytes(path.join(pendingLogDir, "stdout.log"), path.join(pendingLogDir, "stderr.log"));
+  writeAtomicJson(path.join(pendingLogDir, "meta.json"), { ...publicJob(job), outputBytes });
+  renameSync(pendingLogDir, job.logDir);
+  (job as JobRuntime).pendingLogDir = undefined;
+  job.outputBytes = outputBytes;
 }
 
 function publicJob(job: JobMeta): JobMeta {

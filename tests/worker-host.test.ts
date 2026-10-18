@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -167,6 +167,63 @@ test("worker host completes an exact-fork fake-provider run while ignoring works
   });
 });
 
+test("worker host fails when the initial prompt is rejected before an agent turn starts", async () => {
+  await withTempDir(async (directory) => {
+    const parentCwd = path.join(directory, "parent");
+    const workspaceRoot = path.join(directory, "workspace");
+    const stateDir = path.join(directory, "state");
+    const sessionDir = path.join(stateDir, "session");
+    const runDir = path.join(stateDir, "runs", "run-preflight-failure");
+    const resultFile = path.join(runDir, "result.json");
+    await Promise.all([
+      mkdir(parentCwd, { recursive: true }),
+      mkdir(workspaceRoot, { recursive: true }),
+      mkdir(sessionDir, { recursive: true })
+    ]);
+    const parent = SessionManager.create(parentCwd, path.join(directory, "parent-sessions"), { id: "parent-session-preflight-failure" });
+    parent.appendMessage({ role: "user", content: "parent preflight failure context", timestamp: Date.now() });
+    parent.appendMessage(assistantMessage("Ready for the preflight failure probe."));
+    const parentSessionFile = parent.getSessionFile();
+    assert.ok(parentSessionFile);
+    const forked = forkWorkerSession({ parentSessionFile, workspaceRoot, sessionDir, sessionId: "worker-session-preflight-failure" });
+    const record: WorkerRecord = {
+      version: WORKER_RECORD_VERSION,
+      workerId: "worker_20260910200000_preflt01",
+      sessionId: forked.sessionId,
+      sessionFile: forked.sessionFile,
+      parentSessionFile,
+      workspaceRoot,
+      taskIds: ["personal-workere2e"],
+      route: { provider: "worker-faux", model: "worker-faux-1", thinkingLevel: "off" },
+      status: "running",
+      activeRun: { runId: "run-preflight-failure", jobId: "job_20260910200000_preflt01", status: "running" },
+      updatedAt: new Date().toISOString()
+    };
+    const failureExtension = fileURLToPath(new URL("./fixtures/worker-preflight-failure.js", import.meta.url));
+    const launched = launchWorkerHost({ sendMessage(): void {} } as unknown as ExtensionAPI, {
+      cwd: parentCwd,
+      sessionManager: { getSessionId: () => "parent-session-preflight-failure" },
+      isIdle: () => true
+    } as ExtensionContext, {
+      record: launchRecord(record),
+      shellExecution: { kind: "native-test" },
+      prompt: "This prompt must fail before the worker turn starts.",
+      resultFile,
+      runDir,
+      processFile: path.join(runDir, "host-process.json"),
+      processNonce: "host-process-preflight-failure",
+      bdPath: process.execPath,
+      beadsRoute: TEST_BEADS_ROUTE,
+      extensionPaths: [...defaultWorkerExtensionPaths(), failureExtension]
+    });
+    const keepAlive = setInterval(() => {}, 100);
+    const job = await launched.handle.completion.finally(() => clearInterval(keepAlive));
+    assert.equal(job.status, "failed");
+    assert.match(await readFile(job.stderrLog, "utf8"), /prompt was acknowledged but did not begin an agent turn/);
+    assert.equal(existsSync(resultFile), false);
+  });
+});
+
 test("worker host waits for the settled follow-up turn after asynchronous shell completion", async () => {
   await withTempDir(async (directory) => {
     const parentCwd = path.join(directory, "parent");
@@ -225,6 +282,15 @@ test("worker host waits for the settled follow-up turn after asynchronous shell 
     assert.equal(job.exitCode, 0);
     assert.equal(readWorkerRuntimeResult(resultFile).result.outcome, "completed");
     assert.ok(existsSync(path.join(runDir, "settled.json")));
+    const jobsDirectory = path.join(stateDir, "async-shell", "jobs");
+    const entries = await readdir(jobsDirectory);
+    const published = entries.filter((entry) => entry.startsWith("job_"));
+    assert.equal(published.length, 13, "the initial job and all 12 post-idle jobs must be atomically published");
+    assert.deepEqual(entries.filter((entry) => entry.startsWith(".pending-")), []);
+    for (const jobId of published) {
+      const metadata = JSON.parse(await readFile(path.join(jobsDirectory, jobId, "meta.json"), "utf8"));
+      assert.equal(Number.isInteger(metadata.pid) && metadata.pid > 0, true, `${jobId} must publish a complete process identity`);
+    }
   });
 });
 

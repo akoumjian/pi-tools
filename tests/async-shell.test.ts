@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -1537,15 +1537,21 @@ test("managed spawn metadata failure retains and settles the spawned process", a
   await withTempDir(async (dir) => {
     const api = createFakeApi();
     asyncShellExtension(api);
+    const jobId = "job_20260910193000_metafail";
+    const jobsDirectory = path.join(dir, ".pi", "async-shell", "jobs");
+    const logDirectory = path.join(jobsDirectory, jobId);
     const handle = startManagedAsyncJob(api, createContext(dir), {
-      jobId: "job_20260910193000_metafail",
+      jobId,
       command: "post-spawn metadata failure probe",
       cwd: dir,
       executable: process.execPath,
       args: ["-e", "setInterval(()=>{},1000)"],
       notifyOnExit: false,
       settleProcessGroup: true,
-      persistSpawnedMetadata: () => { throw new Error("injected metadata write failure"); }
+      persistSpawnedMetadata: () => {
+        assert.equal(existsSync(logDirectory), false, "final job directory must remain unpublished until metadata is complete");
+        throw new Error("injected metadata write failure");
+      }
     });
     const pid = handle.snapshot().pid;
     assert.ok(pid);
@@ -1553,6 +1559,10 @@ test("managed spawn metadata failure retains and settles the spawned process", a
     const job = await handle.completion.finally(() => clearInterval(keepAlive));
     assert.equal(job.status, "failed");
     assert.match(job.error ?? "", /injected metadata write failure/);
+    const persisted = JSON.parse(await readFile(path.join(logDirectory, "meta.json"), "utf8"));
+    assert.equal(persisted.status, "failed");
+    assert.equal(persisted.pid, pid);
+    assert.deepEqual((await readdir(jobsDirectory)).filter((entry) => entry.startsWith(".pending-")), []);
     let alive = true;
     for (let attempt = 0; attempt < 200 && alive; attempt += 1) {
       try { process.kill(pid, 0); await delay(10); } catch { alive = false; }

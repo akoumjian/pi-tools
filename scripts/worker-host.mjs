@@ -9,6 +9,8 @@ import { writeAtomicJson } from "../extensions/_shared/atomic-json.js";
 const configFile = process.argv[2];
 if (!configFile) throw new Error("Usage: worker-host.mjs <host-config.json>");
 const config = JSON.parse(readFileSync(configFile, "utf8"));
+const PROMPT_START_TIMEOUT_MS = 5_000;
+const settledOwnedShellJobs = new Set();
 if (config.version !== 1) throw new Error(`Unsupported worker host config version: ${config.version}`);
 if (!Array.isArray(config.rpcArgs) || config.rpcArgs.length === 0) throw new Error("Worker host config requires trusted RPC arguments.");
 if (typeof config.authorizationFile !== "string" || !path.isAbsolute(config.authorizationFile)) {
@@ -95,7 +97,7 @@ try {
   const initialState = await client.getState();
   assertSessionIdentity(initialState);
   const resultSettlement = waitForResultSettlement(client, config.resultFile, config.timeoutMs);
-  await Promise.all([client.prompt(config.prompt), resultSettlement]);
+  await Promise.all([client.prompt(config.prompt), waitForPromptStart(client), resultSettlement]);
   const state = await client.getState();
   assertSessionIdentity(state);
   if (state.isStreaming || state.isCompacting || state.pendingMessageCount !== 0) {
@@ -176,6 +178,21 @@ function assertSessionIdentity(state) {
   }
 }
 
+function waitForPromptStart(rpcClient) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      unsubscribe();
+      reject(new Error("Worker RPC prompt was acknowledged but did not begin an agent turn."));
+    }, PROMPT_START_TIMEOUT_MS);
+    const unsubscribe = rpcClient.onEvent((event) => {
+      if (event.type !== "agent_start") return;
+      clearTimeout(timeout);
+      unsubscribe();
+      resolve();
+    });
+  });
+}
+
 function waitForResultSettlement(rpcClient, resultFile, timeoutMs) {
   return new Promise((resolve, reject) => {
     let finished = false;
@@ -233,7 +250,10 @@ function ownedShellJobState() {
     if (!entry.isDirectory() || !/^job_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(entry.name)) continue;
     const meta = readStrictWorkerJobMeta(jobsDirectory, entry.name);
     if (meta.owner.workerId !== config.workerId || meta.owner.runId !== config.runId) continue;
-    seen = true; if (!workerJobIsSettled(meta)) return { seen: true, unsettled: true };
+    seen = true;
+    if (settledOwnedShellJobs.has(meta.jobId)) continue;
+    if (!workerJobIsSettled(meta)) return { seen: true, unsettled: true };
+    settledOwnedShellJobs.add(meta.jobId);
   }
   return { seen, unsettled: false };
 }

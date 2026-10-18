@@ -6,6 +6,21 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 const PROVIDER = "worker-faux";
 const MODEL = "worker-faux-1";
 
+export function createWorkerFauxProvider(): ReturnType<typeof fauxProvider> {
+  return fauxProvider({
+    api: "worker-faux-api",
+    provider: PROVIDER,
+    models: [{
+      id: MODEL,
+      name: "Worker Faux Model",
+      reasoning: false,
+      input: ["text"],
+      contextWindow: 128_000,
+      maxTokens: 16_384
+    }]
+  });
+}
+
 export default function workerFauxProviderExtension(api: ExtensionAPI): void {
   const workspaceRoot = process.env.PI_WORKER_WORKSPACE_ROOT;
   if (!workspaceRoot) throw new Error("Worker faux provider requires PI_WORKER_WORKSPACE_ROOT.");
@@ -19,18 +34,7 @@ export default function workerFauxProviderExtension(api: ExtensionAPI): void {
     execFileSync("git", ["add", "probe.txt"], { cwd: gitLockProbe, stdio: "ignore" });
     requiredGitMutationLocks = true;
   } catch { /* surfaced through the typed test handoff */ }
-  const faux = fauxProvider({
-    api: "worker-faux-api",
-    provider: PROVIDER,
-    models: [{
-      id: MODEL,
-      name: "Worker Faux Model",
-      reasoning: false,
-      input: ["text"],
-      contextWindow: 128_000,
-      maxTokens: 16_384
-    }]
-  });
+  const faux = createWorkerFauxProvider();
   faux.setResponses([
     (context) => {
       const serialized = JSON.stringify(context.messages);
