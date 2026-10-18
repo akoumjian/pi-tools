@@ -97,7 +97,7 @@ function buildLaunchScript() {
     `printf '%s\\n' \"$pgid\" > ${shellQuote(`${controlDirectory}/pgid`)}`,
     "wait \"$pgid\"",
     "status=$?",
-    "while kill -0 -- \"-$pgid\" 2>/dev/null; do sleep 0.1; done",
+    "while kill -0 \"-$pgid\" 2>/dev/null; do sleep 0.1; done",
     `printf '%s\\n' \"$status\" > ${shellQuote(`${controlDirectory}/exit-code`)}`,
     `touch ${shellQuote(`${controlDirectory}/done`)}`
   ].join("\n");
@@ -108,7 +108,7 @@ async function signalContainerGroup(signal) {
   if (pgid === undefined) return;
   spawnSync(config.dockerPath, [
     "exec", config.container.containerId,
-    "/bin/sh", "-c", 'kill -"$1" -- "-$2" 2>/dev/null || true',
+    "/bin/sh", "-c", 'kill -"$1" "-$2" 2>/dev/null || true',
     "pi-worker-signal", signal, String(pgid)
   ], {
     env: dockerEnvironment,

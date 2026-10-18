@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { RpcClient } from "@earendil-works/pi-coding-agent";
 import { readStrictWorkerJobMeta, workerJobIsSettled } from "../extensions/_shared/worker-job-settlement.js";
-import { captureAsyncJobProcessIdentity } from "../extensions/_shared/async-job-process.js";
+import { captureAsyncJobProcessIdentity, isAsyncJobExecutionAlive, signalAsyncJobExecution } from "../extensions/_shared/async-job-process.js";
+import { writeAtomicJson } from "../extensions/_shared/atomic-json.js";
 
 const configFile = process.argv[2];
 if (!configFile) throw new Error("Usage: worker-host.mjs <host-config.json>");
@@ -48,6 +48,7 @@ const client = new RpcClient({
     ...(config.cacheLineage ? { PI_WORKER_CACHE_LINEAGE: JSON.stringify(config.cacheLineage) } : {}),
     PI_WORKER_AUTHORIZATION_FILE: config.authorizationFile,
     PI_WORKER_PROCESS_NONCE: config.processNonce,
+    PI_WORKER_JOB_TOKEN: "",
     GIT_OPTIONAL_LOCKS: "0",
     ...(config.shellExecution.kind === "docker"
       ? {
@@ -59,23 +60,24 @@ const client = new RpcClient({
   args: config.rpcArgs
 });
 
-let stopping = false;
-const stop = async (graceMs = 0, signalGroup = false) => {
-  if (stopping) return;
-  stopping = true;
-  try { await client.abort(); } catch {}
-  if (graceMs > 0) {
-    if (signalGroup) {
-      try { process.kill(-process.pid, "SIGTERM"); } catch {}
-    }
-    await delay(graceMs);
-  }
-  await client.stop();
+let stopping;
+const stop = (cancelOwnedShellWork = false) => {
+  stopping ??= (async () => {
+    try { await client.abort(); } catch {}
+    if (cancelOwnedShellWork) await cancelOwnedShellJobs();
+    await client.stop();
+  })();
+  return stopping;
 };
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
   process.on(signal, () => {
-    if (stopping) return;
-    void stop(2_500, false).finally(() => process.exit(signal === "SIGHUP" ? 129 : 143));
+    void stop(true).then(
+      () => process.exit(signal === "SIGHUP" ? 129 : 143),
+      (error) => {
+        console.error(error);
+        process.exit(1);
+      }
+    );
   });
 }
 
@@ -117,20 +119,43 @@ try {
     resultFile: config.resultFile
   })}\n`);
 } finally {
-  await stop(completedSuccessfully ? 0 : 3_000, !completedSuccessfully);
+  await stop(!completedSuccessfully);
 }
 
 function assertOwnedShellQuiescence() {
-  const jobsDirectory = path.join(config.asyncJobRoot, "jobs");
-  if (!existsSync(jobsDirectory)) return;
-  for (const entry of readdirSync(jobsDirectory, { withFileTypes: true })) {
-    if (!entry.isDirectory() || !/^job_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(entry.name)) continue;
-    const meta = readStrictWorkerJobMeta(jobsDirectory, entry.name);
-    if (meta.owner.workerId !== config.workerId || meta.owner.runId !== config.runId) continue;
-    if (!workerJobIsSettled(meta)) {
-      throw new Error(`Worker result settlement found active or unverifiable owned async-shell job ${entry.name}.`);
+  for (const job of ownedShellJobs()) {
+    if (!workerJobIsSettled(job)) {
+      throw new Error(`Worker result settlement found active or unverifiable owned async-shell job ${job.jobId}.`);
     }
   }
+}
+
+async function cancelOwnedShellJobs() {
+  const jobs = ownedShellJobs().filter((job) => !workerJobIsSettled(job));
+  for (const job of jobs) signalAsyncJobExecution(job.pid, job.processToken, "SIGTERM");
+  await waitForOwnedShellJobs(jobs, 2_000);
+  for (const job of jobs.filter((candidate) => isAsyncJobExecutionAlive(candidate.pid, candidate.processToken))) {
+    signalAsyncJobExecution(job.pid, job.processToken, "SIGKILL");
+  }
+  await waitForOwnedShellJobs(jobs, 2_000);
+  const survivors = jobs.filter((job) => isAsyncJobExecutionAlive(job.pid, job.processToken));
+  if (survivors.length) throw new Error(`Worker-owned async-shell jobs survived host shutdown: ${survivors.map((job) => job.jobId).join(", ")}.`);
+}
+
+async function waitForOwnedShellJobs(jobs, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (jobs.some((job) => isAsyncJobExecutionAlive(job.pid, job.processToken)) && Date.now() < deadline) {
+    await delay(25);
+  }
+}
+
+function ownedShellJobs() {
+  const jobsDirectory = path.join(config.asyncJobRoot, "jobs");
+  if (!existsSync(jobsDirectory)) return [];
+  return readdirSync(jobsDirectory, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && /^job_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(entry.name))
+    .map((entry) => readStrictWorkerJobMeta(jobsDirectory, entry.name))
+    .filter((job) => job.owner.workerId === config.workerId && job.owner.runId === config.runId);
 }
 
 function assertLaunchAuthorization() {
@@ -169,12 +194,12 @@ function waitForResultSettlement(rpcClient, resultFile, timeoutMs) {
       let quiescentSince; let observedOwnedShellWork = false; let requestedSettledFollowUp = false;
       try {
         while (!finished) {
-          if (existsSync(resultFile)) return finish();
           const ownedShellState = ownedShellJobState();
           const ownedShellActive = ownedShellState.unsettled;
           if (ownedShellState.seen) observedOwnedShellWork = true;
           const state = await rpcClient.getState();
           const rpcActive = state.isStreaming || state.isCompacting || state.pendingMessageCount !== 0;
+          if (existsSync(resultFile) && !ownedShellActive && !rpcActive) return finish();
           if (!ownedShellActive && !rpcActive && observedOwnedShellWork && !requestedSettledFollowUp) {
             requestedSettledFollowUp = true; quiescentSince = undefined;
             await rpcClient.prompt("Owned asynchronous work has settled. Inspect its retained completion notification and continue the assignment; submit worker_result_submit only when the run is ready to return control.");
@@ -192,9 +217,7 @@ function waitForResultSettlement(rpcClient, resultFile, timeoutMs) {
       } finally { checking = false; }
     };
     const unsubscribe = rpcClient.onEvent((event) => {
-      if (event.type !== "agent_settled") return;
-      if (existsSync(resultFile)) return finish();
-      void reconcileSettledTurn();
+      if (event.type === "agent_settled") void reconcileSettledTurn();
     });
     if (timeoutMs !== undefined) timeout = setTimeout(() => finish(new Error(`Worker result did not reach a settled turn within the explicit ${timeoutMs}ms timeout.`)), timeoutMs);
   });
@@ -213,13 +236,6 @@ function ownedShellJobState() {
     seen = true; if (!workerJobIsSettled(meta)) return { seen: true, unsettled: true };
   }
   return { seen, unsettled: false };
-}
-
-function writeAtomicJson(target, value) {
-  mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-  const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  renameSync(temporary, target);
 }
 
 function delay(milliseconds) {

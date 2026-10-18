@@ -26,6 +26,7 @@ import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 import { workerResultAdmissionPath } from "../_shared/worker-contract.js";
 import { readStrictWorkerJobMeta, workerJobIsSettled } from "../_shared/worker-job-settlement.js";
+import { writeAtomicJson } from "../_shared/atomic-json.js";
 
 export type JobStatus = "running" | "exited" | "failed" | "cancelled" | "unknown";
 export type AsyncShellJobOwner = {
@@ -857,7 +858,7 @@ export async function cancelPersistedAsyncShellJobsForOwner(
       completionNotified: true,
       outputBytes: asyncJobOutputBytes(job.stdoutLog, job.stderrLog)
     };
-    writeFileSync(path.join(updated.logDir, "meta.json"), `${JSON.stringify(publicJob(updated), null, 2)}\n`);
+    writeMeta(updated);
   }
   return candidates.map((job) => ({ ...job, status: "cancelled", endedAt, notifyOnExit: false, completionNotified: true }));
 }
@@ -883,7 +884,7 @@ export async function reconcileTerminatedPersistedAsyncShellJobsForOwner(
   const endedAt = new Date().toISOString();
   for (const job of candidates) {
     const updated: JobMeta = { ...job, status: "cancelled", endedAt, durationMs: Date.parse(endedAt) - Date.parse(job.startedAt), notifyOnExit: false, completionNotified: true, outputBytes: asyncJobOutputBytes(job.stdoutLog, job.stderrLog) };
-    writeFileSync(path.join(updated.logDir, "meta.json"), `${JSON.stringify(publicJob(updated), null, 2)}\n`);
+    writeMeta(updated);
   }
   return candidates.map((job) => ({ ...job, status: "cancelled", endedAt, notifyOnExit: false, completionNotified: true }));
 }
@@ -1579,8 +1580,7 @@ function assertValidAsyncJobId(jobId: string): void {
 }
 
 function writeMeta(job: JobMeta): void {
-  mkdirSync(job.logDir, { recursive: true });
-  writeFileSync(path.join(job.logDir, "meta.json"), `${JSON.stringify(publicJob(job), null, 2)}\n`);
+  writeAtomicJson(path.join(job.logDir, "meta.json"), publicJob(job));
 }
 
 function publicJob(job: JobMeta): JobMeta {

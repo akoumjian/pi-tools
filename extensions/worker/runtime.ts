@@ -1,7 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
 import { validateToolArguments, type Tool, type ToolCall } from "@earendil-works/pi-ai";
 import { defineTool, type AgentToolResult, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { activeAsyncShellJobsForOwner, cancelAsyncShellJobsForOwner, cancelPersistedAsyncShellJobsForOwner, unsettledPersistedAsyncShellJobsForOwner, type AsyncShellJobOwner } from "../async-shell/index.js";
@@ -12,6 +11,7 @@ import { inputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 import { trustedGit } from "./trusted-git.js";
 import { MAX_WORKER_TASK_IDS, workerMutationAdmissionPath, workerResultAdmissionPath } from "../_shared/worker-contract.js";
 import { asyncJobProcessStartToken } from "../_shared/async-job.js";
+import { writeAtomicJson } from "../_shared/atomic-json.js";
 
 export type AcceptedWorkerResult = { version: 2; workerId: string; runId: string; acceptedAt: string; result: WorkerResultSubmitInput & { repositories?: string[]; artifacts?: string[] } };
 export type WorkerTaskUpdate = { taskId: string; note: string; status?: "in_progress" | "blocked" };
@@ -411,13 +411,6 @@ function requiredEnvironment(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) throw new Error(`Worker runtime requires ${name}.`);
   return value;
-}
-
-function writeAtomicJson(target: string, value: unknown): void {
-  mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-  const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  renameSync(temporary, target);
 }
 
 function workerTaskViews(

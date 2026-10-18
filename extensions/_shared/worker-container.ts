@@ -321,7 +321,7 @@ export function signalWorkerContainerJob(
       execDocker(dockerPath, [
         "exec", container.containerId ?? container.name,
         "/bin/sh", "-c",
-        'pgid=$(cat "$1/pgid" 2>/dev/null) || exit 2; kill -"$2" -- "-$pgid" 2>/dev/null || test -f "$1/done"',
+        'pgid=$(cat "$1/pgid" 2>/dev/null) || exit 2; kill -"$2" "-$pgid" 2>/dev/null || test -f "$1/done"',
         "pi-worker-signal", controlDirectory, signal
       ], 5_000);
       return;

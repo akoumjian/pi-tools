@@ -49,13 +49,18 @@ async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolea
 function job(jobId: string, status: JobMeta["status"], exitCode = status === "exited" ? 0 : undefined): JobMeta { return { jobId, command: "worker", cwd: "/tmp", status, durationMs: 1, exitCode, signal: null, notifyOnExit: false, completionNotified: true, logDir: "/tmp", stdoutLog: `/tmp/${jobId}.out`, stderrLog: `/tmp/${jobId}.err`, outputBytes: { stdout: 0, stderr: 0 } } as JobMeta; }
 function receipt(result: any) { return result.details.runs[0] as { workerId: string; runId: string; role: string }; }
 async function waitFor(check: () => boolean, timeout = 3_000) { const end = Date.now() + timeout; while (!check()) { if (Date.now() > end) throw new Error("condition timed out"); await new Promise((resolve) => setTimeout(resolve, 10)); } }
-async function complete(f: Fixture, item: { workerId: string; runId: string }, result: any = { outcome: "completed", summary: "done" }) {
+function writeCompletionEvidence(f: Fixture, item: { workerId: string; runId: string }, result: any): Launch {
   const launch = f.launches.find((value) => value.record.workerId === item.workerId && value.record.runId === item.runId)!;
   const db = f.registry(); const worker = getWorker(db, item.workerId)!; const currentRun = getWorkerRun(db, item.workerId, item.runId); db.close();
   if (!worker.sessionFile) throw new Error(`worker session missing: ${JSON.stringify({ worker, run: currentRun })}`);
   writeFileSync(worker.sessionFile, `${JSON.stringify({ type: "message", id: `result-${item.runId}`, parentId: null, timestamp: new Date().toISOString(), message: { role: "assistant", content: [] } })}\n`, { flag: "a" });
   writeFileSync(launch.runtime.resultFile, `${JSON.stringify({ version: 2, workerId: item.workerId, runId: item.runId, acceptedAt: new Date().toISOString(), result }, null, 2)}\n`);
   writeFileSync(launch.runtime.settledFile, `${JSON.stringify({ version: 1, workerId: item.workerId, runId: item.runId, sessionId: worker.sessionId, resultFile: launch.runtime.resultFile, settledAt: new Date().toISOString() }, null, 2)}\n`);
+  return launch;
+}
+
+async function complete(f: Fixture, item: { workerId: string; runId: string }, result: any = { outcome: "completed", summary: "done" }) {
+  const launch = writeCompletionEvidence(f, item, result);
   launch.resolve(job(launch.record.jobId, "exited", 0));
   await waitFor(() => { const side = f.registry(); const run = getWorkerRun(side, item.workerId, item.runId); side.close(); return run?.status === "settled"; });
 }
@@ -150,12 +155,46 @@ test("deferred launch failure system-settles instead of leaving a queued run", a
   } finally { await f.close(); }
 });
 
-test("completion finalizes SQLite and leaves pending delivery even after parent runtime shutdown", async () => {
-  const f = await fixture(); try {
+test("a new parent runtime adopts exact settlement after the launching runtime shuts down", async () => {
+  const f = await fixture();
+  const secondHandlers = new Map<string, Function[]>();
+  const secondMessages: any[] = [];
+  try {
     const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "probe" }] })); await f.event("turn_end");
-    await f.event("session_shutdown"); await complete(f, started);
-    const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; assert.equal(run.status, "settled"); assert.equal(run.outcomeSource, "worker"); const pending = db.database.prepare("SELECT state FROM deliveries WHERE run_id=?").get(started.runId) as any; assert.equal(pending.state, "pending"); db.close();
-  } finally { await f.close(); }
+    await f.event("session_shutdown");
+    const detachedLaunch = writeCompletionEvidence(f, started, { outcome: "completed", summary: "detached completion" });
+
+    let relaunches = 0;
+    const secondApi = {
+      registerTool() {}, registerCommand() {}, registerMessageRenderer() {}, sendMessage(message: any) { secondMessages.push(message); },
+      on(name: string, handler: Function) { secondHandlers.set(name, [...(secondHandlers.get(name) ?? []), handler]); }
+    } as unknown as ExtensionAPI;
+    registerWorkerExtension(secondApi, {
+      runtimeRoot: f.runtimeRoot,
+      roots: { stateRoot: f.workersRoot, workspaceRoot: f.workersRoot },
+      codeRoot: f.root,
+      preparedRoot: path.join(f.runtimeRoot, "prepared"),
+      targetRoot: f.root,
+      dockerPath: "/fake/docker",
+      createContainer: async () => { throw new Error("settled detached work must not create a container"); },
+      removeContainer: async () => {},
+      createOverlay: async () => { throw new Error("settled detached work must not create an overlay"); },
+      cleanupOverlay: async () => {},
+      waitForHostIdentity: async () => {},
+      launch: () => { relaunches += 1; throw new Error("settled detached work must not relaunch"); }
+    });
+    for (const handler of secondHandlers.get("session_start") ?? []) await handler({}, f.context);
+    await waitFor(() => { const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId); db.close(); return run?.status === "settled"; });
+
+    const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!;
+    assert.equal(run.outcomeSource, "worker"); assert.equal(run.summary, "detached completion"); assert.equal(relaunches, 0);
+    const delivery = db.database.prepare("SELECT state FROM deliveries WHERE run_id=?").get(started.runId) as any; assert.equal(delivery.state, "claimed"); db.close();
+    assert.equal(secondMessages.filter((message) => message.details?.event === "worker_settled").length, 1);
+    detachedLaunch.resolve(job(detachedLaunch.record.jobId, "exited", 0));
+  } finally {
+    for (const handler of secondHandlers.get("session_shutdown") ?? []) await handler({}, f.context);
+    await f.close();
+  }
 });
 
 test("failed deferred review overlay setup system-settles and releases the subject lease", async () => {

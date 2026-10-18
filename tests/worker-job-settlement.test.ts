@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -70,6 +70,13 @@ test("shared worker job settlement validation is strict for admission and host s
       await writeMeta(jobsDirectory, jobId, candidate);
       assert.throws(() => readStrictWorkerJobMeta(jobsDirectory, jobId), /invalid metadata|unverifiable ownership/, name);
     }
+
+    const alias = path.join(directory, "alias");
+    await symlink(".", alias, "dir");
+    const aliasJobsDirectory = path.join(alias, "jobs");
+    const aliased = validMeta(aliasJobsDirectory, jobId);
+    await writeMeta(jobsDirectory, jobId, aliased);
+    assert.equal(workerJobIsSettled(readStrictWorkerJobMeta(jobsDirectory, jobId)), true);
 
     await writeMeta(jobsDirectory, jobId, { ...base, notifyOnExit: true, completionNotified: false });
     assert.equal(workerJobIsSettled(readStrictWorkerJobMeta(jobsDirectory, jobId)), false);

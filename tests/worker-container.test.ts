@@ -155,7 +155,10 @@ process.stderr.write("unsupported fake docker call: " + JSON.stringify(args) + "
     assert.equal(planned.hostUid, process.getuid?.() ?? 0); assert.equal(planned.hostGid, process.getgid?.() ?? 0);
     assert.ok(create.includes(`type=bind,src=${planned.codeRoot},dst=${planned.codeRoot},readonly,bind-propagation=rprivate`));
     assert.ok(create.includes(`type=bind,src=${planned.workspaceRoot},dst=${planned.workspaceRoot},bind-propagation=rprivate`));
-    assert.ok(calls.some((args) => args[0] === "exec" && args.includes("SIGKILL") && args.some((value) => value.includes("kill"))));
+    const signalCall = calls.find((args) => args[0] === "exec" && args.includes("SIGKILL") && args.some((value) => value.includes("kill")));
+    assert.ok(signalCall);
+    assert.ok(signalCall.some((value) => value.includes('kill -"$2" "-$pgid"')));
+    assert.equal(signalCall.some((value) => value.includes('kill -"$2" --')), false);
     assert.ok(calls.some((args) => args[0] === "stop" && args.includes("SIGTERM") && args.includes("4")));
     assert.ok(calls.some((args) => args[0] === "wait" && args.includes(created.containerId)));
     assert.ok(calls.some((args) => args[0] === "rm" && args.includes(created.containerId)));
@@ -178,6 +181,6 @@ test("root bootstrap privilege drop creates host-owned repositories and supports
     assert.equal(execFileSync("setpriv", ["--reuid", String(uid), "--regid", String(gid), "--clear-groups", "--", "git", "-C", path.join(workspace, "repos", "project"), "status", "--porcelain"], { encoding: "utf8" }), "");
     const discarded = spawnSync("setpriv", ["--reuid", String(uid), "--regid", String(gid), "--clear-groups", "--", "rm", "-rf", path.join(workspace, "repos", "project")]); assert.equal(discarded.status, 0); await assert.rejects(stat(path.join(workspace, "repos", "project")));
     const control = path.join(directory, "root-control"); await mkdir(control, { mode: 0o700 }); const forged = spawnSync("setpriv", ["--reuid", String(uid), "--regid", String(gid), "--clear-groups", "--", "touch", path.join(control, "forged")]); assert.notEqual(forged.status, 0, "worker UID must not forge root launch-control files");
-    const hostSource = await readFile(path.resolve("scripts/worker-shell-host.mjs"), "utf8"); assert.match(hostSource, /setpriv --reuid .* --regid .* --clear-groups -- env -i/); assert.doesNotMatch(hostSource, /"--user"/);
+    const hostSource = await readFile(path.resolve("scripts/worker-shell-host.mjs"), "utf8"); assert.match(hostSource, /setpriv --reuid .* --regid .* --clear-groups -- env -i/); assert.doesNotMatch(hostSource, /"--user"/); assert.doesNotMatch(hostSource, /kill[^\n]* -- "-\$/);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });

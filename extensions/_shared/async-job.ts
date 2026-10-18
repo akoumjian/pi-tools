@@ -9,10 +9,11 @@ import {
   isAsyncJobProcessIdentityAlive,
   isAsyncJobExecutionAlive,
   isAsyncJobProcessAlive,
-  isAsyncJobProcessGroupAlive
+  isAsyncJobProcessGroupAlive,
+  signalAsyncJobExecution
 } from "./async-job-process.js";
 
-export { asyncJobTokenProcessIds, asyncJobProcessStartToken, captureAsyncJobProcessIdentity, isAsyncJobProcessIdentityAlive, isAsyncJobExecutionAlive, isAsyncJobProcessAlive, isAsyncJobProcessGroupAlive };
+export { asyncJobTokenProcessIds, asyncJobProcessStartToken, captureAsyncJobProcessIdentity, isAsyncJobProcessIdentityAlive, isAsyncJobExecutionAlive, isAsyncJobProcessAlive, isAsyncJobProcessGroupAlive, signalAsyncJobExecution };
 export type AsyncJobProcessIdentity = { pid: number; processToken: string; processStartToken: string };
 
 export type SpawnAsyncJobProcessInput = {
@@ -72,30 +73,6 @@ export function signalAsyncJobProcessIdentity(identity: AsyncJobProcessIdentity,
   if (!isAsyncJobProcessIdentityAlive(identity)) return false;
   signalAsyncJobProcessGroup(identity.pid, signal);
   return true;
-}
-
-export function signalAsyncJobExecution(
-  pid: number | undefined,
-  token: string | undefined,
-  signal: NodeJS.Signals
-): void {
-  if (token) {
-    const ownedPids = asyncJobTokenProcessIds(token);
-    for (const ownedPid of ownedPids) {
-      try {
-        process.kill(ownedPid, signal);
-      } catch {
-        if (isAsyncJobProcessAlive(ownedPid)) throw new Error(`Unable to signal async job descendant ${ownedPid}.`);
-      }
-    }
-    return;
-  }
-  if (pid === undefined) return;
-  try {
-    signalAsyncJobProcessGroup(pid, signal);
-  } catch {
-    if (isAsyncJobProcessGroupAlive(pid)) throw new Error(`Unable to signal async job process group ${pid}.`);
-  }
 }
 
 function fileSize(filePath: string): number {

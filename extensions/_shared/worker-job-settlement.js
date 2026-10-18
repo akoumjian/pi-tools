@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { isAsyncJobExecutionAlive } from "./async-job-process.js";
 
@@ -51,9 +51,9 @@ export function readStrictWorkerJobMeta(jobsDirectory, jobId) {
     typeof meta.notifyOnExit === "boolean" &&
     typeof meta.completionNotified === "boolean" &&
     typeof meta.status === "string" && JOB_STATUSES.has(meta.status) &&
-    typeof meta.logDir === "string" && meta.logDir === expectedLogDir &&
-    typeof meta.stdoutLog === "string" && meta.stdoutLog === path.join(expectedLogDir, "stdout.log") &&
-    typeof meta.stderrLog === "string" && meta.stderrLog === path.join(expectedLogDir, "stderr.log");
+    isExactPhysicalPath(meta.logDir, expectedLogDir) &&
+    isExactPhysicalPath(meta.stdoutLog, path.join(expectedLogDir, "stdout.log")) &&
+    isExactPhysicalPath(meta.stderrLog, path.join(expectedLogDir, "stderr.log"));
   if (!valid) throw invalidMetadata(jobId);
   return meta;
 }
@@ -67,6 +67,15 @@ export function workerJobIsSettled(meta) {
 
 function invalidMetadata(jobId) {
   return new Error(`Worker async-shell job ${jobId} has invalid metadata; handoff cannot verify quiescence.`);
+}
+
+function isExactPhysicalPath(candidate, expected) {
+  if (typeof candidate !== "string" || !path.isAbsolute(candidate) || path.normalize(candidate) !== candidate) return false;
+  try {
+    return realpathSync(candidate) === realpathSync(expected);
+  } catch {
+    return false;
+  }
 }
 
 function isObject(value) {

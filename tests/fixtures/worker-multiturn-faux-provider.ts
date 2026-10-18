@@ -30,7 +30,10 @@ export default function workerMultiturnFauxProviderExtension(api: ExtensionAPI):
       summary: "Completed handoff on the asynchronous follow-up turn.",
       artifacts: []
     }), { stopReason: "toolUse" }),
-    fauxAssistantMessage("The multiturn handoff is durable.")
+    async () => {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      return fauxAssistantMessage("The multiturn handoff is durable.");
+    }
   ]);
   api.registerProvider(faux.provider);
 }

@@ -79,6 +79,29 @@ export function isAsyncJobProcessGroupAlive(pid) {
   catch { return isAsyncJobProcessAlive(pid); }
 }
 
+export function signalAsyncJobExecution(pid, token, signal) {
+  if (token) {
+    for (const ownedPid of asyncJobTokenProcessIds(token)) {
+      try {
+        process.kill(ownedPid, signal);
+      } catch {
+        if (isAsyncJobProcessAlive(ownedPid)) throw new Error(`Unable to signal async job descendant ${ownedPid}.`);
+      }
+    }
+    return;
+  }
+  if (pid === undefined) return;
+  try {
+    process.kill(-pid, signal);
+  } catch (groupError) {
+    try {
+      process.kill(pid, signal);
+    } catch {
+      if (isAsyncJobProcessGroupAlive(pid)) throw groupError;
+    }
+  }
+}
+
 export function isAsyncJobProcessAlive(pid) {
   if (pid === undefined) return false;
   try { process.kill(pid, 0); return true; }
