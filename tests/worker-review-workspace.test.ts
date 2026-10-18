@@ -17,7 +17,10 @@ test("review overlay uses one Docker scratch volume for upper/work and determini
     const create = calls.find((args) => args.includes("type=overlay")); assert.ok(create);
     assert.match(create!.join(" "), /upperdir=\/var\/lib\/docker\/volumes/);
     assert.match(create!.join(" "), /workdir=\/var\/lib\/docker\/volumes/);
+    assert.match(create!.join(" "), /metacopy=on/);
     assert.equal(create!.join(" ").includes("/host_mnt"), false);
+    const ownership = calls.find((args) => args.some((value) => value.includes("chown -hR"))); assert.ok(ownership);
+    assert.ok(ownership.includes(String(process.getuid?.() ?? 0))); assert.ok(ownership.includes(String(process.getgid?.() ?? 0)));
     assert.equal(overlay.mounts.some((mount) => mount.target === "/review/session.jsonl" && mount.readOnly), true);
     const cleanup: string[][] = []; cleanupReviewOverlay("/docker", overlay, (args) => { cleanup.push(args); return ""; });
     assert.deepEqual(cleanup.map((args) => args.at(-1)), [overlay.mergedVolume, overlay.scratchVolume]);

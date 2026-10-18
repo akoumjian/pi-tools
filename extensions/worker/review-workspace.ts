@@ -23,9 +23,10 @@ export function createReviewOverlay(input: {
     run(["run", "--rm", "--network", "none", "--mount", `type=volume,src=${scratchVolume},dst=/overlay`, "--entrypoint", "/bin/sh", WORKER_CONTAINER_IMAGE, "-c", "mkdir -p /overlay/upper /overlay/work && chmod 700 /overlay/upper /overlay/work"]);
     const scratch = volumeMountpoint(run, scratchVolume);
     const lower = realDirectory(input.subjectWorkspace);
-    run(["volume", "create", "--driver", "local", "--opt", "type=overlay", "--opt", "device=overlay", "--opt", `o=lowerdir=${lower},upperdir=${scratch}/upper,workdir=${scratch}/work`, mergedVolume]);
+    run(["volume", "create", "--driver", "local", "--opt", "type=overlay", "--opt", "device=overlay", "--opt", `o=lowerdir=${lower},upperdir=${scratch}/upper,workdir=${scratch}/work,metacopy=on`, mergedVolume]);
     created.push(mergedVolume);
     run(["run", "--rm", "--network", "none", "--mount", `type=volume,src=${mergedVolume},dst=/subject`, "--entrypoint", "/bin/sh", WORKER_CONTAINER_IMAGE, "-c", "test -d /subject"]);
+    run(reviewSubjectOwnershipArgs(mergedVolume));
     const mounts: WorkerContainerMount[] = [
       { kind: "volume", source: mergedVolume, target: "/review/subject" },
       { kind: "bind", source: realDirectory(input.reviewerWorkspace), target: "/workspace" },
@@ -59,9 +60,10 @@ export async function createReviewOverlayAsync(input: {
     const scratch = (await run(["volume", "inspect", "--format", "{{.Mountpoint}}", scratchVolume])).trim();
     if (!scratch.startsWith("/")) throw new Error(`Docker returned invalid volume mountpoint for ${scratchVolume}.`);
     const lower = realDirectory(input.subjectWorkspace);
-    await run(["volume", "create", "--driver", "local", "--opt", "type=overlay", "--opt", "device=overlay", "--opt", `o=lowerdir=${lower},upperdir=${scratch}/upper,workdir=${scratch}/work`, mergedVolume]);
+    await run(["volume", "create", "--driver", "local", "--opt", "type=overlay", "--opt", "device=overlay", "--opt", `o=lowerdir=${lower},upperdir=${scratch}/upper,workdir=${scratch}/work,metacopy=on`, mergedVolume]);
     created.push(mergedVolume);
     await run(["run", "--rm", "--network", "none", "--mount", `type=volume,src=${mergedVolume},dst=/subject`, "--entrypoint", "/bin/sh", WORKER_CONTAINER_IMAGE, "-c", "test -d /subject"]);
+    await run(reviewSubjectOwnershipArgs(mergedVolume));
     return { version: 2, mergedVolume, scratchVolume, mounts: [
       { kind: "volume", source: mergedVolume, target: "/review/subject" },
       { kind: "bind", source: realDirectory(input.reviewerWorkspace), target: "/workspace" },
@@ -83,6 +85,18 @@ export function cleanupReviewOverlay(dockerPath: string, overlay: ReviewOverlayR
 export async function cleanupReviewOverlayAsync(dockerPath: string, overlay: ReviewOverlayRecord, run: AsyncDockerRunner = (args) => dockerAsync(dockerPath, args)): Promise<void> {
   await run(["volume", "rm", "--force", overlay.mergedVolume]);
   await run(["volume", "rm", "--force", overlay.scratchVolume]);
+}
+
+function reviewSubjectOwnershipArgs(mergedVolume: string): string[] {
+  const uid = String(process.getuid?.() ?? 0);
+  const gid = String(process.getgid?.() ?? 0);
+  return [
+    "run", "--rm", "--network", "none",
+    "--mount", `type=volume,src=${mergedVolume},dst=/subject`,
+    "--entrypoint", "/bin/sh", WORKER_CONTAINER_IMAGE, "-c",
+    'if [ "$(stat -c %u:%g /subject)" != "$1:$2" ]; then chown -hR "$1:$2" /subject; fi',
+    "pi-review-owner", uid, gid
+  ];
 }
 
 function volumeMountpoint(run: DockerRunner, name: string): string {
