@@ -71,6 +71,9 @@ type PlannedRun = {
   taskIds: string[]; modelSelection: string; binding?: WorkerRunRecord["binding"]; workerRuntime: WorkerRuntime; runRuntime: RunRuntime;
   newWorker: boolean; expectedVersion?: number; reviewedRunId?: string; preparedId?: string; consumedPrepared?: boolean; operationRepositories?: Array<Record<string, unknown>>;
 };
+type WorkerOperationSnapshot =
+  | { scope: "worker_run"; runId: string; operation: WorkerOperation }
+  | { scope: "worker_merge_apply"; preparedId: string; operation: WorkerOperation };
 export type WorkerExtensionDependencies = {
   runtimeRoot?: string; roots?: WorkerRoots; codeRoot?: string; preparedRoot?: string; targetRoot?: string; now?: () => Date; random?: () => string; dockerPath?: string;
   createContainer?: (dockerPath: string, reference: WorkerContainerReference) => WorkerContainerReference | Promise<WorkerContainerReference>;
@@ -107,11 +110,13 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   const starting = new Map<string, { runId: string; completion: Promise<void> }>();
   const deliveredRecovery = new Set<string>();
   const getRegistry = () => registry ??= openWorkerRegistry(runtimeRoot);
-  const operationSnapshots = new Map<string, WorkerOperation>();
-  const rememberOperationSnapshot = (toolCallId: string, operation: WorkerOperation | undefined): void => {
-    if (!operation) return;
+  const operationSnapshots = new Map<string, WorkerOperationSnapshot>();
+  const clearOperationSnapshot = (toolCallId: string): void => { if (toolCallId) operationSnapshots.delete(toolCallId); };
+  const operationSnapshot = (toolCallId: string): WorkerOperationSnapshot | undefined => toolCallId ? operationSnapshots.get(toolCallId) : undefined;
+  const rememberOperationSnapshot = (toolCallId: string, snapshot: WorkerOperationSnapshot | undefined): void => {
+    if (!toolCallId || !snapshot) return;
     operationSnapshots.delete(toolCallId);
-    operationSnapshots.set(toolCallId, operation);
+    operationSnapshots.set(toolCallId, snapshot);
     while (operationSnapshots.size > 128) operationSnapshots.delete(operationSnapshots.keys().next().value!);
   };
   const repaintWorkerActivity = (context: ExtensionContext): void => {
@@ -211,12 +216,16 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     ],
     parameters: WorkerRunParamsV2, executionMode: "sequential" as const,
     renderCall: (args: unknown, theme: any, context: any) => compactCall(theme, runCallLabel(args), workerRunCallOperationHint(args, renderArgumentsComplete(context))),
-    renderResult: (result: AgentToolResult<any>, _options: unknown, theme: any, context: any) => compactResult(theme, result, "worker run", workerRunResultOperationHint(safeResultDetails(result), operationSnapshots.get(safeToolCallId(context)))),
+    renderResult: (result: AgentToolResult<any>, _options: unknown, theme: any, context: any) => {
+      const details = safeResultDetails(result);
+      return compactResult(theme, result, "worker run", workerRunResultOperationHint(details, matchingWorkerRunSnapshot(details, operationSnapshot(safeToolCallId(context)))));
+    },
     execute: async (toolCallId: string, params: WorkerRunInputV2, signal: AbortSignal, onUpdate: any, context: ExtensionContext): Promise<AgentToolResult<any>> => {
+      clearOperationSnapshot(toolCallId);
       throwIfAborted(signal);
       const parentSessionFile = requireParentSession(context);
       const planned = preflightBatch(params, context, parentSessionFile);
-      rememberOperationSnapshot(toolCallId, plannedRunOperation(planned));
+      const operation = plannedRunOperation(planned);
       const timestamp = now().toISOString();
       try {
         for (const plan of planned) if (plan.role === "integration" && plan.consumedPrepared && plan.preparedId) assertIntegrationTargetsCurrent(trustedPreparedSet(getRegistry(), parentSessionFile, plan.preparedId));
@@ -243,6 +252,8 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       const details = { runs: planned.map((plan) => ({ action: plan.request.action, role: plan.role, workerId: plan.workerId, runId: plan.runId, status: "queued", taskIds: plan.taskIds,
         completionDelivery: plan.request.completionDelivery ?? "steer", modelSelection: plan.modelSelection, ...(plan.reviewedRunId ? { reviewedRunId: plan.reviewedRunId } : {}), ...(plan.preparedId ? { preparedId: plan.preparedId } : {}) })) };
       const text = details.runs.map((item) => `queued · ${item.role} · ${item.workerId.slice(-8)}`).join("\n");
+      const firstRun = details.runs[0];
+      rememberOperationSnapshot(toolCallId, firstRun && operation ? { scope: "worker_run", runId: firstRun.runId, operation } : undefined);
       onUpdate?.(resultText(text, details)); return resultText(text, details);
     }
   });
@@ -289,12 +300,16 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     promptSnippet: "Apply every exact repository result in one parent-validated prepared set.",
     promptGuidelines: [inputJsonSchemaGuideline("worker_merge_apply", WorkerMergeApplyParams), outputJsonSchemaGuideline("worker_merge_apply", RetainedToolOutputSchemas.worker_merge_apply), "worker_merge_apply use: Inspect diffs and run checks from every preparedPath before application. On validation failure, create a new prepared set. After partial or failed application, retry only the same preparedId; target drift requires a new worker_merge_test. Push and release remain separate parent actions.", "worker_merge_apply constraints: Only result content is provider-visible; details remain internal."],
     parameters: WorkerMergeApplyParams, executionMode: "sequential",
-    renderCall: (args, theme, context) => compactCall(theme, "applying merge", preparedCallOperationHintFromArgs(args, renderArgumentsComplete(context))), renderResult: (result, _options, theme, context) => compactResult(theme, result as any, "merge apply", renderWorkerOperationHint(operationSnapshots.get(safeToolCallId(context)))),
+    renderCall: (args, theme, context) => compactCall(theme, "applying merge", preparedCallOperationHintFromArgs(args, renderArgumentsComplete(context))), renderResult: (result, _options, theme, context) => {
+      const details = safeResultDetails(result);
+      return compactResult(theme, result as any, "merge apply", mergeApplyResultOperationHint(details, operationSnapshot(safeToolCallId(context))));
+    },
     async execute(toolCallId, params, signal, _update, context) {
+      clearOperationSnapshot(toolCallId);
       throwIfAborted(signal); const parent = requireParentSession(context); const trustedSet = trustedPreparedSet(getRegistry(), parent, params.preparedId); if (!["ready", "partial", "failed"].includes(trustedSet.status)) throw new Error(`Prepared set ${params.preparedId} is not ready.`);
-      rememberOperationSnapshot(toolCallId, mergeOperation(trustedSet.repositories));
+      const operation = mergeOperation(trustedSet.repositories);
       const nonce = claimNonce(); if (!claimPreparedSetApply(getRegistry(), params.preparedId, parent, nonce, now().toISOString())) throw new Error(`Prepared set ${params.preparedId} is already being applied or changed state.`);
-      try { const result = applyPreparedWorkerMerges(parent, params.preparedId, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, sourceForCandidate: managedCandidateWarnings(parent), trustedSet }); finishPreparedSetApply(getRegistry(), params.preparedId, parent, nonce, result.status, now().toISOString()); return resultText(`${result.status} · ${result.repositories.filter((item) => item.status === "applied").length} applied`, result); }
+      try { const result = applyPreparedWorkerMerges(parent, params.preparedId, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, sourceForCandidate: managedCandidateWarnings(parent), trustedSet }); finishPreparedSetApply(getRegistry(), params.preparedId, parent, nonce, result.status, now().toISOString()); rememberOperationSnapshot(toolCallId, operation ? { scope: "worker_merge_apply", preparedId: result.preparedId, operation } : undefined); return resultText(`${result.status} · ${result.repositories.filter((item) => item.status === "applied").length} applied`, result); }
       catch (error) { releasePreparedSetApply(getRegistry(), params.preparedId, parent, nonce, now().toISOString()); throw error; }
     }
   }));
@@ -800,6 +815,19 @@ function safeToolCallId(context: unknown): string {
 }
 function renderArgumentsComplete(context: unknown): boolean {
   try { return recordValue(context) && (context.argsComplete === true || context.executionStarted === true); } catch { return false; }
+}
+function matchingWorkerRunSnapshot(details: unknown, snapshot: WorkerOperationSnapshot | undefined): WorkerOperation | undefined {
+  try {
+    if (snapshot?.scope !== "worker_run" || !recordValue(details) || !Array.isArray(details.runs) || !recordValue(details.runs[0])) return undefined;
+    return details.runs[0].runId === snapshot.runId ? snapshot.operation : undefined;
+  } catch { return undefined; }
+}
+function mergeApplyResultOperationHint(details: unknown, snapshot: WorkerOperationSnapshot | undefined): string | undefined {
+  try {
+    if (!recordValue(details) || typeof details.preparedId !== "string") return undefined;
+    if (snapshot?.scope === "worker_merge_apply" && snapshot.preparedId === details.preparedId) return renderWorkerOperationHint(snapshot.operation) ?? mergeResultOperationHint(details);
+    return mergeResultOperationHint(details);
+  } catch { return undefined; }
 }
 function validTaskIds(value: unknown): string[] {
   if (!Array.isArray(value)) return [];

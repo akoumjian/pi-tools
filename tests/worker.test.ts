@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { execFileSync } from "node:child_process";
 import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -261,6 +262,56 @@ test("collapsed call, progress, and result renderers use structured metadata and
   assert.equal(resumeText.includes("SECRET"), false); assert.equal(resumeText.includes("personal-"), false);
 });
 
+test("worker_run snapshots require nonempty call IDs and exact result run identities", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-worker-snapshot-identity-"));
+  const sessionFile = path.join(root, "parent.jsonl");
+  const runtimeRoot = path.join(root, "runtime"); const workersRoot = path.join(runtimeRoot, "workers");
+  await writeFile(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: "parent", timestamp: "2026-01-01T00:00:00.000Z", cwd: root })}\n`);
+  await mkdir(workersRoot, { recursive: true });
+  const tools: ToolDefinition[] = []; const handlers = new Map<string, Function[]>(); let randomIndex = 0;
+  const api = { registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, sendMessage() {} } as unknown as ExtensionAPI;
+  registerWorkerExtension(api, { runtimeRoot, roots: { stateRoot: workersRoot, workspaceRoot: workersRoot }, codeRoot: root,
+    now: () => new Date("2026-01-01T00:00:00.000Z"), random: () => `${String(++randomIndex).padStart(8, "0")}-0000-4000-8000-000000000000`,
+    launch: () => { throw new Error("snapshot identity test does not launch workers"); }
+  });
+  const model = { id: "gpt-5.6-sol", name: "gpt-5.6-sol", provider: "openai-codex", api: "openai-responses", baseUrl: "https://example.invalid", reasoning: true, thinkingLevelMap: { xhigh: "xhigh" }, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 10000 } as Model<Api>;
+  const context = { cwd: root, sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "parent" }, modelRegistry: { hasConfiguredAuth: () => true, getAll: () => [model] }, isIdle: () => true, hasPendingMessages: () => false, ui: { notify() {} } } as unknown as ExtensionContext;
+  const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as never;
+  const signal = new AbortController().signal;
+  try {
+    for (const handler of handlers.get("session_start") ?? []) await handler({}, context);
+    const run = tools.find((tool) => tool.name === "worker_run")!;
+    const executeWork = (toolCallId: string, taskId: string) => run.execute!(toolCallId, { runs: [{ action: "start", role: "work", taskIds: [taskId], instructions: "Do not render." }] }, signal, undefined, context);
+    const render = (result: unknown, toolCallId: string) => stripTerminalSequences(run.renderResult!(result as never, { expanded: false, isPartial: false }, theme, { toolCallId } as never).render(120).join("\n"));
+
+    const first = await executeWork("same-id", "personal-first");
+    const second = await executeWork("same-id", "personal-second");
+    assert.match(render(first, "same-id"), /personal-first/); assert.doesNotMatch(render(first, "same-id"), /personal-second/);
+    assert.match(render(second, "same-id"), /personal-second/);
+
+    const mismatched = structuredClone(second) as any;
+    mismatched.details.runs[0].runId = "run_20260101000000_mismatch";
+    mismatched.details.runs[0].taskIds = ["personal-details"];
+    assert.match(render(mismatched, "same-id"), /personal-details/); assert.doesNotMatch(render(mismatched, "same-id"), /personal-second/);
+
+    await assert.rejects(run.execute!("same-id", { runs: [{ action: "start", role: "review", reviewedRunId: "run_20260101000000_missingx" }] }, signal, undefined, context));
+    const failed = { content: [{ type: "text", text: "failed" }] };
+    assert.doesNotMatch(render(failed, "same-id"), /personal-(?:first|second)/);
+    assert.match(render(second, "same-id"), /personal-second/, "failed preflight leaves the old row to its own details");
+
+    const emptyFirst = await executeWork("", "personal-emptyfirst");
+    const emptySecond = await executeWork("", "personal-emptysecond");
+    assert.match(render(emptyFirst, ""), /personal-emptyfirst/); assert.doesNotMatch(render(emptyFirst, ""), /personal-emptysecond/);
+    assert.match(render(emptySecond, ""), /personal-emptysecond/);
+    const emptyProbe = structuredClone(emptySecond) as any;
+    emptyProbe.details.runs[0].taskIds = ["personal-emptydetails"];
+    assert.match(render(emptyProbe, ""), /personal-emptydetails/); assert.doesNotMatch(render(emptyProbe, ""), /personal-emptysecond/);
+  } finally {
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, context);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("collapsed merge renderers use complete arguments or trusted returned metadata only", () => {
   const preparedId = `prepared_${"a".repeat(24)}`;
   const repositories = [
@@ -284,6 +335,70 @@ test("collapsed merge renderers use complete arguments or trusted returned metad
   assert.match(applyText, /prepared aaaaaaaa/);
   const applyResult = mergeApply.renderResult!({ content: [{ type: "text", text: "provider-json" }], details: { status: "completed", repositories } } as never, { expanded: false, isPartial: false }, theme, applyContext).render(120).join("\n");
   assert.equal(applyResult.includes("UNTRUSTED"), false);
+});
+
+function snapshotGit(cwd: string, ...args: string[]): string {
+  return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } }).trim();
+}
+
+async function createSnapshotMerge(root: string, name: string): Promise<{ id: string; candidateRepo: string; candidateRef: string; targetRepo: string; targetRef: string; method: "squash"; commitMessage: string }> {
+  const targetRepo = path.join(root, "targets", `target-${name}`); const candidateRepo = path.join(root, "candidates", `candidate-${name}`);
+  await mkdir(targetRepo, { recursive: true });
+  snapshotGit(targetRepo, "init", "--initial-branch=main"); snapshotGit(targetRepo, "config", "user.name", "Snapshot Test"); snapshotGit(targetRepo, "config", "user.email", "snapshot@example.invalid");
+  await writeFile(path.join(targetRepo, "base.txt"), "base\n"); snapshotGit(targetRepo, "add", "base.txt"); snapshotGit(targetRepo, "commit", "-m", "base");
+  await mkdir(path.dirname(candidateRepo), { recursive: true });
+  execFileSync("git", ["clone", "--no-local", "--no-hardlinks", targetRepo, candidateRepo], { stdio: "ignore", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
+  snapshotGit(candidateRepo, "config", "user.name", "Snapshot Test"); snapshotGit(candidateRepo, "config", "user.email", "snapshot@example.invalid");
+  await writeFile(path.join(candidateRepo, `${name}.txt`), `${name}\n`); snapshotGit(candidateRepo, "add", `${name}.txt`); snapshotGit(candidateRepo, "commit", "-m", `candidate ${name}`);
+  return { id: name, candidateRepo, candidateRef: "HEAD", targetRepo, targetRef: "refs/heads/main", method: "squash", commitMessage: `Apply ${name}` };
+}
+
+test("worker_merge_apply snapshots require nonempty call IDs and exact prepared identities", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-worker-merge-snapshot-"));
+  const sessionFile = path.join(root, "parent.jsonl"); const runtimeRoot = path.join(root, "runtime"); const workersRoot = path.join(runtimeRoot, "workers");
+  await writeFile(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: "parent", timestamp: "2026-01-01T00:00:00.000Z", cwd: root })}\n`); await mkdir(workersRoot, { recursive: true });
+  const tools: ToolDefinition[] = []; const handlers = new Map<string, Function[]>();
+  const api = { registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, sendMessage() {} } as unknown as ExtensionAPI;
+  registerWorkerExtension(api, { runtimeRoot, roots: { stateRoot: workersRoot, workspaceRoot: workersRoot }, codeRoot: root, preparedRoot: path.join(root, "prepared"), targetRoot: path.join(root, "targets") });
+  const context = { cwd: root, sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "parent" }, isIdle: () => true, hasPendingMessages: () => false, ui: { notify() {} } } as unknown as ExtensionContext;
+  const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as never; const signal = new AbortController().signal;
+  try {
+    for (const handler of handlers.get("session_start") ?? []) await handler({}, context);
+    const mergeTest = tools.find((tool) => tool.name === "worker_merge_test")!; const apply = tools.find((tool) => tool.name === "worker_merge_apply")!;
+    const prepareAndApply = async (toolCallId: string, name: string) => {
+      const repository = await createSnapshotMerge(root, name);
+      const prepared = await mergeTest.execute!(`prepare-${name}`, { repositories: [repository] }, signal, undefined, context) as any;
+      const preparedId = prepared.details.preparedId as string;
+      return apply.execute!(toolCallId, { preparedId }, signal, undefined, context);
+    };
+    const render = (result: unknown, toolCallId: string) => stripTerminalSequences(apply.renderResult!(result as never, { expanded: false, isPartial: false }, theme, { toolCallId } as never).render(160).join("\n"));
+
+    const first = await prepareAndApply("same-apply", "first");
+    const second = await prepareAndApply("same-apply", "second");
+    assert.match(render(first, "same-apply"), /target-first/); assert.doesNotMatch(render(first, "same-apply"), /target-second/);
+    assert.match(render(second, "same-apply"), /target-second/);
+
+    const mismatched = structuredClone(second) as any;
+    mismatched.details.preparedId = `prepared_${"f".repeat(24)}`;
+    mismatched.details.repositories[0].targetRepo = "/trusted/target-details";
+    assert.match(render(mismatched, "same-apply"), /target-details/); assert.doesNotMatch(render(mismatched, "same-apply"), /target-second/);
+
+    await assert.rejects(apply.execute!("same-apply", { preparedId: `prepared_${"0".repeat(24)}` }, signal, undefined, context));
+    const failed = { content: [{ type: "text", text: "failed" }] };
+    assert.doesNotMatch(render(failed, "same-apply"), /target-(?:first|second)/);
+    assert.match(render(second, "same-apply"), /target-second/, "failed preflight leaves the old row to its own details");
+
+    const emptyFirst = await prepareAndApply("", "empty-first");
+    const emptySecond = await prepareAndApply("", "empty-second");
+    assert.match(render(emptyFirst, ""), /target-empty-first/); assert.doesNotMatch(render(emptyFirst, ""), /target-empty-second/);
+    assert.match(render(emptySecond, ""), /target-empty-second/);
+    const emptyProbe = structuredClone(emptySecond) as any;
+    emptyProbe.details.repositories[0].targetRepo = "/trusted/target-empty-details";
+    assert.match(render(emptyProbe, ""), /target-empty-details/); assert.doesNotMatch(render(emptyProbe, ""), /target-empty-second/);
+  } finally {
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, context);
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("renderers never invoke bd or touch a registry while arguments stream or locks are held", async () => {
