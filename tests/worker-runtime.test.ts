@@ -275,7 +275,7 @@ test("Beads design continuation rejects missing, malformed, and stale full-desig
 
     await writeFile(process.env.FAKE_BEADS_TASKS_FILE!, JSON.stringify([{ id: "personal-test", title: "Mutable", status: "open", priority: 1, issue_type: "task", design: revised }]));
     await assert.rejects(() => tool.execute!("call", { action: "design", taskId: "personal-test", offset: first.design.nextOffset, limit: 4096, expectedSha256: first.design.sha256 }, undefined, undefined, undefined as never), /design changed; restart at offset 0/);
-    await assert.rejects(() => tool.execute!("call", { action: "design", taskId: "personal-test", offset: 0, limit: 4096, expectedSha256: first.design.sha256 }, undefined, undefined, undefined as never), /design changed; restart at offset 0/);
+    await assert.rejects(() => tool.execute!("call", { action: "design", taskId: "personal-test", offset: 0, limit: 4096, expectedSha256: first.design.sha256 }, undefined, undefined, undefined as never), /does not match the design at offset 0; retry without expectedSha256/);
     const restarted = await tool.execute!("call", { action: "design", taskId: "personal-test", offset: 0, limit: 4096 }, undefined, undefined, undefined as never);
     const restartedText = restarted.content[0]!.type === "text" ? restarted.content[0]!.text : "";
     assert.equal((JSON.parse(restartedText) as { design: { sha256: string } }).design.sha256, sha256(revised));

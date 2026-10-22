@@ -175,7 +175,10 @@ async function executeTaskDesignRead(taskId: string, offsetInput?: number, limit
   const output = readTrustedBeadsTaskPage(runtime, [taskId]);
   const design = workerTaskDesign(output, taskId);
   const sha256 = designSha256(design);
-  if (expectedSha256 !== undefined && expectedSha256 !== sha256) throw new Error("worker_beads_tasks design changed; restart at offset 0.");
+  if (expectedSha256 !== undefined && expectedSha256 !== sha256) {
+    if (offset === 0) throw new Error("worker_beads_tasks expectedSha256 does not match the design at offset 0; retry without expectedSha256.");
+    throw new Error("worker_beads_tasks design changed; restart at offset 0.");
+  }
   const response = fitDesignReadToBudget({
     scope: "design" as const,
     assignedTaskIds: [...runtime.taskIds],

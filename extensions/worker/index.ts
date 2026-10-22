@@ -6,7 +6,6 @@ import { Text, stripTerminalSequences, truncateToWidth, visibleWidth, type Compo
 import { defineTool, type AgentToolResult, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { resolveExtensionModel, assertChildAgentRouteAllowed, parseModelThinkingPair } from "../_shared/model-spec.js";
 import { throwIfAborted } from "../_shared/cancellation.js";
-import { resolveExecutable } from "../_shared/executable.js";
 import { asyncJobProcessStartToken, createAsyncJobId, isAsyncJobProcessIdentityAlive, signalAsyncJobProcessIdentity } from "../_shared/async-job.js";
 import { handleAsyncShellViewerCommand, reconcileTerminatedPersistedAsyncShellJobsForOwner, unsettledPersistedAsyncShellJobsForOwner, type JobMeta, type ManagedAsyncJobHandle } from "../async-shell/index.js";
 import { createWorkerContainerAsync, planWorkerContainer, resolveDockerPath, settleWorkerContainerAsync, type WorkerContainerReference } from "../_shared/worker-container.js";
@@ -24,12 +23,12 @@ import {
   subscribeWorkerRegistryChanges, updatePreparedSetStatus, updateWorkerRuntimeMetadata, workerRegistryDataVersion,
   type WorkerBatchCreateItem, type WorkerRegistry, type WorkerRegistryRecord, type WorkerRepositoryResult, type WorkerRole, type WorkerRunRecord
 } from "./registry.js";
-import { readTrustedBeadsTaskPage, readWorkerRuntimeResult } from "./runtime.js";
+import { readWorkerRuntimeResult } from "./runtime.js";
 import { cleanupReviewOverlayAsync, createReviewOverlayAsync, type ReviewOverlayRecord } from "./review-workspace.js";
 import { preferredWorkerModel } from "./settings.js";
 import { createWorkerId, createWorkerRunId, defaultWorkerRoots, provisionWorkerPaths, workerPaths, type WorkerPaths, type WorkerRoots } from "./identity.js";
 import { createWorkerSession, forkWorkerSession, verifyWorkerSession } from "./session.js";
-import { launchWorkerHost, readWorkerHostProcess, readWorkerHostSettlement, resolveBeadsRoute, type WorkerLaunchRecord } from "./runner.js";
+import { launchWorkerHost, readWorkerHostProcess, readWorkerHostSettlement, type WorkerLaunchRecord } from "./runner.js";
 import { renderWorkerRuntimePrompt } from "./prompts.js";
 import { contextInputs, inputMounts, validateAdditionalInputs, type RetainedInput } from "./inputs.js";
 import { inspectInterruptedGitState, inventoryWorkerRepositories, snapshotWorkerRepositories, type RepositorySnapshot } from "./inventory.js";
@@ -70,7 +69,7 @@ type ActiveRun = { runId: string; handle: ManagedAsyncJobHandle };
 type PlannedRun = {
   request: WorkerRunInputV2["runs"][number]; role: WorkerRole; workerId: string; runId: string; jobId: string; paths: WorkerPaths;
   taskIds: string[]; modelSelection: string; binding?: WorkerRunRecord["binding"]; workerRuntime: WorkerRuntime; runRuntime: RunRuntime;
-  newWorker: boolean; expectedVersion?: number; reviewedRunId?: string; preparedId?: string; consumedPrepared?: boolean;
+  newWorker: boolean; expectedVersion?: number; reviewedRunId?: string; preparedId?: string; consumedPrepared?: boolean; operationRepositories?: Array<Record<string, unknown>>;
 };
 export type WorkerExtensionDependencies = {
   runtimeRoot?: string; roots?: WorkerRoots; codeRoot?: string; preparedRoot?: string; targetRoot?: string; now?: () => Date; random?: () => string; dockerPath?: string;
@@ -79,8 +78,6 @@ export type WorkerExtensionDependencies = {
   launch?: (api: ExtensionAPI, context: ExtensionContext, input: { record: WorkerLaunchRecord; runtime: RunRuntime }) => ManagedAsyncJobHandle;
   createOverlay?: (input: Parameters<typeof createReviewOverlayAsync>[0]) => ReviewOverlayRecord | Promise<ReviewOverlayRecord>; cleanupOverlay?: (dockerPath: string, overlay: ReviewOverlayRecord) => void | Promise<void>;
   waitForHostIdentity?: (runtime: RunRuntime, workerId: string, runId: string) => Promise<void>;
-  taskTitle?: (taskId: string, cwd: string) => string | undefined;
-  preparedSet?: (preparedId: string) => { repositories: Array<Record<string, unknown>> } | undefined;
 };
 
 export default function workerExtension(api: ExtensionAPI): void { registerWorkerExtension(api); }
@@ -110,42 +107,12 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   const starting = new Map<string, { runId: string; completion: Promise<void> }>();
   const deliveredRecovery = new Set<string>();
   const getRegistry = () => registry ??= openWorkerRegistry(runtimeRoot);
-  const taskTitleCache = new Map<string, string | undefined>();
-  const taskTitle = overrides.taskTitle ?? ((taskId: string, cwd: string): string | undefined => {
-    const key = `${path.resolve(cwd)}\0${taskId}`;
-    if (taskTitleCache.has(key)) return taskTitleCache.get(key);
-    let title: string | undefined;
-    try {
-      const bdPath = resolveExecutable("bd");
-      const beadsRoute = resolveBeadsRoute(bdPath, cwd);
-      const value = JSON.parse(readTrustedBeadsTaskPage({ bdPath, workspaceRoot: cwd, beadsRoute }, [taskId])) as unknown;
-      if (Array.isArray(value) && value.length === 1 && value[0] && typeof value[0] === "object" && !Array.isArray(value[0])) {
-        const record = value[0] as Record<string, unknown>;
-        if (record.id === taskId && typeof record.title === "string" && Buffer.byteLength(record.title, "utf8") <= 512) title = record.title;
-      }
-    } catch {}
-    taskTitleCache.set(key, title);
-    return title;
-  });
-  const currentParentSessionFile = (): string | undefined => {
-    const value = currentContext?.sessionManager.getSessionFile();
-    return value ? realpathOrResolve(value) : undefined;
-  };
-  const operationLookups: WorkerOperationLookups = {
-    taskTitle: (taskId, cwd) => { try { return taskTitle(taskId, cwd); } catch { return undefined; } },
-    worker: (workerId) => {
-      const parent = currentParentSessionFile(); if (!parent) return undefined;
-      const worker = getWorker(getRegistry(), workerId); return worker?.parentSessionFile === parent ? worker : undefined;
-    },
-    run: (runId) => {
-      const parent = currentParentSessionFile(); if (!parent) return undefined;
-      const found = findWorkerRunById(getRegistry(), runId); return found?.worker.parentSessionFile === parent ? found : undefined;
-    },
-    prepared: (preparedId) => {
-      if (overrides.preparedSet) return overrides.preparedSet(preparedId);
-      const parent = currentParentSessionFile(); if (!parent) return undefined;
-      try { return readPreparedSetRecord(getRegistry(), parent, preparedId); } catch { return undefined; }
-    }
+  const operationSnapshots = new Map<string, WorkerOperation>();
+  const rememberOperationSnapshot = (toolCallId: string, operation: WorkerOperation | undefined): void => {
+    if (!operation) return;
+    operationSnapshots.delete(toolCallId);
+    operationSnapshots.set(toolCallId, operation);
+    while (operationSnapshots.size > 128) operationSnapshots.delete(operationSnapshots.keys().next().value!);
   };
   const repaintWorkerActivity = (context: ExtensionContext): void => {
     try { updateWorkerActivityStatus(getRegistry(), context); }
@@ -243,12 +210,13 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       "worker_run constraints: Only result content is provider-visible; details remain internal."
     ],
     parameters: WorkerRunParamsV2, executionMode: "sequential" as const,
-    renderCall: (args: unknown, theme: any, context: any) => compactCall(theme, runCallLabel(args as WorkerRunInputV2), workerRunOperationHint(args as WorkerRunInputV2, operationLookups, context?.cwd ?? currentContext?.cwd ?? process.cwd())),
-    renderResult: (result: AgentToolResult<any>, _options: unknown, theme: any, context: any) => compactResult(theme, result, "worker run", workerRunOperationHint(context?.args as WorkerRunInputV2, operationLookups, context?.cwd ?? currentContext?.cwd ?? process.cwd())),
-    execute: async (_callId: string, params: WorkerRunInputV2, signal: AbortSignal, onUpdate: any, context: ExtensionContext): Promise<AgentToolResult<any>> => {
+    renderCall: (args: unknown, theme: any, context: any) => compactCall(theme, runCallLabel(args), workerRunCallOperationHint(args, renderArgumentsComplete(context))),
+    renderResult: (result: AgentToolResult<any>, _options: unknown, theme: any, context: any) => compactResult(theme, result, "worker run", workerRunResultOperationHint(safeResultDetails(result), operationSnapshots.get(safeToolCallId(context)))),
+    execute: async (toolCallId: string, params: WorkerRunInputV2, signal: AbortSignal, onUpdate: any, context: ExtensionContext): Promise<AgentToolResult<any>> => {
       throwIfAborted(signal);
       const parentSessionFile = requireParentSession(context);
       const planned = preflightBatch(params, context, parentSessionFile);
+      rememberOperationSnapshot(toolCallId, plannedRunOperation(planned));
       const timestamp = now().toISOString();
       try {
         for (const plan of planned) if (plan.role === "integration" && plan.consumedPrepared && plan.preparedId) assertIntegrationTargetsCurrent(trustedPreparedSet(getRegistry(), parentSessionFile, plan.preparedId));
@@ -290,7 +258,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       "worker_control constraints: Only result content is provider-visible; details remain internal."
     ],
     parameters: WorkerControlParamsV2, executionMode: "sequential" as const,
-    renderCall: (args: unknown, theme: any) => compactCall(theme, `worker ${String((args as any).action ?? "control")}`),
+    renderCall: (args: unknown, theme: any) => compactCall(theme, workerControlCallLabel(args)),
     renderResult: (result: AgentToolResult<any>, _options: unknown, theme: any) => compactResult(theme, result, "worker control"),
     execute: async (_callId: string, params: WorkerControlInputV2, signal: AbortSignal, _update: any, context: ExtensionContext): Promise<AgentToolResult<any>> => {
       throwIfAborted(signal); return control(params, context);
@@ -304,7 +272,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     promptSnippet: "Test repository candidates against target branches and prepare exact disposable merge results without promotion.",
     promptGuidelines: [inputJsonSchemaGuideline("worker_merge_test", WorkerMergeTestParams), outputJsonSchemaGuideline("worker_merge_test", RetainedToolOutputSchemas.worker_merge_test), "worker_merge_test use: Prepare exact merges, validate every prepared view separately, and apply only through an explicit worker_merge_apply call.", "worker_merge_test constraints: Only result content is provider-visible; details remain internal."],
     parameters: WorkerMergeTestParams, executionMode: "sequential",
-    renderCall: (args, theme) => compactCall(theme, "testing merge", mergeOperationHint((args as any).repositories)), renderResult: (result, _options, theme, context) => compactResult(theme, result as any, "merge test", mergeOperationHint((result as any).details?.repositories ?? (context as any)?.args?.repositories)),
+    renderCall: (args, theme, context) => compactCall(theme, "testing merge", mergeCallOperationHint(args, renderArgumentsComplete(context))), renderResult: (result, _options, theme) => compactResult(theme, result as any, "merge test", mergeResultOperationHint(safeResultDetails(result))),
     async execute(_id, params, signal, _update, context) {
       throwIfAborted(signal); const parent = requireParentSession(context);
       const resolved = params.repositories.map((request) => ({ ...request, candidateRef: request.candidateRef ?? "HEAD" }));
@@ -321,9 +289,10 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     promptSnippet: "Apply every exact repository result in one parent-validated prepared set.",
     promptGuidelines: [inputJsonSchemaGuideline("worker_merge_apply", WorkerMergeApplyParams), outputJsonSchemaGuideline("worker_merge_apply", RetainedToolOutputSchemas.worker_merge_apply), "worker_merge_apply use: Inspect diffs and run checks from every preparedPath before application. On validation failure, create a new prepared set. After partial or failed application, retry only the same preparedId; target drift requires a new worker_merge_test. Push and release remain separate parent actions.", "worker_merge_apply constraints: Only result content is provider-visible; details remain internal."],
     parameters: WorkerMergeApplyParams, executionMode: "sequential",
-    renderCall: (args, theme) => compactCall(theme, "applying merge", preparedOperationHint((args as any).preparedId, operationLookups)), renderResult: (result, _options, theme, context) => compactResult(theme, result as any, "merge apply", preparedOperationHint((context as any)?.args?.preparedId, operationLookups)),
-    async execute(_id, params, signal, _update, context) {
+    renderCall: (args, theme, context) => compactCall(theme, "applying merge", preparedCallOperationHintFromArgs(args, renderArgumentsComplete(context))), renderResult: (result, _options, theme, context) => compactResult(theme, result as any, "merge apply", renderWorkerOperationHint(operationSnapshots.get(safeToolCallId(context)))),
+    async execute(toolCallId, params, signal, _update, context) {
       throwIfAborted(signal); const parent = requireParentSession(context); const trustedSet = trustedPreparedSet(getRegistry(), parent, params.preparedId); if (!["ready", "partial", "failed"].includes(trustedSet.status)) throw new Error(`Prepared set ${params.preparedId} is not ready.`);
+      rememberOperationSnapshot(toolCallId, mergeOperation(trustedSet.repositories));
       const nonce = claimNonce(); if (!claimPreparedSetApply(getRegistry(), params.preparedId, parent, nonce, now().toISOString())) throw new Error(`Prepared set ${params.preparedId} is already being applied or changed state.`);
       try { const result = applyPreparedWorkerMerges(parent, params.preparedId, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, sourceForCandidate: managedCandidateWarnings(parent), trustedSet }); finishPreparedSetApply(getRegistry(), params.preparedId, parent, nonce, result.status, now().toISOString()); return resultText(`${result.status} · ${result.repositories.filter((item) => item.status === "applied").length} applied`, result); }
       catch (error) { releasePreparedSetApply(getRegistry(), params.preparedId, parent, nonce, now().toISOString()); throw error; }
@@ -361,7 +330,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
           const latest = worker.latestRunId ? getWorkerRun(getRegistry(), worker.workerId, worker.latestRunId) : undefined;
           const binding = latest?.binding; const paths = workerPaths(roots, worker.workerId); provisionWorkerPaths(paths);
           const role = worker.role; const inputs = validateAdditionalInputs({ values: request.additionalInputs, existing: runtimeInputs(worker), role, workspaceRoot: paths.workspaceRoot, runtimeRoot });
-          let reviewOverlayPlan: ReviewOverlayPlan | undefined; let contextFile: string | undefined; let reviewedRunId: string | undefined; let preparedId: string | undefined; const pendingWorkSessionId = !worker.sessionId && role === "work" ? randomUUID() : undefined; const reservedRunId = role === "review" ? createWorkerRunId(now(), random()) : undefined;
+          let reviewOverlayPlan: ReviewOverlayPlan | undefined; let contextFile: string | undefined; let reviewedRunId: string | undefined; let preparedId: string | undefined; let operationRepositories: Array<Record<string, unknown>> | undefined; const pendingWorkSessionId = !worker.sessionId && role === "work" ? randomUUID() : undefined; const reservedRunId = role === "review" ? createWorkerRunId(now(), random()) : undefined;
           const mounts = inputMounts(inputs);
           if (role === "review") {
             if (!binding || !("reviewedRunId" in binding)) throw new Error(`Review worker ${worker.workerId} lost its reviewed-run binding.`);
@@ -370,11 +339,12 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
             reviewOverlayPlan = { workerId: worker.workerId, runId: reservedRunId!, subjectWorkspace: subject.worker.workspaceRoot, reviewerWorkspace: paths.workspaceRoot, contextFile, reviewedSessionFile: subject.worker.sessionFile!, additionalInputs: inputs.map((item) => ({ source: item.source, target: item.target })) };
           } else if (role === "integration") {
             if (!binding || !("preparedId" in binding)) throw new Error(`Integration worker ${worker.workerId} lost its prepared-set binding.`); preparedId = binding.preparedId;
-            contextFile = writeIntegrationContext(paths, trustedPreparedSet(getRegistry(), parentSessionFile, preparedId, paths.workspaceRoot), inputs, true); mounts.push({ kind: "bind", source: paths.workspaceRoot, target: "/workspace" }, { kind: "bind", source: contextFile, target: "/integration/context.json", readOnly: true });
+            const trustedSet = trustedPreparedSet(getRegistry(), parentSessionFile, preparedId, paths.workspaceRoot); operationRepositories = snapshotOperationRepositories(trustedSet.repositories);
+            contextFile = writeIntegrationContext(paths, trustedSet, inputs, true); mounts.push({ kind: "bind", source: paths.workspaceRoot, target: "/workspace" }, { kind: "bind", source: contextFile, target: "/integration/context.json", readOnly: true });
           }
           const retained = retainedWorkerRuntime(worker);
           if (pendingWorkSessionId) retained.cacheLineage = prepareWorkerCacheLineage({ stateRoot: roots.stateRoot, workerStateDir: paths.stateDir, parentSessionFile, parentSessionId: context.sessionManager.getSessionId(), route: parseWorkerModelSelection(worker.modelSelection!), now: now() });
-          const plan = finishPlanSafely({ request, role, workerId: worker.workerId, ...(reservedRunId ? { runId: reservedRunId } : {}), paths, taskIds: unique([...worker.taskIds, ...(request.additionalTaskIds ?? [])]), modelSelection: worker.modelSelection!, binding, workerRuntime: { version: 2, inputs, ...retained }, newWorker: false, expectedVersion: worker.version, reviewOverlayPlan, contextFile, reviewedRunId, preparedId, pendingWorkSessionId, mounts, parentSessionFile, context });
+          const plan = finishPlanSafely({ request, role, workerId: worker.workerId, ...(reservedRunId ? { runId: reservedRunId } : {}), paths, taskIds: unique([...worker.taskIds, ...(request.additionalTaskIds ?? [])]), modelSelection: worker.modelSelection!, binding, workerRuntime: { version: 2, inputs, ...retained }, newWorker: false, expectedVersion: worker.version, reviewOverlayPlan, contextFile, reviewedRunId, preparedId, operationRepositories, pendingWorkSessionId, mounts, parentSessionFile, context });
           plans.push(plan); continue;
         }
         const role = request.role;
@@ -384,10 +354,11 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         let subject: ReturnType<typeof reviewSubject> | undefined;
         let repositoryBaselines: Array<{ path: string; resolvedCommit: string }> | undefined;
         let cacheLineage: WorkerCacheLineageRecord | undefined;
+        let integrationSet: ReturnType<typeof readPreparedMergeSet> | undefined;
         let inputs: RetainedInput[] = [];
         if (role === "work") repositoryBaselines = (request.repositoryBaselines ?? []).map((item) => { const repo = canonicalRepository(item.path); return { path: repo, resolvedCommit: trustedGit(repo, ["rev-parse", `${item.revision ?? "HEAD"}^{commit}`]).trim() }; });
         else if (role === "review") { subject = reviewSubject(request.reviewedRunId, parentSessionFile); inputs = validateAdditionalInputs({ values: request.additionalInputs, role, workspaceRoot: paths.workspaceRoot, runtimeRoot }); }
-        else { trustedPreparedSet(getRegistry(), parentSessionFile, request.preparedId); inputs = validateAdditionalInputs({ values: request.additionalInputs, role, workspaceRoot: paths.workspaceRoot, runtimeRoot }); }
+        else { integrationSet = trustedPreparedSet(getRegistry(), parentSessionFile, request.preparedId); inputs = validateAdditionalInputs({ values: request.additionalInputs, role, workspaceRoot: paths.workspaceRoot, runtimeRoot }); }
         provisionWorkerPaths(paths);
         try { if (role === "work") cacheLineage = prepareWorkerCacheLineage({ stateRoot: roots.stateRoot, workerStateDir: paths.stateDir, parentSessionFile, parentSessionId: context.sessionManager.getSessionId(), route: parseWorkerModelSelection(modelSelection), now: now() }); }
         catch (error) { rmSync(paths.stateDir, { recursive: true, force: true }); throw error; }
@@ -401,12 +372,12 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
             contextFile = writeReviewContext(paths, workerId, reservedRunId!, subject!.worker, subject!.run, inputs);
             reviewOverlayPlan = { workerId, runId: reservedRunId!, subjectWorkspace: subject!.worker.workspaceRoot, reviewerWorkspace: paths.workspaceRoot, contextFile, reviewedSessionFile: subject!.worker.sessionFile!, additionalInputs: inputs.map((item) => ({ source: item.source, target: item.target })) };
           } else if (role === "integration") {
-            preparedId = request.preparedId; const trustedSet = trustedPreparedSet(getRegistry(), parentSessionFile, preparedId); const moved = consumePreparedMergeSet(parentSessionFile, preparedId, workerId, paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, trustedSet }); consumedPrepared = true; binding = { preparedId };
+            preparedId = request.preparedId; const trustedSet = integrationSet!; const moved = consumePreparedMergeSet(parentSessionFile, preparedId, workerId, paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, trustedSet }); consumedPrepared = true; binding = { preparedId };
             createWorkerSession({ workspaceRoot: paths.workspaceRoot, sessionDir: paths.sessionDir, sessionId: randomUUID() });
             contextFile = writeIntegrationContext(paths, moved, inputs, false); mounts = [...inputMounts(inputs), { kind: "bind", source: paths.workspaceRoot, target: "/workspace" }, { kind: "bind", source: contextFile, target: "/integration/context.json", readOnly: true }];
           }
           const plan = finishPlan({ request, role, workerId, ...(reservedRunId ? { runId: reservedRunId } : {}), paths, taskIds: role === "review" ? subject!.run.taskIds : taskIds, modelSelection, binding,
-            workerRuntime: { version: 2, inputs, ...(repositoryBaselines ? { repositoryBaselines } : {}), ...(cacheLineage ? { cacheLineage } : {}) }, newWorker: true, reviewOverlayPlan, contextFile, reviewedRunId, preparedId, consumedPrepared, pendingWorkSessionId, mounts, parentSessionFile, context });
+            workerRuntime: { version: 2, inputs, ...(repositoryBaselines ? { repositoryBaselines } : {}), ...(cacheLineage ? { cacheLineage } : {}) }, newWorker: true, reviewOverlayPlan, contextFile, reviewedRunId, preparedId, consumedPrepared, operationRepositories: snapshotOperationRepositories(integrationSet?.repositories), pendingWorkSessionId, mounts, parentSessionFile, context });
           plans.push(plan);
         } catch (error) {
           if (consumedPrepared && preparedId) { try { restoreConsumedPreparedMergeSet(parentSessionFile, preparedId, paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, trustedSet: trustedPreparedSet(getRegistry(), parentSessionFile, preparedId) }); } catch {} }
@@ -447,7 +418,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       container: reference, ...(input.reviewOverlayPlan ? { reviewOverlayPlan: input.reviewOverlayPlan } : {}), ...(input.contextFile ? { contextFile: input.contextFile } : {}), inputs: input.workerRuntime.inputs,
       repositoryBefore: snapshotWorkerRepositories(input.paths.workspaceRoot), ...(input.pendingWorkSessionId ? { pendingWorkSessionId: input.pendingWorkSessionId } : {}), ...(interruptionWarnings.length ? { interruptionWarnings } : {}) };
     return { request, role: input.role, workerId: input.workerId, runId, jobId, paths: input.paths, taskIds: input.taskIds, modelSelection: input.modelSelection, ...(input.binding ? { binding: input.binding } : {}), workerRuntime: input.workerRuntime, runRuntime,
-      newWorker: input.newWorker, ...(input.expectedVersion === undefined ? {} : { expectedVersion: input.expectedVersion }), ...(input.reviewedRunId ? { reviewedRunId: input.reviewedRunId } : {}), ...(input.preparedId ? { preparedId: input.preparedId } : {}), ...(input.consumedPrepared ? { consumedPrepared: true } : {}) };
+      newWorker: input.newWorker, ...(input.expectedVersion === undefined ? {} : { expectedVersion: input.expectedVersion }), ...(input.reviewedRunId ? { reviewedRunId: input.reviewedRunId } : {}), ...(input.preparedId ? { preparedId: input.preparedId } : {}), ...(input.consumedPrepared ? { consumedPrepared: true } : {}), ...(input.operationRepositories ? { operationRepositories: input.operationRepositories } : {}) };
   }
 
   function rollbackPlans(plans: PlannedRun[], parentSessionFile: string): void {
@@ -777,7 +748,7 @@ function boundedWorkerText(theme: any, text: string, color: string, bold: boolea
   return {
     render(width: number): string[] {
       const boundedWidth = Math.max(1, Math.min(maximumWidth, width));
-      const visible = truncateToWidth(safe, boundedWidth, "…");
+      const visible = sanitizeWorkerOperationText(truncateToWidth(safe, boundedWidth, "…"));
       return [theme.fg(color, bold ? theme.bold(visible) : visible)];
     },
     invalidate() {}
@@ -788,123 +759,184 @@ function compactCall(theme: any, label: string, hint?: string): Component {
   return boundedWorkerText(theme, text, "toolTitle", true, 72);
 }
 function compactResult(theme: any, result: AgentToolResult<any>, fallback: string, hint?: string): Component {
-  const summary = compactResultSummary((result as any).details, fallback);
+  const summary = compactResultSummary(safeResultDetails(result), fallback);
   return boundedWorkerText(theme, hint ? `${summary} · ${hint}` : summary, "success", false, 96);
 }
 function compactResultSummary(details: any, fallback: string): string {
-  if (Array.isArray(details?.runs) && details.runs.some((run: any) => run?.action)) return `${details.runs.length} worker run${details.runs.length === 1 ? "" : "s"} queued`;
-  if (typeof details?.preparedId === "string") return `${details.status ?? fallback} · ${details.repositories?.length ?? 0} repositories`;
-  if (Array.isArray(details?.workers)) return `${details.total ?? details.workers.length} workers`;
-  if (Array.isArray(details?.runs)) return `${details.total ?? details.runs.length} retained runs`;
-  if (typeof details?.cancellation === "string") return details.cancellation.replace("_", " ");
-  if (details?.discarded) return "worker discarded";
-  if (typeof details?.workerId === "string" && typeof details?.runId === "string") return `${details.outcome ?? details.status ?? fallback} · ${details.role ?? "worker"}`;
-  return fallback;
+  try {
+    if (Array.isArray(details?.runs) && details.runs.slice(0, 32).some((run: any) => recordValue(run) && typeof run.action === "string")) return `${details.runs.length} worker run${details.runs.length === 1 ? "" : "s"} queued`;
+    if (typeof details?.preparedId === "string") return `${details.status ?? fallback} · ${Array.isArray(details.repositories) ? details.repositories.length : 0} repositories`;
+    if (Array.isArray(details?.workers)) return `${Number.isInteger(details.total) ? details.total : details.workers.length} workers`;
+    if (Array.isArray(details?.runs)) return `${Number.isInteger(details.total) ? details.total : details.runs.length} retained runs`;
+    if (typeof details?.cancellation === "string") return details.cancellation.replace("_", " ");
+    if (details?.discarded) return "worker discarded";
+    if (typeof details?.workerId === "string" && typeof details?.runId === "string") return `${details.outcome ?? details.status ?? fallback} · ${details.role ?? "worker"}`;
+    return fallback;
+  } catch { return fallback; }
 }
 
-type WorkerOperationLookups = {
-  taskTitle(taskId: string, cwd: string): string | undefined;
-  worker(workerId: string): WorkerRegistryRecord | undefined;
-  run(runId: string): { worker: WorkerRegistryRecord; run: WorkerRunRecord } | undefined;
-  prepared(preparedId: string): { repositories: Array<Record<string, unknown>> } | undefined;
-};
 type WorkerOperation =
   | { kind: "work"; taskIds: string[]; title?: string; batchExtra?: number }
   | { kind: "review"; taskIds: string[]; reviewedRunId: string; batchExtra?: number }
   | { kind: "integration"; repositories: Array<Record<string, unknown>>; batchExtra?: number }
-  | { kind: "merge"; repositories: Array<Record<string, unknown>> };
+  | { kind: "merge"; repositories: Array<Record<string, unknown>> }
+  | { kind: "prepared"; preparedId: string; batchExtra?: number };
 
 const PERSONAL_TASK_ID = /^personal-[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)*$/;
-const TERMINAL_CONTROL_PATTERN = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]/gu;
+const PREPARED_ID = /^prepared_[0-9a-f]{24}$/;
+const TERMINAL_CONTROL_PATTERN = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]/gu;
 const MAX_WORKER_OPERATION_HINT_WIDTH = 48;
 
 export function sanitizeWorkerOperationText(value: unknown): string {
   if (typeof value !== "string") return "";
-  return stripTerminalSequences(value).replace(TERMINAL_CONTROL_PATTERN, " ").replace(/\s+/gu, " ").trim();
+  const bounded = value.slice(0, 4096);
+  return stripTerminalSequences(bounded).replace(TERMINAL_CONTROL_PATTERN, " ").replace(/\s+/gu, " ").trim();
 }
 
+function recordValue(value: unknown): value is Record<string, unknown> { return Boolean(value) && typeof value === "object" && !Array.isArray(value); }
+function safeResultDetails(result: unknown): unknown { try { return recordValue(result) ? result.details : undefined; } catch { return undefined; } }
+function safeToolCallId(context: unknown): string {
+  try { return recordValue(context) && typeof context.toolCallId === "string" ? context.toolCallId : ""; } catch { return ""; }
+}
+function renderArgumentsComplete(context: unknown): boolean {
+  try { return recordValue(context) && (context.argsComplete === true || context.executionStarted === true); } catch { return false; }
+}
+function validTaskIds(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 32).filter((item): item is string => typeof item === "string" && item.length <= 128 && PERSONAL_TASK_ID.test(item));
+}
+function operationRecords(value: unknown): Array<Record<string, unknown>> {
+  return Array.isArray(value) ? value.slice(0, 16).filter(recordValue) : [];
+}
+function snapshotOperationRepositories(value: unknown): Array<Record<string, unknown>> | undefined {
+  const repositories = operationRecords(value).map((repository) => {
+    const snapshot: Record<string, unknown> = {};
+    for (const field of ["targetRepo", "candidateRepo", "preparedPath", "path", "targetRef", "method"] as const) {
+      const item = repository[field]; if (typeof item === "string") snapshot[field] = item.slice(0, 4096);
+    }
+    return snapshot;
+  });
+  return repositories.length > 0 ? repositories : undefined;
+}
 function plusCount(value: string, count: number): string { return count > 0 ? `${value} +${count}` : value; }
 function repositoryBasename(value: unknown): string {
   const safe = sanitizeWorkerOperationText(value).replaceAll("\\", "/").replace(/\/+$/u, "");
   return safe.split("/").at(-1) ?? "";
 }
-function taskOperation(taskIds: unknown, lookups: WorkerOperationLookups, cwd: string, batchExtra: number): WorkerOperation | undefined {
-  if (!Array.isArray(taskIds)) return undefined;
-  const trusted = taskIds.filter((value): value is string => typeof value === "string" && PERSONAL_TASK_ID.test(value));
-  if (!trusted[0]) return undefined;
-  const title = lookups.taskTitle(trusted[0], cwd);
-  return { kind: "work", taskIds: trusted, ...(title ? { title } : {}), ...(batchExtra > 0 ? { batchExtra } : {}) };
+function withBatchExtra<T extends WorkerOperation>(operation: T, batchExtra: number): T {
+  return batchExtra > 0 && operation.kind !== "merge" ? { ...operation, batchExtra } : operation;
 }
-function reviewedOperation(runId: unknown, lookups: WorkerOperationLookups, batchExtra: number): WorkerOperation | undefined {
-  if (typeof runId !== "string") return undefined;
-  const found = lookups.run(runId);
-  const taskIds = found?.run.taskIds.filter((value) => PERSONAL_TASK_ID.test(value)) ?? [];
-  return { kind: "review", taskIds, reviewedRunId: runId, ...(batchExtra > 0 ? { batchExtra } : {}) };
+function workOperation(taskIds: unknown, batchExtra = 0, title?: unknown): WorkerOperation | undefined {
+  const trusted = validTaskIds(taskIds); if (!trusted[0]) return undefined;
+  return withBatchExtra({ kind: "work", taskIds: trusted, ...(typeof title === "string" ? { title } : {}) }, batchExtra);
 }
-function preparedOperation(preparedId: unknown, lookups: WorkerOperationLookups, batchExtra: number): WorkerOperation | undefined {
-  if (typeof preparedId !== "string") return undefined;
-  const prepared = lookups.prepared(preparedId);
-  return prepared ? { kind: "integration", repositories: prepared.repositories, ...(batchExtra > 0 ? { batchExtra } : {}) } : undefined;
+function reviewOperation(taskIds: unknown, reviewedRunId: unknown, batchExtra = 0): WorkerOperation | undefined {
+  if (typeof reviewedRunId !== "string" || !/^run_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(reviewedRunId)) return undefined;
+  return withBatchExtra({ kind: "review", taskIds: validTaskIds(taskIds), reviewedRunId }, batchExtra);
 }
-
-export function workerRunOperationHint(input: WorkerRunInputV2 | undefined, lookups: WorkerOperationLookups, cwd: string): string | undefined {
-  const runs = input && Array.isArray(input.runs) ? input.runs : [];
-  const first = runs[0] as any; if (!first || typeof first !== "object") return undefined;
-  const batchExtra = Math.max(0, runs.length - 1);
-  let operation: WorkerOperation | undefined;
-  if (first.action === "start" && first.role === "work") operation = taskOperation(first.taskIds, lookups, cwd, batchExtra);
-  else if (first.action === "start" && first.role === "review") operation = reviewedOperation(first.reviewedRunId, lookups, batchExtra);
-  else if (first.action === "start" && first.role === "integration") operation = preparedOperation(first.preparedId, lookups, batchExtra);
-  else if (first.action === "resume" && typeof first.workerId === "string") {
-    const worker = lookups.worker(first.workerId);
-    if (worker) operation = taskOperation(worker.taskIds, lookups, cwd, batchExtra);
-  }
-  return operation ? renderWorkerOperationHint(operation) : undefined;
+function preparedOperation(preparedId: unknown, batchExtra = 0): WorkerOperation | undefined {
+  return typeof preparedId === "string" && PREPARED_ID.test(preparedId) ? withBatchExtra({ kind: "prepared", preparedId }, batchExtra) : undefined;
+}
+function integrationOperation(repositories: unknown, batchExtra = 0): WorkerOperation | undefined {
+  const records = snapshotOperationRepositories(repositories); if (!records?.[0]) return undefined;
+  return withBatchExtra({ kind: "integration", repositories: records }, batchExtra);
+}
+function mergeOperation(repositories: unknown): WorkerOperation | undefined {
+  const records = snapshotOperationRepositories(repositories); return records?.[0] ? { kind: "merge", repositories: records } : undefined;
 }
 
-export function renderWorkerOperationHint(operation: WorkerOperation): string | undefined {
-  let raw = "";
-  if (operation.kind === "work") {
-    const first = operation.taskIds.find((value) => PERSONAL_TASK_ID.test(value)); if (!first) return undefined;
-    const task = plusCount(first, Math.max(0, operation.taskIds.length - 1));
-    const title = sanitizeWorkerOperationText(operation.title);
-    raw = `${task}${title ? ` — ${title}` : ""}`;
-  } else if (operation.kind === "review") {
-    const task = operation.taskIds.find((value) => PERSONAL_TASK_ID.test(value));
-    const taskPart = task ? plusCount(task, Math.max(0, operation.taskIds.length - 1)) : "review";
-    const run = sanitizeWorkerOperationText(operation.reviewedRunId).slice(-8);
-    raw = `${taskPart}${run ? ` · run ${run}` : ""}`;
-  } else if (operation.kind === "integration") {
-    const first = operation.repositories[0]; if (!first) return undefined;
-    const repository = repositoryBasename(first.targetRepo ?? first.candidateRepo ?? first.preparedPath ?? first.path); if (!repository) return undefined;
-    raw = plusCount(repository, Math.max(0, operation.repositories.length - 1));
-  } else {
-    const first = operation.repositories[0]; if (!first) return undefined;
-    const repository = repositoryBasename(first.targetRepo); if (!repository) return undefined;
-    const branch = sanitizeWorkerOperationText(first.targetRef).replace(/^refs\/heads\//u, "");
-    const method = first.method === "merge" || first.method === "squash" ? first.method : "";
-    raw = `${repository}${branch ? ` → ${branch}` : ""}${method ? ` · ${method}` : ""}${operation.repositories.length > 1 ? ` +${operation.repositories.length - 1}` : ""}`;
-  }
-  if (operation.kind !== "merge" && (operation.batchExtra ?? 0) > 0) raw += ` · +${operation.batchExtra}`;
-  const safe = sanitizeWorkerOperationText(raw);
-  if (!safe) return undefined;
-  return visibleWidth(safe) <= MAX_WORKER_OPERATION_HINT_WIDTH ? safe : sanitizeWorkerOperationText(truncateToWidth(safe, MAX_WORKER_OPERATION_HINT_WIDTH, "…"));
+export function workerRunCallOperationHint(input: unknown, argsComplete: boolean): string | undefined {
+  try {
+    if (!argsComplete || !recordValue(input) || !Array.isArray(input.runs)) return undefined;
+    const runs = input.runs; const first = runs[0]; if (!recordValue(first)) return undefined;
+    const batchExtra = Math.max(0, runs.length - 1);
+    if (first.action === "start" && first.role === "work") return renderWorkerOperationHint(workOperation(first.taskIds, batchExtra));
+    if (first.action === "start" && first.role === "review") return renderWorkerOperationHint(reviewOperation([], first.reviewedRunId, batchExtra));
+    if (first.action === "start" && first.role === "integration") return renderWorkerOperationHint(preparedOperation(first.preparedId, batchExtra));
+    return undefined;
+  } catch { return undefined; }
 }
-function mergeOperationHint(repositories: unknown): string | undefined {
-  return Array.isArray(repositories) ? renderWorkerOperationHint({ kind: "merge", repositories: repositories.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value)) }) : undefined;
+
+export function workerRunResultOperationHint(details: unknown, snapshot?: WorkerOperation): string | undefined {
+  try {
+    if (snapshot) return renderWorkerOperationHint(snapshot);
+    if (!recordValue(details) || !Array.isArray(details.runs)) return undefined;
+    const runs = details.runs; const first = runs[0]; if (!recordValue(first)) return undefined;
+    const batchExtra = Math.max(0, runs.length - 1);
+    if (first.action === "start" && first.role === "review") return renderWorkerOperationHint(reviewOperation(first.taskIds, first.reviewedRunId, batchExtra));
+    if (first.action === "start" && first.role === "integration") return renderWorkerOperationHint(preparedOperation(first.preparedId, batchExtra));
+    return renderWorkerOperationHint(workOperation(first.taskIds, batchExtra));
+  } catch { return undefined; }
 }
-function preparedOperationHint(preparedId: unknown, lookups: WorkerOperationLookups): string | undefined {
-  const operation = preparedOperation(preparedId, lookups, 0);
-  if (!operation || operation.kind !== "integration") return undefined;
-  const repositories = operation.repositories.map((repository) => ({ ...repository, method: repository.method }));
-  return renderWorkerOperationHint({ kind: "merge", repositories });
+
+function plannedRunOperation(plans: PlannedRun[]): WorkerOperation | undefined {
+  try {
+    const first = plans[0]; if (!first) return undefined;
+    const batchExtra = Math.max(0, plans.length - 1);
+    if (first.request.action === "resume") return workOperation(first.taskIds, batchExtra);
+    if (first.role === "review") return reviewOperation(first.taskIds, first.reviewedRunId, batchExtra);
+    if (first.role === "integration") return integrationOperation(first.operationRepositories, batchExtra) ?? preparedOperation(first.preparedId, batchExtra);
+    return workOperation(first.taskIds, batchExtra);
+  } catch { return undefined; }
 }
-function runCallLabel(input: WorkerRunInputV2 | undefined): string {
-  const first = input?.runs?.[0] as any;
-  if (first?.action === "resume") return "Resume Worker";
-  if (first?.role === "review") return "Review Worker Output";
-  if (first?.role === "integration") return "Resolve Repository Conflicts";
-  return "Run Workers";
+
+export function renderWorkerOperationHint(operation: unknown): string | undefined {
+  try {
+    if (!recordValue(operation) || typeof operation.kind !== "string") return undefined;
+    let raw = "";
+    if (operation.kind === "work") {
+      const taskIds = validTaskIds(operation.taskIds); const first = taskIds[0]; if (!first) return undefined;
+      const task = plusCount(first, Math.max(0, taskIds.length - 1));
+      const title = sanitizeWorkerOperationText(operation.title);
+      raw = `${task}${title ? ` — ${title}` : ""}`;
+    } else if (operation.kind === "review") {
+      const taskIds = validTaskIds(operation.taskIds); const task = taskIds[0];
+      const taskPart = task ? plusCount(task, Math.max(0, taskIds.length - 1)) : "review";
+      const run = sanitizeWorkerOperationText(operation.reviewedRunId).slice(-8);
+      raw = `${taskPart}${run ? ` · run ${run}` : ""}`;
+    } else if (operation.kind === "integration") {
+      const repositories = operationRecords(operation.repositories); const first = repositories[0]; if (!first) return undefined;
+      const repository = repositoryBasename(first.targetRepo ?? first.candidateRepo ?? first.preparedPath ?? first.path); if (!repository) return undefined;
+      raw = plusCount(repository, Math.max(0, repositories.length - 1));
+    } else if (operation.kind === "merge") {
+      const repositories = operationRecords(operation.repositories); const first = repositories[0]; if (!first) return undefined;
+      const repository = repositoryBasename(first.targetRepo); if (!repository) return undefined;
+      const branch = sanitizeWorkerOperationText(first.targetRef).replace(/^refs\/heads\//u, "");
+      const method = first.method === "merge" || first.method === "squash" ? first.method : "";
+      raw = `${repository}${branch ? ` → ${branch}` : ""}${method ? ` · ${method}` : ""}${repositories.length > 1 ? ` +${repositories.length - 1}` : ""}`;
+    } else if (operation.kind === "prepared") {
+      if (typeof operation.preparedId !== "string" || !PREPARED_ID.test(operation.preparedId)) return undefined;
+      raw = `prepared ${operation.preparedId.slice(-8)}`;
+    } else return undefined;
+    if (operation.kind !== "merge" && Number.isInteger(operation.batchExtra) && (operation.batchExtra as number) > 0) raw += ` · +${operation.batchExtra}`;
+    const safe = sanitizeWorkerOperationText(raw); if (!safe) return undefined;
+    return visibleWidth(safe) <= MAX_WORKER_OPERATION_HINT_WIDTH ? safe : sanitizeWorkerOperationText(truncateToWidth(safe, MAX_WORKER_OPERATION_HINT_WIDTH, "…"));
+  } catch { return undefined; }
+}
+function mergeOperationHint(repositories: unknown): string | undefined { return renderWorkerOperationHint(mergeOperation(repositories)); }
+function mergeCallOperationHint(input: unknown, argsComplete: boolean): string | undefined {
+  try { return argsComplete && recordValue(input) ? mergeOperationHint(input.repositories) : undefined; } catch { return undefined; }
+}
+function mergeResultOperationHint(details: unknown): string | undefined {
+  try { return recordValue(details) ? mergeOperationHint(details.repositories) : undefined; } catch { return undefined; }
+}
+function preparedCallOperationHint(preparedId: unknown): string | undefined { return renderWorkerOperationHint(preparedOperation(preparedId)); }
+function preparedCallOperationHintFromArgs(input: unknown, argsComplete: boolean): string | undefined {
+  try { return argsComplete && recordValue(input) ? preparedCallOperationHint(input.preparedId) : undefined; } catch { return undefined; }
+}
+function runCallLabel(input: unknown): string {
+  try {
+    if (!recordValue(input) || !Array.isArray(input.runs) || !recordValue(input.runs[0])) return "Run Workers";
+    const first = input.runs[0];
+    if (first.action === "resume") return "Resume Worker";
+    if (first.role === "review") return "Review Worker Output";
+    if (first.role === "integration") return "Resolve Repository Conflicts";
+    return "Run Workers";
+  } catch { return "Run Workers"; }
+}
+function workerControlCallLabel(input: unknown): string {
+  try { return `worker ${recordValue(input) && typeof input.action === "string" ? sanitizeWorkerOperationText(input.action) || "control" : "control"}`; }
+  catch { return "worker control"; }
 }
 function publicPreparedSet(set: any) { return { preparedId: set.preparedId, status: set.status, order: set.order, repositories: set.repositories.map((item: any) => ({ id: item.id, candidateRepo: item.candidateRepo, candidateCommit: item.candidateCommit, targetRepo: item.targetRepo, targetRef: item.targetRef, method: item.method, status: item.status, expectedCommit: item.expectedCommit, ...(item.desiredCommit ? { desiredCommit: item.desiredCommit } : {}), preparedPath: item.preparedPath, overlapCount: item.overlapCount, dependsOn: item.dependsOn, ...(item.source ? { source: item.source } : {}), ...(item.warnings ? { warnings: item.warnings } : {}) })), ...(set.resolutionCases ? { resolutionCases: set.resolutionCases } : {}) }; }
 function sessionDeliveryIds(context: ExtensionContext): string[] { const ids = new Set<string>(); const visit = (value: unknown): void => { if (!value || typeof value !== "object") return; const record = value as Record<string, unknown>; if (typeof record.deliveryId === "string" && record.deliveryId.startsWith("worker-run:")) ids.add(record.deliveryId); for (const child of Object.values(record)) Array.isArray(child) ? child.forEach(visit) : visit(child); }; try { for (const entry of context.sessionManager.getEntries()) visit(entry); } catch {} return [...ids]; }

@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { Check } from "typebox/value";
-import { WORKER_ACTIVITY_STATUS_KEY, WorkerControlParams, WorkerMergeApplyParams, WorkerMergeTestParams, WorkerRunParams, activeWorkerCountForContext, registerWorkerExtension, renderWorkerActivityStatus, renderWorkerOperationHint, sanitizeWorkerOperationText, workerRunOperationHint } from "../extensions/worker/index.js";
+import { WORKER_ACTIVITY_STATUS_KEY, WorkerControlParams, WorkerMergeApplyParams, WorkerMergeTestParams, WorkerRunParams, activeWorkerCountForContext, registerWorkerExtension, renderWorkerActivityStatus, renderWorkerOperationHint, sanitizeWorkerOperationText, workerRunCallOperationHint, workerRunResultOperationHint } from "../extensions/worker/index.js";
 import { RetainedToolOutputSchemas } from "../extensions/_shared/tool-output.js";
 import { normalizeWorkerSettings } from "../extensions/worker/settings.js";
 import { validateWorkerResultInput, WorkerResultValidationError } from "../extensions/worker/contract.js";
@@ -202,78 +202,128 @@ test("worker activity footer repaints from registry events, fences reload listen
   } finally { registry.close(); await rm(root, { recursive: true, force: true }); }
 });
 
-test("trusted worker operation hints cover work, resume, review, integration, and merge metadata", () => {
-  const worker = { role: "work", taskIds: ["personal-resume", "personal-extra"], latestRunId: "run_20260101000000_resumeaa" } as never;
-  const reviewed = { worker: {} as never, run: { taskIds: ["personal-reviewed", "personal-second"] } as never };
-  const lookups = {
-    taskTitle: (taskId: string) => taskId === "personal-work" ? "Trusted work title" : taskId === "personal-resume" ? "Trusted resume title" : undefined,
-    worker: (workerId: string) => workerId.endsWith("aaaaaaaa") ? worker : undefined,
-    run: (runId: string) => runId.endsWith("reviewaa") ? reviewed : undefined,
-    prepared: (preparedId: string) => preparedId.endsWith("a".repeat(24)) ? { repositories: [{ targetRepo: "/code/pi-tools", targetRef: "refs/heads/main", method: "merge" }, { targetRepo: "/code/pi-agent-config", targetRef: "refs/heads/main", method: "squash" }] } : undefined
-  };
-  assert.equal(workerRunOperationHint({ runs: [{ action: "start", role: "work", taskIds: ["personal-work", "personal-other"], instructions: "UNTRUSTED-INSTRUCTIONS" }] } as never, lookups as never, "/tmp"), "personal-work +1 — Trusted work title");
-  assert.equal(workerRunOperationHint({ runs: [{ action: "resume", workerId: "worker_20260101000000_aaaaaaaa", instructions: "UNTRUSTED-RESUME" }] } as never, lookups as never, "/tmp"), "personal-resume +1 — Trusted resume title");
-  assert.equal(workerRunOperationHint({ runs: [{ action: "resume", workerId: "worker_20260101000000_reviewbb", instructions: "UNTRUSTED-REVIEW-RESUME" }] } as never, { ...lookups, worker: () => ({ role: "review", taskIds: ["personal-work"], latestRunId: "run_20260101000000_reviewaa" }) } as never, "/tmp"), "personal-work — Trusted work title");
-  assert.equal(workerRunOperationHint({ runs: [{ action: "start", role: "review", reviewedRunId: "run_20260101000000_reviewaa" }] } as never, lookups as never, "/tmp"), "personal-reviewed +1 · run reviewaa");
-  assert.equal(workerRunOperationHint({ runs: [{ action: "start", role: "integration", preparedId: `prepared_${"a".repeat(24)}`, taskIds: ["personal-work"] }] } as never, lookups as never, "/tmp"), "pi-tools +1");
-  assert.equal(renderWorkerOperationHint({ kind: "merge", repositories: [{ targetRepo: "/code/pi-tools", targetRef: "refs/heads/main", method: "merge" }, { targetRepo: "/code/second", targetRef: "refs/heads/release", method: "squash" }] } as never), "pi-tools → main · merge +1");
+test("pure worker operation projections cover complete calls, progress, results, roles, and merge operations", () => {
+  const workCall = { runs: [{ action: "start", role: "work", taskIds: ["personal-work", "personal-other"], instructions: "UNTRUSTED-INSTRUCTIONS" }] };
+  assert.equal(workerRunCallOperationHint(workCall, false), undefined, "streaming arguments expose no partial metadata");
+  assert.equal(workerRunCallOperationHint(workCall, true), "personal-work +1");
+  assert.equal(workerRunCallOperationHint({ runs: [{ action: "resume", workerId: "worker_20260101000000_aaaaaaaa", instructions: "UNTRUSTED" }] }, true), undefined);
+  assert.equal(workerRunCallOperationHint({ runs: [{ action: "start", role: "review", reviewedRunId: "run_20260101000000_reviewaa" }] }, true), "review · run reviewaa");
+  assert.equal(workerRunCallOperationHint({ runs: [{ action: "start", role: "integration", preparedId: `prepared_${"a".repeat(24)}`, taskIds: ["personal-work"] }] }, true), "prepared aaaaaaaa");
+
+  assert.equal(workerRunResultOperationHint({ runs: [{ action: "start", role: "work", taskIds: ["personal-work", "personal-other"] }] }), "personal-work +1");
+  assert.equal(workerRunResultOperationHint({ runs: [{ action: "resume", role: "review", taskIds: ["personal-resume"] }] }), "personal-resume");
+  assert.equal(workerRunResultOperationHint({ runs: [{ action: "start", role: "review", taskIds: ["personal-reviewed", "personal-second"], reviewedRunId: "run_20260101000000_reviewaa" }] }), "personal-reviewed +1 · run reviewaa");
+  assert.equal(workerRunResultOperationHint({ runs: [{ action: "start", role: "integration", taskIds: ["personal-work"], preparedId: `prepared_${"a".repeat(24)}` }] }, { kind: "integration", repositories: [{ targetRepo: "/code/pi-tools" }, { targetRepo: "/code/pi-agent-config" }] } as never), "pi-tools +1");
+  assert.equal(renderWorkerOperationHint({ kind: "merge", repositories: [{ targetRepo: "/code/pi-tools", targetRef: "refs/heads/main", method: "merge" }, { targetRepo: "/code/second", targetRef: "refs/heads/release", method: "squash" }] }), "pi-tools → main · merge +1");
+
+  for (const malformed of [undefined, null, {}, { kind: "work" }, { kind: "integration", repositories: [null] }, new Proxy({}, { get() { throw new Error("hostile getter"); } })]) {
+    assert.doesNotThrow(() => renderWorkerOperationHint(malformed));
+  }
+  assert.doesNotThrow(() => workerRunCallOperationHint(new Proxy({}, { get() { throw new Error("hostile getter"); } }), true));
+  assert.doesNotThrow(() => workerRunResultOperationHint(new Proxy({}, { get() { throw new Error("hostile getter"); } })));
 });
 
-test("worker operation hints sanitize hostile titles, truncate by visible Unicode width, and omit failed lookup context", () => {
-  const hostile = `\u001b[31mline one\nline two\u001b[0m ${"家族👨‍👩‍👧‍👦".repeat(20)}\u202e`;
-  const hint = renderWorkerOperationHint({ kind: "work", taskIds: ["personal-safe"], title: hostile } as never)!;
+test("worker operation hints sanitize hostile optional titles and truncate by visible Unicode width", () => {
+  const hostile = `\u001b[31mline one\nline two\u001b[0m \u061c\u200e\u200f${"家族👨‍👩‍👧‍👦".repeat(20)}\u202e`;
+  const hint = renderWorkerOperationHint({ kind: "work", taskIds: ["personal-safe"], title: hostile })!;
   assert.ok(visibleWidth(hint) <= 48, `${visibleWidth(hint)}: ${hint}`);
-  assert.equal(hint.includes("\u001b"), false); assert.equal(/[\r\n\u202e]/u.test(hint), false); assert.equal(hint.includes("�"), false);
-  assert.equal(sanitizeWorkerOperationText("\u001b]8;;https://evil.invalid\u0007safe\u001b]8;;\u0007\ntext"), "safe text");
-  const noTitle = workerRunOperationHint({ runs: [{ action: "start", role: "work", taskIds: ["personal-safe"], instructions: "SECRET-SUMMARY" }] } as never, {
-    taskTitle: () => undefined, worker: () => undefined, run: () => undefined, prepared: () => undefined
-  } as never, "/tmp");
-  assert.equal(noTitle, "personal-safe"); assert.equal(noTitle?.includes("SECRET-SUMMARY"), false);
-  assert.equal(workerRunOperationHint({ runs: [{ action: "resume", workerId: "worker_20260101000000_missinga", instructions: "SECRET" }] } as never, {
-    taskTitle: () => undefined, worker: () => undefined, run: () => undefined, prepared: () => undefined
-  } as never, "/tmp"), undefined);
+  assert.equal(hint.includes("\u001b"), false); assert.equal(/[\r\n\u061c\u200e\u200f\u202e]/u.test(hint), false); assert.equal(hint.includes("�"), false);
+  assert.equal(sanitizeWorkerOperationText("\u001b]8;;https://evil.invalid\u0007safe\u001b]8;;\u0007\n\u061c\u200e\u200ftext"), "safe text");
 });
 
-test("collapsed worker call, progress, and result renderers keep structured hints and obey narrow widths", () => {
+test("collapsed call, progress, and result renderers use structured metadata and obey narrow widths", () => {
   const tools: ToolDefinition[] = [];
-  registerWorkerExtension({ registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, on() {}, sendMessage() {} } as unknown as ExtensionAPI, { taskTitle: () => "Trusted title" });
-  const tool = tools.find((candidate) => candidate.name === "worker_run")!;
-  const args = { runs: [{ action: "start", role: "work", taskIds: ["personal-display"], instructions: "DO-NOT-RENDER-RAW-PROSE" }] };
+  registerWorkerExtension({ registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, on() {}, sendMessage() {} } as unknown as ExtensionAPI);
   const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as never;
-  const context = { args, cwd: "/tmp" } as never;
-  const call = tool.renderCall!(args as never, theme, context);
+  const workerRun = tools.find((candidate) => candidate.name === "worker_run")!;
+  const args = { runs: [{ action: "start", role: "work", taskIds: ["personal-display"], instructions: "DO-NOT-RENDER-RAW-PROSE" }] };
+  const partialContext = { args, argsComplete: false, executionStarted: false, toolCallId: "partial", cwd: "/tmp" } as never;
+  const partialCall = workerRun.renderCall!(args as never, theme, partialContext).render(120).join("\n");
+  assert.equal(partialCall.includes("personal-display"), false);
+  const completeContext = { args, argsComplete: true, executionStarted: false, toolCallId: "complete", cwd: "/tmp" } as never;
+  const call = workerRun.renderCall!(args as never, theme, completeContext);
   const callWide = stripTerminalSequences(call.render(120).join("\n"));
-  assert.match(callWide, /personal-display.*Trusted title/); assert.equal(callWide.includes("DO-NOT-RENDER-RAW-PROSE"), false);
-  const callNarrow = call.render(16).join("\n"); assert.ok(visibleWidth(callNarrow) <= 16); assert.equal(callNarrow.includes("�"), false);
+  assert.match(callWide, /personal-display/); assert.equal(callWide.includes("DO-NOT-RENDER-RAW-PROSE"), false);
+  const callNarrow = call.render(16).join("\n"); assert.ok(visibleWidth(callNarrow) <= 16); assert.equal(callNarrow.includes("�"), false); assert.equal(callNarrow.includes("\u001b"), false);
   const result = { content: [{ type: "text", text: JSON.stringify({ provider: "unchanged" }) }], details: { runs: [{ action: "start", role: "work", workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_aaaaaaaa", status: "queued", taskIds: ["personal-display"] }] } };
   for (const isPartial of [true, false]) {
-    const rendered = tool.renderResult!(result as never, { expanded: false, isPartial }, theme, context).render(120).join("\n");
-    assert.match(stripTerminalSequences(rendered), /personal-display.*Trusted title/); assert.equal(rendered.includes("DO-NOT-RENDER-RAW-PROSE"), false);
+    const rendered = workerRun.renderResult!(result as never, { expanded: false, isPartial }, theme, completeContext).render(120).join("\n");
+    assert.match(rendered, /personal-display/); assert.equal(rendered.includes("DO-NOT-RENDER-RAW-PROSE"), false);
   }
   assert.equal(result.content[0]!.text, '{"provider":"unchanged"}');
+
+  const reviewArgs = { runs: [{ action: "start", role: "review", reviewedRunId: "run_20260101000000_reviewaa" }] };
+  assert.match(workerRun.renderCall!(reviewArgs as never, theme, { args: reviewArgs, argsComplete: true, toolCallId: "review" } as never).render(120).join("\n"), /run reviewaa/);
+  const integrationArgs = { runs: [{ action: "start", role: "integration", preparedId: `prepared_${"a".repeat(24)}`, taskIds: ["personal-task"] }] };
+  assert.match(workerRun.renderCall!(integrationArgs as never, theme, { args: integrationArgs, argsComplete: true, toolCallId: "integration" } as never).render(120).join("\n"), /prepared aaaaaaaa/);
+  const resumeArgs = { runs: [{ action: "resume", workerId: "worker_20260101000000_aaaaaaaa", instructions: "SECRET" }] };
+  const resumeText = workerRun.renderCall!(resumeArgs as never, theme, { args: resumeArgs, argsComplete: true, toolCallId: "resume" } as never).render(120).join("\n");
+  assert.equal(resumeText.includes("SECRET"), false); assert.equal(resumeText.includes("personal-"), false);
 });
 
-test("collapsed merge test and apply renderers use structured repository metadata only", () => {
+test("collapsed merge renderers use complete arguments or trusted returned metadata only", () => {
   const preparedId = `prepared_${"a".repeat(24)}`;
   const repositories = [
     { id: "first", candidateRepo: "/candidate/pi-tools", candidateRef: "HEAD", targetRepo: "/target/pi-tools", targetRef: "refs/heads/main", method: "merge", commitMessage: "UNTRUSTED-COMMIT-PROSE" },
     { id: "second", candidateRepo: "/candidate/config", candidateRef: "HEAD", targetRepo: "/target/config", targetRef: "refs/heads/release", method: "squash", commitMessage: "ALSO-UNTRUSTED" }
   ];
   const tools: ToolDefinition[] = [];
-  registerWorkerExtension({ registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, on() {}, sendMessage() {} } as unknown as ExtensionAPI, {
-    preparedSet: (value) => value === preparedId ? { repositories } : undefined
-  });
+  registerWorkerExtension({ registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, on() {}, sendMessage() {} } as unknown as ExtensionAPI);
   const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as never;
   const mergeTest = tools.find((tool) => tool.name === "worker_merge_test")!;
-  const testContext = { args: { repositories }, cwd: "/tmp" } as never;
+  const partial = mergeTest.renderCall!({ repositories } as never, theme, { args: { repositories }, argsComplete: false, toolCallId: "merge-partial" } as never).render(120).join("\n");
+  assert.equal(partial.includes("pi-tools"), false);
+  const testContext = { args: { repositories }, argsComplete: true, toolCallId: "merge-test", cwd: "/tmp" } as never;
   const testText = mergeTest.renderCall!({ repositories } as never, theme, testContext).render(120).join("\n");
   assert.match(testText, /pi-tools → main · merge \+1/); assert.equal(testText.includes("UNTRUSTED"), false);
   const testResult = mergeTest.renderResult!({ content: [{ type: "text", text: "provider-json" }], details: { preparedId, status: "ready", repositories } } as never, { expanded: false, isPartial: false }, theme, testContext).render(120).join("\n");
   assert.match(testResult, /pi-tools → main · merge \+1/); assert.equal(testResult.includes("UNTRUSTED"), false);
   const mergeApply = tools.find((tool) => tool.name === "worker_merge_apply")!;
-  const applyContext = { args: { preparedId }, cwd: "/tmp" } as never;
+  const applyContext = { args: { preparedId }, argsComplete: true, toolCallId: "merge-apply", cwd: "/tmp" } as never;
   const applyText = mergeApply.renderCall!({ preparedId } as never, theme, applyContext).render(120).join("\n");
-  assert.match(applyText, /pi-tools → main · merge \+1/);
+  assert.match(applyText, /prepared aaaaaaaa/);
   const applyResult = mergeApply.renderResult!({ content: [{ type: "text", text: "provider-json" }], details: { status: "completed", repositories } } as never, { expanded: false, isPartial: false }, theme, applyContext).render(120).join("\n");
-  assert.match(applyResult, /pi-tools → main · merge \+1/);
+  assert.equal(applyResult.includes("UNTRUSTED"), false);
+});
+
+test("renderers never invoke bd or touch a registry while arguments stream or locks are held", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-worker-render-pure-"));
+  const bin = path.join(root, "bin"); await mkdir(bin);
+  const marker = path.join(root, "bd-invoked"); const bd = path.join(bin, "bd");
+  await writeFile(bd, `#!/usr/bin/env node\nimport { appendFileSync } from "node:fs";\nappendFileSync(${JSON.stringify(marker)}, "invoked\\n");\nAtomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30000);\n`);
+  await chmod(bd, 0o700);
+  const oldPath = process.env.PATH; process.env.PATH = `${bin}:${oldPath ?? ""}`;
+  const runtimeRoot = path.join(root, "runtime"); const registry = openWorkerRegistry(runtimeRoot); registry.database.exec("BEGIN IMMEDIATE");
+  try {
+    const tools: ToolDefinition[] = [];
+    registerWorkerExtension({ registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, on() {}, sendMessage() {} } as unknown as ExtensionAPI, { runtimeRoot, roots: { stateRoot: path.join(runtimeRoot, "workers"), workspaceRoot: path.join(runtimeRoot, "workers") } });
+    const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as never;
+    const run = tools.find((tool) => tool.name === "worker_run")!; const control = tools.find((tool) => tool.name === "worker_control")!; const mergeTest = tools.find((tool) => tool.name === "worker_merge_test")!; const apply = tools.find((tool) => tool.name === "worker_merge_apply")!;
+    const started = performance.now();
+    for (const taskId of ["personal-z", "personal-z5", "personal-z52", "personal-z52n", "personal-z52n5", "personal-z52n5.1", "personal-z52n5.11"]) {
+      const streamed = { runs: [{ action: "start", role: "work", taskIds: [taskId], instructions: "partial" }] };
+      run.renderCall!(streamed as never, theme, { args: streamed, argsComplete: false, executionStarted: false, toolCallId: taskId } as never).render(120);
+    }
+    const complete = { runs: [{ action: "start", role: "work", taskIds: ["personal-z52n5.11"], instructions: "complete" }] };
+    run.renderCall!(complete as never, theme, { args: complete, argsComplete: true, toolCallId: "complete" } as never).render(120);
+    const review = { runs: [{ action: "start", role: "review", reviewedRunId: "run_20260101000000_aaaaaaaa" }] };
+    run.renderCall!(review as never, theme, { args: review, argsComplete: true, toolCallId: "review" } as never).render(120);
+    const resume = { runs: [{ action: "resume", workerId: "worker_20260101000000_aaaaaaaa", instructions: "resume" }] };
+    run.renderCall!(resume as never, theme, { args: resume, argsComplete: true, toolCallId: "resume" } as never).render(120);
+    const integration = { runs: [{ action: "start", role: "integration", preparedId: `prepared_${"a".repeat(24)}`, taskIds: ["personal-task"] }] };
+    run.renderCall!(integration as never, theme, { args: integration, argsComplete: true, toolCallId: "integration" } as never).render(120);
+    apply.renderCall!({ preparedId: `prepared_${"a".repeat(24)}` } as never, theme, { argsComplete: true, toolCallId: "apply" } as never).render(120);
+    run.renderResult!({ content: [{ type: "text", text: "provider" }], details: { runs: [{ action: "resume", role: "work", taskIds: ["personal-task"] }] } } as never, { expanded: false, isPartial: true }, theme, { toolCallId: "missing" } as never).render(120);
+    const hostile = new Proxy({}, { get() { throw new Error("malformed metadata"); } });
+    for (const tool of [run, control, mergeTest, apply]) {
+      assert.doesNotThrow(() => tool.renderCall!(hostile as never, theme, hostile as never).render(40));
+      assert.doesNotThrow(() => tool.renderResult!(hostile as never, { expanded: false, isPartial: false }, theme, hostile as never).render(40));
+    }
+    assert.ok(performance.now() - started < 500, `rendering blocked for ${performance.now() - started}ms`);
+    await assert.rejects(readFile(marker, "utf8"), (error: any) => error?.code === "ENOENT");
+  } finally {
+    registry.database.exec("ROLLBACK"); registry.close();
+    oldPath === undefined ? delete process.env.PATH : process.env.PATH = oldPath;
+    await rm(root, { recursive: true, force: true });
+  }
 });
