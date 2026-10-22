@@ -4,12 +4,14 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Check } from "typebox/value";
-import { WorkerControlParams, WorkerMergeApplyParams, WorkerMergeTestParams, WorkerRunParams, registerWorkerExtension } from "../extensions/worker/index.js";
+import { WORKER_ACTIVITY_STATUS_KEY, WorkerControlParams, WorkerMergeApplyParams, WorkerMergeTestParams, WorkerRunParams, activeWorkerCountForContext, registerWorkerExtension, renderWorkerActivityStatus } from "../extensions/worker/index.js";
 import { RetainedToolOutputSchemas } from "../extensions/_shared/tool-output.js";
 import { normalizeWorkerSettings } from "../extensions/worker/settings.js";
 import { validateWorkerResultInput, WorkerResultValidationError } from "../extensions/worker/contract.js";
+import { ASYNC_SHELL_ACTIVITY_STATUS_KEY, renderAsyncShellActivityStatus } from "../extensions/async-shell/index.js";
+import { createWorkerAndRun, openWorkerRegistry, settleWorkerRun, type WorkerRegistry, type WorkerRunRecord } from "../extensions/worker/registry.js";
 
 const settings = {
   modelPreferences: {
@@ -112,4 +114,89 @@ test("strict control and beads schemas reject unrelated fields and approved boun
   assert.equal(Check(WorkerBeadsTasksParams, { action: "get", taskIds: ["personal-a", "personal-b", "personal-c", "personal-d", "personal-e"] }), false);
   assert.equal(Check(WorkerBeadsTasksParams, { action: "search", query: "x", offset: 1 }), false);
   assert.equal(Check(WorkerBeadsTasksParams, { action: "update", taskId: "personal-a", note: "x", query: "bad" }), false);
+});
+
+function addActivityWorker(registry: WorkerRegistry, parentSessionFile: string, suffix: string, status: "queued" | "running", claimNonce = "activity-hold"): { workerId: string; runId: string } {
+  const workerId = `worker_20260101000000_${suffix.padEnd(8, "a")}`;
+  const runId = `run_20260101000000_${suffix.padEnd(8, "b")}`;
+  const timestamp = "2026-01-01T00:00:00.000Z";
+  const run: WorkerRunRecord = {
+    runId, workerId, status, taskIds: ["personal-test"], modelSelection: "openai-codex/gpt-5.6-sol:xhigh", completionDelivery: "steer",
+    repositories: [], artifacts: [], errors: [], claimKind: "launch", claimNonce, createdAt: timestamp,
+    ...(status === "running" ? { startedAt: timestamp } : {})
+  };
+  createWorkerAndRun(registry, {
+    workerId, parentSessionFile, role: "work", status, activeRunId: runId, taskIds: ["personal-test"],
+    modelSelection: "openai-codex/gpt-5.6-sol:xhigh", workspaceRoot: `/tmp/${workerId}`, runtime: {}, createdAt: timestamp, updatedAt: timestamp
+  }, run);
+  return { workerId, runId };
+}
+
+test("worker activity count is exact-session registry state across queued, running, settled, and cancelled transitions", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-worker-activity-registry-"));
+  const registry = openWorkerRegistry(root);
+  try {
+    const parent = path.join(root, "parent.jsonl"); const other = path.join(root, "other.jsonl");
+    await writeFile(parent, "\n"); await writeFile(other, "\n");
+    const context = { sessionManager: { getSessionFile: () => parent } } as Pick<ExtensionContext, "sessionManager">;
+    const queued = addActivityWorker(registry, parent, "queued", "queued");
+    const running = addActivityWorker(registry, parent, "running", "running");
+    addActivityWorker(registry, other, "other", "running");
+    assert.equal(activeWorkerCountForContext(registry, context), 2);
+    assert.equal(activeWorkerCountForContext(registry, { sessionManager: { getSessionFile: () => undefined } } as unknown as Pick<ExtensionContext, "sessionManager">), 0);
+    settleWorkerRun(registry, { parentSessionFile: parent, ...queued, outcome: "failed", outcomeSource: "system", settledAt: "2026-01-01T00:00:01.000Z" });
+    assert.equal(activeWorkerCountForContext(registry, context), 1);
+    settleWorkerRun(registry, { parentSessionFile: parent, ...running, outcome: "cancelled", outcomeSource: "system", settledAt: "2026-01-01T00:00:02.000Z" });
+    assert.equal(activeWorkerCountForContext(registry, context), 0);
+    const theme = { fg: (color: string, text: string) => `<${color}>${text}</${color}>` } as Theme;
+    assert.equal(renderWorkerActivityStatus(0, theme), undefined);
+    assert.equal(renderWorkerActivityStatus(12, theme), "<accent>w12</accent>");
+  } finally { registry.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("worker activity footer repaints from registry events, fences reload listeners, and orders before direct shell activity", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-worker-activity-ui-"));
+  const runtimeRoot = path.join(root, "runtime"); const workersRoot = path.join(runtimeRoot, "workers"); await mkdir(workersRoot, { recursive: true });
+  const sessionFile = path.join(root, "parent.jsonl"); await writeFile(sessionFile, "\n");
+  const registry = openWorkerRegistry(runtimeRoot);
+  const first = addActivityWorker(registry, sessionFile, "first", "queued", "1-hold");
+  const handlers = new Map<string, Function[]>(); const statuses: Array<{ key: string; text: string | undefined }> = [];
+  const api = {
+    registerTool() {}, registerCommand() {}, registerMessageRenderer() {}, sendMessage() {},
+    on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }
+  } as unknown as ExtensionAPI;
+  const theme = { fg: (_color: string, text: string) => text } as Theme;
+  const context = {
+    cwd: root, mode: "tui", hasUI: true, sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "activity-session" },
+    ui: { theme, setStatus(key: string, text: string | undefined) { statuses.push({ key, text }); }, notify() {} },
+    isIdle: () => true, hasPendingMessages: () => false
+  } as unknown as ExtensionContext;
+  try {
+    registerWorkerExtension(api, { runtimeRoot, roots: { stateRoot: workersRoot, workspaceRoot: workersRoot }, codeRoot: root, random: () => "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", launch: () => ({ jobId: "job_test", completion: new Promise(() => {}), snapshot: () => ({ status: "running" } as never), cancel: async () => ({ status: "cancelled" } as never) }) });
+    for (const handler of handlers.get("session_start") ?? []) handler({ reason: "startup" }, context);
+    assert.deepEqual(statuses.at(-1), { key: WORKER_ACTIVITY_STATUS_KEY, text: "w1" });
+    const second = addActivityWorker(registry, sessionFile, "second", "running", "1-hold-2");
+    assert.deepEqual(statuses.at(-1), { key: WORKER_ACTIVITY_STATUS_KEY, text: "w2" });
+
+    registry.database.prepare("UPDATE runs SET claim_nonce='2-reload-hold' WHERE claim_kind='launch'").run();
+    const beforeReloadEvent = statuses.length;
+    for (const handler of handlers.get("session_start") ?? []) handler({ reason: "reload" }, context);
+    const third = addActivityWorker(registry, sessionFile, "third", "queued", "2-hold-3");
+    assert.equal(statuses.slice(beforeReloadEvent).filter((item) => item.text === "w3").length, 1, "only the current reload listener repaints");
+    const footer = new Map([
+      [ASYNC_SHELL_ACTIVITY_STATUS_KEY, renderAsyncShellActivityStatus(2, theme)!],
+      [WORKER_ACTIVITY_STATUS_KEY, renderWorkerActivityStatus(3, theme)!]
+    ]);
+    assert.equal([...footer.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([, text]) => text).join(" "), "w3 sh2");
+    settleWorkerRun(registry, { parentSessionFile: sessionFile, ...third, outcome: "completed", outcomeSource: "worker", settledAt: "2026-01-01T00:00:03.000Z" });
+    assert.deepEqual(statuses.at(-1), { key: WORKER_ACTIVITY_STATUS_KEY, text: "w2" });
+    settleWorkerRun(registry, { parentSessionFile: sessionFile, ...first, outcome: "cancelled", outcomeSource: "system", settledAt: "2026-01-01T00:00:04.000Z" });
+    assert.deepEqual(statuses.at(-1), { key: WORKER_ACTIVITY_STATUS_KEY, text: "w1" });
+
+    for (const handler of handlers.get("session_shutdown") ?? []) handler({ reason: "reload" }, context);
+    assert.deepEqual(statuses.at(-1), { key: WORKER_ACTIVITY_STATUS_KEY, text: undefined });
+    const afterShutdown = statuses.length;
+    settleWorkerRun(registry, { parentSessionFile: sessionFile, ...second, outcome: "cancelled", outcomeSource: "system", settledAt: "2026-01-01T00:00:05.000Z" });
+    assert.equal(statuses.length, afterShutdown, "shutdown removes the registry listener");
+  } finally { registry.close(); await rm(root, { recursive: true, force: true }); }
 });

@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { Text } from "@earendil-works/pi-tui";
-import { defineTool, type AgentToolResult, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { defineTool, type AgentToolResult, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { resolveExtensionModel, assertChildAgentRouteAllowed, parseModelThinkingPair } from "../_shared/model-spec.js";
 import { throwIfAborted } from "../_shared/cancellation.js";
 import { asyncJobProcessStartToken, createAsyncJobId, isAsyncJobProcessIdentityAlive, signalAsyncJobProcessIdentity } from "../_shared/async-job.js";
@@ -20,7 +20,7 @@ import {
   countWorkers, createWorkerRunBatch, finalizeClaimedWorkerRun, finalizeWorkerDiscard, finalizeWorkerRunLaunch, findWorkerRunById, finishPreparedSetApply,
   getWorker, getWorkerRun, listWorkerRuns, listWorkers, markWorkerDeliveryDelivered, openWorkerRegistry, pendingWorkerDeliveries,
   readPreparedSetRecord, recordWorkerSettlementRecovery, recoverInterruptedClaimsForParent, reconcileWorkerDeliveries, registerParentRuntime, releasePreparedSetApply, releaseWorkerDeliveryClaim, releaseWorkerRunClaim, setWorkerRecoveryError, storePreparedSet,
-  updatePreparedSetStatus, updateWorkerRuntimeMetadata, workerRegistryDataVersion,
+  subscribeWorkerRegistryChanges, updatePreparedSetStatus, updateWorkerRuntimeMetadata, workerRegistryDataVersion,
   type WorkerBatchCreateItem, type WorkerRegistry, type WorkerRegistryRecord, type WorkerRepositoryResult, type WorkerRole, type WorkerRunRecord
 } from "./registry.js";
 import { readWorkerRuntimeResult } from "./runtime.js";
@@ -38,6 +38,24 @@ import { prepareWorkerCacheLineage, registerParentCacheLineageCapture, type Work
 export { WorkerRunParamsV2 as WorkerRunParams, WorkerControlParamsV2 as WorkerControlParams, WorkerMergeTestParams, WorkerMergeApplyParams };
 export type WorkerRunInput = WorkerRunInputV2;
 export type WorkerControlInput = WorkerControlInputV2;
+
+export const WORKER_ACTIVITY_STATUS_KEY = "00-pi-tools-worker-activity";
+
+export function activeWorkerCountForContext(registry: WorkerRegistry, context: Pick<ExtensionContext, "sessionManager">): number {
+  const parentSessionFile = context.sessionManager.getSessionFile();
+  if (!parentSessionFile) return 0;
+  try {
+    const counts = countWorkers(registry, realpathOrResolve(parentSessionFile));
+    return counts.queued + counts.running;
+  } catch {
+    return 0;
+  }
+}
+
+export function renderWorkerActivityStatus(count: number, theme: Pick<Theme, "fg">): string | undefined {
+  if (count <= 0) return undefined;
+  return theme.fg("accent", `w${count}`);
+}
 
 type ReviewOverlayPlan = Omit<Parameters<typeof createReviewOverlayAsync>[0], "dockerPath">;
 type RunRuntime = {
@@ -82,11 +100,19 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   let deliveryTimer: NodeJS.Timeout | undefined;
   let observedDataVersion = 0;
   let currentContext: ExtensionContext | undefined;
+  let unsubscribeActivity: (() => void) | undefined;
+  let activityGeneration = 0;
   const pending = new Map<string, PendingRun>();
   const active = new Map<string, ActiveRun>();
   const starting = new Map<string, { runId: string; completion: Promise<void> }>();
   const deliveredRecovery = new Set<string>();
   const getRegistry = () => registry ??= openWorkerRegistry(runtimeRoot);
+  const repaintWorkerActivity = (context: ExtensionContext): void => {
+    try { updateWorkerActivityStatus(getRegistry(), context); }
+    catch {
+      if (context.mode === "tui" && context.hasUI && typeof context.ui?.setStatus === "function") context.ui.setStatus(WORKER_ACTIVITY_STATUS_KEY, undefined);
+    }
+  };
   registerParentCacheLineageCapture(api, roots.stateRoot, now);
 
   const launch = (context: ExtensionContext, record: WorkerLaunchRecord, runtime: RunRuntime): ManagedAsyncJobHandle => {
@@ -99,28 +125,44 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   };
 
   api.on("session_start", (_event, context) => {
-    currentContext = context;
-    const parent = context.sessionManager.getSessionFile(); if (!parent) return;
-    const exactParent = realpathOrResolve(parent);
-    runtimeGeneration = registerParentRuntime(getRegistry(), exactParent, randomUUID(), now().toISOString());
-    recoverInterruptedDiscardFiles(exactParent, runtimeGeneration);
-    recoverInterruptedClaimsForParent(getRegistry(), exactParent, runtimeGeneration, now().toISOString());
-    reconcileWorkerDeliveries(getRegistry(), exactParent, sessionDeliveryIds(context));
-    deliveredRecovery.clear();
-    observedDataVersion = workerRegistryDataVersion(getRegistry());
-    deliverPendingCompletions(api, getRegistry(), exactParent, runtimeGeneration);
-    void Promise.resolve().then(() => reconcileActiveRuns(context, exactParent));
-    if (deliveryTimer) clearInterval(deliveryTimer);
-    deliveryTimer = setInterval(() => {
-      try {
-        const current = workerRegistryDataVersion(getRegistry());
-        if (current !== observedDataVersion) observedDataVersion = current;
-        deliverPendingCompletions(api, getRegistry(), exactParent, runtimeGeneration);
-        void reconcileActiveRuns(context, exactParent);
-      } catch {}
-    }, 1_000);
-    deliveryTimer.unref();
+    const generation = ++activityGeneration;
+    unsubscribeActivity?.();
+    unsubscribeActivity = undefined;
+    if (context.mode === "tui" && context.hasUI) {
+      unsubscribeActivity = subscribeWorkerRegistryChanges(() => {
+        if (generation === activityGeneration) repaintWorkerActivity(context);
+      });
+    }
+    try {
+      currentContext = context;
+      const parent = context.sessionManager.getSessionFile(); if (!parent) return;
+      const exactParent = realpathOrResolve(parent);
+      runtimeGeneration = registerParentRuntime(getRegistry(), exactParent, randomUUID(), now().toISOString());
+      recoverInterruptedDiscardFiles(exactParent, runtimeGeneration);
+      recoverInterruptedClaimsForParent(getRegistry(), exactParent, runtimeGeneration, now().toISOString());
+      reconcileWorkerDeliveries(getRegistry(), exactParent, sessionDeliveryIds(context));
+      deliveredRecovery.clear();
+      observedDataVersion = workerRegistryDataVersion(getRegistry());
+      deliverPendingCompletions(api, getRegistry(), exactParent, runtimeGeneration);
+      void Promise.resolve().then(() => reconcileActiveRuns(context, exactParent));
+      if (deliveryTimer) clearInterval(deliveryTimer);
+      deliveryTimer = setInterval(() => {
+        try {
+          const current = workerRegistryDataVersion(getRegistry());
+          if (current !== observedDataVersion) {
+            observedDataVersion = current;
+            repaintWorkerActivity(context);
+          }
+          deliverPendingCompletions(api, getRegistry(), exactParent, runtimeGeneration);
+          void reconcileActiveRuns(context, exactParent);
+        } catch {}
+      }, 1_000);
+      deliveryTimer.unref();
+    } finally {
+      if (generation === activityGeneration) repaintWorkerActivity(context);
+    }
   });
+  api.on("input", (_event, context) => repaintWorkerActivity(context));
   api.on("turn_end", (_event, context) => {
     const parentFile = context.sessionManager.getSessionFile(); if (!parentFile) return;
     const parent = realpathOrResolve(parentFile); const parentSessionId = context.sessionManager.getSessionId();
@@ -134,7 +176,11 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const parent = context.sessionManager.getSessionFile(); if (!parent) return;
     try { markWorkerDeliveryDelivered(getRegistry(), deliveryId, runtimeGeneration, now().toISOString()); } catch {}
   });
-  api.on("session_shutdown", () => {
+  api.on("session_shutdown", (_event, context) => {
+    activityGeneration += 1;
+    if (context.mode === "tui" && context.hasUI && typeof context.ui?.setStatus === "function") context.ui.setStatus(WORKER_ACTIVITY_STATUS_KEY, undefined);
+    unsubscribeActivity?.();
+    unsubscribeActivity = undefined;
     currentContext = undefined;
     if (deliveryTimer) clearInterval(deliveryTimer); deliveryTimer = undefined;
     if (active.size === 0) { registry?.close(); registry = undefined; }
@@ -629,6 +675,13 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     for (const row of rows) { const item = (JSON.parse(row.repositories_json) as WorkerRepositoryResult[]).find((candidate) => realpathOrResolve(path.resolve(row.workspace_root, candidate.path)) === exactCandidate && candidate.commit === candidateCommit); if (!item) continue; const latest = row.run_id === row.latest_run_id; const warnings = [...(!latest ? [`Candidate belongs to historical run ${row.run_id}; latest is ${row.latest_run_id}.`] : []), ...(row.status !== "idle" ? ["Source worker has a newer active run that may supersede this candidate."] : [])]; return { source: { workerId: row.worker_id, runId: row.run_id, latest }, ...(warnings.length ? { warnings } : {}) }; } return {}; } }
   function deliverRecovery(worker: WorkerRegistryRecord, run: WorkerRunRecord, error: string): void { const key = `${runtimeGeneration}:${run.runId}`; if (deliveredRecovery.has(key) || !currentContext?.sessionManager.getSessionFile() || realpathOrResolve(currentContext.sessionManager.getSessionFile()!) !== worker.parentSessionFile) return; deliveredRecovery.add(key); const event = { event: "worker_recovery_required", workerId: worker.workerId, runId: run.runId, role: worker.role, status: run.status === "settled" ? "running" : run.status, error: sanitizeError(error) }; api.sendMessage({ customType: "worker-run", content: JSON.stringify(event), display: true, details: event }, { triggerTurn: true, deliverAs: "steer" }); }
   function recordRecovery(workerId: string, runId: string, error: unknown): void { try { const message = sanitizeError(error); setWorkerRecoveryError(getRegistry(), workerId, runId, message, now().toISOString()); const worker = getWorker(getRegistry(), workerId); const run = worker && getWorkerRun(getRegistry(), workerId, runId); if (worker && run) deliverRecovery(worker, run, message); } catch {} }
+}
+
+function updateWorkerActivityStatus(registry: WorkerRegistry, context: ExtensionContext): void {
+  if (context.mode !== "tui" || !context.hasUI || typeof context.ui?.setStatus !== "function" || !context.ui.theme) return;
+  let count = 0;
+  try { count = activeWorkerCountForContext(registry, context); } catch {}
+  context.ui.setStatus(WORKER_ACTIVITY_STATUS_KEY, renderWorkerActivityStatus(count, context.ui.theme));
 }
 
 function writeReviewContext(paths: WorkerPaths, reviewerWorkerId: string, contextId: string, subjectWorker: WorkerRegistryRecord, subjectRun: WorkerRunRecord, inputs: RetainedInput[]): string {

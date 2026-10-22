@@ -112,19 +112,25 @@ export type WorkerResultSubmitInput = Static<typeof WorkerResultSubmitParams>;
 const BeadsAssigned = Type.Object({ action: Type.Literal("assigned", { description: "Read this worker’s assigned tasks." }), offset: Type.Optional(Type.Integer({ minimum: 0, maximum: 31, default: 0, description: "Zero-based offset into assigned task IDs." })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 4, default: 4, description: "Maximum tasks to return; defaults to four and cannot exceed four." })) }, { additionalProperties: false });
 const BeadsGet = Type.Object({ action: Type.Literal("get", { description: "Read one to four exact central personal task IDs." }), taskIds: Type.Array(TaskId, { minItems: 1, maxItems: 4, description: "Exact central personal task IDs to read." }) }, { additionalProperties: false });
 const BeadsSearch = Type.Object({ action: Type.Literal("search", { description: "Search task titles and IDs across statuses." }), query: Type.String({ minLength: 1, maxLength: 256, description: "Bounded title or task-ID query." }), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 4, default: 4, description: "Maximum matches to return; defaults to four and cannot exceed four." })) }, { additionalProperties: false });
+const BeadsDesign = Type.Object({
+  action: Type.Literal("design", { description: "Continue reading one exact task's canonical design field." }),
+  taskId: TaskId,
+  offset: Type.Optional(Type.Integer({ minimum: 0, maximum: 512 * 1024, default: 0, description: "UTF-8 byte offset returned by the prior design chunk. Defaults to zero." })),
+  limit: Type.Optional(Type.Integer({ minimum: 4, maximum: 48 * 1024, default: 32 * 1024, description: "Maximum raw UTF-8 design bytes to return before the global response budget is applied." }))
+}, { additionalProperties: false });
 const BeadsUpdate = Type.Object({ action: Type.Literal("update", { description: "Append a meaningful progress or blocker note to one assigned task." }), taskId: Type.String({ minLength: 1, maxLength: 128, pattern: "^personal-[a-zA-Z0-9]+(?:\\.[a-zA-Z0-9]+)*$", description: "Assigned central personal task to update." }), note: Type.String({ minLength: 1, maxLength: 4000, description: "Progress or blocker note to append without replacing existing notes." }), status: Type.Optional(Type.Union([Type.Literal("in_progress"), Type.Literal("blocked")], { description: "Optional allowed status transition." })) }, { additionalProperties: false });
-const WorkerBeadsTasksReadStrict = Type.Union([BeadsAssigned, BeadsGet, BeadsSearch]);
-const WorkerBeadsTasksStrict = Type.Union([BeadsAssigned, BeadsGet, BeadsSearch, BeadsUpdate]);
+const WorkerBeadsTasksReadStrict = Type.Union([BeadsAssigned, BeadsGet, BeadsSearch, BeadsDesign]);
+const WorkerBeadsTasksStrict = Type.Union([BeadsAssigned, BeadsGet, BeadsSearch, BeadsDesign, BeadsUpdate]);
 const BeadsProviderProperties = {
-  action: Type.Union([Type.Literal("assigned"), Type.Literal("get"), Type.Literal("search"), Type.Literal("update")]),
-  offset: Type.Optional(Type.Integer({ minimum: 0, maximum: 31, default: 0, description: "Zero-based offset into assigned task IDs." })),
-  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 4, default: 4, description: "Maximum tasks or matches to return; defaults to four and cannot exceed four." })),
+  action: Type.Union([Type.Literal("assigned"), Type.Literal("get"), Type.Literal("search"), Type.Literal("design"), Type.Literal("update")]),
+  offset: Type.Optional(Type.Integer({ minimum: 0, maximum: 512 * 1024, default: 0, description: "Assigned-page offset or design UTF-8 byte offset, depending on action." })),
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 48 * 1024, description: "Bounded task count or raw design-byte limit, depending on action." })),
   taskIds: Type.Optional(Type.Array(TaskId, { minItems: 1, maxItems: 4, description: "Exact central personal task IDs to read." })),
   query: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "Bounded title or task-ID query." })),
   taskId: Type.Optional(TaskId), note: Type.Optional(Type.String({ minLength: 1, maxLength: 4000, description: "Progress or blocker note to append without replacing existing notes." })),
   status: Type.Optional(Type.Union([Type.Literal("in_progress"), Type.Literal("blocked")], { description: "Optional allowed status transition." }))
 };
-export const WorkerBeadsTasksReadParams = Type.Unsafe<Static<typeof WorkerBeadsTasksReadStrict>>({ ...WorkerBeadsTasksReadStrict, type: "object", required: ["action"], additionalProperties: false, properties: { ...BeadsProviderProperties, action: Type.Union([Type.Literal("assigned"), Type.Literal("get"), Type.Literal("search")]) } });
+export const WorkerBeadsTasksReadParams = Type.Unsafe<Static<typeof WorkerBeadsTasksReadStrict>>({ ...WorkerBeadsTasksReadStrict, type: "object", required: ["action"], additionalProperties: false, properties: { ...BeadsProviderProperties, action: Type.Union([Type.Literal("assigned"), Type.Literal("get"), Type.Literal("search"), Type.Literal("design")]) } });
 export const WorkerBeadsTasksParams = Type.Unsafe<Static<typeof WorkerBeadsTasksStrict>>({ ...WorkerBeadsTasksStrict, type: "object", required: ["action"], additionalProperties: false, properties: BeadsProviderProperties });
 
 export type ValidatedWorkerResult = { outcome: WorkerOutcome; summary: string; question?: string; repositories: string[]; artifacts: string[] };
