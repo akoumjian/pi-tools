@@ -16,7 +16,7 @@ Parent tools:
 Worker-only tools:
 
 - `worker_result_submit`: submit one role-valid outcome, concise summary/question, and canonical workspace repository/artifact paths; the runtime seals and reconciles owned work internally.
-- `worker_beads_tasks`: bounded assigned/get/search reads and assigned-only work/integration progress updates.
+- `worker_beads_tasks`: bounded assigned/get/search reads, digest-fenced UTF-8-byte continuation of canonical `design` fields, and assigned-only work/integration progress updates. Every inline and continuation view includes lowercase SHA-256 of the complete canonical UTF-8 design plus `totalBytes`, `returnedBytes`, `truncated`, and `nextOffset`; continuation requires that digest and rejects task revisions with a restart-at-zero error. Every provider-visible read remains within 64 KiB. Search omits design content, reviewers retain read-only access, and no branch can close tasks or change dependencies.
 
 Human commands are `/worker:list [status] [role]`, `/worker:show <workerId> [runId]`, `/worker:logs <workerId> [runId]`, `/worker:cancel <workerId>`, and `/worker:discard <workerId> --confirm`.
 
@@ -26,7 +26,7 @@ A `workerId` is reusable. Every execution has an immutable `runId`; task/model s
 
 Trusted host processes open one owner-only SQLite database at `~/.local/share/agent/worker-runtime/registry.sqlite`. SQLite transactions serialize lifecycle changes. Numbered schema migrations run transactionally; schema-source fingerprints are diagnostic rather than an availability gate. Containers and model code never access the registry. Large files stay beneath `worker-runtime/workers/<workerId>/`. v2 does not import or mutate legacy worker/fold state.
 
-Completion settlement inserts a stable delivery record in the same transaction. The newest runtime generation for the exact parent session claims pending delivery; `PRAGMA data_version` plus an unreferenced one-second check makes reload delivery durable. Delivery state is transport bookkeeping and never gates resume.
+Completion settlement inserts a stable delivery record in the same transaction. The newest runtime generation for the exact parent session claims pending delivery; `PRAGMA data_version` plus an unreferenced one-second check makes reload delivery durable. Delivery state is transport bookkeeping and never gates resume. The compact TUI footer derives `wN` from exact-current-session queued/running registry rows and updates on committed registry transitions; direct visible async-shell work remains the separate `shN` count. Both disappear at zero. Separately, collapsed worker call/progress/result rows show a width-bounded operation hint derived only from complete structured call arguments, trusted returned details, or bounded in-memory snapshots captured as a byproduct of authoritative preflight reads. Rendering performs no filesystem, process, Beads, or registry I/O; unavailable context and optional titles are omitted. Worker prose and artifact contents never enter the hint.
 
 ## Roles and results
 

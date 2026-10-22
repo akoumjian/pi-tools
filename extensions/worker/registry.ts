@@ -109,6 +109,34 @@ export type WorkerRegistry = {
   close(): void;
 };
 
+type WorkerRegistryChangeListener = () => void;
+type WorkerRegistryActivityHolder = { version: 1; listeners: Set<WorkerRegistryChangeListener> };
+const WORKER_REGISTRY_ACTIVITY_HOLDER_KEY = Symbol.for("@akoumjian/pi-tools/worker-registry-activity");
+
+function workerRegistryActivityHolder(): WorkerRegistryActivityHolder {
+  const existing = Reflect.get(globalThis, WORKER_REGISTRY_ACTIVITY_HOLDER_KEY) as WorkerRegistryActivityHolder | undefined;
+  if (existing !== undefined) {
+    if (existing.version !== 1 || !(existing.listeners instanceof Set)) throw new Error("Incompatible worker-registry activity holder.");
+    return existing;
+  }
+  const created: WorkerRegistryActivityHolder = { version: 1, listeners: new Set() };
+  Reflect.set(globalThis, WORKER_REGISTRY_ACTIVITY_HOLDER_KEY, created);
+  return created;
+}
+
+const workerRegistryChangeListeners = workerRegistryActivityHolder().listeners;
+
+export function subscribeWorkerRegistryChanges(listener: WorkerRegistryChangeListener): () => void {
+  workerRegistryChangeListeners.add(listener);
+  return () => workerRegistryChangeListeners.delete(listener);
+}
+
+function notifyWorkerRegistryChanges(): void {
+  for (const listener of workerRegistryChangeListeners) {
+    try { listener(); } catch { /* Observational UI listeners never affect committed lifecycle state. */ }
+  }
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS registry_meta (
   key TEXT PRIMARY KEY,
@@ -430,6 +458,7 @@ function transaction<T>(registry: WorkerRegistry, fn: () => T): T {
     assertSchema(registry);
     const value = fn();
     registry.database.exec("COMMIT");
+    notifyWorkerRegistryChanges();
     return value;
   } catch (error) {
     registry.database.exec("ROLLBACK");
