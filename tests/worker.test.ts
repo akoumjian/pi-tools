@@ -5,8 +5,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { Check } from "typebox/value";
-import { WORKER_ACTIVITY_STATUS_KEY, WorkerControlParams, WorkerMergeApplyParams, WorkerMergeTestParams, WorkerRunParams, activeWorkerCountForContext, registerWorkerExtension, renderWorkerActivityStatus } from "../extensions/worker/index.js";
+import { WORKER_ACTIVITY_STATUS_KEY, WorkerControlParams, WorkerMergeApplyParams, WorkerMergeTestParams, WorkerRunParams, activeWorkerCountForContext, registerWorkerExtension, renderWorkerActivityStatus, renderWorkerOperationHint, sanitizeWorkerOperationText, workerRunOperationHint } from "../extensions/worker/index.js";
 import { RetainedToolOutputSchemas } from "../extensions/_shared/tool-output.js";
 import { normalizeWorkerSettings } from "../extensions/worker/settings.js";
 import { validateWorkerResultInput, WorkerResultValidationError } from "../extensions/worker/contract.js";
@@ -199,4 +200,80 @@ test("worker activity footer repaints from registry events, fences reload listen
     settleWorkerRun(registry, { parentSessionFile: sessionFile, ...second, outcome: "cancelled", outcomeSource: "system", settledAt: "2026-01-01T00:00:05.000Z" });
     assert.equal(statuses.length, afterShutdown, "shutdown removes the registry listener");
   } finally { registry.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("trusted worker operation hints cover work, resume, review, integration, and merge metadata", () => {
+  const worker = { role: "work", taskIds: ["personal-resume", "personal-extra"], latestRunId: "run_20260101000000_resumeaa" } as never;
+  const reviewed = { worker: {} as never, run: { taskIds: ["personal-reviewed", "personal-second"] } as never };
+  const lookups = {
+    taskTitle: (taskId: string) => taskId === "personal-work" ? "Trusted work title" : taskId === "personal-resume" ? "Trusted resume title" : undefined,
+    worker: (workerId: string) => workerId.endsWith("aaaaaaaa") ? worker : undefined,
+    run: (runId: string) => runId.endsWith("reviewaa") ? reviewed : undefined,
+    prepared: (preparedId: string) => preparedId.endsWith("a".repeat(24)) ? { repositories: [{ targetRepo: "/code/pi-tools", targetRef: "refs/heads/main", method: "merge" }, { targetRepo: "/code/pi-agent-config", targetRef: "refs/heads/main", method: "squash" }] } : undefined
+  };
+  assert.equal(workerRunOperationHint({ runs: [{ action: "start", role: "work", taskIds: ["personal-work", "personal-other"], instructions: "UNTRUSTED-INSTRUCTIONS" }] } as never, lookups as never, "/tmp"), "personal-work +1 — Trusted work title");
+  assert.equal(workerRunOperationHint({ runs: [{ action: "resume", workerId: "worker_20260101000000_aaaaaaaa", instructions: "UNTRUSTED-RESUME" }] } as never, lookups as never, "/tmp"), "personal-resume +1 — Trusted resume title");
+  assert.equal(workerRunOperationHint({ runs: [{ action: "resume", workerId: "worker_20260101000000_reviewbb", instructions: "UNTRUSTED-REVIEW-RESUME" }] } as never, { ...lookups, worker: () => ({ role: "review", taskIds: ["personal-work"], latestRunId: "run_20260101000000_reviewaa" }) } as never, "/tmp"), "personal-work — Trusted work title");
+  assert.equal(workerRunOperationHint({ runs: [{ action: "start", role: "review", reviewedRunId: "run_20260101000000_reviewaa" }] } as never, lookups as never, "/tmp"), "personal-reviewed +1 · run reviewaa");
+  assert.equal(workerRunOperationHint({ runs: [{ action: "start", role: "integration", preparedId: `prepared_${"a".repeat(24)}`, taskIds: ["personal-work"] }] } as never, lookups as never, "/tmp"), "pi-tools +1");
+  assert.equal(renderWorkerOperationHint({ kind: "merge", repositories: [{ targetRepo: "/code/pi-tools", targetRef: "refs/heads/main", method: "merge" }, { targetRepo: "/code/second", targetRef: "refs/heads/release", method: "squash" }] } as never), "pi-tools → main · merge +1");
+});
+
+test("worker operation hints sanitize hostile titles, truncate by visible Unicode width, and omit failed lookup context", () => {
+  const hostile = `\u001b[31mline one\nline two\u001b[0m ${"家族👨‍👩‍👧‍👦".repeat(20)}\u202e`;
+  const hint = renderWorkerOperationHint({ kind: "work", taskIds: ["personal-safe"], title: hostile } as never)!;
+  assert.ok(visibleWidth(hint) <= 48, `${visibleWidth(hint)}: ${hint}`);
+  assert.equal(hint.includes("\u001b"), false); assert.equal(/[\r\n\u202e]/u.test(hint), false); assert.equal(hint.includes("�"), false);
+  assert.equal(sanitizeWorkerOperationText("\u001b]8;;https://evil.invalid\u0007safe\u001b]8;;\u0007\ntext"), "safe text");
+  const noTitle = workerRunOperationHint({ runs: [{ action: "start", role: "work", taskIds: ["personal-safe"], instructions: "SECRET-SUMMARY" }] } as never, {
+    taskTitle: () => undefined, worker: () => undefined, run: () => undefined, prepared: () => undefined
+  } as never, "/tmp");
+  assert.equal(noTitle, "personal-safe"); assert.equal(noTitle?.includes("SECRET-SUMMARY"), false);
+  assert.equal(workerRunOperationHint({ runs: [{ action: "resume", workerId: "worker_20260101000000_missinga", instructions: "SECRET" }] } as never, {
+    taskTitle: () => undefined, worker: () => undefined, run: () => undefined, prepared: () => undefined
+  } as never, "/tmp"), undefined);
+});
+
+test("collapsed worker call, progress, and result renderers keep structured hints and obey narrow widths", () => {
+  const tools: ToolDefinition[] = [];
+  registerWorkerExtension({ registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, on() {}, sendMessage() {} } as unknown as ExtensionAPI, { taskTitle: () => "Trusted title" });
+  const tool = tools.find((candidate) => candidate.name === "worker_run")!;
+  const args = { runs: [{ action: "start", role: "work", taskIds: ["personal-display"], instructions: "DO-NOT-RENDER-RAW-PROSE" }] };
+  const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as never;
+  const context = { args, cwd: "/tmp" } as never;
+  const call = tool.renderCall!(args as never, theme, context);
+  const callWide = stripTerminalSequences(call.render(120).join("\n"));
+  assert.match(callWide, /personal-display.*Trusted title/); assert.equal(callWide.includes("DO-NOT-RENDER-RAW-PROSE"), false);
+  const callNarrow = call.render(16).join("\n"); assert.ok(visibleWidth(callNarrow) <= 16); assert.equal(callNarrow.includes("�"), false);
+  const result = { content: [{ type: "text", text: JSON.stringify({ provider: "unchanged" }) }], details: { runs: [{ action: "start", role: "work", workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_aaaaaaaa", status: "queued", taskIds: ["personal-display"] }] } };
+  for (const isPartial of [true, false]) {
+    const rendered = tool.renderResult!(result as never, { expanded: false, isPartial }, theme, context).render(120).join("\n");
+    assert.match(stripTerminalSequences(rendered), /personal-display.*Trusted title/); assert.equal(rendered.includes("DO-NOT-RENDER-RAW-PROSE"), false);
+  }
+  assert.equal(result.content[0]!.text, '{"provider":"unchanged"}');
+});
+
+test("collapsed merge test and apply renderers use structured repository metadata only", () => {
+  const preparedId = `prepared_${"a".repeat(24)}`;
+  const repositories = [
+    { id: "first", candidateRepo: "/candidate/pi-tools", candidateRef: "HEAD", targetRepo: "/target/pi-tools", targetRef: "refs/heads/main", method: "merge", commitMessage: "UNTRUSTED-COMMIT-PROSE" },
+    { id: "second", candidateRepo: "/candidate/config", candidateRef: "HEAD", targetRepo: "/target/config", targetRef: "refs/heads/release", method: "squash", commitMessage: "ALSO-UNTRUSTED" }
+  ];
+  const tools: ToolDefinition[] = [];
+  registerWorkerExtension({ registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, on() {}, sendMessage() {} } as unknown as ExtensionAPI, {
+    preparedSet: (value) => value === preparedId ? { repositories } : undefined
+  });
+  const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as never;
+  const mergeTest = tools.find((tool) => tool.name === "worker_merge_test")!;
+  const testContext = { args: { repositories }, cwd: "/tmp" } as never;
+  const testText = mergeTest.renderCall!({ repositories } as never, theme, testContext).render(120).join("\n");
+  assert.match(testText, /pi-tools → main · merge \+1/); assert.equal(testText.includes("UNTRUSTED"), false);
+  const testResult = mergeTest.renderResult!({ content: [{ type: "text", text: "provider-json" }], details: { preparedId, status: "ready", repositories } } as never, { expanded: false, isPartial: false }, theme, testContext).render(120).join("\n");
+  assert.match(testResult, /pi-tools → main · merge \+1/); assert.equal(testResult.includes("UNTRUSTED"), false);
+  const mergeApply = tools.find((tool) => tool.name === "worker_merge_apply")!;
+  const applyContext = { args: { preparedId }, cwd: "/tmp" } as never;
+  const applyText = mergeApply.renderCall!({ preparedId } as never, theme, applyContext).render(120).join("\n");
+  assert.match(applyText, /pi-tools → main · merge \+1/);
+  const applyResult = mergeApply.renderResult!({ content: [{ type: "text", text: "provider-json" }], details: { status: "completed", repositories } } as never, { expanded: false, isPartial: false }, theme, applyContext).render(120).join("\n");
+  assert.match(applyResult, /pi-tools → main · merge \+1/);
 });

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -9,6 +10,8 @@ import { Check } from "typebox/value";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import workerRuntimeExtension, { readWorkerRuntimeResult } from "../extensions/worker/runtime.js";
 import { buildWorkerRpcArgs, type WorkerHostConfig } from "../extensions/worker/runner.js";
+
+const sha256 = (value: string): string => createHash("sha256").update(value, "utf8").digest("hex");
 
 type FakeApi = ExtensionAPI & { tools: ToolDefinition[] };
 function fakeApi(): FakeApi { const tools: ToolDefinition[] = []; return { tools, registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, on() {}, sendMessage() {} } as unknown as FakeApi; }
@@ -180,21 +183,21 @@ test("Beads task reads expose canonical design with UTF-8-safe continuation unde
     const tool = api.tools.find((candidate) => candidate.name === "worker_beads_tasks")!;
     const firstResult = await tool.execute!("call", { action: "get", taskIds: ["personal-test"] }, undefined, undefined, undefined as never);
     const firstText = firstResult.content[0]!.type === "text" ? firstResult.content[0]!.text : "";
-    const first = JSON.parse(firstText) as { tasks: Array<{ design: { content: string; offset: number; returnedBytes: number; totalBytes: number; truncated: boolean; nextOffset?: number }; truncatedFields: string[] }> };
+    const first = JSON.parse(firstText) as { tasks: Array<{ design: { content: string; offset: number; returnedBytes: number; totalBytes: number; sha256: string; truncated: boolean; nextOffset?: number }; truncatedFields: string[] }> };
     const initial = first.tasks[0]!.design;
     assert.equal(Buffer.byteLength(firstText), (firstResult.details as { contentBytes: number }).contentBytes);
     assert.ok(Buffer.byteLength(firstText) <= 64 * 1024);
-    assert.equal(initial.offset, 0); assert.equal(initial.totalBytes, Buffer.byteLength(canonical)); assert.equal(initial.truncated, true);
+    assert.equal(initial.offset, 0); assert.equal(initial.totalBytes, Buffer.byteLength(canonical)); assert.equal(initial.sha256, sha256(canonical)); assert.equal(initial.truncated, true);
     assert.equal(canonical.startsWith(initial.content), true); assert.ok(!initial.content.includes("�"));
     assert.ok(first.tasks[0]!.truncatedFields.includes("design"));
 
     let combined = initial.content;
     let offset = initial.nextOffset!;
     while (offset < initial.totalBytes) {
-      const result = await tool.execute!("call", { action: "design", taskId: "personal-test", offset, limit: 32 * 1024 }, undefined, undefined, undefined as never);
+      const result = await tool.execute!("call", { action: "design", taskId: "personal-test", offset, limit: 32 * 1024, expectedSha256: initial.sha256 }, undefined, undefined, undefined as never);
       const text = result.content[0]!.type === "text" ? result.content[0]!.text : "";
-      const page = JSON.parse(text) as { design: { content: string; offset: number; returnedBytes: number; totalBytes: number; truncated: boolean; nextOffset?: number } };
-      assert.ok(Buffer.byteLength(text) <= 64 * 1024); assert.equal(page.design.offset, offset); assert.ok(page.design.returnedBytes > 0); assert.ok(!page.design.content.includes("�"));
+      const page = JSON.parse(text) as { design: { content: string; offset: number; returnedBytes: number; totalBytes: number; sha256: string; truncated: boolean; nextOffset?: number } };
+      assert.ok(Buffer.byteLength(text) <= 64 * 1024); assert.equal(page.design.offset, offset); assert.equal(page.design.sha256, initial.sha256); assert.ok(page.design.returnedBytes > 0); assert.ok(!page.design.content.includes("�"));
       combined += page.design.content;
       offset = page.design.nextOffset ?? page.design.totalBytes;
     }
@@ -209,13 +212,14 @@ test("Beads design chunks enforce serialized response bytes and reject non-bound
     const tool = api.tools.find((candidate) => candidate.name === "worker_beads_tasks")!;
     const result = await tool.execute!("call", { action: "design", taskId: "personal-test", offset: 0, limit: 48 * 1024 }, undefined, undefined, undefined as never);
     const text = result.content[0]!.type === "text" ? result.content[0]!.text : "";
-    const value = JSON.parse(text) as { design: { content: string; returnedBytes: number; totalBytes: number; nextOffset?: number } };
+    const value = JSON.parse(text) as { design: { content: string; returnedBytes: number; totalBytes: number; sha256: string; nextOffset?: number } };
     assert.ok(Buffer.byteLength(text) <= 64 * 1024); assert.equal(Buffer.byteLength(text), (result.details as { contentBytes: number }).contentBytes);
-    assert.ok(value.design.returnedBytes > 0); assert.ok(value.design.returnedBytes < 48 * 1024); assert.equal(canonical.startsWith(value.design.content), true); assert.ok(value.design.nextOffset);
+    assert.ok(value.design.returnedBytes > 0); assert.ok(value.design.returnedBytes < 48 * 1024); assert.equal(value.design.sha256, sha256(canonical)); assert.equal(canonical.startsWith(value.design.content), true); assert.ok(value.design.nextOffset);
 
     await writeFile(process.env.FAKE_BEADS_TASKS_FILE!, JSON.stringify([{ id: "personal-test", title: "UTF-8", status: "open", priority: 1, issue_type: "task", design: "🙂x" }]));
-    await assert.rejects(() => tool.execute!("call", { action: "design", taskId: "personal-test", offset: 1, limit: 4 }, undefined, undefined, undefined as never), /UTF-8 character boundary/);
-    await assert.rejects(() => tool.execute!("call", { action: "design", taskId: "personal-test", offset: 100, limit: 4 }, undefined, undefined, undefined as never), /exceeds 5 UTF-8 bytes/);
+    const utf8Digest = sha256("🙂x");
+    await assert.rejects(() => tool.execute!("call", { action: "design", taskId: "personal-test", offset: 1, limit: 4, expectedSha256: utf8Digest }, undefined, undefined, undefined as never), /UTF-8 character boundary/);
+    await assert.rejects(() => tool.execute!("call", { action: "design", taskId: "personal-test", offset: 100, limit: 4, expectedSha256: utf8Digest }, undefined, undefined, undefined as never), /exceeds 5 UTF-8 bytes/);
   });
 });
 
@@ -224,7 +228,10 @@ test("Beads search omits design while the design continuation branch preserves r
     await writeFile(process.env.FAKE_BEADS_TASKS_FILE!, JSON.stringify([{ id: "personal-test", title: "Searchable", status: "open", priority: 1, issue_type: "task", design: "private-sized-spec" }]));
     const tool = api.tools.find((candidate) => candidate.name === "worker_beads_tasks")!;
     assert.equal(Check(tool.parameters, { action: "design", taskId: "personal-test", offset: 0, limit: 4096 }), true);
-    assert.equal(Check(tool.parameters, { action: "design", taskId: "personal-test", offset: 1, limit: 3 }), false);
+    assert.equal(Check(tool.parameters, { action: "design", taskId: "personal-test", offset: 1, limit: 4096 }), false);
+    assert.equal(Check(tool.parameters, { action: "design", taskId: "personal-test", offset: 1, limit: 4096, expectedSha256: "a".repeat(64) }), true);
+    assert.equal(Check(tool.parameters, { action: "design", taskId: "personal-test", offset: 1, limit: 4096, expectedSha256: "A".repeat(64) }), false);
+    assert.equal(Check(tool.parameters, { action: "design", taskId: "personal-test", offset: 1, limit: 3, expectedSha256: "a".repeat(64) }), false);
     assert.equal(Check(tool.parameters, { action: "update", taskId: "personal-test", note: "no" }), false);
     const result = await tool.execute!("call", { action: "search", query: "Searchable", limit: 1 }, undefined, undefined, undefined as never);
     const text = result.content[0]!.type === "text" ? result.content[0]!.text : "";
@@ -242,9 +249,35 @@ test("multi-task design projection shrinks inline chunks rather than exceeding t
     const tool = api.tools.find((candidate) => candidate.name === "worker_beads_tasks")!;
     const result = await tool.execute!("call", { action: "assigned", limit: 4 }, undefined, undefined, undefined as never);
     const text = result.content[0]!.type === "text" ? result.content[0]!.text : "";
-    const value = JSON.parse(text) as { tasks: Array<{ design: { content: string; totalBytes: number; truncated: boolean; nextOffset?: number }; truncatedFields: string[] }> };
+    const value = JSON.parse(text) as { tasks: Array<{ design: { content: string; totalBytes: number; sha256: string; truncated: boolean; nextOffset?: number }; truncatedFields: string[] }> };
     assert.ok(Buffer.byteLength(text) <= 64 * 1024); assert.equal(value.tasks.length, 4);
-    assert.ok(value.tasks.every((task) => task.design.totalBytes === Buffer.byteLength(design) && design.startsWith(task.design.content)));
+    assert.ok(value.tasks.every((task) => task.design.totalBytes === Buffer.byteLength(design) && task.design.sha256 === sha256(design) && design.startsWith(task.design.content)));
     assert.ok(value.tasks.some((task) => task.design.truncated && task.truncatedFields.includes("design") && task.design.nextOffset !== undefined));
+  });
+});
+
+test("Beads design continuation rejects missing, malformed, and stale full-design digests", async () => {
+  await fixture("work", async (_root, api) => {
+    const original = "A".repeat(20_000) + "OLD-TAIL";
+    const revised = "B".repeat(20_000) + "NEW-TAIL";
+    assert.equal(Buffer.byteLength(original), Buffer.byteLength(revised), "mutation fixture must preserve byte length");
+    await writeFile(process.env.FAKE_BEADS_TASKS_FILE!, JSON.stringify([{ id: "personal-test", title: "Mutable", status: "open", priority: 1, issue_type: "task", design: original }]));
+    const tool = api.tools.find((candidate) => candidate.name === "worker_beads_tasks")!;
+    const firstResult = await tool.execute!("call", { action: "design", taskId: "personal-test", offset: 0, limit: 4096 }, undefined, undefined, undefined as never);
+    const firstText = firstResult.content[0]!.type === "text" ? firstResult.content[0]!.text : "";
+    const first = JSON.parse(firstText) as { design: { sha256: string; nextOffset: number } };
+    assert.equal(first.design.sha256, sha256(original));
+    const pinnedAtZero = await tool.execute!("call", { action: "design", taskId: "personal-test", offset: 0, limit: 4096, expectedSha256: first.design.sha256 }, undefined, undefined, undefined as never);
+    const pinnedText = pinnedAtZero.content[0]!.type === "text" ? pinnedAtZero.content[0]!.text : "";
+    assert.equal((JSON.parse(pinnedText) as { design: { sha256: string } }).design.sha256, first.design.sha256);
+    await assert.rejects(() => tool.execute!("call", { action: "design", taskId: "personal-test", offset: first.design.nextOffset, limit: 4096 }, undefined, undefined, undefined as never), /requires expectedSha256 from offset 0/);
+    await assert.rejects(() => tool.execute!("call", { action: "design", taskId: "personal-test", offset: first.design.nextOffset, limit: 4096, expectedSha256: "not-a-digest" }, undefined, undefined, undefined as never), /64 lowercase hexadecimal/);
+
+    await writeFile(process.env.FAKE_BEADS_TASKS_FILE!, JSON.stringify([{ id: "personal-test", title: "Mutable", status: "open", priority: 1, issue_type: "task", design: revised }]));
+    await assert.rejects(() => tool.execute!("call", { action: "design", taskId: "personal-test", offset: first.design.nextOffset, limit: 4096, expectedSha256: first.design.sha256 }, undefined, undefined, undefined as never), /design changed; restart at offset 0/);
+    await assert.rejects(() => tool.execute!("call", { action: "design", taskId: "personal-test", offset: 0, limit: 4096, expectedSha256: first.design.sha256 }, undefined, undefined, undefined as never), /design changed; restart at offset 0/);
+    const restarted = await tool.execute!("call", { action: "design", taskId: "personal-test", offset: 0, limit: 4096 }, undefined, undefined, undefined as never);
+    const restartedText = restarted.content[0]!.type === "text" ? restarted.content[0]!.text : "";
+    assert.equal((JSON.parse(restartedText) as { design: { sha256: string } }).design.sha256, sha256(revised));
   });
 });

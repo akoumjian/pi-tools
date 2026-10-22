@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { validateToolArguments, type Tool, type ToolCall } from "@earendil-works/pi-ai";
@@ -17,7 +18,7 @@ export type AcceptedWorkerResult = { version: 2; workerId: string; runId: string
 export type WorkerTaskUpdate = { taskId: string; note: string; status?: "in_progress" | "blocked" };
 export type WorkerTaskRead = { taskIds?: string[]; query?: string; offset?: number; limit?: number };
 type WorkerTaskReadDetails = { scope: "assigned" | "requested" | "search" | "design"; offset?: number; limit: number; totalAssigned: number; returned: number; nextOffset?: number; contentBytes: number; truncated: boolean };
-type WorkerTaskDesignView = { content: string; offset: number; returnedBytes: number; totalBytes: number; truncated: boolean; nextOffset?: number };
+type WorkerTaskDesignView = { content: string; offset: number; returnedBytes: number; totalBytes: number; sha256: string; truncated: boolean; nextOffset?: number };
 type WorkerTaskRelationView = { id: string; assigned: boolean; title: string; status: string; priority: number; issueType: string; dependencyType?: string; truncatedFields: string[] };
 type WorkerTaskView = { id: string; assigned: boolean; title: string; status: string; priority: number; issueType: string; assignee?: string; parent?: { id: string; assigned: boolean }; description?: string; design?: WorkerTaskDesignView; notes?: string; acceptanceCriteria?: string; dependencyCount: number; dependentCount: number; dependencies: WorkerTaskRelationView[]; dependents: WorkerTaskRelationView[]; truncatedFields: string[] };
 type WorkerResultError = { code: string; path: string; message: string };
@@ -47,7 +48,7 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
     description: "Read bounded assigned or relevant central Beads tasks, continue canonical design fields, search task metadata, or append a progress note to one assigned task. Work and integration workers may update only assigned tasks; review workers have read-only branches. The tool cannot close tasks or change dependencies.",
     promptSnippet: "Read or search Beads tasks, and when permitted update one assigned task.",
     promptGuidelines: [
-      "worker_beads_tasks use: Use assigned for this worker's task page, get for exact task IDs, design with the returned UTF-8 byte offset to continue a truncated canonical design, search for bounded discovery, and update only for meaningful progress or blockers on one assigned task.",
+      "worker_beads_tasks use: Use assigned for this worker's task page, get for exact task IDs, and design with both the returned UTF-8 byte offset and sha256 to continue a truncated canonical design. Restart at offset zero if the digest changes. Use search for bounded discovery and update only for meaningful progress or blockers on one assigned task.",
       inputJsonSchemaGuideline("worker_beads_tasks", WorkerBeadsTasksParams),
       "worker_beads_tasks constraints: Reads and canonical design chunks share a 64 KiB provider-visible response ceiling. Updates append notes and may set only in_progress or blocked; review workers cannot update. The adapter never exposes the database, routing, or arbitrary commands."
     ],
@@ -56,7 +57,7 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
       assertRuntimeOpen("worker_beads_tasks");
       validateBeadsAction(params);
       if (params.action === "update") return executeTaskUpdate({ taskId: params.taskId!, note: params.note!, status: params.status });
-      if (params.action === "design") return executeTaskDesignRead(params.taskId!, params.offset, params.limit);
+      if (params.action === "design") return executeTaskDesignRead(params.taskId!, params.offset, params.limit, params.expectedSha256);
       const read: WorkerTaskRead = params.action === "assigned"
         ? { offset: params.offset, limit: params.limit }
         : params.action === "get" ? { taskIds: params.taskIds! } : { query: params.query!, limit: params.limit };
@@ -123,11 +124,13 @@ function rejectedResult(errors: WorkerResultError[]): AgentToolResult<WorkerResu
 }
 
 function validateBeadsAction(params: any): void {
-  const keys = Object.keys(params); const allowed = params.action === "assigned" ? ["action","offset","limit"] : params.action === "get" ? ["action","taskIds"] : params.action === "search" ? ["action","query","limit"] : params.action === "design" ? ["action","taskId","offset","limit"] : ["action","taskId","note","status"];
+  const keys = Object.keys(params); const allowed = params.action === "assigned" ? ["action","offset","limit"] : params.action === "get" ? ["action","taskIds"] : params.action === "search" ? ["action","query","limit"] : params.action === "design" ? ["action","taskId","offset","limit","expectedSha256"] : ["action","taskId","note","status"];
   if (!keys.every((key) => allowed.includes(key))) throw new Error(`worker_beads_tasks ${params.action} received unsupported fields.`);
   if (params.action === "get" && !params.taskIds?.length) throw new Error("worker_beads_tasks get requires taskIds.");
   if (params.action === "search" && !params.query?.trim()) throw new Error("worker_beads_tasks search requires query.");
   if (params.action === "design" && !params.taskId) throw new Error("worker_beads_tasks design requires taskId.");
+  if (params.action === "design" && params.expectedSha256 !== undefined && !/^[0-9a-f]{64}$/.test(params.expectedSha256)) throw new Error("worker_beads_tasks expectedSha256 must be 64 lowercase hexadecimal characters.");
+  if (params.action === "design" && (params.offset ?? 0) > 0 && params.expectedSha256 === undefined) throw new Error("worker_beads_tasks design continuation requires expectedSha256 from offset 0.");
   if (params.action === "update" && (!params.taskId || !params.note?.trim())) throw new Error("worker_beads_tasks update requires taskId and note.");
 }
 
@@ -143,14 +146,14 @@ function resultPathMetadata(value: string): { exists: boolean; directory: boolea
 
 async function executeTaskRead(params: WorkerTaskRead): Promise<AgentToolResult<WorkerTaskReadDetails>> {
   validateWorkerTaskReadMode(params);
-  const runtime = workerTaskRuntime(); verifyPersonalBeadsRoute(runtime);
+  const runtime = workerTaskRuntime();
   const assigned = [...runtime.taskIds]; const explicitTaskIds = params.taskIds; const query = params.query;
   const scope: "search" | "requested" | "assigned" = query !== undefined ? "search" : explicitTaskIds !== undefined ? "requested" : "assigned";
   const offset = scope === "assigned" ? params.offset ?? 0 : undefined;
   const limit = explicitTaskIds === undefined ? params.limit ?? Math.min(MAX_WORKER_TASK_READ_LIMIT, 4) : explicitTaskIds.length;
   if (scope === "assigned" && offset! >= assigned.length) throw new Error(`worker_beads_tasks offset ${offset} exceeds ${assigned.length} assigned task IDs.`);
   const taskIds = query !== undefined ? searchWorkerTaskIds(runtime, query, limit) : explicitTaskIds !== undefined ? requestedWorkerTaskIds(explicitTaskIds) : assigned.slice(offset, offset! + limit);
-  const output = taskIds.length === 0 ? "[]" : readBeadsTaskPage(runtime, taskIds);
+  const output = taskIds.length === 0 ? "[]" : readTrustedBeadsTaskPage(runtime, taskIds);
   const tasks = workerTaskViews(output, taskIds, runtime.taskIds, scope !== "search");
   const truncated = tasks.some((task) => task.truncatedFields.length > 0 || [...task.dependencies, ...task.dependents].some((relation) => relation.truncatedFields.length > 0));
   const nextOffset = scope === "assigned" && offset! + taskIds.length < assigned.length ? offset! + taskIds.length : undefined;
@@ -160,21 +163,26 @@ async function executeTaskRead(params: WorkerTaskRead): Promise<AgentToolResult<
   return { content: [{ type: "text", text }], details: { scope, ...(offset === undefined ? {} : { offset }), limit, totalAssigned: assigned.length, returned: tasks.length, ...(nextOffset === undefined ? {} : { nextOffset }), contentBytes, truncated: pageTruncated } };
 }
 
-async function executeTaskDesignRead(taskId: string, offsetInput?: number, limitInput?: number): Promise<AgentToolResult<WorkerTaskReadDetails>> {
-  const runtime = workerTaskRuntime(); verifyPersonalBeadsRoute(runtime);
+async function executeTaskDesignRead(taskId: string, offsetInput?: number, limitInput?: number, expectedSha256?: string): Promise<AgentToolResult<WorkerTaskReadDetails>> {
+  const runtime = workerTaskRuntime();
   requestedWorkerTaskIds([taskId]);
   const offset = offsetInput ?? 0;
   const limit = limitInput ?? DEFAULT_WORKER_TASK_DESIGN_BYTES;
   if (!Number.isInteger(offset) || offset < 0 || offset > 512 * 1024) throw new Error("worker_beads_tasks design offset is invalid.");
   if (!Number.isInteger(limit) || limit < 4 || limit > MAX_WORKER_TASK_DESIGN_BYTES) throw new Error("worker_beads_tasks design limit is invalid.");
-  const output = readBeadsTaskPage(runtime, [taskId]);
+  if (expectedSha256 !== undefined && !/^[0-9a-f]{64}$/.test(expectedSha256)) throw new Error("worker_beads_tasks expectedSha256 must be 64 lowercase hexadecimal characters.");
+  if (offset > 0 && expectedSha256 === undefined) throw new Error("worker_beads_tasks design continuation requires expectedSha256 from offset 0.");
+  const output = readTrustedBeadsTaskPage(runtime, [taskId]);
   const design = workerTaskDesign(output, taskId);
+  const sha256 = designSha256(design);
+  if (expectedSha256 !== undefined && expectedSha256 !== sha256) throw new Error("worker_beads_tasks design changed; restart at offset 0.");
   const response = fitDesignReadToBudget({
     scope: "design" as const,
     assignedTaskIds: [...runtime.taskIds],
     taskId,
     assigned: runtime.taskIds.has(taskId),
-    design
+    design,
+    sha256
   }, offset, limit);
   return {
     content: [{ type: "text", text: response.text }],
@@ -315,7 +323,10 @@ function searchWorkerTaskIds(
   return taskIds;
 }
 
-function readBeadsTaskPage(runtime: ReturnType<typeof workerTaskRuntime>, taskIds: readonly string[]): string {
+export type TrustedBeadsReadRuntime = Pick<ReturnType<typeof workerTaskRuntime>, "workspaceRoot" | "bdPath" | "beadsRoute">;
+
+export function readTrustedBeadsTaskPage(runtime: TrustedBeadsReadRuntime, taskIds: readonly string[]): string {
+  verifyPersonalBeadsRoute(runtime);
   try {
     return execFileSync(runtime.bdPath, [
       "--readonly",
@@ -336,7 +347,7 @@ function readBeadsTaskPage(runtime: ReturnType<typeof workerTaskRuntime>, taskId
   }
 }
 
-function verifyPersonalBeadsRoute(runtime: ReturnType<typeof workerTaskRuntime>): void {
+function verifyPersonalBeadsRoute(runtime: TrustedBeadsReadRuntime): void {
   let route: { prefix?: unknown; path?: unknown; database_path?: unknown };
   try {
     const output = execFileSync(runtime.bdPath, ["where", "--json"], {
@@ -540,10 +551,12 @@ function optionalTaskDesign(value: Record<string, unknown>): WorkerTaskDesignVie
   const raw = value.design;
   if (raw === undefined || raw === null || raw === "") return undefined;
   if (typeof raw !== "string") throw new Error("worker_beads_tasks expected design to be text.");
-  return designWindow(raw, 0, MAX_WORKER_TASK_INLINE_DESIGN_BYTES);
+  return designWindow(raw, 0, MAX_WORKER_TASK_INLINE_DESIGN_BYTES, designSha256(raw));
 }
 
-function designWindow(value: string, offset: number, maximumBytes: number): WorkerTaskDesignView {
+function designSha256(value: string): string { return createHash("sha256").update(value, "utf8").digest("hex"); }
+
+function designWindow(value: string, offset: number, maximumBytes: number, sha256: string): WorkerTaskDesignView {
   const buffer = Buffer.from(value, "utf8");
   if (offset > buffer.length) throw new Error(`worker_beads_tasks design offset ${offset} exceeds ${buffer.length} UTF-8 bytes.`);
   if (offset > 0 && offset < buffer.length && (buffer[offset]! & 0xc0) === 0x80) throw new Error("worker_beads_tasks design offset must be a UTF-8 character boundary.");
@@ -556,6 +569,7 @@ function designWindow(value: string, offset: number, maximumBytes: number): Work
     offset,
     returnedBytes,
     totalBytes: buffer.length,
+    sha256,
     truncated,
     ...(truncated ? { nextOffset: end } : {})
   };
@@ -592,13 +606,14 @@ function shrinkDesignView(design: WorkerTaskDesignView, maximumBytes: number): W
     offset: design.offset,
     returnedBytes,
     totalBytes: design.totalBytes,
+    sha256: design.sha256,
     truncated,
     ...(truncated ? { nextOffset } : {})
   };
 }
 
 function fitDesignReadToBudget(
-  base: { scope: "design"; assignedTaskIds: string[]; taskId: string; assigned: boolean; design: string },
+  base: { scope: "design"; assignedTaskIds: string[]; taskId: string; assigned: boolean; design: string; sha256: string },
   offset: number,
   limit: number
 ): { text: string; contentBytes: number; design: WorkerTaskDesignView } {
@@ -610,8 +625,8 @@ function fitDesignReadToBudget(
   let best: { text: string; contentBytes: number; design: WorkerTaskDesignView } | undefined;
   while (low <= high) {
     const requested = Math.floor((low + high) / 2);
-    const design = designWindow(base.design, offset, requested);
-    const text = JSON.stringify({ ...base, design }, null, 2);
+    const design = designWindow(base.design, offset, requested, base.sha256);
+    const text = JSON.stringify({ scope: base.scope, assignedTaskIds: base.assignedTaskIds, taskId: base.taskId, assigned: base.assigned, design }, null, 2);
     const contentBytes = Buffer.byteLength(text, "utf8");
     if (contentBytes <= MAX_WORKER_TASK_READ_CONTENT_BYTES) {
       if (!best || design.returnedBytes >= best.design.returnedBytes) best = { text, contentBytes, design };

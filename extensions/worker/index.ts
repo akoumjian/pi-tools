@@ -2,10 +2,11 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSy
 import { homedir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { Text } from "@earendil-works/pi-tui";
+import { Text, stripTerminalSequences, truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
 import { defineTool, type AgentToolResult, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { resolveExtensionModel, assertChildAgentRouteAllowed, parseModelThinkingPair } from "../_shared/model-spec.js";
 import { throwIfAborted } from "../_shared/cancellation.js";
+import { resolveExecutable } from "../_shared/executable.js";
 import { asyncJobProcessStartToken, createAsyncJobId, isAsyncJobProcessIdentityAlive, signalAsyncJobProcessIdentity } from "../_shared/async-job.js";
 import { handleAsyncShellViewerCommand, reconcileTerminatedPersistedAsyncShellJobsForOwner, unsettledPersistedAsyncShellJobsForOwner, type JobMeta, type ManagedAsyncJobHandle } from "../async-shell/index.js";
 import { createWorkerContainerAsync, planWorkerContainer, resolveDockerPath, settleWorkerContainerAsync, type WorkerContainerReference } from "../_shared/worker-container.js";
@@ -23,12 +24,12 @@ import {
   subscribeWorkerRegistryChanges, updatePreparedSetStatus, updateWorkerRuntimeMetadata, workerRegistryDataVersion,
   type WorkerBatchCreateItem, type WorkerRegistry, type WorkerRegistryRecord, type WorkerRepositoryResult, type WorkerRole, type WorkerRunRecord
 } from "./registry.js";
-import { readWorkerRuntimeResult } from "./runtime.js";
+import { readTrustedBeadsTaskPage, readWorkerRuntimeResult } from "./runtime.js";
 import { cleanupReviewOverlayAsync, createReviewOverlayAsync, type ReviewOverlayRecord } from "./review-workspace.js";
 import { preferredWorkerModel } from "./settings.js";
 import { createWorkerId, createWorkerRunId, defaultWorkerRoots, provisionWorkerPaths, workerPaths, type WorkerPaths, type WorkerRoots } from "./identity.js";
 import { createWorkerSession, forkWorkerSession, verifyWorkerSession } from "./session.js";
-import { launchWorkerHost, readWorkerHostProcess, readWorkerHostSettlement, type WorkerLaunchRecord } from "./runner.js";
+import { launchWorkerHost, readWorkerHostProcess, readWorkerHostSettlement, resolveBeadsRoute, type WorkerLaunchRecord } from "./runner.js";
 import { renderWorkerRuntimePrompt } from "./prompts.js";
 import { contextInputs, inputMounts, validateAdditionalInputs, type RetainedInput } from "./inputs.js";
 import { inspectInterruptedGitState, inventoryWorkerRepositories, snapshotWorkerRepositories, type RepositorySnapshot } from "./inventory.js";
@@ -78,6 +79,8 @@ export type WorkerExtensionDependencies = {
   launch?: (api: ExtensionAPI, context: ExtensionContext, input: { record: WorkerLaunchRecord; runtime: RunRuntime }) => ManagedAsyncJobHandle;
   createOverlay?: (input: Parameters<typeof createReviewOverlayAsync>[0]) => ReviewOverlayRecord | Promise<ReviewOverlayRecord>; cleanupOverlay?: (dockerPath: string, overlay: ReviewOverlayRecord) => void | Promise<void>;
   waitForHostIdentity?: (runtime: RunRuntime, workerId: string, runId: string) => Promise<void>;
+  taskTitle?: (taskId: string, cwd: string) => string | undefined;
+  preparedSet?: (preparedId: string) => { repositories: Array<Record<string, unknown>> } | undefined;
 };
 
 export default function workerExtension(api: ExtensionAPI): void { registerWorkerExtension(api); }
@@ -107,6 +110,43 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   const starting = new Map<string, { runId: string; completion: Promise<void> }>();
   const deliveredRecovery = new Set<string>();
   const getRegistry = () => registry ??= openWorkerRegistry(runtimeRoot);
+  const taskTitleCache = new Map<string, string | undefined>();
+  const taskTitle = overrides.taskTitle ?? ((taskId: string, cwd: string): string | undefined => {
+    const key = `${path.resolve(cwd)}\0${taskId}`;
+    if (taskTitleCache.has(key)) return taskTitleCache.get(key);
+    let title: string | undefined;
+    try {
+      const bdPath = resolveExecutable("bd");
+      const beadsRoute = resolveBeadsRoute(bdPath, cwd);
+      const value = JSON.parse(readTrustedBeadsTaskPage({ bdPath, workspaceRoot: cwd, beadsRoute }, [taskId])) as unknown;
+      if (Array.isArray(value) && value.length === 1 && value[0] && typeof value[0] === "object" && !Array.isArray(value[0])) {
+        const record = value[0] as Record<string, unknown>;
+        if (record.id === taskId && typeof record.title === "string" && Buffer.byteLength(record.title, "utf8") <= 512) title = record.title;
+      }
+    } catch {}
+    taskTitleCache.set(key, title);
+    return title;
+  });
+  const currentParentSessionFile = (): string | undefined => {
+    const value = currentContext?.sessionManager.getSessionFile();
+    return value ? realpathOrResolve(value) : undefined;
+  };
+  const operationLookups: WorkerOperationLookups = {
+    taskTitle: (taskId, cwd) => { try { return taskTitle(taskId, cwd); } catch { return undefined; } },
+    worker: (workerId) => {
+      const parent = currentParentSessionFile(); if (!parent) return undefined;
+      const worker = getWorker(getRegistry(), workerId); return worker?.parentSessionFile === parent ? worker : undefined;
+    },
+    run: (runId) => {
+      const parent = currentParentSessionFile(); if (!parent) return undefined;
+      const found = findWorkerRunById(getRegistry(), runId); return found?.worker.parentSessionFile === parent ? found : undefined;
+    },
+    prepared: (preparedId) => {
+      if (overrides.preparedSet) return overrides.preparedSet(preparedId);
+      const parent = currentParentSessionFile(); if (!parent) return undefined;
+      try { return readPreparedSetRecord(getRegistry(), parent, preparedId); } catch { return undefined; }
+    }
+  };
   const repaintWorkerActivity = (context: ExtensionContext): void => {
     try { updateWorkerActivityStatus(getRegistry(), context); }
     catch {
@@ -203,8 +243,8 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       "worker_run constraints: Only result content is provider-visible; details remain internal."
     ],
     parameters: WorkerRunParamsV2, executionMode: "sequential" as const,
-    renderCall: (args: unknown, theme: any) => compactCall(theme, runCallHint(args as WorkerRunInputV2)),
-    renderResult: (result: AgentToolResult<any>, _options: unknown, theme: any) => compactResult(theme, result, "worker run"),
+    renderCall: (args: unknown, theme: any, context: any) => compactCall(theme, runCallLabel(args as WorkerRunInputV2), workerRunOperationHint(args as WorkerRunInputV2, operationLookups, context?.cwd ?? currentContext?.cwd ?? process.cwd())),
+    renderResult: (result: AgentToolResult<any>, _options: unknown, theme: any, context: any) => compactResult(theme, result, "worker run", workerRunOperationHint(context?.args as WorkerRunInputV2, operationLookups, context?.cwd ?? currentContext?.cwd ?? process.cwd())),
     execute: async (_callId: string, params: WorkerRunInputV2, signal: AbortSignal, onUpdate: any, context: ExtensionContext): Promise<AgentToolResult<any>> => {
       throwIfAborted(signal);
       const parentSessionFile = requireParentSession(context);
@@ -264,7 +304,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     promptSnippet: "Test repository candidates against target branches and prepare exact disposable merge results without promotion.",
     promptGuidelines: [inputJsonSchemaGuideline("worker_merge_test", WorkerMergeTestParams), outputJsonSchemaGuideline("worker_merge_test", RetainedToolOutputSchemas.worker_merge_test), "worker_merge_test use: Prepare exact merges, validate every prepared view separately, and apply only through an explicit worker_merge_apply call.", "worker_merge_test constraints: Only result content is provider-visible; details remain internal."],
     parameters: WorkerMergeTestParams, executionMode: "sequential",
-    renderCall: (args, theme) => compactCall(theme, mergeHint("testing", (args as any).repositories)), renderResult: (result, _options, theme) => compactResult(theme, result as any, "merge test"),
+    renderCall: (args, theme) => compactCall(theme, "testing merge", mergeOperationHint((args as any).repositories)), renderResult: (result, _options, theme, context) => compactResult(theme, result as any, "merge test", mergeOperationHint((result as any).details?.repositories ?? (context as any)?.args?.repositories)),
     async execute(_id, params, signal, _update, context) {
       throwIfAborted(signal); const parent = requireParentSession(context);
       const resolved = params.repositories.map((request) => ({ ...request, candidateRef: request.candidateRef ?? "HEAD" }));
@@ -281,7 +321,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     promptSnippet: "Apply every exact repository result in one parent-validated prepared set.",
     promptGuidelines: [inputJsonSchemaGuideline("worker_merge_apply", WorkerMergeApplyParams), outputJsonSchemaGuideline("worker_merge_apply", RetainedToolOutputSchemas.worker_merge_apply), "worker_merge_apply use: Inspect diffs and run checks from every preparedPath before application. On validation failure, create a new prepared set. After partial or failed application, retry only the same preparedId; target drift requires a new worker_merge_test. Push and release remain separate parent actions.", "worker_merge_apply constraints: Only result content is provider-visible; details remain internal."],
     parameters: WorkerMergeApplyParams, executionMode: "sequential",
-    renderCall: (args, theme) => compactCall(theme, `applying · ${(args as any).preparedId?.slice(-8)}`), renderResult: (result, _options, theme) => compactResult(theme, result as any, "merge apply"),
+    renderCall: (args, theme) => compactCall(theme, "applying merge", preparedOperationHint((args as any).preparedId, operationLookups)), renderResult: (result, _options, theme, context) => compactResult(theme, result as any, "merge apply", preparedOperationHint((context as any)?.args?.preparedId, operationLookups)),
     async execute(_id, params, signal, _update, context) {
       throwIfAborted(signal); const parent = requireParentSession(context); const trustedSet = trustedPreparedSet(getRegistry(), parent, params.preparedId); if (!["ready", "partial", "failed"].includes(trustedSet.status)) throw new Error(`Prepared set ${params.preparedId} is not ready.`);
       const nonce = claimNonce(); if (!claimPreparedSetApply(getRegistry(), params.preparedId, parent, nonce, now().toISOString())) throw new Error(`Prepared set ${params.preparedId} is already being applied or changed state.`);
@@ -732,8 +772,25 @@ function workerListItem(worker: WorkerRegistryRecord) { return { workerId: worke
 function exactRun(worker: WorkerRegistryRecord, run: WorkerRunRecord) { return { workerId: worker.workerId, role: worker.role, runId: run.runId, status: run.status, taskIds: run.taskIds, ...(run.modelSelection ? { modelSelection: run.modelSelection } : {}), createdAt: run.createdAt, ...(run.startedAt ? { startedAt: run.startedAt } : {}), ...(run.settledAt ? { settledAt: run.settledAt } : {}), ...(run.jobId ? { jobId: run.jobId } : {}), ...(run.stdoutLog ? { stdoutLog: run.stdoutLog } : {}), ...(run.stderrLog ? { stderrLog: run.stderrLog } : {}), ...(worker.sessionId ? { sessionId: worker.sessionId } : {}), ...(worker.sessionFile ? { sessionFile: worker.sessionFile } : {}), sessionRange: { ...(run.sessionStartLine === undefined ? {} : { startLine: run.sessionStartLine }), ...(run.sessionEndLine === undefined ? {} : { endLine: run.sessionEndLine }) }, workspaceRoot: worker.workspaceRoot, ...(run.binding ? { binding: run.binding } : {}), ...(worker.recoveryError ? { recoveryError: worker.recoveryError } : {}), ...((run.runtime as RunRuntime | undefined)?.interruptionWarnings?.length ? { warnings: (run.runtime as RunRuntime).interruptionWarnings } : {}), ...(run.status === "settled" ? { outcome: run.outcome, outcomeSource: run.outcomeSource, ...(run.summary ? { summary: run.summary } : {}), ...(run.question ? { question: run.question } : {}), repositories: run.repositories.map(({ path: relativePath, commit, source, reported, changed, dirty, eligible, issues }) => ({ repositoryPath: path.join(worker.workspaceRoot, relativePath), commit, ...(source ? { source } : {}), reported, changed, dirty, eligible, ...(issues ? { issues } : {}) })), artifacts: run.artifacts, errors: run.errors } : {}) }; }
 function compactWorkerList(value: any): string { const workers = Array.isArray(value?.workers) ? value.workers : []; return workers.length ? workers.map((worker: any) => `${worker.status} · ${worker.role} · ${worker.workerId}`).join("\n") : "No workers."; }
 function formatExactRun(value: any): string { return `${value.outcome ?? value.status} · ${value.role} · ${value.workerId}\nrun ${value.runId}\n${value.taskIds?.length ?? 0} tasks · ${value.repositories?.length ?? 0} repositories · ${value.artifacts?.length ?? 0} artifacts${value.recoveryError ? `\nrecovery: ${value.recoveryError}` : ""}`; }
-function compactCall(theme: any, text: string): Text { return new Text(theme.fg("toolTitle", theme.bold(text.slice(0, 80))), 0, 0); }
-function compactResult(theme: any, result: AgentToolResult<any>, fallback: string): Text { return new Text(theme.fg("success", compactResultSummary((result as any).details, fallback).slice(0, 120)), 0, 0); }
+function boundedWorkerText(theme: any, text: string, color: string, bold: boolean, maximumWidth: number): Component {
+  const safe = sanitizeWorkerOperationText(text);
+  return {
+    render(width: number): string[] {
+      const boundedWidth = Math.max(1, Math.min(maximumWidth, width));
+      const visible = truncateToWidth(safe, boundedWidth, "…");
+      return [theme.fg(color, bold ? theme.bold(visible) : visible)];
+    },
+    invalidate() {}
+  };
+}
+function compactCall(theme: any, label: string, hint?: string): Component {
+  const text = hint ? `${sanitizeWorkerOperationText(label)} · ${hint}` : sanitizeWorkerOperationText(label);
+  return boundedWorkerText(theme, text, "toolTitle", true, 72);
+}
+function compactResult(theme: any, result: AgentToolResult<any>, fallback: string, hint?: string): Component {
+  const summary = compactResultSummary((result as any).details, fallback);
+  return boundedWorkerText(theme, hint ? `${summary} · ${hint}` : summary, "success", false, 96);
+}
 function compactResultSummary(details: any, fallback: string): string {
   if (Array.isArray(details?.runs) && details.runs.some((run: any) => run?.action)) return `${details.runs.length} worker run${details.runs.length === 1 ? "" : "s"} queued`;
   if (typeof details?.preparedId === "string") return `${details.status ?? fallback} · ${details.repositories?.length ?? 0} repositories`;
@@ -744,8 +801,111 @@ function compactResultSummary(details: any, fallback: string): string {
   if (typeof details?.workerId === "string" && typeof details?.runId === "string") return `${details.outcome ?? details.status ?? fallback} · ${details.role ?? "worker"}`;
   return fallback;
 }
-function runCallHint(input: WorkerRunInputV2): string { const first = input.runs[0]; if (!first) return "Run Workers"; const hint = first.action === "resume" ? first.workerId.slice(-8) : first.role === "work" ? first.taskIds[0] : first.role === "review" ? `run ${first.reviewedRunId.slice(-8)}` : first.preparedId.slice(-8); const label = first.action === "start" && first.role === "review" ? "Review Worker Output" : first.action === "start" && first.role === "integration" ? "Resolve Repository Conflicts" : "Run Workers"; return `${label} · ${hint}${input.runs.length > 1 ? ` +${input.runs.length - 1}` : ""}`; }
-function mergeHint(action: string, repositories: any[]): string { const first = repositories?.[0]; return first ? `${action} · ${String(first.id).slice(-8)} → ${String(first.targetRef).replace("refs/heads/", "")} · ${first.method}${repositories.length > 1 ? ` +${repositories.length - 1}` : ""}` : `${action} merge`; }
+
+type WorkerOperationLookups = {
+  taskTitle(taskId: string, cwd: string): string | undefined;
+  worker(workerId: string): WorkerRegistryRecord | undefined;
+  run(runId: string): { worker: WorkerRegistryRecord; run: WorkerRunRecord } | undefined;
+  prepared(preparedId: string): { repositories: Array<Record<string, unknown>> } | undefined;
+};
+type WorkerOperation =
+  | { kind: "work"; taskIds: string[]; title?: string; batchExtra?: number }
+  | { kind: "review"; taskIds: string[]; reviewedRunId: string; batchExtra?: number }
+  | { kind: "integration"; repositories: Array<Record<string, unknown>>; batchExtra?: number }
+  | { kind: "merge"; repositories: Array<Record<string, unknown>> };
+
+const PERSONAL_TASK_ID = /^personal-[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)*$/;
+const TERMINAL_CONTROL_PATTERN = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]/gu;
+const MAX_WORKER_OPERATION_HINT_WIDTH = 48;
+
+export function sanitizeWorkerOperationText(value: unknown): string {
+  if (typeof value !== "string") return "";
+  return stripTerminalSequences(value).replace(TERMINAL_CONTROL_PATTERN, " ").replace(/\s+/gu, " ").trim();
+}
+
+function plusCount(value: string, count: number): string { return count > 0 ? `${value} +${count}` : value; }
+function repositoryBasename(value: unknown): string {
+  const safe = sanitizeWorkerOperationText(value).replaceAll("\\", "/").replace(/\/+$/u, "");
+  return safe.split("/").at(-1) ?? "";
+}
+function taskOperation(taskIds: unknown, lookups: WorkerOperationLookups, cwd: string, batchExtra: number): WorkerOperation | undefined {
+  if (!Array.isArray(taskIds)) return undefined;
+  const trusted = taskIds.filter((value): value is string => typeof value === "string" && PERSONAL_TASK_ID.test(value));
+  if (!trusted[0]) return undefined;
+  const title = lookups.taskTitle(trusted[0], cwd);
+  return { kind: "work", taskIds: trusted, ...(title ? { title } : {}), ...(batchExtra > 0 ? { batchExtra } : {}) };
+}
+function reviewedOperation(runId: unknown, lookups: WorkerOperationLookups, batchExtra: number): WorkerOperation | undefined {
+  if (typeof runId !== "string") return undefined;
+  const found = lookups.run(runId);
+  const taskIds = found?.run.taskIds.filter((value) => PERSONAL_TASK_ID.test(value)) ?? [];
+  return { kind: "review", taskIds, reviewedRunId: runId, ...(batchExtra > 0 ? { batchExtra } : {}) };
+}
+function preparedOperation(preparedId: unknown, lookups: WorkerOperationLookups, batchExtra: number): WorkerOperation | undefined {
+  if (typeof preparedId !== "string") return undefined;
+  const prepared = lookups.prepared(preparedId);
+  return prepared ? { kind: "integration", repositories: prepared.repositories, ...(batchExtra > 0 ? { batchExtra } : {}) } : undefined;
+}
+
+export function workerRunOperationHint(input: WorkerRunInputV2 | undefined, lookups: WorkerOperationLookups, cwd: string): string | undefined {
+  const runs = input && Array.isArray(input.runs) ? input.runs : [];
+  const first = runs[0] as any; if (!first || typeof first !== "object") return undefined;
+  const batchExtra = Math.max(0, runs.length - 1);
+  let operation: WorkerOperation | undefined;
+  if (first.action === "start" && first.role === "work") operation = taskOperation(first.taskIds, lookups, cwd, batchExtra);
+  else if (first.action === "start" && first.role === "review") operation = reviewedOperation(first.reviewedRunId, lookups, batchExtra);
+  else if (first.action === "start" && first.role === "integration") operation = preparedOperation(first.preparedId, lookups, batchExtra);
+  else if (first.action === "resume" && typeof first.workerId === "string") {
+    const worker = lookups.worker(first.workerId);
+    if (worker) operation = taskOperation(worker.taskIds, lookups, cwd, batchExtra);
+  }
+  return operation ? renderWorkerOperationHint(operation) : undefined;
+}
+
+export function renderWorkerOperationHint(operation: WorkerOperation): string | undefined {
+  let raw = "";
+  if (operation.kind === "work") {
+    const first = operation.taskIds.find((value) => PERSONAL_TASK_ID.test(value)); if (!first) return undefined;
+    const task = plusCount(first, Math.max(0, operation.taskIds.length - 1));
+    const title = sanitizeWorkerOperationText(operation.title);
+    raw = `${task}${title ? ` — ${title}` : ""}`;
+  } else if (operation.kind === "review") {
+    const task = operation.taskIds.find((value) => PERSONAL_TASK_ID.test(value));
+    const taskPart = task ? plusCount(task, Math.max(0, operation.taskIds.length - 1)) : "review";
+    const run = sanitizeWorkerOperationText(operation.reviewedRunId).slice(-8);
+    raw = `${taskPart}${run ? ` · run ${run}` : ""}`;
+  } else if (operation.kind === "integration") {
+    const first = operation.repositories[0]; if (!first) return undefined;
+    const repository = repositoryBasename(first.targetRepo ?? first.candidateRepo ?? first.preparedPath ?? first.path); if (!repository) return undefined;
+    raw = plusCount(repository, Math.max(0, operation.repositories.length - 1));
+  } else {
+    const first = operation.repositories[0]; if (!first) return undefined;
+    const repository = repositoryBasename(first.targetRepo); if (!repository) return undefined;
+    const branch = sanitizeWorkerOperationText(first.targetRef).replace(/^refs\/heads\//u, "");
+    const method = first.method === "merge" || first.method === "squash" ? first.method : "";
+    raw = `${repository}${branch ? ` → ${branch}` : ""}${method ? ` · ${method}` : ""}${operation.repositories.length > 1 ? ` +${operation.repositories.length - 1}` : ""}`;
+  }
+  if (operation.kind !== "merge" && (operation.batchExtra ?? 0) > 0) raw += ` · +${operation.batchExtra}`;
+  const safe = sanitizeWorkerOperationText(raw);
+  if (!safe) return undefined;
+  return visibleWidth(safe) <= MAX_WORKER_OPERATION_HINT_WIDTH ? safe : sanitizeWorkerOperationText(truncateToWidth(safe, MAX_WORKER_OPERATION_HINT_WIDTH, "…"));
+}
+function mergeOperationHint(repositories: unknown): string | undefined {
+  return Array.isArray(repositories) ? renderWorkerOperationHint({ kind: "merge", repositories: repositories.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value)) }) : undefined;
+}
+function preparedOperationHint(preparedId: unknown, lookups: WorkerOperationLookups): string | undefined {
+  const operation = preparedOperation(preparedId, lookups, 0);
+  if (!operation || operation.kind !== "integration") return undefined;
+  const repositories = operation.repositories.map((repository) => ({ ...repository, method: repository.method }));
+  return renderWorkerOperationHint({ kind: "merge", repositories });
+}
+function runCallLabel(input: WorkerRunInputV2 | undefined): string {
+  const first = input?.runs?.[0] as any;
+  if (first?.action === "resume") return "Resume Worker";
+  if (first?.role === "review") return "Review Worker Output";
+  if (first?.role === "integration") return "Resolve Repository Conflicts";
+  return "Run Workers";
+}
 function publicPreparedSet(set: any) { return { preparedId: set.preparedId, status: set.status, order: set.order, repositories: set.repositories.map((item: any) => ({ id: item.id, candidateRepo: item.candidateRepo, candidateCommit: item.candidateCommit, targetRepo: item.targetRepo, targetRef: item.targetRef, method: item.method, status: item.status, expectedCommit: item.expectedCommit, ...(item.desiredCommit ? { desiredCommit: item.desiredCommit } : {}), preparedPath: item.preparedPath, overlapCount: item.overlapCount, dependsOn: item.dependsOn, ...(item.source ? { source: item.source } : {}), ...(item.warnings ? { warnings: item.warnings } : {}) })), ...(set.resolutionCases ? { resolutionCases: set.resolutionCases } : {}) }; }
 function sessionDeliveryIds(context: ExtensionContext): string[] { const ids = new Set<string>(); const visit = (value: unknown): void => { if (!value || typeof value !== "object") return; const record = value as Record<string, unknown>; if (typeof record.deliveryId === "string" && record.deliveryId.startsWith("worker-run:")) ids.add(record.deliveryId); for (const child of Object.values(record)) Array.isArray(child) ? child.forEach(visit) : visit(child); }; try { for (const entry of context.sessionManager.getEntries()) visit(entry); } catch {} return [...ids]; }
 function deliverPendingCompletions(api: ExtensionAPI, registry: WorkerRegistry, parent: string, generation: number): void { for (const delivery of pendingWorkerDeliveries(registry, parent)) { if (!claimWorkerDelivery(registry, delivery.deliveryId, parent, generation)) continue; const worker = getWorker(registry, delivery.workerId); const run = getWorkerRun(registry, delivery.workerId, delivery.runId); if (!worker || !run?.outcome || !run.outcomeSource) { releaseWorkerDeliveryClaim(registry, delivery.deliveryId, generation); continue; } const event = { event: "worker_settled", workerId: worker.workerId, runId: run.runId, role: worker.role, outcome: run.outcome, outcomeSource: run.outcomeSource, ...(run.summary ? { summary: run.summary } : {}), ...(run.question ? { question: run.question } : {}), repositoryCount: run.repositories.length, artifactCount: run.artifacts.length, ...(run.errors.length ? { errors: run.errors } : {}) }; try { api.sendMessage({ customType: "worker-run", content: JSON.stringify(event), display: true, details: { ...event, deliveryId: delivery.deliveryId } }, { triggerTurn: true, deliverAs: delivery.completionDelivery }); } catch { releaseWorkerDeliveryClaim(registry, delivery.deliveryId, generation); } } }
