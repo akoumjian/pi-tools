@@ -165,13 +165,15 @@ test("work resume uses bounded session identity for a sparse session beyond 512 
   try {
     const first = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "create retained session" }] }));
     await f.event("turn_end"); await complete(f, first);
-    const before = f.registry(); const sessionFile = getWorker(before, first.workerId)!.sessionFile!; before.close();
+    const before = f.registry(); const sessionFile = getWorker(before, first.workerId)!.sessionFile!; const previousEnd = getWorkerRun(before, first.workerId, first.runId)!.sessionEndLine!; before.close();
     const fd = openSync(sessionFile, "r+"); try { ftruncateSync(fd, 600 * 1024 * 1024); } finally { closeSync(fd); }
     const rssBefore = process.memoryUsage().rss; const started = performance.now();
     const resumed = receipt(await f.call("worker_run", { runs: [{ action: "resume", workerId: first.workerId, instructions: "resume a very large retained session" }] }));
     const elapsed = performance.now() - started; const rssGrowth = process.memoryUsage().rss - rssBefore;
-    assert.equal(resumed.workerId, first.workerId); assert.ok(elapsed < 5_000, `large resume took ${elapsed}ms`); assert.ok(rssGrowth < 128 * 1024 * 1024, `large resume grew RSS by ${rssGrowth} bytes`);
+    assert.equal(resumed.workerId, first.workerId); assert.ok(elapsed < 1_000, `large resume should not scan the retained session; took ${elapsed}ms`); assert.ok(rssGrowth < 32 * 1024 * 1024, `large resume grew RSS by ${rssGrowth} bytes`);
+    let db = f.registry(); assert.equal(getWorkerRun(db, resumed.workerId, resumed.runId)!.sessionStartLine, previousEnd + 1); db.close();
     await f.event("turn_end"); assert.equal(f.launches.some((launch) => launch.record.runId === resumed.runId), true);
+    db = f.registry(); assert.equal(getWorkerRun(db, resumed.workerId, resumed.runId)!.sessionStartLine, previousEnd + 1); db.close();
     await f.call("worker_control", { action: "cancel", workerId: resumed.workerId });
   } finally { await f.close(); }
 });

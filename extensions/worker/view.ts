@@ -7,6 +7,8 @@ import { Key, matchesKey, truncateToWidth, wrapTextWithAnsi, type Component, typ
 
 const MAX_SESSION_PAGE_BYTES = 8 * 1024 * 1024;
 const MAX_SESSION_PAGE_LINES = 512;
+const MAX_SESSION_PAGE_BLOCKS = 2_048;
+const OVERSIZED_ENTRY_PREFIX_BYTES = 16 * 1024;
 const MAX_SESSION_HEADER_BYTES = 64 * 1024;
 const SESSION_READ_CHUNK = 1024 * 1024;
 const INITIAL_LINE_INDEX_STRIDE = 1;
@@ -68,6 +70,7 @@ type RunVisibilityState = RunVisibility & {
 type ReadSessionPage = {
   headerLine: string;
   lines: Array<{ lineNumber: number; text: string }>;
+  oversizedEntryPrefixes: Array<{ lineNumber: number; text: string }>;
   runStartLine: number;
   runEndLine: number;
   pageStartLine: number;
@@ -89,6 +92,7 @@ type ReadPageLines = Omit<ReadSessionPage, "headerLine" | "runStartLine" | "runE
 
 const sessionLineIndexes = new Map<string, SessionLineIndex>();
 const runVisibilityStates = new Map<string, RunVisibilityState>();
+const runVisibilityFlights = new Map<string, Promise<void>>();
 let sessionLineIndexGeneration = 0;
 
 export type WorkerSessionViewTarget = {
@@ -111,8 +115,8 @@ export type WorkerSessionViewTarget = {
 export type WorkerSessionPageRequest =
   | { mode: "tail" }
   | { mode: "first" }
-  | { mode: "before"; line: number }
-  | { mode: "after"; line: number };
+  | { mode: "before"; line: number; block?: number }
+  | { mode: "after"; line: number; block?: number };
 
 export type WorkerSessionViewBlock = {
   kind: "user" | "assistant" | "thinking" | "tool" | "toolResult" | "error" | "status" | "compaction" | "custom";
@@ -137,6 +141,12 @@ export type WorkerSessionViewSnapshot = {
   runEndLine: number;
   pageStartLine: number;
   pageEndLine: number;
+  /** Zero-based rendered-block cursor within pageStartLine. */
+  pageStartBlock?: number;
+  /** Exclusive rendered-block cursor within pageEndLine. */
+  pageEndBlock?: number;
+  hasPreviousBlocksInEntry?: boolean;
+  hasNextBlocksInEntry?: boolean;
   hasPreviousPage: boolean;
   hasNextPage: boolean;
   refreshedAt: string;
@@ -175,39 +185,95 @@ export function loadWorkerSessionViewSnapshot(
   request: WorkerSessionPageRequest = { mode: "tail" }
 ): WorkerSessionViewSnapshot {
   validateRunRange(target);
-  return snapshotFromPage(target, readTrustedSessionPage(target, request, dependencies));
+  return snapshotFromPage(target, readTrustedSessionPage(target, request, dependencies), request);
 }
 
 export async function loadWorkerSessionViewSnapshotAsync(target: WorkerSessionViewTarget, request: WorkerSessionPageRequest = { mode: "tail" }): Promise<WorkerSessionViewSnapshot> {
   validateRunRange(target);
-  return snapshotFromPage(target, await readTrustedSessionPageAsync(target, request));
+  return snapshotFromPage(target, await readTrustedSessionPageAsync(target, request), request);
 }
 
-function snapshotFromPage(target: WorkerSessionViewTarget, selected: ReadSessionPage): WorkerSessionViewSnapshot {
+function snapshotFromPage(target: WorkerSessionViewTarget, selected: ReadSessionPage, request: WorkerSessionPageRequest): WorkerSessionViewSnapshot {
   const header = parseSessionHeader(selected.headerLine);
   validateSessionHeader(header, target);
-  const { entries, malformedEntries } = parseSessionEntries(selected.lines);
+  const { entries, malformedEntries } = parseSessionEntriesForBlockPage(selected.lines, request);
   const ordered = orderedSessionEntries(entries);
+  const descriptors = ordered.map((entry) => ({ entry, line: entry.lineNumber, count: renderableBlockCount(entry) }));
+  const totalBlocks = descriptors.reduce((total, descriptor) => total + descriptor.count, 0);
+  let availableStart = 0;
+  let availableEnd = totalBlocks;
+  if (request.mode === "after" && request.block !== undefined) availableStart = blockCursor(descriptors, request.line, request.block, "after");
+  if (request.mode === "before" && request.block !== undefined) availableEnd = blockCursor(descriptors, request.line, request.block, "before");
+  availableStart = Math.max(0, Math.min(totalBlocks, availableStart));
+  availableEnd = Math.max(availableStart, Math.min(totalBlocks, availableEnd));
+  const keepTail = request.mode === "tail" || request.mode === "before";
+  const blockStart = keepTail ? Math.max(availableStart, availableEnd - MAX_SESSION_PAGE_BLOCKS) : availableStart;
+  const blockEnd = keepTail ? availableEnd : Math.min(availableEnd, availableStart + MAX_SESSION_PAGE_BLOCKS);
+  const blocks: WorkerSessionViewBlock[] = [];
+  let pageStartLine = selected.pageStartLine;
+  let pageEndLine = selected.pageEndLine;
+  let pageStartBlock = 0;
+  let pageEndBlock = 0;
+  let representedEntries = 0;
+  let cursor = 0;
+  for (const descriptor of descriptors) {
+    const descriptorStart = cursor;
+    const descriptorEnd = cursor + descriptor.count;
+    cursor = descriptorEnd;
+    const localStart = Math.max(0, blockStart - descriptorStart);
+    const localEnd = Math.min(descriptor.count, blockEnd - descriptorStart);
+    if (localEnd <= localStart) continue;
+    if (representedEntries === 0) { pageStartLine = descriptor.line; pageStartBlock = localStart; }
+    representedEntries += 1;
+    pageEndLine = descriptor.line;
+    pageEndBlock = localEnd;
+    blocks.push(...renderableBlockSlice(descriptor.entry, localStart, localEnd));
+  }
+  const sourceLines = [...new Set([...selected.lines, ...selected.oversizedEntryPrefixes].map((item) => item.lineNumber))];
+  const activeEntries = ordered.filter((entry) => entry.lineNumber >= pageStartLine && entry.lineNumber <= pageEndLine).length;
+  const previousVisibleEntries = selected.previousVisibleEntries + sourceLines.filter((line) => line >= selected.pageStartLine && line < pageStartLine).length;
+  const nextVisibleEntries = selected.nextVisibleEntries + sourceLines.filter((line) => line > pageEndLine && line <= selected.pageEndLine).length;
+  const startDescriptor = descriptors.find((descriptor) => descriptor.line === pageStartLine);
+  const endDescriptor = descriptors.find((descriptor) => descriptor.line === pageEndLine);
+  const hasPreviousBlocksInEntry = Boolean(startDescriptor && pageStartBlock > 0);
+  const hasNextBlocksInEntry = Boolean(endDescriptor && pageEndBlock < endDescriptor.count);
+  const hasPreviousPage = selected.hasPreviousPage || previousVisibleEntries > 0 || blockStart > 0;
+  const hasNextPage = selected.hasNextPage || nextVisibleEntries > 0 || blockEnd < totalBlocks;
   return {
     target,
-    blocks: ordered.flatMap(renderableBlocks),
-    totalActiveEntries: ordered.length,
+    blocks,
+    totalActiveEntries: activeEntries,
     malformedEntries,
     skippedOversizedEntries: selected.skippedOversizedEntries,
     incompleteTrailingEntry: selected.incompleteTrailingEntry,
     hiddenCompactedEntries: selected.hiddenCompactedEntries,
     compactionCount: selected.compactionCount,
-    previousVisibleEntries: selected.previousVisibleEntries,
-    nextVisibleEntries: selected.nextVisibleEntries,
+    previousVisibleEntries,
+    nextVisibleEntries,
     totalVisibleEntries: selected.totalVisibleEntries,
     runStartLine: selected.runStartLine,
     runEndLine: selected.runEndLine,
-    pageStartLine: selected.pageStartLine,
-    pageEndLine: selected.pageEndLine,
-    hasPreviousPage: selected.hasPreviousPage,
-    hasNextPage: selected.hasNextPage,
+    pageStartLine,
+    pageEndLine,
+    pageStartBlock,
+    pageEndBlock,
+    hasPreviousBlocksInEntry,
+    hasNextBlocksInEntry,
+    hasPreviousPage,
+    hasNextPage,
     refreshedAt: new Date().toISOString()
   };
+}
+
+function blockCursor(descriptors: Array<{ line: number; count: number }>, line: number, block: number, direction: "before" | "after"): number {
+  const safeBlock = Number.isSafeInteger(block) && block >= 0 ? block : 0;
+  let cursor = 0;
+  for (const descriptor of descriptors) {
+    if (descriptor.line === line) return cursor + Math.min(descriptor.count, safeBlock);
+    if (descriptor.line > line) return cursor;
+    cursor += descriptor.count;
+  }
+  return direction === "after" ? cursor : 0;
 }
 
 
@@ -281,12 +347,12 @@ export function createWorkerSessionViewerComponent(options: WorkerSessionViewerC
       if (matchesKey(data, Key.up) || data === "k") return move(-1);
       if (matchesKey(data, Key.down) || data === "j") return move(1);
       if (matchesKey(data, Key.pageUp)) {
-        if (state.topLine === 0 && state.snapshot.hasPreviousPage) load({ mode: "before", line: state.snapshot.pageStartLine }, "end");
+        if (state.topLine === 0 && state.snapshot.hasPreviousPage) load({ mode: "before", line: state.snapshot.pageStartLine, block: state.snapshot.pageStartBlock }, "end");
         else move(-pageSize);
         return;
       }
       if (matchesKey(data, Key.pageDown)) {
-        if (state.topLine >= maxTopLine && state.snapshot.hasNextPage) load({ mode: "after", line: state.snapshot.pageEndLine }, "start");
+        if (state.topLine >= maxTopLine && state.snapshot.hasNextPage) load({ mode: "after", line: state.snapshot.pageEndLine, block: state.snapshot.pageEndBlock }, "start");
         else move(pageSize);
         return;
       }
@@ -300,8 +366,8 @@ export function createWorkerSessionViewerComponent(options: WorkerSessionViewerC
         else { state.pinnedToEnd = true; options.tui.requestRender(); }
         return;
       }
-      if (data === "[") { if (state.snapshot.hasPreviousPage) load({ mode: "before", line: state.snapshot.pageStartLine }, "end"); return; }
-      if (data === "]") { if (state.snapshot.hasNextPage) load({ mode: "after", line: state.snapshot.pageEndLine }, "start"); return; }
+      if (data === "[") { if (state.snapshot.hasPreviousPage) load({ mode: "before", line: state.snapshot.pageStartLine, block: state.snapshot.pageStartBlock }, "end"); return; }
+      if (data === "]") { if (state.snapshot.hasNextPage) load({ mode: "after", line: state.snapshot.pageEndLine, block: state.snapshot.pageEndBlock }, "start"); return; }
       if (data === "r" || data === "R") load({ mode: "tail" }, "end");
     }
   };
@@ -313,8 +379,10 @@ export function buildWorkerSessionViewerFrame(theme: Theme, state: WorkerSession
   const target = state.snapshot.target;
   const status = target.outcome ?? target.runStatus;
   const warnings = [
-    state.snapshot.hasPreviousPage ? `${state.snapshot.previousVisibleEntries} earlier visible run entr${state.snapshot.previousVisibleEntries === 1 ? "y is" : "ies are"} available with [ or PgUp at the top (g opens the first page).` : undefined,
-    state.snapshot.hasNextPage ? `${state.snapshot.nextVisibleEntries} later visible run entr${state.snapshot.nextVisibleEntries === 1 ? "y is" : "ies are"} available with ] or PgDn at the bottom (G opens the latest page).` : undefined,
+    state.snapshot.hasPreviousPage && state.snapshot.previousVisibleEntries > 0 ? `${state.snapshot.previousVisibleEntries} earlier visible run entr${state.snapshot.previousVisibleEntries === 1 ? "y is" : "ies are"} available with [ or PgUp at the top (g opens the first page).` : undefined,
+    state.snapshot.hasPreviousBlocksInEntry ? "Earlier rendered blocks from this run entry are available with [ or PgUp at the top (g opens the first page)." : undefined,
+    state.snapshot.hasNextPage && state.snapshot.nextVisibleEntries > 0 ? `${state.snapshot.nextVisibleEntries} later visible run entr${state.snapshot.nextVisibleEntries === 1 ? "y is" : "ies are"} available with ] or PgDn at the bottom (G opens the latest page).` : undefined,
+    state.snapshot.hasNextBlocksInEntry ? "Later rendered blocks from this run entry are available with ] or PgDn at the bottom (G opens the latest page)." : undefined,
     body.truncatedBlocks > 0 ? `${body.truncatedBlocks} long block${body.truncatedBlocks === 1 ? " was" : "s were"} explicitly truncated within this page.` : undefined,
     state.snapshot.skippedOversizedEntries > 0 ? `${state.snapshot.skippedOversizedEntries} session entr${state.snapshot.skippedOversizedEntries === 1 ? "y exceeds" : "ies exceed"} the ${MAX_SESSION_PAGE_BYTES}-byte per-entry display bound and ${state.snapshot.skippedOversizedEntries === 1 ? "was" : "were"} skipped.` : undefined,
     state.snapshot.malformedEntries > 0 ? `${state.snapshot.malformedEntries} malformed session entr${state.snapshot.malformedEntries === 1 ? "y was" : "ies were"} skipped.` : undefined,
@@ -387,7 +455,7 @@ function validateRunRange(target: WorkerSessionViewTarget): void {
     throw new Error("Worker run has no retained session range.");
   }
   if (!Number.isSafeInteger(target.sessionStartLine) || target.sessionStartLine < 1) throw new Error("Worker run session range is invalid.");
-  if (target.sessionEndLine !== undefined && (!Number.isSafeInteger(target.sessionEndLine) || target.sessionEndLine < target.sessionStartLine)) throw new Error("Worker run session range is invalid.");
+  if (target.sessionEndLine !== undefined && (!Number.isSafeInteger(target.sessionEndLine) || target.sessionEndLine < target.sessionStartLine - 1)) throw new Error("Worker run session range is invalid.");
 }
 
 function readTrustedSessionPage(target: WorkerSessionViewTarget, request: WorkerSessionPageRequest, dependencies: WorkerSessionReadDependencies): ReadSessionPage {
@@ -490,7 +558,7 @@ async function readStableSessionPageAsync(file: string, target: WorkerSessionVie
 }
 
 function emptyQueuedPage(headerLine: string): ReadSessionPage {
-  return { headerLine, lines: [], runStartLine: 1, runEndLine: 0, pageStartLine: 1, pageEndLine: 0, hasPreviousPage: false, hasNextPage: false, skippedOversizedEntries: 0, incompleteTrailingEntry: false, hiddenCompactedEntries: 0, compactionCount: 0, previousVisibleEntries: 0, nextVisibleEntries: 0, totalVisibleEntries: 0, droppedLeadingEntries: 0, decodedBytes: 0 };
+  return { headerLine, lines: [], oversizedEntryPrefixes: [], runStartLine: 1, runEndLine: 0, pageStartLine: 1, pageEndLine: 0, hasPreviousPage: false, hasNextPage: false, skippedOversizedEntries: 0, incompleteTrailingEntry: false, hiddenCompactedEntries: 0, compactionCount: 0, previousVisibleEntries: 0, nextVisibleEntries: 0, totalVisibleEntries: 0, droppedLeadingEntries: 0, decodedBytes: 0 };
 }
 
 function selectVisiblePage(fd: number, snapshotSize: number, index: SessionLineIndex, headerLine: string, request: WorkerSessionPageRequest, runStartLine: number, runEndLine: number, visibility: RunVisibility): ReadSessionPage {
@@ -520,9 +588,9 @@ function visiblePageBounds(request: WorkerSessionPageRequest, runStartLine: numb
   let firstOrdinal: number;
   let lastOrdinal: number;
   if (request.mode === "first") { firstOrdinal = 0; lastOrdinal = Math.min(count - 1, MAX_SESSION_PAGE_LINES - 1); }
-  else if (request.mode === "after") { firstOrdinal = visibleCountLessThanOrEqual(request.line, runEndLine, visibility); lastOrdinal = Math.min(count - 1, firstOrdinal + MAX_SESSION_PAGE_LINES - 1); }
+  else if (request.mode === "after") { firstOrdinal = request.block === undefined ? visibleCountLessThanOrEqual(request.line, runEndLine, visibility) : visibleCountLessThan(request.line, runEndLine, visibility); lastOrdinal = Math.min(count - 1, firstOrdinal + MAX_SESSION_PAGE_LINES - 1); }
   else {
-    lastOrdinal = request.mode === "before" ? visibleCountLessThan(request.line, runEndLine, visibility) - 1 : count - 1;
+    lastOrdinal = request.mode === "before" ? (request.block === undefined ? visibleCountLessThan(request.line, runEndLine, visibility) : visibleCountLessThanOrEqual(request.line, runEndLine, visibility)) - 1 : count - 1;
     firstOrdinal = Math.max(0, lastOrdinal - MAX_SESSION_PAGE_LINES + 1);
   }
   if (firstOrdinal < 0 || firstOrdinal >= count || lastOrdinal < firstOrdinal) return { startLine: runStartLine, endLine: runStartLine - 1 };
@@ -562,6 +630,7 @@ function readVisiblePage(fd: number, snapshotSize: number, index: SessionLineInd
   }
   return {
     lines: [...opening.lines, ...main.lines],
+    oversizedEntryPrefixes: [...opening.oversizedEntryPrefixes, ...main.oversizedEntryPrefixes],
     pageStartLine: opening.pageStartLine,
     pageEndLine: main.pageEndLine >= main.pageStartLine ? main.pageEndLine : opening.pageEndLine,
     skippedOversizedEntries: opening.skippedOversizedEntries + main.skippedOversizedEntries,
@@ -597,35 +666,70 @@ function visibilityState(file: string, index: SessionLineIndex, runStartLine: nu
   let state: RunVisibilityState | undefined = runVisibilityStates.get(key);
   if (!state) {
     const running = fixedEndLine === undefined ? undefined : runVisibilityStates.get(visibilityStateKey(file, index, runStartLine, undefined));
-    if (running && running.analyzedEndLine === fixedEndLine) {
-      state = { ...running, entryIds: new Map(running.entryIds) };
-      if (running.pendingCompaction) state.pendingCompaction = { ...running.pendingCompaction };
-    } else state = { generation: index.generation, analyzedEndLine: runStartLine - 1, validEntries: 0, entryIds: new Map(), keptLine: runStartLine, hiddenEntries: 0, compactionCount: 0 };
+    if (running && running.analyzedEndLine <= fixedEndLine!) state = cloneVisibilityState(running);
+    else state = { generation: index.generation, analyzedEndLine: runStartLine - 1, validEntries: 0, entryIds: new Map(), keptLine: runStartLine, hiddenEntries: 0, compactionCount: 0 };
     runVisibilityStates.set(key, state);
   }
-  runVisibilityStates.delete(key); runVisibilityStates.set(key, state);
-  while (runVisibilityStates.size > MAX_VISIBILITY_CACHE_ENTRIES) runVisibilityStates.delete(runVisibilityStates.keys().next().value!);
+  touchVisibilityState(key, state);
   return { key, state };
 }
 
-function analyzeRunVisibility(fd: number, file: string, snapshotSize: number, index: SessionLineIndex, runStartLine: number, runEndLine: number, fixedEndLine?: number): RunVisibility {
-  const { state } = visibilityState(file, index, runStartLine, fixedEndLine);
-  if (state.analyzedEndLine < runEndLine) {
-    const scan = scanRunEntries(fd, snapshotSize, index, Math.max(runStartLine, state.analyzedEndLine + 1), runEndLine, (entry, line) => updateVisibilityState(state, entry, line));
-    state.analyzedEndLine = Math.max(state.analyzedEndLine, scan.lastCompleteLine);
+function cloneVisibilityState(state: RunVisibilityState): RunVisibilityState {
+  return { ...state, entryIds: new Map(state.entryIds), ...(state.pendingCompaction ? { pendingCompaction: { ...state.pendingCompaction } } : {}) };
+}
+
+function touchVisibilityState(key: string, state: RunVisibilityState): void {
+  runVisibilityStates.delete(key); runVisibilityStates.set(key, state);
+  while (runVisibilityStates.size > MAX_VISIBILITY_CACHE_ENTRIES) {
+    const evicted = [...runVisibilityStates.keys()].find((candidate) => !runVisibilityFlights.has(candidate));
+    if (!evicted) break;
+    runVisibilityStates.delete(evicted);
   }
-  if (state.pendingCompaction) resolveCompactionBoundary(fd, snapshotSize, index, runStartLine, state);
+}
+
+function visibilityResult(state: RunVisibilityState): RunVisibility {
   return { openingLine: state.openingLine, keptLine: state.keptLine, hiddenEntries: state.hiddenEntries, compactionCount: state.compactionCount };
 }
 
-async function analyzeRunVisibilityCooperatively(fd: number, file: string, snapshotSize: number, index: SessionLineIndex, runStartLine: number, runEndLine: number, fixedEndLine?: number): Promise<RunVisibility> {
-  const { state } = visibilityState(file, index, runStartLine, fixedEndLine);
-  if (state.analyzedEndLine < runEndLine) {
-    const scan = await scanRunEntriesCooperatively(fd, snapshotSize, index, Math.max(runStartLine, state.analyzedEndLine + 1), runEndLine, (entry, line) => updateVisibilityState(state, entry, line));
-    state.analyzedEndLine = Math.max(state.analyzedEndLine, scan.lastCompleteLine);
+function analyzeRunVisibility(fd: number, file: string, snapshotSize: number, index: SessionLineIndex, runStartLine: number, runEndLine: number, fixedEndLine?: number): RunVisibility {
+  for (;;) {
+    const { key, state } = visibilityState(file, index, runStartLine, fixedEndLine);
+    if (state.analyzedEndLine >= runEndLine && !state.pendingCompaction) return visibilityResult(state);
+    const next = cloneVisibilityState(state);
+    if (next.analyzedEndLine < runEndLine) {
+      const scan = scanRunEntries(fd, snapshotSize, index, Math.max(runStartLine, next.analyzedEndLine + 1), runEndLine, (entry, line) => updateVisibilityState(next, entry, line));
+      next.analyzedEndLine = Math.max(next.analyzedEndLine, scan.lastCompleteLine);
+    }
+    if (next.pendingCompaction) resolveCompactionBoundary(fd, snapshotSize, index, runStartLine, next);
+    if (runVisibilityStates.get(key) === state) {
+      touchVisibilityState(key, next);
+      return visibilityResult(next);
+    }
   }
-  if (state.pendingCompaction) await resolveCompactionBoundaryCooperatively(fd, snapshotSize, index, runStartLine, state);
-  return { openingLine: state.openingLine, keptLine: state.keptLine, hiddenEntries: state.hiddenEntries, compactionCount: state.compactionCount };
+}
+
+async function analyzeRunVisibilityCooperatively(fd: number, file: string, snapshotSize: number, index: SessionLineIndex, runStartLine: number, runEndLine: number, fixedEndLine?: number): Promise<RunVisibility> {
+  for (;;) {
+    const { key, state } = visibilityState(file, index, runStartLine, fixedEndLine);
+    if (state.analyzedEndLine >= runEndLine && !state.pendingCompaction) return visibilityResult(state);
+    let flight = runVisibilityFlights.get(key);
+    if (!flight) {
+      const base = state;
+      const next = cloneVisibilityState(base);
+      flight = (async () => {
+        if (next.analyzedEndLine < runEndLine) {
+          const scan = await scanRunEntriesCooperatively(fd, snapshotSize, index, Math.max(runStartLine, next.analyzedEndLine + 1), runEndLine, (entry, line) => updateVisibilityState(next, entry, line));
+          next.analyzedEndLine = Math.max(next.analyzedEndLine, scan.lastCompleteLine);
+        }
+        if (next.pendingCompaction) await resolveCompactionBoundaryCooperatively(fd, snapshotSize, index, runStartLine, next);
+        if (runVisibilityStates.get(key) === base) touchVisibilityState(key, next);
+      })();
+      runVisibilityFlights.set(key, flight);
+      const clearFlight = () => { if (runVisibilityFlights.get(key) === flight) runVisibilityFlights.delete(key); };
+      void flight.then(clearFlight, clearFlight);
+    }
+    await flight;
+  }
 }
 
 function updateVisibilityState(state: RunVisibilityState, entry: WorkerSessionEntry, line: number): void {
@@ -697,11 +801,7 @@ async function scanRunEntriesCooperatively(fd: number, snapshotSize: number, ind
   let lastCompleteLine = startLine - 1;
   while (line <= endLine) {
     const page = readPageLines(fd, snapshotSize, index, line, Math.min(endLine, line + MAX_SESSION_PAGE_LINES - 1), false);
-    for (const item of page.lines) {
-      let value: unknown;
-      try { value = JSON.parse(item.text); } catch { continue; }
-      if (isSessionEntry(value)) visit({ ...value, lineNumber: item.lineNumber }, item.lineNumber);
-    }
+    for (const entry of parsedRunPageEntries(page)) visit(entry, entry.lineNumber);
     lastCompleteLine = page.incompleteTrailingEntry ? page.pageEndLine - 1 : page.pageEndLine;
     if (page.incompleteTrailingEntry) break;
     line = Math.max(line + 1, page.pageEndLine + 1);
@@ -715,16 +815,43 @@ function scanRunEntries(fd: number, snapshotSize: number, index: SessionLineInde
   let lastCompleteLine = startLine - 1;
   while (line <= endLine) {
     const page = readPageLines(fd, snapshotSize, index, line, Math.min(endLine, line + MAX_SESSION_PAGE_LINES - 1), false);
-    for (const item of page.lines) {
-      let value: unknown;
-      try { value = JSON.parse(item.text); } catch { continue; }
-      if (isSessionEntry(value)) visit({ ...value, lineNumber: item.lineNumber }, item.lineNumber);
-    }
+    for (const entry of parsedRunPageEntries(page)) visit(entry, entry.lineNumber);
     lastCompleteLine = page.incompleteTrailingEntry ? page.pageEndLine - 1 : page.pageEndLine;
     if (page.incompleteTrailingEntry) break;
     line = Math.max(line + 1, page.pageEndLine + 1);
   }
   return { lastCompleteLine };
+}
+
+function parsedRunPageEntries(page: ReadPageLines): WorkerSessionEntry[] {
+  const entries: WorkerSessionEntry[] = [];
+  for (const item of page.lines) {
+    let value: unknown;
+    try { value = JSON.parse(item.text); } catch { continue; }
+    if (isSessionEntry(value)) entries.push({ ...value, lineNumber: item.lineNumber });
+  }
+  for (const item of page.oversizedEntryPrefixes) {
+    const entry = parseOversizedSessionEntryPrefix(item.text, item.lineNumber);
+    if (entry) entries.push(entry);
+  }
+  return entries.sort((left, right) => left.lineNumber - right.lineNumber);
+}
+
+function parseOversizedSessionEntryPrefix(prefix: string, lineNumber: number): WorkerSessionEntry | undefined {
+  const match = prefix.match(/^\s*\{\s*"type"\s*:\s*("(?:\\.|[^"\\])*")\s*,\s*"id"\s*:\s*("(?:\\.|[^"\\])*")\s*,\s*"parentId"\s*:\s*(null|"(?:\\.|[^"\\])*")\s*,\s*"timestamp"\s*:\s*("(?:\\.|[^"\\])*")/u);
+  if (!match) return undefined;
+  try {
+    const type = JSON.parse(match[1]!) as unknown;
+    const id = JSON.parse(match[2]!) as unknown;
+    const parentId = JSON.parse(match[3]!) as unknown;
+    const timestamp = JSON.parse(match[4]!) as unknown;
+    const value: Record<string, unknown> = { type, id, parentId, timestamp };
+    const firstKept = prefix.match(/"firstKeptEntryId"\s*:\s*("(?:\\.|[^"\\])*")/u);
+    if (firstKept) value.firstKeptEntryId = JSON.parse(firstKept[1]!);
+    const role = prefix.match(/"message"\s*:\s*\{\s*"role"\s*:\s*("(?:\\.|[^"\\])*")/u);
+    if (role) value.message = { role: JSON.parse(role[1]!) };
+    return isSessionEntry(value) ? { ...value, lineNumber } : undefined;
+  } catch { return undefined; }
 }
 
 function ensureSessionLineIndex(fd: number, file: string, opened: Stats, snapshotSize: number, dependencies: WorkerSessionReadDependencies = {}): SessionLineIndex {
@@ -785,7 +912,8 @@ function extendSessionLineIndex(fd: number, file: string, index: SessionLineInde
   index.ctimeMs = fstatSync(fd).ctimeMs;
   index.fingerprint = sessionPrefixFingerprint(fd, position);
   while (index.checkpoints.length > MAX_LINE_INDEX_CHECKPOINTS) {
-    index.checkpoints = index.checkpoints.filter((value, position) => value.pinned || position % 2 === 0);
+    const last = index.checkpoints.length - 1;
+    index.checkpoints = index.checkpoints.filter((_value, position) => position === 0 || position === last || position % 2 === 0);
     index.stride *= 2;
   }
 }
@@ -826,14 +954,16 @@ function readHeaderLine(fd: number, snapshotSize: number): string {
 }
 
 function readPageLines(fd: number, snapshotSize: number, index: SessionLineIndex, desiredStart: number, desiredEnd: number, keepTail: boolean, maxPageBytes = MAX_SESSION_PAGE_BYTES): ReadPageLines {
-  if (desiredEnd < desiredStart) return { lines: [], pageStartLine: desiredStart, pageEndLine: desiredEnd, skippedOversizedEntries: 0, incompleteTrailingEntry: false, droppedLeadingEntries: 0, decodedBytes: 0 };
+  if (desiredEnd < desiredStart) return { lines: [], oversizedEntryPrefixes: [], pageStartLine: desiredStart, pageEndLine: desiredEnd, skippedOversizedEntries: 0, incompleteTrailingEntry: false, droppedLeadingEntries: 0, decodedBytes: 0 };
   const checkpoint = nearestCheckpoint(index, desiredStart);
   const buffer = Buffer.allocUnsafe(Math.min(SESSION_READ_CHUNK, Math.max(1, snapshotSize - checkpoint.offset)));
   const lines: Array<{ lineNumber: number; text: string; bytes: number }> = [];
+  const oversizedEntryPrefixes: Array<{ lineNumber: number; text: string }> = [];
   let totalBytes = 0;
   let skippedOversizedEntries = 0;
   let position = checkpoint.offset;
   let lineNumber = checkpoint.lineNumber;
+  let lineStartOffset = checkpoint.offset;
   let parts: Buffer[] = [];
   let partBytes = 0;
   let oversized = false;
@@ -848,11 +978,13 @@ function readPageLines(fd: number, snapshotSize: number, index: SessionLineIndex
     parts.push(Buffer.from(part));
     partBytes += part.length;
   };
-  const finish = (): boolean => {
+  const finish = (lineEndOffset: number): boolean => {
     if (lineNumber >= desiredStart && lineNumber <= desiredEnd) {
       pageEndLine = lineNumber;
-      if (oversized) skippedOversizedEntries += 1;
-      else {
+      if (oversized) {
+        skippedOversizedEntries += 1;
+        oversizedEntryPrefixes.push({ lineNumber, text: readOversizedEntryPrefix(fd, { startOffset: lineStartOffset, endOffset: lineEndOffset }, snapshotSize) });
+      } else {
         const bytes = partBytes + 1;
         if (!keepTail && totalBytes + bytes > maxPageBytes && (lines.length > 0 || maxPageBytes < MAX_SESSION_PAGE_BYTES)) { pageEndLine = lineNumber - 1; stoppedForPageBytes = true; return false; }
         if (bytes > MAX_SESSION_PAGE_BYTES) skippedOversizedEntries += 1;
@@ -863,7 +995,7 @@ function readPageLines(fd: number, snapshotSize: number, index: SessionLineIndex
         }
       }
     }
-    parts = []; partBytes = 0; oversized = false; lineNumber += 1;
+    parts = []; partBytes = 0; oversized = false; lineNumber += 1; lineStartOffset = lineEndOffset + 1;
     return lineNumber <= desiredEnd;
   };
 
@@ -876,7 +1008,7 @@ function readPageLines(fd: number, snapshotSize: number, index: SessionLineIndex
       const end = newline >= 0 && newline < count ? newline : count;
       if (end > cursor) append(buffer.subarray(cursor, end));
       if (newline < 0 || newline >= count) break;
-      if (!finish()) break scan;
+      if (!finish(position + newline)) break scan;
       cursor = newline + 1;
     }
     position += count;
@@ -887,7 +1019,16 @@ function readPageLines(fd: number, snapshotSize: number, index: SessionLineIndex
   }
   const publicLines = lines.map(({ lineNumber: number, text }) => ({ lineNumber: number, text }));
   const pageStartLine = keepTail && droppedLeadingEntries > 0 ? publicLines[0]?.lineNumber ?? desiredStart : desiredStart;
-  return { lines: publicLines, pageStartLine, pageEndLine: Math.max(desiredStart - 1, pageEndLine), skippedOversizedEntries, incompleteTrailingEntry, droppedLeadingEntries, decodedBytes: totalBytes };
+  return { lines: publicLines, oversizedEntryPrefixes, pageStartLine, pageEndLine: Math.max(desiredStart - 1, pageEndLine), skippedOversizedEntries, incompleteTrailingEntry, droppedLeadingEntries, decodedBytes: totalBytes };
+}
+
+function readOversizedEntryPrefix(fd: number, offsets: { startOffset: number; endOffset: number }, snapshotSize: number): string {
+  const length = Math.min(OVERSIZED_ENTRY_PREFIX_BYTES, offsets.endOffset - offsets.startOffset, snapshotSize - offsets.startOffset);
+  if (length <= 0) return "";
+  const buffer = Buffer.allocUnsafe(length);
+  const count = readSync(fd, buffer, 0, length, offsets.startOffset);
+  if (count !== length) throw new SessionChangedDuringReadError();
+  return new TextDecoder("utf-8").decode(buffer);
 }
 
 function nearestCheckpoint(index: SessionLineIndex, lineNumber: number): SessionLineCheckpoint {
@@ -905,16 +1046,26 @@ function parseSessionHeader(text: string): WorkerSessionHeader {
   return value;
 }
 
-function parseSessionEntries(lines: Array<{ lineNumber: number; text: string }>): { entries: WorkerSessionEntry[]; malformedEntries: number } {
+function parseSessionEntriesForBlockPage(lines: Array<{ lineNumber: number; text: string }>, request: WorkerSessionPageRequest): { entries: WorkerSessionEntry[]; malformedEntries: number } {
+  const keepTail = request.mode === "tail" || request.mode === "before";
+  const source = keepTail ? [...lines].reverse() : lines;
   const entries: WorkerSessionEntry[] = [];
   let malformedEntries = 0;
-  for (const line of lines) {
+  let remainingBlocks = MAX_SESSION_PAGE_BLOCKS;
+  for (const line of source) {
     if (!line.text.trim()) continue;
     let value: unknown;
     try { value = JSON.parse(line.text); } catch { malformedEntries += 1; continue; }
     if (!isSessionEntry(value)) { malformedEntries += 1; continue; }
-    entries.push({ ...value, lineNumber: line.lineNumber });
+    const entry = { ...value, lineNumber: line.lineNumber };
+    entries.push(entry);
+    const count = renderableBlockCount(entry);
+    const available = request.mode === "after" && request.block !== undefined && line.lineNumber === request.line ? Math.max(0, count - request.block)
+      : request.mode === "before" && request.block !== undefined && line.lineNumber === request.line ? Math.min(count, Math.max(0, request.block)) : count;
+    remainingBlocks -= available;
+    if (remainingBlocks <= 0) break;
   }
+  if (keepTail) entries.reverse();
   return { entries, malformedEntries };
 }
 
@@ -952,6 +1103,21 @@ function orderedSessionEntries(entries: WorkerSessionEntry[]): WorkerSessionEntr
   return entries;
 }
 
+function renderableBlockCount(entry: WorkerSessionEntry): number {
+  if (entry.type !== "message") return renderableBlocks(entry).length;
+  const message = record(entry.message);
+  if (!message || message.role !== "assistant") return 1;
+  let count = 0;
+  for (const part of contentParts(message.content)) if (part !== undefined && part !== null) count += 1;
+  if (message.stopReason === "error" || message.stopReason === "aborted") count += 1;
+  return Math.max(1, count);
+}
+
+function renderableBlockSlice(entry: WorkerSessionEntry, start: number, end: number): WorkerSessionViewBlock[] {
+  if (entry.type === "message" && record(entry.message)?.role === "assistant") return messageBlocks(entry, start, end);
+  return renderableBlocks(entry).slice(start, end);
+}
+
 function renderableBlocks(entry: WorkerSessionEntry): WorkerSessionViewBlock[] {
   if (entry.type === "message") return messageBlocks(entry);
   if (entry.type === "compaction") return [{ kind: "compaction", label: `Compaction · ${numberField(entry.tokensBefore)} tokens`, timestamp: entry.timestamp, text: boundBlockText(textField(entry.summary, "(empty compaction summary)")) }];
@@ -962,23 +1128,31 @@ function renderableBlocks(entry: WorkerSessionEntry): WorkerSessionViewBlock[] {
   return [];
 }
 
-function messageBlocks(entry: WorkerSessionEntry): WorkerSessionViewBlock[] {
+function messageBlocks(entry: WorkerSessionEntry, start = 0, end = Number.POSITIVE_INFINITY): WorkerSessionViewBlock[] {
   const message = record(entry.message);
   if (!message) return [{ kind: "status", label: "Malformed message", timestamp: entry.timestamp, text: "Message payload was not an object." }];
   const role = typeof message.role === "string" ? message.role : "unknown";
   if (role === "assistant") {
     const model = [message.provider, message.model].filter((value): value is string => typeof value === "string").join("/");
     const blocks: WorkerSessionViewBlock[] = [];
+    let ordinal = 0;
     for (const part of contentParts(message.content)) {
       if (part === undefined || part === null) continue;
-      const value = record(part);
-      if (value?.type === "thinking") blocks.push({ kind: "thinking", label: "Thinking", timestamp: entry.timestamp, text: boundBlockText(textField(value.thinking, textField(value.text, ""))) });
-      else if (value?.type === "toolCall") blocks.push({ kind: "tool", label: `Tool call · ${textField(value.name, "unknown")}`, timestamp: entry.timestamp, text: boundedJson(value.arguments ?? value.input ?? {}) });
-      else blocks.push({ kind: "assistant", label: model ? `Assistant · ${model}` : "Assistant", timestamp: entry.timestamp, text: partText(part) });
+      if (ordinal >= start && ordinal < end) {
+        const value = record(part);
+        if (value?.type === "thinking") blocks.push({ kind: "thinking", label: "Thinking", timestamp: entry.timestamp, text: boundBlockText(textField(value.thinking, textField(value.text, ""))) });
+        else if (value?.type === "toolCall") blocks.push({ kind: "tool", label: `Tool call · ${textField(value.name, "unknown")}`, timestamp: entry.timestamp, text: boundedJson(value.arguments ?? value.input ?? {}) });
+        else blocks.push({ kind: "assistant", label: model ? `Assistant · ${model}` : "Assistant", timestamp: entry.timestamp, text: partText(part) });
+      }
+      ordinal += 1;
     }
     const stopReason = typeof message.stopReason === "string" ? message.stopReason : undefined;
-    if (stopReason === "error" || stopReason === "aborted") blocks.push({ kind: "error", label: stopReason === "error" ? "Provider error" : "Provider aborted", timestamp: entry.timestamp, text: boundBlockText(textField(message.errorMessage, stopReason === "error" ? "The provider ended this response with an error." : "The provider response was aborted.")) });
-    return blocks.length ? blocks : [{ kind: "assistant", label: model ? `Assistant · ${model}` : "Assistant", timestamp: entry.timestamp, text: "(empty message)" }];
+    if (stopReason === "error" || stopReason === "aborted") {
+      if (ordinal >= start && ordinal < end) blocks.push({ kind: "error", label: stopReason === "error" ? "Provider error" : "Provider aborted", timestamp: entry.timestamp, text: boundBlockText(textField(message.errorMessage, stopReason === "error" ? "The provider ended this response with an error." : "The provider response was aborted.")) });
+      ordinal += 1;
+    }
+    if (ordinal === 0 && start === 0 && end > 0) blocks.push({ kind: "assistant", label: model ? `Assistant · ${model}` : "Assistant", timestamp: entry.timestamp, text: "(empty message)" });
+    return blocks;
   }
   if (role === "toolResult") {
     const failed = message.isError === true;
