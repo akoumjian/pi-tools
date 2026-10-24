@@ -243,7 +243,7 @@ test("review creation refuses an unauthenticated independent provider without re
     await f.event("turn_end"); await complete(f, subject);
     const before = readdirSync(f.workersRoot).sort();
     await assert.rejects(f.call("worker_run", { runs: [{ action: "start", role: "review", reviewedRunId: subject.runId }] }), /No configured review model selection independent from subject provider openai-codex.*no configured auth/i);
-    const db = f.registry(); const rows = listWorkers(db, { parentSessionFile: path.resolve(f.session.getSessionFile()!) });
+    const db = f.registry(); const rows = listWorkers(db, { parentSessionFile: realpathSync(f.session.getSessionFile()!) });
     assert.equal(rows.total, 1); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, undefined); db.close();
     assert.deepEqual(readdirSync(f.workersRoot).sort(), before);
   } finally { await f.close(); }
