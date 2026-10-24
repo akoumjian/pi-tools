@@ -21,7 +21,7 @@ const model = (provider: string, id: string) => ({ id, name: id, provider, api: 
 type Launch = { record: any; runtime: any; resolve(job: JobMeta): void; handle: ManagedAsyncJobHandle };
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
-async function fixture(options: { tui?: boolean; sendMessageThrows?: boolean; launchThrows?: boolean; overlayThrows?: boolean; removeThrowsOnce?: boolean; removeAlwaysThrows?: boolean; deferRemove?: boolean; containerThrows?: boolean; deferContainer?: boolean; cleanupFailsWhileContainerLive?: boolean; staleOnReload?: boolean; launchReadsContext?: boolean; revokeClaimDuringLaunchOnce?: boolean; dockerOutage?: boolean; ownerWaitTimeoutMs?: number; ownerProbeIntervalMs?: number; readProcessStartToken?: (pid: number) => string | undefined; probeHostIdentity?: () => "alive" | "dead" | "unknown"; beforeCreateRunBatch?: () => void | Promise<void>; signalHostIdentity?: (_identity: any, signal: NodeJS.Signals) => boolean } = {}) {
+async function fixture(options: { tui?: boolean; staleWarningContext?: boolean; sendMessageThrows?: boolean; launchThrows?: boolean; overlayThrows?: boolean; removeThrowsOnce?: boolean; removeAlwaysThrows?: boolean; deferRemove?: boolean; containerThrows?: boolean; deferContainer?: boolean; cleanupFailsWhileContainerLive?: boolean; staleOnReload?: boolean; launchReadsContext?: boolean; revokeClaimDuringLaunchOnce?: boolean; dockerOutage?: boolean; ownerWaitTimeoutMs?: number; ownerProbeIntervalMs?: number; readProcessStartToken?: (pid: number) => string | undefined; probeHostIdentity?: () => "alive" | "dead" | "unknown"; beforeCreateRunBatch?: () => void | Promise<void>; signalHostIdentity?: (_identity: any, signal: NodeJS.Signals) => boolean } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "pi-worker-v2-lifecycle-"));
   const runtimeRoot = path.join(root, "runtime"); const workersRoot = path.join(runtimeRoot, "workers"); mkdirSync(workersRoot, { recursive: true });
   const session = SessionManager.create(root, path.join(root, "parent-session"), { id: `parent-${Date.now()}` }); writeFileSync(session.getSessionFile()!, `${JSON.stringify(session.getHeader())}\n`, { mode: 0o600 });
@@ -64,6 +64,7 @@ async function fixture(options: { tui?: boolean; sendMessageThrows?: boolean; la
     const context = Object.create(baseContext) as ExtensionContext;
     Object.defineProperty(context, "cwd", { get: () => { if (invalidated && options.staleOnReload) throw new Error("This extension ctx is stale after session replacement or reload."); return root; } });
     Object.defineProperty(context, "sessionManager", { get: () => { if (invalidated && options.staleOnReload) throw new Error("This extension ctx is stale after session replacement or reload."); return session; } });
+    if (options.staleWarningContext) Object.defineProperty(context, "mode", { get: () => { if (invalidated) throw new Error("This extension warning context is stale."); return baseContext.mode; } });
     const tools: ToolDefinition[] = []; const handlers = new Map<string, Function[]>(); const commands = new Map<string, any>(); const renderers = new Map<string, Function>();
     const api = { registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand(name: string, command: any) { commands.set(name, command); }, registerMessageRenderer(name: string, renderer: Function) { renderers.set(name, renderer); }, on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, sendMessage(message: any) { messageAttempts.push(message); if (options.sendMessageThrows) throw new Error("send acceptance unavailable"); messages.push(message); } } as unknown as ExtensionAPI;
     registerWorkerExtension(api, dependencies);
@@ -75,7 +76,7 @@ async function fixture(options: { tui?: boolean; sendMessageThrows?: boolean; la
   const reload = async () => { await current.event("session_shutdown"); current.invalidate(); current = await createInstance(); return current; };
   const registry = () => openWorkerRegistry(runtimeRoot);
   return { root, runtimeRoot, workersRoot, session, messages, messageAttempts, notifications, launches, get releaseContainer() { return releaseContainer; }, releaseRemove, blockContainer, created, removed, liveContainers, lifecycleEvents, overlays, cleaned, cleanupLeaseOwners, context: baseContext, get cancelledHandles() { return cancelledHandles; }, setDockerOutage(value: boolean) { dockerOutage = value; },
-    tools: first.tools, handlers: first.handlers, commands: first.commands, renderers: first.renderers, call: first.call, event: first.event, registry, reload, createInstance,
+    tools: first.tools, handlers: first.handlers, commands: first.commands, renderers: first.renderers, call: first.call, event: first.event, registry, reload, createInstance, invalidateCurrentContext: () => current.invalidate(),
     async close() { releaseContainer(); releaseRemove(); for (const instance of instances) { try { await instance.event("session_shutdown"); } catch {} } rmSync(root, { recursive: true, force: true }); }
   };
 }
@@ -419,7 +420,7 @@ test("Escape-like lost completion remains visible across reload without replay o
     const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "queued completion visibility" }] })); await f.event("turn_end"); await complete(f, started);
     assert.equal(f.messageAttempts.filter((message) => message.details?.runId === started.runId).length, 1, "the original completion send starts once");
     const listed = await f.call("worker_control", { action: "list" }); assert.equal((listed.details as any).workers[0].notification.state, "send_started_unconfirmed"); assert.equal((listed.details as any).workers[0].notification.runId, started.runId); assert.deepEqual((listed.details as any).counts, { queued: 0, running: 0, idle: 1 }); assert.equal((listed.details as any).total, 1);
-    await f.commands.get("worker:list").handler("", f.context); assert.match(f.notifications.at(-1)!, /send_started_unconfirmed/);
+    await f.commands.get("worker:list").handler("", f.context); assert.match(f.notifications.at(-1)!, /send_started_unconfirmed/); assert.match(f.notifications.at(-1)!, new RegExp(started.runId));
     await f.commands.get("worker:show").handler(`${started.workerId} ${started.runId}`, f.context); assert.match(f.notifications.at(-1)!, /send_started_unconfirmed/);
     const beforeWarnings = f.notifications.filter((message) => /completed, but its notification is send_started_unconfirmed/.test(message)).length; assert.equal(beforeWarnings, 0);
     const current = await f.reload();
@@ -442,6 +443,23 @@ test("owner crash promotion emits one UI-only unconfirmed warning without model 
     db = f.registry(); const parent = realpathSync(f.session.getSessionFile()!); assert.ok(currentParentRuntime(db, parent)!.generation > claimed.generation); const delivery = db.database.prepare("SELECT state,send_started_at FROM deliveries WHERE run_id=?").get(started.runId) as any; db.close(); assert.equal(delivery.state, "claimed"); assert.ok(delivery.send_started_at);
     await f.event("session_start"); assert.equal(f.notifications.filter((message) => message.includes(`${started.workerId}/${started.runId}`)).length, 1, "same-generation promotion notice remains deduped");
     const launch = f.launches.find((candidate) => candidate.record.runId === started.runId); if (launch) launch.resolve(job(launch.record.jobId, "exited", 0));
+  } finally { if (owner) await stopLifecycleClaimOwner(owner.child); await f.close(); }
+});
+
+test("stale warning-context reads cannot escape synchronous runtime promotion", async () => {
+  const f = await fixture({ tui: true, staleWarningContext: true }); let owner: Awaited<ReturnType<typeof spawnDeliveryClaimOwner>> | undefined; try {
+    const batch = await f.call("worker_run", { runs: [
+      { action: "start", role: "work", taskIds: ["personal-warning"], instructions: "ambiguous completion" },
+      { action: "start", role: "work", taskIds: ["personal-cancel"], instructions: "force synchronous promotion" }
+    ] });
+    const ambiguous = (batch.details as any).runs[0]; const cancellable = (batch.details as any).runs[1];
+    owner = await spawnDeliveryClaimOwner(f, ambiguous);
+    let db = f.registry(); settleWorkerRun(db, { parentSessionFile: realpathSync(f.session.getSessionFile()!), workerId: ambiguous.workerId, runId: ambiguous.runId, outcome: "completed", outcomeSource: "worker", summary: "retained", settledAt: new Date().toISOString() }); db.close();
+    const claimed = await owner.claim(); db = f.registry(); assert.equal(markWorkerDeliverySendStarted(db, claimed.deliveryId, claimed.generation, new Date().toISOString()), true); db.close();
+    f.invalidateCurrentContext(); await stopLifecycleClaimOwner(owner.child);
+    const cancelled = await f.call("worker_control", { action: "cancel", workerId: cancellable.workerId }); assert.equal((cancelled.details as any).cancellation, "cancelled", "stale UI reads must not escape promotion or lifecycle work");
+    db = f.registry(); const current = currentParentRuntime(db, realpathSync(f.session.getSessionFile()!)); const retained = db.database.prepare("SELECT state,send_started_at FROM deliveries WHERE run_id=?").get(ambiguous.runId) as any; db.close();
+    assert.ok(current!.generation > claimed.generation); assert.equal(retained.state, "claimed"); assert.ok(retained.send_started_at); assert.equal(f.notifications.some((message) => message.includes(ambiguous.runId)), false);
   } finally { if (owner) await stopLifecycleClaimOwner(owner.child); await f.close(); }
 });
 
@@ -856,7 +874,7 @@ test("session_start defers reconciliation and recovery renderer never reports gr
 test("worker commands exercise compact list/show and exact cancel/discard lifecycle paths", async () => {
   const f = await fixture(); try {
     const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "command probe" }] }));
-    await f.commands.get("worker:list").handler("", f.context); assert.match(f.notifications.at(-1)!, /queued · work/); assert.doesNotMatch(f.notifications.at(-1)!, /^\{/);
+    await f.commands.get("worker:list").handler("", f.context); assert.match(f.notifications.at(-1)!, /queued · work/); assert.doesNotMatch(f.notifications.at(-1)!, /send_started_unconfirmed|^\{/);
     await f.commands.get("worker:show").handler(`${started.workerId} ${started.runId}`, f.context); assert.match(f.notifications.at(-1)!, new RegExp(started.runId));
     await f.commands.get("worker:cancel").handler(started.workerId, f.context); assert.match(f.notifications.at(-1)!, /Cancelled/);
     await f.commands.get("worker:discard").handler(`${started.workerId} --confirm`, f.context); assert.match(f.notifications.at(-1)!, /Discarded/);
