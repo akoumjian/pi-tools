@@ -18,7 +18,7 @@ Worker-only tools:
 - `worker_result_submit`: submit one role-valid outcome, concise summary/question, and canonical workspace repository/artifact paths; the runtime seals and reconciles owned work internally.
 - `worker_beads_tasks`: bounded assigned/get/search reads, digest-fenced UTF-8-byte continuation of canonical `design` fields, and assigned-only work/integration progress updates. Every inline and continuation view includes lowercase SHA-256 of the complete canonical UTF-8 design plus `totalBytes`, `returnedBytes`, `truncated`, and `nextOffset`; continuation requires that digest and rejects task revisions with a restart-at-zero error. Every provider-visible read remains within 64 KiB. Search omits design content, reviewers retain read-only access, and no branch can close tasks or change dependencies.
 
-Human commands are `/worker:list [status] [role]`, `/worker:show <workerId> [runId]`, `/worker:view <workerId> [runId]`, `/worker:logs <workerId> [runId]`, `/worker:cancel <workerId>`, and `/worker:discard <workerId> --confirm`. `/worker:view` opens a bounded, read-only manual-refresh rendering of the exact retained run range. It streams past arbitrarily large inherited parent history without loading it, refreshes run status/range from the registry only when requested with `r`, and never acknowledges delivery or mutates worker lifecycle state.
+Human commands are `/worker:list [status] [role]`, `/worker:show <workerId> [runId]`, `/worker:view <workerId> [runId]`, `/worker:logs <workerId> [runId]`, `/worker:cancel <workerId>`, and `/worker:discard <workerId> --confirm`. `/worker:view` opens a bounded, read-only manual-refresh rendering of the exact retained run range. It uses bounded transcript pages rather than refusing long runs: `[`/`]` move between pages, `J`/`K` jump between block boundaries, `g`/`G` open the first/latest page, and `r` refreshes the latest registry-backed snapshot. Run line indexes are streamed and reused, so inherited history is not loaded as one string and refresh/navigation do not rescan it. The command never acknowledges delivery or mutates worker lifecycle state.
 
 ## Identities and registry
 
@@ -75,3 +75,7 @@ Cancellation preserves workspace/session/evidence. Resume after cancellation inc
 ```
 
 Fallback is startup-only before worker-visible effects. An explicit work `modelSelection` disables fallback. No package-imposed worker deadline exists.
+
+## Repository discovery boundaries
+
+Repository discovery prioritizes `workspace/repos/` and protects that subtree from unrelated breadth under `artifacts/` or other workspace directories. Runtime-owned `workspace/cache/` and `workspace/tmp/` are intentionally excluded, as are recognized HOME tool-cache subtrees such as Cargo registries, language environments, and build caches. Keep candidate repositories under `repos/` (or another ordinary workspace directory); a reported repository inside an excluded cache/temp subtree fails closed as not independently found.

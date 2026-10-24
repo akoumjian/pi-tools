@@ -154,3 +154,21 @@ test("inventory matches symlink aliases by physical identity and sanitizes hosti
     assert.equal(candidate.eligible, false); assert.doesNotMatch(candidate.path, /\u001b/); assert.match(candidate.issues?.join(" ") ?? "", /terminal-control/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+
+test("inventory protects repos priority from artifact breadth and suppresses known HOME tool-cache noise", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-inventory-priority-"));
+  try {
+    const workspace = path.join(root, "workspace"); mkdirSync(workspace, { recursive: true });
+    const repo = repository(path.join(workspace, "repos", "a")); const relative = path.relative(workspace, repo);
+    const before = snapshotWorkerRepositories(workspace);
+    writeFileSync(path.join(repo, "changed.txt"), "changed\n"); execFileSync("git", ["-C", repo, "add", "."]); execFileSync("git", ["-C", repo, "commit", "-qm", "changed"]);
+    const artifacts = path.join(workspace, "artifacts"); mkdirSync(artifacts); for (let index = 0; index < 40; index += 1) mkdirSync(path.join(artifacts, `wide-${index}`));
+    mkdirSync(path.join(workspace, ".cargo", "registry", "src", "deep", "crate"), { recursive: true });
+    mkdirSync(path.join(workspace, "scratch", ".venv", "lib", "python", "site-packages", "pkg"), { recursive: true });
+    const inventory = inventoryWorkerRepositories({ workspaceRoot: workspace, workerId: "worker_priority", runId: "run_priority", reported: [relative], before }, { scanLimits: { maxDirectories: 8, maxDirectoryEntries: 128, maxDepth: 3 } });
+    assert.equal(inventory.repositories.find((item) => item.path === relative.split(path.sep).join("/"))?.eligible, true);
+    assert.doesNotMatch(inventory.errors.join(" "), /\.cargo|\.venv/);
+    assert.match(inventory.errors.join(" "), /artifacts\/wide-.*after scheduling 8 directories/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

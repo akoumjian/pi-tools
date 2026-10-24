@@ -125,11 +125,12 @@ export function discoverWorkerRepositories(
       }
       continue;
     }
-    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    for (const entry of entries.sort((a, b) => directoryPriority(current.depth, a.name) - directoryPriority(current.depth, b.name) || a.name.localeCompare(b.name))) {
       if (!entry.isDirectory() || entry.isSymbolicLink() || entry.name === ".git" || entry.name === ".pi" || entry.name === "node_modules") continue;
       const directory = path.join(current.directory, entry.name);
       const relative = displayRelative(root, directory);
       if (current.depth === 0 && RUNTIME_OWNED_SCAN_ROOTS.has(entry.name)) continue;
+      if (isKnownToolCache(relative) && !hasGitMarker(directory)) continue;
       if (current.depth >= limits.maxDepth) {
         markIncomplete(diagnostics, `Repository scan skipped subtree ${safeInventoryText(relative)} below depth ${limits.maxDepth}.`);
         continue;
@@ -138,7 +139,9 @@ export function discoverWorkerRepositories(
         markIncomplete(diagnostics, `Repository scan skipped subtree ${safeInventoryText(relative)} after scheduling ${limits.maxDirectories} directories.`);
         continue;
       }
-      queue.push({ directory, depth: current.depth + 1 });
+      const next = { directory, depth: current.depth + 1 };
+      if (currentRelative === "repos" || currentRelative.startsWith("repos/")) queue.splice(cursor, 0, next);
+      else queue.push(next);
     }
   }
   return found.sort((a, b) => a.relative.localeCompare(b.relative));
@@ -207,6 +210,12 @@ function boundedDirectoryEntries(directory: string, relative: string, diagnostic
   } finally { dir.closeSync(); }
   return entries;
 }
+
+function directoryPriority(depth: number, name: string): number { return depth === 0 && name === "repos" ? -1 : 0; }
+function isKnownToolCache(relative: string): boolean {
+  return relative === ".cache" || relative === ".cargo/registry" || relative === ".cargo/git" || relative === ".rustup/downloads" || relative === ".rustup/tmp" || relative === ".rustup/toolchains" || relative === ".gradle/caches" || relative === ".gradle/wrapper" || relative === ".m2/repository" || relative === "go/pkg" || relative === ".local/share" || relative.split("/").some((part) => part === ".venv" || part === "venv");
+}
+function hasGitMarker(directory: string): boolean { try { return lstatSync(path.join(directory, ".git")).isDirectory() || lstatSync(path.join(directory, ".git")).isFile(); } catch { return false; } }
 
 function scanLimits(overrides: Partial<InventoryScanLimits> | undefined): InventoryScanLimits {
   const values = { ...DEFAULT_SCAN_LIMITS, ...overrides };

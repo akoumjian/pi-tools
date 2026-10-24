@@ -32,7 +32,7 @@ import { launchWorkerHost, readWorkerHostProcess, readWorkerHostSettlement, type
 import { renderWorkerRuntimePrompt } from "./prompts.js";
 import { contextInputs, inputMounts, validateAdditionalInputs, type RetainedInput } from "./inputs.js";
 import { inspectInterruptedGitState, inventoryWorkerRepositories, snapshotWorkerRepositories, type RepositorySnapshot } from "./inventory.js";
-import { openWorkerSessionViewer, sanitizeViewText, type WorkerSessionViewTarget } from "./view.js";
+import { countSessionLines, openWorkerSessionViewer, sanitizeViewText, type WorkerSessionViewTarget } from "./view.js";
 import { canonicalPathWithin, canonicalRepository, trustedGit } from "./trusted-git.js";
 import { prepareWorkerCacheLineage, registerParentCacheLineageCapture, type WorkerCacheLineageRecord } from "./cache-lineage.js";
 
@@ -705,7 +705,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const run = getWorkerRun(getRegistry(), worker.workerId, runId);
     if (!run) throw new Error("Worker has no matching retained run.");
     if (!worker.sessionId || !worker.sessionFile) throw new Error("Worker has no retained Pi session.");
-    return { workerId: worker.workerId, role: worker.role, workerStatus: worker.status, runId: run.runId, runStatus: run.status, ...(run.outcome ? { outcome: run.outcome } : {}), ...(run.modelSelection ?? worker.modelSelection ? { modelSelection: run.modelSelection ?? worker.modelSelection } : {}), sessionId: worker.sessionId, sessionFile: worker.sessionFile, workspaceRoot: worker.workspaceRoot, parentSessionFile: worker.parentSessionFile, ...(run.sessionStartLine === undefined ? {} : { sessionStartLine: run.sessionStartLine }), ...(run.sessionEndLine === undefined ? {} : { sessionEndLine: run.sessionEndLine }) };
+    return { workerId: worker.workerId, role: worker.role, workerStatus: worker.status, runId: run.runId, runStatus: run.status, ...(run.outcome ? { outcome: run.outcome } : {}), ...(run.modelSelection ?? worker.modelSelection ? { modelSelection: run.modelSelection ?? worker.modelSelection } : {}), sessionId: worker.sessionId, sessionFile: worker.sessionFile, sessionRoot: workerPaths(roots, worker.workerId).sessionDir, workspaceRoot: worker.workspaceRoot, parentSessionFile: worker.parentSessionFile, ...(run.sessionStartLine === undefined ? {} : { sessionStartLine: run.sessionStartLine }), ...(run.sessionEndLine === undefined ? {} : { sessionEndLine: run.sessionEndLine }) };
   }
   function ownedWorker(workerId: string, parent: string): WorkerRegistryRecord { const worker = getWorker(getRegistry(), workerId); if (!worker || worker.parentSessionFile !== parent) throw new Error(`Unknown worker ${workerId} for this parent session.`); return worker; }
   function reviewSubject(runId: string, parent: string, reviewerWorkerId?: string) {
@@ -756,7 +756,7 @@ function roleInstructionsFor(role: WorkerRole): string { return workerRoleInstru
 function resolveModel(role: WorkerRole, explicit: string | undefined, context: ExtensionContext): string { const errors: string[] = []; for (const requested of preferredWorkerModel(role, explicit)) { try { const parsed = parseModelThinkingPair(requested); const resolved = resolveExtensionModel({ registry: context.modelRegistry, requested, fallbackThinkingLevel: parsed.thinkingLevel, label: `${role} worker`, noModelMessage: `No configured ${role} model is available.` }); assertChildAgentRouteAllowed(resolved.model, resolved.thinkingLevel, `${role} worker`); if (`${resolved.model.provider}/${resolved.model.id}:${resolved.thinkingLevel}` !== requested) throw new Error(`Selection ${requested} could not be honored exactly.`); return requested; } catch (error) { errors.push(sanitizeError(error)); } } throw new Error(`No configured ${role} model selection is available before launch. ${errors.join(" ")}`); }
 function requireParentSession(context: ExtensionContext): string { const file = context.sessionManager.getSessionFile(); if (!file) throw new Error("Managed workers require a persisted parent session."); return realpathOrResolve(file); }
 function realpathOrResolve(value: string): string { try { return realpathSync(value); } catch { return path.resolve(value); } }
-function countLines(file: string): number { try { const text = readFileSync(file, "utf8"); return text === "" ? 0 : text.split("\n").length - (text.endsWith("\n") ? 1 : 0); } catch { return 0; } }
+function countLines(file: string): number { return countSessionLines(file); }
 function validateRunRequestBounds(request: WorkerRunInputV2["runs"][number]): void {
   if (Buffer.byteLength(request.instructions ?? "") > 12 * 1024) throw new Error("instructions must be at most 12 KiB UTF-8.");
   for (const value of ("additionalInputs" in request ? request.additionalInputs : undefined) ?? []) if (Buffer.byteLength(value) > 4096) throw new Error("additionalInputs paths must be at most 4 KiB UTF-8.");

@@ -6,3 +6,5 @@
 - If you change a repository, leave a clean local commit and run the relevant checks. For research, analysis, or testing, preserve useful result files or directories in the workspace.
 - Use `worker_beads_tasks` for meaningful progress or blocker updates on assigned tasks. The parent owns task acceptance and closure.
 - Return control through `worker_result_submit` with a concise summary and useful repository or artifact entry points.
+
+Repository candidates must live outside the workspace `cache/`, `tmp/`, and known HOME tool-cache subtrees; prefer `repos/`, which inventory scans first.
