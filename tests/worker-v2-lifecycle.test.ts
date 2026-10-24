@@ -197,6 +197,43 @@ test("a new parent runtime adopts exact settlement after the launching runtime s
   }
 });
 
+test("unreceipted managed completion retries once in the same runtime generation", async () => {
+  const f = await fixture();
+  try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "retry delivery" }] }));
+    await f.event("turn_end");
+    await complete(f, started);
+    await waitFor(() => f.messages.filter((message) => message.details?.event === "worker_settled").length === 1);
+    await f.event("agent_end");
+    assert.equal(f.messages.filter((message) => message.details?.event === "worker_settled").length, 2, "one absent receipt gets one same-generation retry");
+    await f.event("agent_end");
+    assert.equal(f.messages.filter((message) => message.details?.event === "worker_settled").length, 2, "retry is bounded until the next session reconciliation");
+    const db = f.registry();
+    const delivery = db.database.prepare("SELECT state,runtime_generation FROM deliveries WHERE run_id=?").get(started.runId) as { state: string; runtime_generation: number };
+    assert.equal(delivery.state, "claimed");
+    assert.ok(delivery.runtime_generation > 0);
+    db.close();
+  } finally { await f.close(); }
+});
+
+test("managed completion accepted while active is not ambiguously retried at agent_end", async () => {
+  const f = await fixture();
+  try {
+    (f.context as unknown as { isIdle: () => boolean }).isIdle = () => false;
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "active delivery" }] }));
+    await f.event("turn_end");
+    await complete(f, started);
+    await waitFor(() => f.messages.filter((message) => message.details?.event === "worker_settled").length === 1);
+    await f.event("agent_end");
+    assert.equal(f.messages.filter((message) => message.details?.event === "worker_settled").length, 1, "an active-origin send may still be queued and must not be duplicated");
+    const db = f.registry();
+    const delivery = db.database.prepare("SELECT state,runtime_generation FROM deliveries WHERE run_id=?").get(started.runId) as { state: string; runtime_generation: number };
+    assert.equal(delivery.state, "claimed");
+    assert.ok(delivery.runtime_generation > 0);
+    db.close();
+  } finally { await f.close(); }
+});
+
 test("failed deferred review overlay setup system-settles and releases the subject lease", async () => {
   const f = await fixture({ overlayThrows: true }); try {
     const subject = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "subject" }] })); await f.event("turn_end"); await complete(f, subject);

@@ -1,6 +1,6 @@
 import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { accessSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { Type, type Static } from "@earendil-works/pi-ai";
@@ -27,10 +27,26 @@ import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/
 import { workerResultAdmissionPath } from "../_shared/worker-contract.js";
 import { readStrictWorkerJobMeta, workerJobIsSettled } from "../_shared/worker-job-settlement.js";
 import { writeAtomicJson } from "../_shared/atomic-json.js";
+import {
+  isCanonicalAsyncShellJobId,
+  parseAsyncShellLeftoverName,
+  managedWorkerEvidenceReason,
+  readManagedWorkerHostJobIds,
+  scanAsyncShellRetention,
+  summarizeAsyncShellRetentionEntries,
+  type AsyncShellRetentionEntry,
+  type AsyncShellRetentionProgress,
+  type AsyncShellRetentionSnapshot
+} from "./retention.js";
 
 export type JobStatus = "running" | "exited" | "failed" | "cancelled" | "unknown";
 export type AsyncShellJobOwner = {
   kind: "worker-run";
+  workerId: string;
+  runId: string;
+};
+export type AsyncShellManagedBy = {
+  kind: "worker-host";
   workerId: string;
   runId: string;
 };
@@ -68,7 +84,10 @@ export type JobMeta = {
   error?: string;
   notifyOnExit: boolean;
   completionNotified: boolean;
+  /** Terminal result was returned directly by shell_start and must never enqueue a notice. */
+  reportedInBand: boolean;
   owner?: AsyncShellJobOwner;
+  managedBy?: AsyncShellManagedBy;
   processToken?: string;
   logDir: string;
   stdoutLog: string;
@@ -91,6 +110,8 @@ export type StartManagedAsyncJobInput = {
   notifyOnExit?: boolean;
   settleProcessGroup?: boolean;
   persistSpawnedMetadata?: (job: JobMeta) => void;
+  /** Trusted callers mark parent host jobs as managed-worker evidence. */
+  managedBy?: AsyncShellManagedBy;
   /** Trusted callers may bind an exact externally persisted process identity. */
   processToken?: string;
 };
@@ -115,6 +136,7 @@ type JobStartDetails = Pick<JobMeta,
   | "stdoutLog"
   | "stderrLog"
   | "outputBytes"
+  | "reportedInBand"
 >;
 
 type CompletionDeliveryContext = {
@@ -124,6 +146,12 @@ type CompletionDeliveryContext = {
 
 type CompletionDeliveryRuntime = {
   active: boolean;
+  generation: number;
+  sessionId?: string;
+  projectCwd?: string;
+  api?: ExtensionAPI;
+  context?: CompletionDeliveryContext;
+  batchFlushTimer?: NodeJS.Timeout;
 };
 
 type AsyncShellActivityListener = () => void;
@@ -142,7 +170,6 @@ type JobRuntime = JobMeta & {
   // Suppresses completion notices until shell_start returns its in-band result.
   startResultPending: boolean;
   cancelRequested: boolean;
-  completionContext: CompletionDeliveryContext;
   originProjectCwd: string;
   originSessionId: string;
   completionDelivery: CompletionDelivery;
@@ -202,6 +229,46 @@ export type AsyncShellViewerArgs = {
   follow: boolean;
 };
 
+export type AsyncShellPruneInventory = "eligible" | "ineligible" | "leftovers";
+
+export type AsyncShellPruneArgs = {
+  help: boolean;
+  confirm: boolean;
+  recover: boolean;
+  inventory?: AsyncShellPruneInventory;
+  after?: string;
+  limit: number;
+  targets: string[];
+};
+
+export type AsyncShellPruneEntry = {
+  target: string;
+  kind: "job" | "pending" | "prune";
+  jobId: string;
+  status?: JobStatus;
+  bytes: number;
+  logDir: string;
+  recoveryEligible: boolean;
+};
+
+export type AsyncShellPrunePage = {
+  inventory: AsyncShellPruneInventory;
+  entries: AsyncShellRetentionEntry[];
+  after?: string;
+  nextAfter?: string;
+  snapshot: AsyncShellRetentionSnapshot;
+};
+
+type AsyncShellRetentionState = {
+  snapshot?: AsyncShellRetentionSnapshot;
+  scan?: Promise<AsyncShellRetentionSnapshot>;
+  progress?: AsyncShellRetentionProgress;
+  progressListeners?: Set<(progress: AsyncShellRetentionProgress) => void>;
+  removedNames?: Set<string>;
+  mutationRevision?: number;
+  lastError?: string;
+};
+
 export type AsyncShellViewerStreamSnapshot = {
   stream: OutputStreamName;
   logPath: string;
@@ -242,6 +309,7 @@ type StartUpdate = (partial: AgentToolResult<StartDetails>) => void;
 type CompletionNotificationTarget = {
   notifyOnExit: boolean;
   completionNotified: boolean;
+  reportedInBand: boolean;
 };
 
 type CompletionNotificationOptions = {
@@ -315,32 +383,69 @@ type ReadInput = Static<typeof ReadParams>;
 type CancelInput = Static<typeof CancelParams>;
 
 const ASYNC_SHELL_RUNTIME_HOLDER_KEY = Symbol.for("@akoumjian/pi-tools/async-shell-runtime");
-const ASYNC_SHELL_RUNTIME_HOLDER_VERSION = 1;
+const ASYNC_SHELL_RUNTIME_HOLDER_VERSION = 2;
 
 type AsyncShellRuntimeHolder = {
   version: typeof ASYNC_SHELL_RUNTIME_HOLDER_VERSION;
   jobs: Map<string, JobRuntime>;
   activityListeners: Set<AsyncShellActivityListener>;
+  pendingCompletionNotifications: Map<string, JobRuntime>;
+  completionDeliveryBatches: Map<string, CompletionDeliveryBatch>;
+  scheduledCompletionJobIds: Set<string>;
+  completionRuntimes: Map<string, CompletionDeliveryRuntime>;
+  retentionSnapshots: Map<string, AsyncShellRetentionState>;
+  nextCompletionGeneration: number;
 };
 
-function asyncShellRuntimeHolder(): AsyncShellRuntimeHolder {
-  const existing = Reflect.get(globalThis, ASYNC_SHELL_RUNTIME_HOLDER_KEY) as Partial<AsyncShellRuntimeHolder> | undefined;
-  if (existing !== undefined) {
-    if (
-      existing === null ||
-      typeof existing !== "object" ||
-      existing.version !== ASYNC_SHELL_RUNTIME_HOLDER_VERSION ||
-      !(existing.jobs instanceof Map) ||
-      !(existing.activityListeners instanceof Set)
-    ) {
-      throw new Error(`Incompatible async-shell runtime holder for version ${ASYNC_SHELL_RUNTIME_HOLDER_VERSION}.`);
-    }
-    return existing as AsyncShellRuntimeHolder;
+export function migrateAsyncShellRuntimeHolder(existingValue: unknown): AsyncShellRuntimeHolder {
+  const existing = existingValue as Partial<Omit<AsyncShellRuntimeHolder, "version">> & { version?: number };
+  if (
+    existing === null ||
+    typeof existing !== "object" ||
+    (existing.version !== 1 && existing.version !== ASYNC_SHELL_RUNTIME_HOLDER_VERSION) ||
+    !(existing.jobs instanceof Map) ||
+    !(existing.activityListeners instanceof Set)
+  ) {
+    throw new Error(`Incompatible async-shell runtime holder for version ${ASYNC_SHELL_RUNTIME_HOLDER_VERSION}.`);
   }
+  // Version 1 contained only jobs and activity listeners. Upgrade that object
+  // in place so a compatible prior holder survives an uncached same-version
+  // development reload. Version 2 fields are also initialized
+  // defensively for the short-lived pre-release holder shape.
+  existing.pendingCompletionNotifications ??= new Map<string, JobRuntime>();
+  existing.completionDeliveryBatches ??= new Map<string, CompletionDeliveryBatch>();
+  existing.scheduledCompletionJobIds ??= new Set<string>();
+  existing.completionRuntimes ??= new Map<string, CompletionDeliveryRuntime>();
+  existing.retentionSnapshots ??= new Map<string, AsyncShellRetentionState>();
+  existing.nextCompletionGeneration ??= 0;
+  for (const job of existing.jobs.values()) job.reportedInBand ??= false;
+  if (
+    !(existing.pendingCompletionNotifications instanceof Map) ||
+    !(existing.completionDeliveryBatches instanceof Map) ||
+    !(existing.scheduledCompletionJobIds instanceof Set) ||
+    !(existing.completionRuntimes instanceof Map) ||
+    !(existing.retentionSnapshots instanceof Map) ||
+    typeof existing.nextCompletionGeneration !== "number"
+  ) {
+    throw new Error(`Incompatible async-shell runtime holder for version ${ASYNC_SHELL_RUNTIME_HOLDER_VERSION}.`);
+  }
+  existing.version = ASYNC_SHELL_RUNTIME_HOLDER_VERSION;
+  return existing as AsyncShellRuntimeHolder;
+}
+
+function asyncShellRuntimeHolder(): AsyncShellRuntimeHolder {
+  const existing = Reflect.get(globalThis, ASYNC_SHELL_RUNTIME_HOLDER_KEY);
+  if (existing !== undefined) return migrateAsyncShellRuntimeHolder(existing);
   const created: AsyncShellRuntimeHolder = {
     version: ASYNC_SHELL_RUNTIME_HOLDER_VERSION,
     jobs: new Map<string, JobRuntime>(),
-    activityListeners: new Set<AsyncShellActivityListener>()
+    activityListeners: new Set<AsyncShellActivityListener>(),
+    pendingCompletionNotifications: new Map<string, JobRuntime>(),
+    completionDeliveryBatches: new Map<string, CompletionDeliveryBatch>(),
+    scheduledCompletionJobIds: new Set<string>(),
+    completionRuntimes: new Map<string, CompletionDeliveryRuntime>(),
+    retentionSnapshots: new Map<string, AsyncShellRetentionState>(),
+    nextCompletionGeneration: 0
   };
   Reflect.set(globalThis, ASYNC_SHELL_RUNTIME_HOLDER_KEY, created);
   return created;
@@ -349,6 +454,10 @@ function asyncShellRuntimeHolder(): AsyncShellRuntimeHolder {
 const asyncShellRuntime = asyncShellRuntimeHolder();
 const jobs = asyncShellRuntime.jobs;
 const asyncShellActivityListeners = asyncShellRuntime.activityListeners;
+const pendingCompletionNotifications = asyncShellRuntime.pendingCompletionNotifications;
+const completionDeliveryBatches = asyncShellRuntime.completionDeliveryBatches;
+const scheduledCompletionJobIds = asyncShellRuntime.scheduledCompletionJobIds;
+const retentionSnapshots = asyncShellRuntime.retentionSnapshots;
 
 function subscribeAsyncShellActivity(listener: AsyncShellActivityListener): () => void {
   asyncShellActivityListeners.add(listener);
@@ -365,11 +474,6 @@ function notifyAsyncShellActivity(): void {
   }
 }
 
-const scheduledCompletionNotifications = new WeakSet<CompletionNotificationTarget>();
-const pendingCompletionNotifications = new Map<string, JobRuntime>();
-const completionDeliveryBatches = new Map<string, CompletionDeliveryBatch>();
-let completionBatchFlushTimer: NodeJS.Timeout | undefined;
-let latestCompletionContext: CompletionDeliveryContext | undefined;
 
 export function getAsyncShellCompletionBarrier(
   context: Pick<ExtensionContext, "cwd" | "sessionManager">,
@@ -392,15 +496,20 @@ export function isAsyncShellCompletionBarrierTarget(target: {
   notifyOnExit: boolean;
   completionNotified: boolean;
   completionFollowUpQueued: boolean;
+  reportedInBand?: boolean;
 }): boolean {
-  return target.notifyOnExit && (!target.completionNotified || target.completionFollowUpQueued);
+  return target.reportedInBand !== true && target.notifyOnExit && (!target.completionNotified || target.completionFollowUpQueued);
 }
 
 export default function asyncShellExtension(api: ExtensionAPI): void {
-  const completionRuntime: CompletionDeliveryRuntime = { active: true };
+  const completionRuntime: CompletionDeliveryRuntime = {
+    active: false,
+    generation: 0
+  };
   let unsubscribeActivity: (() => void) | undefined;
 
   api.on("session_start", (_event, context) => {
+    bindCompletionRuntime(api, completionRuntime, context);
     unsubscribeActivity?.();
     unsubscribeActivity = undefined;
     if (context.mode !== "tui" || !context.hasUI) return;
@@ -419,7 +528,19 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     {
       description: "Show async-shell job storage and recent job diagnostics",
       handler: async (_args, context) => {
-        context.ui.notify(buildAsyncShellStatusText(context), "info");
+        context.ui.notify(buildLatestAsyncShellStatusText(context), "info");
+      }
+    },
+    []
+  );
+
+  registerCommandWithAliases(
+    api,
+    "async:prune",
+    {
+      description: "Inspect retention inventory or preview, prune, and recover exact async-shell storage targets",
+      handler: async (args, context) => {
+        await handleAsyncShellPruneCommand(context, args);
       }
     },
     []
@@ -444,21 +565,20 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
   api.on("message_end", (event, context) => {
     acknowledgeCompletionMessage(event.message, context);
     if (event.message.role === "user") {
-      flushCompletionNotificationBatch(api, createCompletionDeliveryContext(context), { allowActive: true });
+      flushCompletionNotificationBatch(completionRuntime, { allowActive: true });
     }
   });
-  api.on("turn_end", (_event, context) => {
-    flushCompletionNotificationBatch(api, createCompletionDeliveryContext(context), { allowActive: true });
+  api.on("turn_end", () => {
+    flushCompletionNotificationBatch(completionRuntime, { allowActive: true });
   });
-  api.on("agent_end", (_event, context) => {
-    scheduleCompletionBatchFlush(api, createCompletionDeliveryContext(context));
+  api.on("agent_end", () => {
+    scheduleCompletionBatchFlush(completionRuntime);
   });
   api.on("session_shutdown", async (_event, context) => {
     if (context.mode === "tui" && context.hasUI && typeof context.ui?.setStatus === "function") context.ui.setStatus(ASYNC_SHELL_ACTIVITY_STATUS_KEY, undefined);
     unsubscribeActivity?.();
     unsubscribeActivity = undefined;
-    completionRuntime.active = false;
-    abandonCompletionRuntime(completionRuntime);
+    detachCompletionRuntime(completionRuntime);
     const owner = workerOwnerFromEnvironment();
     if (owner) await cancelAsyncShellJobsForOwner(owner);
   });
@@ -515,9 +635,11 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     async execute(_toolCallId, params: StatusInput, signal, _onUpdate, context): Promise<AgentToolResult<JobSummaryDetails | JobListDetails>> {
       throwIfAborted(signal);
       if (params.jobId === undefined) {
-        const jobsList = listJobs(context, params.limit ?? 20);
+        const hadSnapshot = latestAsyncShellRetentionSnapshot(context) !== undefined;
+        const jobsList = await listJobs(context, params.limit ?? 20);
+        const retentionError = retentionState(context).state.lastError;
         return {
-          content: [{ type: "text", text: formatJobList(jobsList) }],
+          content: [{ type: "text", text: formatJobList(jobsList, !hadSnapshot, retentionError) }],
           details: { jobs: jobsList }
         };
       }
@@ -604,23 +726,42 @@ async function startJobs(
 ): Promise<AgentToolResult<StartDetails>> {
   throwIfAborted(signal);
   assertWorkerRunAcceptsSideEffects();
+  if (
+    !completionRuntime.active ||
+    completionRuntime.api !== api ||
+    completionRuntime.sessionId !== context.sessionManager.getSessionId() ||
+    completionRuntime.projectCwd !== context.cwd
+  ) {
+    bindCompletionRuntime(api, completionRuntime, context);
+  }
   const specs = normalizeCommandSpecs(input);
 
-  const runtimes = specs.map((spec) => startJob(api, context, {
-    command: spec.command,
-    cwd: spec.cwd,
-    job_name: spec.job_name,
-    shell: spec.shell,
-    notifyOnExit: spec.notifyOnExit ?? true,
-    completionDelivery: resolveCompletionDelivery(spec.completionDelivery),
-    completionRuntime
-  }));
+  const runtimes: JobRuntime[] = [];
+  try {
+    for (const spec of specs) {
+      runtimes.push(startJob(api, context, {
+        command: spec.command,
+        cwd: spec.cwd,
+        job_name: spec.job_name,
+        shell: spec.shell,
+        notifyOnExit: spec.notifyOnExit ?? true,
+        completionDelivery: resolveCompletionDelivery(spec.completionDelivery),
+        completionRuntime
+      }));
+    }
+  } catch (error) {
+    releaseStartResultBarriers(api, runtimes);
+    const startedIds = runtimes.map((job) => job.jobId);
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${message}${startedIds.length > 0 ? `; already-started async job IDs: ${startedIds.join(", ")}` : ""}`, { cause: error });
+  }
 
-  onUpdate?.(partialStartResult(runtimes));
-
-  await waitForJobsWithUpdates(runtimes, secondsToMilliseconds(START_WAIT_FOR_COMPLETION_SECONDS), onUpdate, signal);
-
-  finishStartGracePeriod(runtimes);
+  try {
+    onUpdate?.(partialStartResult(runtimes));
+    await waitForJobsWithUpdates(runtimes, secondsToMilliseconds(START_WAIT_FOR_COMPLETION_SECONDS), onUpdate, signal);
+  } finally {
+    finishStartGracePeriod(runtimes);
+  }
   return startResult(runtimes);
 }
 
@@ -675,6 +816,7 @@ function startJob(
     startedAtMs,
     notifyOnExit: input.notifyOnExit ?? true,
     owner,
+    managedBy: input.managedBy,
     processToken
   });
 
@@ -693,43 +835,68 @@ function startJob(
     throw error;
   }
 
+  const pid = child.pid;
+  const failedBeforeSpawn = pid === undefined;
   const runtime: JobRuntime = {
     ...job,
+    ...(failedBeforeSpawn
+      ? {
+          status: "failed" as const,
+          endedAt: new Date().toISOString(),
+          durationMs: Date.now() - startedAtMs,
+          error: `Unable to spawn async job process: ${processInput.executable} did not receive a process id.`
+        }
+      : {}),
     process: child,
     waiters: [],
     activeWaiters: 0,
     startResultPending: true,
     cancelRequested: false,
-    completionContext: createCompletionDeliveryContext(context),
     originProjectCwd: context.cwd,
     originSessionId: context.sessionManager.getSessionId(),
     completionDelivery: resolveCompletionDelivery(input.completionDelivery),
-    completionRuntime: input.completionRuntime ?? { active: true },
+    completionRuntime: input.completionRuntime ?? completionRuntimeForJob(api, context),
     completionFollowUpQueued: false,
     settleProcessGroup: input.settleProcessGroup ?? false,
     showInActivity: input.showInActivity ?? true,
     pendingLogDir,
     cancellationEffect: processInput.cancellationEffect,
-    pid: child.pid
+    pid
   };
 
-  jobs.set(jobId, runtime);
-  notifyAsyncShellActivity();
-  child.on("error", (error) => finalizeJob(api, runtime, "failed", undefined, undefined, error.message));
-  child.on("close", (code, signal) => {
-    finalizeJobAfterProcessGroupExit(api, runtime, code, signal);
+  child.on("error", (error) => {
+    if (failedBeforeSpawn) {
+      runtime.error = runtime.error ? `${runtime.error}; ${error.message}` : error.message;
+      try {
+        writeMeta(runtime);
+      } catch (cause) {
+        const persistenceError = `Terminal metadata persistence failed: ${cause instanceof Error ? cause.message : String(cause)}`;
+        runtime.error = `${runtime.error}; ${persistenceError}`;
+      }
+      try { notifyAsyncShellActivity(); } catch {}
+      return;
+    }
+    finalizeJob(api, runtime, "failed", undefined, undefined, error.message);
   });
+  child.on("close", (code, signal) => {
+    if (!failedBeforeSpawn) finalizeJobAfterProcessGroupExit(api, runtime, code, signal);
+  });
+  jobs.set(jobId, runtime);
   try {
-    input.persistSpawnedMetadata?.(runtime);
+    if (!failedBeforeSpawn) input.persistSpawnedMetadata?.(runtime);
     writeMeta(runtime);
   } catch (cause) {
     runtime.startupError = `Unable to persist spawned async job metadata: ${cause instanceof Error ? cause.message : String(cause)}`;
     runtime.notifyOnExit = false;
-    try {
-      signalAsyncJobExecution(runtime.pid, runtime.processToken, "SIGKILL");
-    } catch {}
+    if (failedBeforeSpawn) runtime.error = runtime.error ? `${runtime.error}; ${runtime.startupError}` : runtime.startupError;
+    if (!failedBeforeSpawn) {
+      try {
+        signalAsyncJobExecution(runtime.pid, runtime.processToken, "SIGKILL");
+      } catch {}
+      finalizeJob(api, runtime, "failed", null, null, runtime.startupError);
+    }
   }
-
+  notifyAsyncShellActivity();
   child.unref();
 
   return runtime;
@@ -944,6 +1111,7 @@ function createJobMeta(input: {
   startedAtMs: number;
   notifyOnExit: boolean;
   owner?: AsyncShellJobOwner;
+  managedBy?: AsyncShellManagedBy;
   processToken?: string;
 }): JobMeta {
   return {
@@ -956,7 +1124,9 @@ function createJobMeta(input: {
     startedAt: new Date(input.startedAtMs).toISOString(),
     notifyOnExit: input.notifyOnExit,
     completionNotified: false,
+    reportedInBand: false,
     owner: input.owner,
+    managedBy: input.managedBy,
     processToken: input.processToken,
     logDir: input.logDir,
     stdoutLog: path.join(input.logDir, "stdout.log"),
@@ -976,9 +1146,7 @@ function finalizeJob(
   signal: NodeJS.Signals | null | undefined,
   error?: string
 ): void {
-  if (isTerminal(job.status)) {
-    return;
-  }
+  if (isTerminal(job.status)) return;
 
   const endedAtMs = Date.now();
   job.status = status;
@@ -986,15 +1154,28 @@ function finalizeJob(
   job.durationMs = endedAtMs - Date.parse(job.startedAt);
   job.exitCode = exitCode;
   job.signal = signal;
-  job.error = error;
-  job.outputBytes = asyncJobOutputBytes(job.stdoutLog, job.stderrLog);
-  writeMeta(job);
-  notifyAsyncShellActivity();
+  if (error !== undefined && !job.error?.includes(error)) job.error = job.error ? `${job.error}; ${error}` : error;
 
-  for (const resolve of job.waiters.splice(0)) {
-    resolve();
+  try {
+    job.outputBytes = asyncJobOutputBytes(job.stdoutLog, job.stderrLog);
+    writeMeta(job);
+  } catch (cause) {
+    const persistenceError = `Terminal metadata persistence failed: ${cause instanceof Error ? cause.message : String(cause)}`;
+    job.status = "failed";
+    job.error = job.error ? `${job.error}; ${persistenceError}` : persistenceError;
+    // A transient first failure may still permit a truthful failed record. A
+    // persistent filesystem failure remains represented by the in-memory
+    // result; it must never prevent waiters or the interactive host settling.
+    try {
+      job.outputBytes = asyncJobOutputBytes(job.stdoutLog, job.stderrLog);
+      writeMeta(job);
+    } catch {}
   }
 
+  try { notifyAsyncShellActivity(); } catch {}
+  for (const resolve of job.waiters.splice(0)) {
+    try { resolve(); } catch {}
+  }
   scheduleCompletionNotification(api, job);
 }
 
@@ -1006,19 +1187,20 @@ function scheduleCompletionNotification(api: ExtensionAPI, job: JobRuntime): voi
 }
 
 function scheduleCompletionFollowUp(target: CompletionNotificationTarget, options: CompletionNotificationOptions): void {
-  if (!target.notifyOnExit || target.completionNotified || scheduledCompletionNotifications.has(target)) {
+  const scheduledJobId = "jobId" in target && typeof target.jobId === "string" ? target.jobId : undefined;
+  if (!target.notifyOnExit || target.completionNotified || target.reportedInBand || (scheduledJobId !== undefined && scheduledCompletionJobIds.has(scheduledJobId))) {
     return;
   }
 
-  scheduledCompletionNotifications.add(target);
+  if (scheduledJobId !== undefined) scheduledCompletionJobIds.add(scheduledJobId);
   setTimeout(() => {
-    scheduledCompletionNotifications.delete(target);
+    if (scheduledJobId !== undefined) scheduledCompletionJobIds.delete(scheduledJobId);
 
     // The timer intentionally runs after waiter promises and shell_start's
     // finishStartGracePeriod() continuation have had a chance to suppress an
     // in-band result. The inner latch check is still required because multiple
     // job finalizers can schedule work before any timer callback runs.
-    if (target.completionNotified || !options.isReady()) {
+    if (target.completionNotified || target.reportedInBand || !target.notifyOnExit || !options.isReady()) {
       return;
     }
 
@@ -1026,35 +1208,39 @@ function scheduleCompletionFollowUp(target: CompletionNotificationTarget, option
   }, 0);
 }
 
-function queueCompletionNotification(api: ExtensionAPI, job: JobRuntime): void {
-  if (!job.completionRuntime.active || job.completionNotified) return;
+function queueCompletionNotification(_api: ExtensionAPI, job: JobRuntime): void {
+  if (!job.completionRuntime.active || job.completionNotified || job.reportedInBand || !job.notifyOnExit) return;
   pendingCompletionNotifications.set(job.jobId, job);
-  scheduleCompletionBatchFlush(api, job.completionContext);
+  scheduleCompletionBatchFlush(job.completionRuntime);
 }
 
-function scheduleCompletionBatchFlush(api: ExtensionAPI, context: CompletionDeliveryContext): void {
-  latestCompletionContext = context;
-  if (completionBatchFlushTimer !== undefined) {
-    return;
-  }
-
-  completionBatchFlushTimer = setTimeout(() => {
-    completionBatchFlushTimer = undefined;
-    flushCompletionNotificationBatch(api, latestCompletionContext, { allowActive: false });
+function scheduleCompletionBatchFlush(runtime: CompletionDeliveryRuntime): void {
+  if (!runtime.active || runtime.api === undefined || runtime.context === undefined || runtime.batchFlushTimer !== undefined) return;
+  const generation = runtime.generation;
+  runtime.batchFlushTimer = setTimeout(() => {
+    runtime.batchFlushTimer = undefined;
+    if (!runtime.active || runtime.generation !== generation) return;
+    flushCompletionNotificationBatch(runtime, { allowActive: false });
   }, COMPLETION_BATCH_FLUSH_DELAY_MS);
 }
 
-function flushCompletionNotificationBatch(api: ExtensionAPI, context: CompletionDeliveryContext | undefined, options: { allowActive: boolean }): void {
-  if (pendingCompletionNotifications.size === 0 || context === undefined) return;
+function flushCompletionNotificationBatch(runtime: CompletionDeliveryRuntime, options: { allowActive: boolean }): void {
+  const api = runtime.api;
+  const context = runtime.context;
+  if (!runtime.active || api === undefined || context === undefined || pendingCompletionNotifications.size === 0) return;
   if (!options.allowActive && !context.isIdle()) return;
   const sessionId = context.sessionId();
-  if (!sessionId) return;
-
+  if (!sessionId || runtime.sessionId !== sessionId) return;
+  for (const [jobId, job] of pendingCompletionNotifications) {
+    if (job.reportedInBand || !job.notifyOnExit) pendingCompletionNotifications.delete(jobId);
+  }
   const eligible = Array.from(pendingCompletionNotifications.values()).filter((job) =>
-    job.completionRuntime.active &&
+    job.completionRuntime === runtime &&
     job.originSessionId === sessionId &&
     !job.completionNotified &&
-    !job.completionFollowUpQueued
+    !job.completionFollowUpQueued &&
+    !job.reportedInBand &&
+    job.notifyOnExit
   );
   const byMode = new Map<CompletionDelivery, JobRuntime[]>();
   for (const job of eligible) {
@@ -1101,7 +1287,89 @@ function acknowledgeCompletionMessage(message: unknown, context: ExtensionContex
     batch.originSessionId !== context.sessionManager.getSessionId() ||
     details.originSessionId !== batch.originSessionId
   ) return;
+  acknowledgeCompletionBatch(batch);
+}
 
+function bindCompletionRuntime(api: ExtensionAPI, runtime: CompletionDeliveryRuntime, context: ExtensionContext): void {
+  const sessionId = context.sessionManager.getSessionId();
+  if (!sessionId) return;
+  const retainBinding = completionSessionIsPersistent(context);
+  const prior = retainBinding ? asyncShellRuntime.completionRuntimes.get(sessionId) : undefined;
+  if (prior !== undefined && prior !== runtime) detachCompletionRuntime(prior);
+
+  runtime.active = true;
+  runtime.generation = ++asyncShellRuntime.nextCompletionGeneration;
+  runtime.sessionId = sessionId;
+  runtime.projectCwd = context.cwd;
+  runtime.api = api;
+  runtime.context = createCompletionDeliveryContext(context);
+  if (retainBinding) asyncShellRuntime.completionRuntimes.set(sessionId, runtime);
+
+  const observedDeliveryIds = asyncShellSessionDeliveryIds(context);
+  for (const batch of completionDeliveryBatches.values()) {
+    if (batch.originSessionId === sessionId && observedDeliveryIds.has(batch.deliveryId)) acknowledgeCompletionBatch(batch);
+    // An accepted send absent from the session ledger is ambiguous because Pi may
+    // still hold the custom message in its queue. Keep it claimed rather than
+    // replaying and risking a duplicate turn.
+  }
+
+  for (const job of jobs.values()) {
+    if (job.originProjectCwd !== context.cwd || job.originSessionId !== sessionId) continue;
+    if (job.completionRuntime !== runtime && job.completionRuntime.active) continue;
+    job.completionRuntime = runtime;
+    if (job.reportedInBand) {
+      job.completionFollowUpQueued = false;
+      pendingCompletionNotifications.delete(job.jobId);
+      forgetCompletionDelivery(job.jobId);
+      continue;
+    }
+    if (isTerminal(job.status) && job.notifyOnExit && !job.completionNotified && !job.completionFollowUpQueued) {
+      pendingCompletionNotifications.set(job.jobId, job);
+    }
+  }
+  if (Array.from(pendingCompletionNotifications.values()).some((job) => job.completionRuntime === runtime)) {
+    scheduleCompletionBatchFlush(runtime);
+  }
+}
+
+function completionSessionIsPersistent(context: ExtensionContext): boolean {
+  const manager = context.sessionManager as unknown as { getSessionFile?: () => string | undefined };
+  if (typeof manager.getSessionFile !== "function") return true;
+  try {
+    return manager.getSessionFile() !== undefined;
+  } catch {
+    return false;
+  }
+}
+
+function completionRuntimeForJob(api: ExtensionAPI, context: ExtensionContext): CompletionDeliveryRuntime {
+  const sessionId = context.sessionManager.getSessionId();
+  const bound = sessionId ? asyncShellRuntime.completionRuntimes.get(sessionId) : undefined;
+  if (bound?.active && bound.api === api && bound.projectCwd === context.cwd) return bound;
+  return {
+    active: true,
+    generation: ++asyncShellRuntime.nextCompletionGeneration,
+    sessionId,
+    projectCwd: context.cwd,
+    api,
+    context: createCompletionDeliveryContext(context)
+  };
+}
+
+function asyncShellSessionDeliveryIds(context: ExtensionContext): Set<string> {
+  const ids = new Set<string>();
+  const visit = (value: unknown): void => {
+    if (!isRecord(value)) return;
+    if (typeof value.deliveryId === "string" && value.deliveryId.startsWith("async-shell:")) ids.add(value.deliveryId);
+    for (const child of Object.values(value)) Array.isArray(child) ? child.forEach(visit) : visit(child);
+  };
+  try {
+    for (const entry of context.sessionManager.getEntries()) visit(entry);
+  } catch {}
+  return ids;
+}
+
+function acknowledgeCompletionBatch(batch: CompletionDeliveryBatch): void {
   completionDeliveryBatches.delete(batch.deliveryId);
   for (const jobId of batch.jobIds) {
     const job = jobs.get(jobId);
@@ -1109,26 +1377,21 @@ function acknowledgeCompletionMessage(message: unknown, context: ExtensionContex
     job.completionNotified = true;
     job.completionFollowUpQueued = false;
     pendingCompletionNotifications.delete(job.jobId);
-    writeMeta(job);
+    try { writeMeta(job); } catch {}
   }
 }
 
-function abandonCompletionRuntime(runtime: CompletionDeliveryRuntime): void {
-  if (completionBatchFlushTimer !== undefined) {
-    clearTimeout(completionBatchFlushTimer);
-    completionBatchFlushTimer = undefined;
-    latestCompletionContext = undefined;
+function detachCompletionRuntime(runtime: CompletionDeliveryRuntime): void {
+  runtime.active = false;
+  if (runtime.batchFlushTimer !== undefined) {
+    clearTimeout(runtime.batchFlushTimer);
+    runtime.batchFlushTimer = undefined;
   }
-  for (const [jobId, job] of pendingCompletionNotifications) {
-    if (job.completionRuntime !== runtime) continue;
-    job.completionFollowUpQueued = false;
-    pendingCompletionNotifications.delete(jobId);
+  if (runtime.sessionId && asyncShellRuntime.completionRuntimes.get(runtime.sessionId) === runtime) {
+    asyncShellRuntime.completionRuntimes.delete(runtime.sessionId);
   }
-  for (const [deliveryId, batch] of completionDeliveryBatches) {
-    if (Array.from(batch.jobIds).some((jobId) => jobs.get(jobId)?.completionRuntime === runtime)) {
-      completionDeliveryBatches.delete(deliveryId);
-    }
-  }
+  runtime.api = undefined;
+  runtime.context = undefined;
 }
 
 function createCompletionDeliveryContext(
@@ -1222,7 +1485,8 @@ function startJobDetails(job: JobMeta): JobStartDetails {
     error: job.error,
     stdoutLog: job.stdoutLog,
     stderrLog: job.stderrLog,
-    outputBytes: asyncJobOutputBytes(job.stdoutLog, job.stderrLog)
+    outputBytes: asyncJobOutputBytes(job.stdoutLog, job.stderrLog),
+    reportedInBand: job.reportedInBand === true
   };
 }
 
@@ -1280,22 +1544,19 @@ function formatJobMessageOutput(output: JobOutput, stream?: OutputStreamName): s
 }
 
 function cancelJob(job: JobRuntime, signal: NodeJS.Signals): void {
-  if (isTerminal(job.status)) {
-    return;
-  }
+  if (isTerminal(job.status)) return;
+  if (job.pid === undefined) throw new Error(`Job ${job.jobId} has no process id to cancel.`);
 
   job.cancelRequested = true;
   job.process.ref();
   job.groupMonitor?.ref();
   job.notifyOnExit = false;
-  writeMeta(job);
-
-  if (job.pid === undefined) {
-    throw new Error(`Job ${job.jobId} has no process id to cancel.`);
+  try {
+    job.cancellationEffect?.(signal);
+    signalAsyncJobExecution(job.pid, job.processToken, signal);
+  } finally {
+    persistJobMetadataBestEffort(job, "Cancellation metadata persistence failed");
   }
-
-  job.cancellationEffect?.(signal);
-  signalAsyncJobExecution(job.pid, job.processToken, signal);
 }
 
 async function waitForJob(job: JobRuntime, timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
@@ -1470,12 +1731,15 @@ function partialStartResult(jobsList: JobRuntime[]): AgentToolResult<StartDetail
   };
 }
 
-function formatJobList(jobsList: JobMeta[]): string {
+function formatJobList(jobsList: JobMeta[], historyRefreshPending = false, retentionError?: string): string {
+  const protection = retentionError === undefined ? "" : `Async-shell history protection failed closed: ${retentionError}\n\n`;
   if (jobsList.length === 0) {
-    return "No async shell jobs for this project.";
+    return `${protection}${historyRefreshPending
+      ? "No attached async shell jobs. Historical registry refresh started in the background; call shell_status later only if another lifecycle event requires it."
+      : "No async shell jobs for this project."}`;
   }
 
-  return jobsList.map((job) => {
+  return protection + jobsList.map((job) => {
     const jobName = job.job_name ? ` (${job.job_name})` : "";
     const outcome = job.exitCode === undefined ? "" : ` exit=${job.exitCode}`;
     return `${job.jobId}${jobName}: ${job.status}${outcome}\n  ${job.command}\n  cwd: ${job.cwd}`;
@@ -1513,29 +1777,34 @@ function requireActiveJob(context: ExtensionContext, jobId: string): JobRuntime 
   return job;
 }
 
-function listJobs(context: ExtensionContext, limit: number): JobMeta[] {
-  const root = path.join(jobsRoot(context.cwd), "jobs");
-  const diskJobs = existsSync(root)
-    ? readdirSync(root, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && isValidAsyncJobId(entry.name))
-      .map((entry) => readMetaFile(path.join(root, entry.name, "meta.json"), root, entry.name))
-      .filter((job): job is JobMeta => job !== undefined)
-    : [];
+async function listJobs(context: ExtensionContext, limit: number): Promise<JobMeta[]> {
+  const state = beginAsyncShellRetentionRefresh(context);
+  return jobsFromRetentionSnapshot(context, state.snapshot, limit);
+}
 
+function jobsFromRetentionSnapshot(context: ExtensionContext, snapshot: AsyncShellRetentionSnapshot | undefined, limit: number): JobMeta[] {
+  const owner = workerOwnerFromEnvironment();
+  const diskJobs = (snapshot?.recentJobs ?? [])
+    .filter(isSnapshotJobMeta)
+    .map((job) => job as JobMeta)
+    .filter((job) => owner === undefined || sameJobOwner(job.owner, owner))
+    .map(publicJob);
   const activeJobs = Array.from(jobs.values())
     .filter((job) => isJobInContext(context, job))
+    .filter((job) => owner === undefined || sameJobOwner(job.owner, owner))
     .map(publicJob);
   const byId = new Map<string, JobMeta>();
-  for (const job of diskJobs) {
-    byId.set(job.jobId, job);
-  }
-  for (const job of activeJobs) {
-    byId.set(job.jobId, job);
-  }
-
+  for (const job of diskJobs) byId.set(job.jobId, job);
+  for (const job of activeJobs) byId.set(job.jobId, job);
   return Array.from(byId.values())
     .sort((left, right) => Date.parse(right.startedAt) - Date.parse(left.startedAt))
     .slice(0, clampInteger(limit, 1, 100));
+}
+
+function isSnapshotJobMeta(value: Record<string, unknown>): boolean {
+  return typeof value.jobId === "string" && typeof value.command === "string" && typeof value.cwd === "string" &&
+    typeof value.startedAt === "string" && typeof value.status === "string" && typeof value.logDir === "string" &&
+    typeof value.stdoutLog === "string" && typeof value.stderrLog === "string";
 }
 
 function activeJobForContext(context: Pick<ExtensionContext, "cwd">, jobId: string): JobRuntime | undefined {
@@ -1562,6 +1831,12 @@ function readMetaFile(metaPath: string, jobsDirectory: string, expectedJobId: st
   if (typeof raw.jobId !== "string" || typeof raw.command !== "string" || typeof raw.cwd !== "string") {
     return undefined;
   }
+  if (raw.managedBy !== undefined && (
+    !isRecord(raw.managedBy) ||
+    raw.managedBy.kind !== "worker-host" ||
+    typeof raw.managedBy.workerId !== "string" ||
+    typeof raw.managedBy.runId !== "string"
+  )) return undefined;
   const expectedLogDir = path.join(path.resolve(jobsDirectory), expectedJobId);
   if (
     raw.jobId !== expectedJobId ||
@@ -1619,7 +1894,9 @@ function publicJob(job: JobMeta): JobMeta {
     error: job.error,
     notifyOnExit: job.notifyOnExit,
     completionNotified: job.completionNotified,
+    reportedInBand: job.reportedInBand === true,
     owner: job.owner ? { ...job.owner } : undefined,
+    managedBy: job.managedBy ? { ...job.managedBy } : undefined,
     processToken: job.processToken,
     logDir: job.logDir,
     stdoutLog: job.stdoutLog,
@@ -1652,31 +1929,73 @@ function normalizeCommandSpecs(input: StartInput): CommandSpec[] {
 }
 
 function finishStartGracePeriod(jobsList: JobRuntime[]): void {
-  for (const job of jobsList.filter((candidate) => isTerminal(candidate.status))) {
-    job.completionNotified = true;
-    job.completionFollowUpQueued = false;
-    forgetCompletionDelivery(job.jobId);
-    pendingCompletionNotifications.delete(job.jobId);
-    writeMeta(job);
-  }
-
   for (const job of jobsList) {
-    job.startResultPending = false;
+    try {
+      if (!isTerminal(job.status)) continue;
+      // This holder-backed latch is authoritative even when the metadata write
+      // below fails. Mark it before shell_start can release the in-band result.
+      job.reportedInBand = true;
+      job.notifyOnExit = false;
+      job.completionFollowUpQueued = false;
+      pendingCompletionNotifications.delete(job.jobId);
+      scheduledCompletionJobIds.delete(job.jobId);
+      forgetCompletionDelivery(job.jobId);
+      acknowledgeObservedJobCompletion(job);
+    } catch (cause) {
+      recordMetadataPersistenceFailure(job, cause, "Grace finalization failed");
+    } finally {
+      job.startResultPending = false;
+    }
   }
 }
 
-function acknowledgeObservedJobCompletion(job: JobMeta): void {
+function releaseStartResultBarriers(api: ExtensionAPI, jobsList: JobRuntime[]): void {
+  for (const job of jobsList) {
+    job.startResultPending = false;
+    if (isTerminal(job.status)) scheduleCompletionNotification(api, job);
+  }
+}
+
+function acknowledgeObservedJobCompletion(job: JobMeta): boolean {
   const runtime = jobs.get(job.jobId);
   const target = runtime ?? job;
-  if (!isTerminal(target.status)) return;
+  if (!isTerminal(target.status)) return true;
 
+  const priorNotified = target.completionNotified;
+  const priorQueued = runtime?.completionFollowUpQueued;
   target.completionNotified = true;
+  if (runtime) runtime.completionFollowUpQueued = false;
+  try {
+    writeMeta(target);
+  } catch (cause) {
+    target.completionNotified = priorNotified;
+    if (runtime && priorQueued !== undefined) runtime.completionFollowUpQueued = priorQueued;
+    recordMetadataPersistenceFailure(target, cause, "Completion acknowledgement persistence failed");
+    try { writeMeta(target); } catch {}
+    return false;
+  }
   if (runtime) {
-    runtime.completionFollowUpQueued = false;
     forgetCompletionDelivery(runtime.jobId);
     pendingCompletionNotifications.delete(runtime.jobId);
   }
-  writeMeta(target);
+  return true;
+}
+
+function persistJobMetadataBestEffort(job: JobMeta, label: string): boolean {
+  try {
+    writeMeta(job);
+    return true;
+  } catch (cause) {
+    recordMetadataPersistenceFailure(job, cause, label);
+    try { writeMeta(job); } catch {}
+    return false;
+  }
+}
+
+function recordMetadataPersistenceFailure(job: JobMeta, cause: unknown, label: string): void {
+  const failure = `${label}: ${cause instanceof Error ? cause.message : String(cause)}`;
+  if (!job.error?.includes(failure)) job.error = job.error ? `${job.error}; ${failure}` : failure;
+  if (isTerminal(job.status)) job.status = "failed";
 }
 
 function forgetCompletionDelivery(jobId: string): void {
@@ -1804,6 +2123,433 @@ function resolveCwd(context: ExtensionContext, requestedCwd: string | undefined)
   return path.resolve(base, expandHome(requestedCwd));
 }
 
+export function parseAsyncShellPruneArgs(rawArgs: string): AsyncShellPruneArgs {
+  const tokens = rawArgs.trim() === "" ? [] : rawArgs.trim().split(/\s+/);
+  const targets: string[] = [];
+  let help = false;
+  let confirm = false;
+  let recover = false;
+  let inventory: AsyncShellPruneInventory | undefined;
+  let after: string | undefined;
+  let limit = 100;
+  let pagingRequested = false;
+  const selectInventory = (value: AsyncShellPruneInventory): void => {
+    if (inventory !== undefined && inventory !== value) throw new Error("Select exactly one inventory class: --eligible, --ineligible, or --leftovers.");
+    inventory = value;
+  };
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    if (token === "--help" || token === "-h") { help = true; continue; }
+    if (token === "--confirm") { confirm = true; continue; }
+    if (token === "--recover") { recover = true; continue; }
+    if (token === "--eligible") { selectInventory("eligible"); continue; }
+    if (token === "--ineligible") { selectInventory("ineligible"); continue; }
+    if (token === "--leftovers") { selectInventory("leftovers"); continue; }
+    if (token === "--offset" || token.startsWith("--offset=")) throw new Error("--offset is not supported because deletion can skip entries; use the deletion-stable --after cursor.");
+    if (token === "--after" || token.startsWith("--after=")) {
+      pagingRequested = true;
+      const value = token === "--after" ? tokens[++index] : token.slice("--after=".length);
+      if (value === undefined || !isSafeAsyncShellRegistryName(value)) throw new Error("--after requires one exact safe registry directory name.");
+      after = value;
+      continue;
+    }
+    if (token === "--limit" || token.startsWith("--limit=")) {
+      pagingRequested = true;
+      const value = token === "--limit" ? tokens[++index] : token.slice("--limit=".length);
+      if (value === undefined || !/^\d+$/.test(value)) throw new Error("--limit must be an integer from 1 to 100.");
+      limit = Number.parseInt(value, 10);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error("--limit must be an integer from 1 to 100.");
+      continue;
+    }
+    if (token.startsWith("-")) throw new Error(`${buildAsyncShellPruneUsage()}\n\nUnknown option: ${token}`);
+    assertValidAsyncShellPruneTarget(token);
+    if (!targets.includes(token)) targets.push(token);
+  }
+  if (targets.length > 250) throw new Error("Prune accepts at most 250 exact targets.");
+  if (inventory !== undefined && (confirm || recover || targets.length > 0)) throw new Error("Inventory discovery is read-only and cannot be combined with exact targets, --recover, or --confirm.");
+  if (inventory === undefined && pagingRequested) throw new Error("--after and --limit require --eligible, --ineligible, or --leftovers.");
+  if (recover && targets.some((target) => parseAsyncShellLeftoverName(target)?.kind !== "prune")) throw new Error("--recover accepts only exact .prune-* leftover targets.");
+  return { help, confirm, recover, inventory, after, limit, targets };
+}
+
+function isSafeAsyncShellRegistryName(name: string): boolean {
+  return name.length > 0 && Buffer.byteLength(name, "utf8") <= 255 && name !== "." && name !== ".." && !/[\/\\\0]/.test(name);
+}
+
+function assertValidAsyncShellPruneTarget(target: string): void {
+  if (isCanonicalAsyncShellJobId(target) || parseAsyncShellLeftoverName(target) !== undefined) return;
+  throw new Error(`Invalid async-shell job or leftover target: ${target}`);
+}
+
+export function buildAsyncShellPruneUsage(): string {
+  return [
+    "Usage: /async:prune <exact-job-or-leftover> [...] [--confirm]",
+    "       /async:prune <exact-.prune-leftover> [...] --recover [--confirm]",
+    "       /async:prune --eligible|--ineligible|--leftovers [--after EXACT-NAME] [--limit 1..100]",
+    "",
+    "Without --confirm, up to 250 exact targets receive a read-only preview. Confirmation revalidates the complete exact set before deletion or recovery.",
+    "Inventory discovery is bounded and read-only. Its --after cursor is deletion-stable; it never deletes.",
+    "Eligible jobs are terminal ordinary jobs with completed delivery evidence. Active, unknown, worker-owned, managed-worker-host evidence, process-live, or undelivered jobs fail closed.",
+    "Interrupted .pending-* and .prune-* entries are classified as leftovers and require exact preview/revalidation. Only exact .prune-* leftovers with intact metadata/stdout/stderr can be recovered; incomplete residue is purge-only.",
+    "There is no wildcard, deletion selector, age selector, automatic pruning, or time-based deletion."
+  ].join("\n");
+}
+
+function retentionState(context: Pick<ExtensionContext, "cwd">): { root: string; state: AsyncShellRetentionState } {
+  const root = path.join(jobsRoot(context.cwd), "jobs");
+  let state = retentionSnapshots.get(root);
+  if (!state) {
+    state = {};
+    retentionSnapshots.set(root, state);
+  }
+  return { root, state };
+}
+
+export async function refreshAsyncShellRetentionSnapshot(
+  context: Pick<ExtensionContext, "cwd">,
+  onProgress?: (progress: AsyncShellRetentionProgress) => void,
+  managedWorkerRuntimeRoot?: string
+): Promise<AsyncShellRetentionSnapshot> {
+  const { root, state } = retentionState(context);
+  state.progressListeners ??= new Set();
+  if (onProgress !== undefined) state.progressListeners.add(onProgress);
+  if (state.scan === undefined) {
+    state.progress = { scanned: 0, total: 0 };
+    const scanRevision = state.mutationRevision ?? 0;
+    state.scan = Promise.resolve().then(() => {
+      const managedWorkerJobIds = managedWorkerRuntimeRoot === undefined
+        ? readManagedWorkerHostJobIds()
+        : readManagedWorkerHostJobIds(managedWorkerRuntimeRoot);
+      return scanAsyncShellRetention(root, (progress) => {
+        state.progress = progress;
+        for (const listener of state.progressListeners ?? []) {
+          try { listener(progress); } catch {}
+        }
+      }, managedWorkerJobIds);
+    }).then((snapshot) => {
+      const removed = state.removedNames;
+      const current = removed && removed.size > 0 ? withoutRetentionEntries(snapshot, removed) : snapshot;
+      state.removedNames?.clear();
+      state.lastError = undefined;
+      if ((state.mutationRevision ?? 0) === scanRevision) state.snapshot = current;
+      return current;
+    }).catch((cause) => {
+      state.lastError = cause instanceof Error ? cause.message : String(cause);
+      throw cause;
+    }).finally(() => {
+      state.scan = undefined;
+      state.progress = undefined;
+      state.progressListeners?.clear();
+    });
+  }
+  try {
+    return await state.scan;
+  } finally {
+    if (onProgress !== undefined) state.progressListeners?.delete(onProgress);
+  }
+}
+
+export function latestAsyncShellRetentionSnapshot(context: Pick<ExtensionContext, "cwd">): AsyncShellRetentionSnapshot | undefined {
+  return retentionState(context).state.snapshot;
+}
+
+export async function listEligibleAsyncShellPrune(
+  context: Pick<ExtensionContext, "cwd">,
+  after?: string,
+  limit = 100,
+  inventory: AsyncShellPruneInventory = "eligible"
+): Promise<AsyncShellPrunePage> {
+  if (after !== undefined && !isSafeAsyncShellRegistryName(after)) throw new Error("Prune inventory cursor must be one exact safe registry directory name.");
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error("Prune inventory limit must be from 1 to 100.");
+  const snapshot = await refreshAsyncShellRetentionSnapshot(context);
+  return asyncShellPrunePageFromSnapshot(snapshot, after, limit, inventory);
+}
+
+function asyncShellPrunePageFromSnapshot(
+  snapshot: AsyncShellRetentionSnapshot,
+  after: string | undefined,
+  limit: number,
+  inventory: AsyncShellPruneInventory
+): AsyncShellPrunePage {
+  const matching = snapshot.entries.filter((entry) => inventory === "leftovers"
+    ? entry.kind === "pending" || entry.kind === "prune" || entry.kind === "unknown-leftover"
+    : entry.kind === inventory);
+  const afterIndex = after === undefined ? 0 : matching.findIndex((entry) => entry.name > after);
+  const start = after === undefined ? 0 : afterIndex < 0 ? matching.length : afterIndex;
+  const entries = matching.slice(start, start + limit);
+  const nextAfter = start + entries.length < matching.length ? entries.at(-1)?.name : undefined;
+  return { inventory, entries, snapshot, ...(after === undefined ? {} : { after }), ...(nextAfter === undefined ? {} : { nextAfter }) };
+}
+
+function beginAsyncShellRetentionRefresh(context: Pick<ExtensionContext, "cwd">): AsyncShellRetentionState {
+  const { state } = retentionState(context);
+  if (state.scan === undefined) void refreshAsyncShellRetentionSnapshot(context).catch(() => {});
+  return state;
+}
+
+function previewAsyncShellPruneEntry(
+  root: string,
+  realRoot: string,
+  target: string,
+  managedWorkerJobIds: ReadonlySet<string>
+): AsyncShellPruneEntry {
+  assertValidAsyncShellPruneTarget(target);
+  const logDir = path.join(root, target);
+  if (!existsSync(logDir)) throw new Error(`Async-shell prune target does not exist: ${target}`);
+  const entryStat = lstatSync(logDir);
+  if (!entryStat.isDirectory() || entryStat.isSymbolicLink()) throw new Error(`Async-shell prune target is not an ordinary directory: ${target}`);
+  const realLogDir = realpathSync(logDir);
+  if (path.dirname(realLogDir) !== realRoot || path.basename(realLogDir) !== target) throw new Error(`Async-shell prune target escapes its registry: ${target}`);
+  const leftover = parseAsyncShellLeftoverName(target);
+  if (leftover !== undefined && managedWorkerJobIds.has(leftover.jobId)) throw new Error(`${leftover.jobId}: ${managedWorkerEvidenceReason({ jobId: leftover.jobId }, managedWorkerJobIds)}`);
+  if (leftover?.kind === "pending") {
+    const maybeJob = readMetaFile(path.join(logDir, "meta.json"), root, leftover.jobId);
+    if (maybeJob !== undefined) {
+      assertNotManagedWorkerEvidence(maybeJob, managedWorkerJobIds);
+      assertPrunablePendingArtifact(maybeJob, leftover.jobId);
+    }
+    return { target, kind: "pending", jobId: leftover.jobId, bytes: directoryTreeBytes(logDir), logDir, recoveryEligible: false };
+  }
+  const jobId = leftover?.jobId ?? target;
+  const job = readMetaFile(path.join(logDir, "meta.json"), root, jobId);
+  if (!job && leftover?.kind === "prune") {
+    return { target, kind: "prune", jobId, bytes: directoryTreeBytes(logDir), logDir, recoveryEligible: false };
+  }
+  if (!job) throw new Error(`Async-shell job metadata is missing or invalid: ${target}`);
+  assertNotManagedWorkerEvidence(job, managedWorkerJobIds);
+  if (leftover?.kind === "prune" && !isTerminal(job.status)) {
+    assertPrunablePendingArtifact(job, jobId);
+    return { target, kind: "prune", jobId, status: job.status, bytes: directoryTreeBytes(logDir), logDir, recoveryEligible: false };
+  }
+  assertPrunableAsyncShellJob(job, jobId);
+  if (leftover === undefined) {
+    if (realpathSync(job.logDir) !== realLogDir) throw new Error(`Async-shell job metadata path escapes its registry: ${jobId}`);
+  }
+  return {
+    target,
+    kind: leftover?.kind ?? "job",
+    jobId,
+    status: job.status,
+    bytes: directoryTreeBytes(logDir),
+    logDir,
+    recoveryEligible: leftover?.kind === "prune" && !existsSync(path.join(root, jobId)) && hasRecoverableAsyncShellPruneEvidence(logDir)
+  };
+}
+
+function hasRecoverableAsyncShellPruneEvidence(logDir: string): boolean {
+  for (const name of ["meta.json", "stdout.log", "stderr.log"]) {
+    const candidate = path.join(logDir, name);
+    try {
+      const info = lstatSync(candidate);
+      if (!info.isFile() || info.isSymbolicLink()) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+function assertNotManagedWorkerEvidence(job: JobMeta, managedWorkerJobIds: ReadonlySet<string>): void {
+  const reason = managedWorkerEvidenceReason(job as unknown as Record<string, unknown>, managedWorkerJobIds);
+  if (reason !== undefined) throw new Error(`${job.jobId}: ${reason}`);
+}
+
+function assertPrunablePendingArtifact(job: JobMeta, jobId: string): void {
+  const live = jobs.get(jobId);
+  if (job.owner !== undefined) throw new Error(`Worker-owned async artifact must be removed through worker cleanup: ${jobId}`);
+  if (live !== undefined && (!isTerminal(live.status) || live.activeWaiters > 0)) throw new Error(`Async-shell job is still active: ${jobId}`);
+  if (live?.completionFollowUpQueued) throw new Error(`Async-shell job still has a queued completion follow-up: ${jobId}`);
+  if (isAsyncJobExecutionAlive(job.pid, job.processToken)) throw new Error(`Async-shell job process identity is still alive: ${jobId}`);
+}
+
+function assertPrunableAsyncShellJob(job: JobMeta, jobId: string): void {
+  const live = jobs.get(jobId);
+  if (job.owner !== undefined) throw new Error(`Worker-owned async job must be removed through worker cleanup: ${jobId}`);
+  if (!isTerminal(job.status) || job.status === "unknown") throw new Error(`Async-shell job is not terminal: ${jobId} (${job.status})`);
+  if (live !== undefined && (!isTerminal(live.status) || live.activeWaiters > 0)) throw new Error(`Async-shell job is still active: ${jobId}`);
+  if (job.notifyOnExit && !job.completionNotified) throw new Error(`Async-shell job still has undelivered completion evidence: ${jobId}`);
+  if (live?.completionFollowUpQueued) throw new Error(`Async-shell job still has a queued completion follow-up: ${jobId}`);
+  if (isAsyncJobExecutionAlive(job.pid, job.processToken)) throw new Error(`Async-shell job process identity is still alive: ${jobId}`);
+}
+
+function directoryTreeBytes(target: string): number {
+  const info = lstatSync(target);
+  if (info.isSymbolicLink()) return 0;
+  if (!info.isDirectory()) return info.isFile() ? info.size : 0;
+  return readdirSync(target, { withFileTypes: true }).reduce((total, entry) => total + directoryTreeBytes(path.join(target, entry.name)), 0);
+}
+
+export function previewAsyncShellPrune(
+  context: Pick<ExtensionContext, "cwd">,
+  targets: string[],
+  managedWorkerJobIds: ReadonlySet<string> = readManagedWorkerHostJobIds()
+): AsyncShellPruneEntry[] {
+  if (targets.length === 0) throw new Error(buildAsyncShellPruneUsage());
+  if (targets.length > 250) throw new Error("Prune accepts at most 250 exact targets.");
+  const root = path.join(jobsRoot(context.cwd), "jobs");
+  const realRoot = realpathSync(root);
+  return targets.map((target) => previewAsyncShellPruneEntry(root, realRoot, target, managedWorkerJobIds));
+}
+
+export function pruneAsyncShellJobs(context: Pick<ExtensionContext, "cwd">, targets: string[]): AsyncShellPruneEntry[] {
+  const entries = previewAsyncShellPrune(context, targets);
+  const renamed: Array<{ entry: AsyncShellPruneEntry; trash: string }> = [];
+  try {
+    for (const entry of entries) {
+      const trash = path.join(path.dirname(entry.logDir), `.prune-${entry.jobId}-${randomUUID()}`);
+      renameSync(entry.logDir, trash);
+      renamed.push({ entry, trash });
+    }
+  } catch (error) {
+    for (const item of renamed.reverse()) {
+      try { renameSync(item.trash, item.entry.logDir); } catch {}
+    }
+    invalidateAsyncShellRetentionSnapshot(context);
+    throw error;
+  }
+  let removed = 0;
+  try {
+    for (const item of renamed) {
+      rmSync(item.trash, { recursive: true, force: false });
+      removed += 1;
+    }
+  } catch (error) {
+    for (const item of renamed.slice(0, removed)) if (item.entry.kind === "job") forgetAsyncShellJob(item.entry.jobId);
+    // Do not rename a partially removed directory back to a canonical job ID.
+    // Complete entries remain under their classified .prune-* names and can be
+    // recovered through the exact preview/confirm path.
+    invalidateAsyncShellRetentionSnapshot(context);
+    const retained = renamed.slice(removed).filter((item) => existsSync(item.trash)).map((item) => path.basename(item.trash));
+    throw new Error(`${error instanceof Error ? error.message : String(error)}${retained.length > 0 ? `; retained classified purge/recovery residue: ${retained.join(", ")}` : ""}`);
+  }
+  for (const item of renamed) if (item.entry.kind === "job") forgetAsyncShellJob(item.entry.jobId);
+  subtractAsyncShellRetentionEntries(context, entries);
+  return entries;
+}
+
+export function recoverAsyncShellPruneLeftovers(context: Pick<ExtensionContext, "cwd">, targets: string[]): AsyncShellPruneEntry[] {
+  const entries = previewAsyncShellPrune(context, targets);
+  for (const entry of entries) {
+    if (entry.kind !== "prune" || !entry.recoveryEligible) throw new Error(`Async-shell leftover is not recoverable: ${entry.target}`);
+  }
+  const root = path.join(jobsRoot(context.cwd), "jobs");
+  const recovered: AsyncShellPruneEntry[] = [];
+  try {
+    for (const entry of entries) {
+      const destination = path.join(root, entry.jobId);
+      if (existsSync(destination)) throw new Error(`Cannot recover ${entry.target}; ${entry.jobId} already exists.`);
+      renameSync(entry.logDir, destination);
+      recovered.push(entry);
+    }
+  } catch (error) {
+    for (const entry of recovered.reverse()) {
+      try { renameSync(path.join(root, entry.jobId), entry.logDir); } catch {}
+    }
+    invalidateAsyncShellRetentionSnapshot(context);
+    throw error;
+  }
+  invalidateAsyncShellRetentionSnapshot(context);
+  return entries;
+}
+
+function withoutRetentionEntries(snapshot: AsyncShellRetentionSnapshot, removedNames: ReadonlySet<string>): AsyncShellRetentionSnapshot {
+  const entries = snapshot.entries.filter((entry) => !removedNames.has(entry.name));
+  const recentJobs = snapshot.recentJobs.filter((job) => typeof job.jobId !== "string" || !removedNames.has(job.jobId));
+  return { ...snapshot, entries, recentJobs, totals: summarizeAsyncShellRetentionEntries(entries) };
+}
+
+function subtractAsyncShellRetentionEntries(context: Pick<ExtensionContext, "cwd">, entries: AsyncShellPruneEntry[]): void {
+  const { state } = retentionState(context);
+  state.removedNames ??= new Set<string>();
+  for (const entry of entries) state.removedNames.add(entry.target);
+  if (state.snapshot !== undefined) state.snapshot = withoutRetentionEntries(state.snapshot, state.removedNames);
+}
+
+function invalidateAsyncShellRetentionSnapshot(context: Pick<ExtensionContext, "cwd">): void {
+  const { state } = retentionState(context);
+  state.snapshot = undefined;
+  state.mutationRevision = (state.mutationRevision ?? 0) + 1;
+  // Preserve an in-flight scan so another command joins it rather than starting
+  // a second full scan. A stale completion is discarded; the next request starts
+  // one fresh scan.
+}
+
+function forgetAsyncShellJob(jobId: string): void {
+  jobs.delete(jobId);
+  pendingCompletionNotifications.delete(jobId);
+  scheduledCompletionJobIds.delete(jobId);
+  for (const [deliveryId, batch] of completionDeliveryBatches) {
+    batch.jobIds.delete(jobId);
+    if (batch.jobIds.size === 0) completionDeliveryBatches.delete(deliveryId);
+  }
+  notifyAsyncShellActivity();
+}
+
+export async function handleAsyncShellPruneCommand(context: ExtensionCommandContext, rawArgs: string): Promise<void> {
+  let args: AsyncShellPruneArgs;
+  try {
+    args = parseAsyncShellPruneArgs(rawArgs);
+  } catch (error) {
+    context.ui.notify(error instanceof Error ? error.message : String(error), "error");
+    return;
+  }
+  if (args.help) {
+    context.ui.notify(buildAsyncShellPruneUsage(), "info");
+    return;
+  }
+  try {
+    if (args.inventory !== undefined) {
+      const state = beginAsyncShellRetentionRefresh(context);
+      if (state.snapshot === undefined) {
+        if (state.lastError !== undefined) {
+          context.ui.notify(`Async-shell inventory protection failed closed: ${state.lastError}${state.scan !== undefined ? " A background retry is in progress." : ""}`, "error");
+          return;
+        }
+        const progress = state.progress;
+        context.ui.notify(progress && progress.total > 0
+          ? `Async-shell inventory scan in progress: ${progress.scanned}/${progress.total} entries. Run the same command again for the latest completed snapshot.`
+          : "Async-shell inventory scan started asynchronously. Run the same command again for progress or the latest completed snapshot.", "info");
+        return;
+      }
+      const page = asyncShellPrunePageFromSnapshot(state.snapshot, args.after, args.limit, args.inventory);
+      const total = args.inventory === "eligible" ? page.snapshot.totals.eligible
+        : args.inventory === "ineligible" ? page.snapshot.totals.ineligible
+          : page.snapshot.totals.leftovers;
+      const pageBytes = page.entries.reduce((sum, entry) => sum + entry.bytes, 0);
+      const exactTargets = page.entries.map((entry) => entry.name);
+      const actionableTargets = page.entries
+        .filter((entry) => entry.kind === "eligible" || entry.kind === "pending" || entry.kind === "prune")
+        .map((entry) => entry.name);
+      context.ui.notify([
+        `${capitalize(args.inventory)} inventory: ${total.count} total (${formatBytes(total.bytes)}); page ${page.entries.length} (${formatBytes(pageBytes)}). Registry: ${page.snapshot.totals.directories} stored entries, ${formatBytes(page.snapshot.totals.bytes)}.`,
+        `Snapshot ${page.snapshot.scannedAt}; ${state.progress && state.progress.total > 0 ? `refresh ${state.progress.scanned}/${state.progress.total}` : "refresh started"}.`,
+        state.lastError === undefined ? undefined : `Protection warning: latest refresh failed closed: ${state.lastError}`,
+        `Eligible ${page.snapshot.totals.eligible.count} (${formatBytes(page.snapshot.totals.eligible.bytes)}); ineligible ${page.snapshot.totals.ineligible.count} (${formatBytes(page.snapshot.totals.ineligible.bytes)}); leftovers ${page.snapshot.totals.leftovers.count} (${formatBytes(page.snapshot.totals.leftovers.bytes)}: ${page.snapshot.totals.pending.count} pending, ${page.snapshot.totals.prune.count} prune, ${page.snapshot.totals.unknownLeftovers.count} unknown).`,
+        ...page.entries.map((entry) => `${entry.name} · ${entry.kind}${entry.status ? `/${entry.status}` : ""} · ${formatBytes(entry.bytes)} · ${entry.reason}`),
+        exactTargets.length > 0 ? `Exact IDs: ${exactTargets.join(" ")}` : "No exact IDs in this page.",
+        actionableTargets.length > 0 ? `Preview actionable exact targets: /async:prune ${actionableTargets.join(" ")}` : undefined,
+        page.nextAfter === undefined ? "End of inventory." : `Next page: /async:prune --${args.inventory} --after ${page.nextAfter} --limit ${args.limit}`
+      ].filter((line): line is string => line !== undefined).join("\n"), "info");
+      return;
+    }
+    const entries = args.confirm
+      ? args.recover ? recoverAsyncShellPruneLeftovers(context, args.targets) : pruneAsyncShellJobs(context, args.targets)
+      : previewAsyncShellPrune(context, args.targets);
+    const bytes = entries.reduce((sum, entry) => sum + entry.bytes, 0);
+    const action = args.recover ? args.confirm ? "Recovered" : "Recovery preview" : args.confirm ? "Pruned" : "Prune preview";
+    context.ui.notify(
+      `${action}: ${entries.length} target${entries.length === 1 ? "" : "s"}, ${formatBytes(bytes)}\n${entries.map((entry) => `${entry.target} · ${entry.kind}${entry.status ? `/${entry.status}` : ""}${entry.kind === "prune" ? entry.recoveryEligible ? " · recoverable" : " · purge-only" : ""} · ${formatBytes(entry.bytes)}`).join("\n")}${args.confirm ? "" : `\nRun the same exact command with --confirm to ${args.recover ? "recover" : "delete"}.`}`,
+      args.confirm ? "info" : "warning"
+    );
+  } catch (error) {
+    context.ui.notify(error instanceof Error ? error.message : String(error), "error");
+  }
+}
+
+function capitalize(value: string): string {
+  return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
 export function parseAsyncShellViewerArgs(rawArgs: string): AsyncShellViewerArgs {
   const tokens = rawArgs.trim() === "" ? [] : rawArgs.trim().split(/\s+/);
   const result: AsyncShellViewerArgs = {
@@ -1919,9 +2665,15 @@ export async function handleAsyncShellViewerCommand(context: ExtensionCommandCon
 }
 
 async function pickAsyncShellViewerJob(context: ExtensionCommandContext): Promise<string | undefined> {
-  const recentJobs = listJobs(context, ASYNC_SHELL_VIEWER_MAX_JOBS);
+  const hadSnapshot = latestAsyncShellRetentionSnapshot(context) !== undefined;
+  const recentJobs = await listJobs(context, ASYNC_SHELL_VIEWER_MAX_JOBS);
   if (recentJobs.length === 0) {
-    context.ui.notify(`No async-shell jobs found under ${jobsRoot(context.cwd)}.`, "warning");
+    const retentionError = retentionState(context).state.lastError;
+    context.ui.notify(retentionError !== undefined
+      ? `Async-shell history protection failed closed: ${retentionError}`
+      : hadSnapshot
+        ? `No async-shell jobs found under ${jobsRoot(context.cwd)}.`
+        : "Async-shell history scan started in the background. Run /async:view again for the latest completed snapshot.", retentionError !== undefined || hadSnapshot ? "warning" : "info");
     return undefined;
   }
 
@@ -2253,18 +3005,84 @@ function statusColor(status: JobStatus): "success" | "error" | "warning" | "mute
   return "muted";
 }
 
-export function buildAsyncShellStatusText(context: Pick<ExtensionContext, "cwd">): string {
+function formatAsyncShellDeliveryBacklog(
+  context: Pick<ExtensionContext, "cwd"> & Partial<Pick<ExtensionContext, "sessionManager">>
+): string {
+  let sessionId: string | undefined;
+  try { sessionId = context.sessionManager?.getSessionId(); } catch {}
+  if (!sessionId) return "Completion delivery backlog: unavailable without an exact session ID.";
+  const claimedIds = new Set<string>();
+  let batches = 0;
+  for (const batch of completionDeliveryBatches.values()) {
+    if (batch.originSessionId !== sessionId) continue;
+    const matching = Array.from(batch.jobIds).filter((jobId) => jobs.get(jobId)?.originProjectCwd === context.cwd);
+    if (matching.length === 0) continue;
+    batches += 1;
+    matching.forEach((jobId) => claimedIds.add(jobId));
+  }
+  const unsentIds = Array.from(pendingCompletionNotifications.values())
+    .filter((job) => job.originSessionId === sessionId && job.originProjectCwd === context.cwd && !job.reportedInBand && job.notifyOnExit && !job.completionFollowUpQueued)
+    .map((job) => job.jobId);
+  const exact = [...claimedIds, ...unsentIds].slice(0, 20);
+  return `Completion delivery backlog: ${claimedIds.size} claimed in ${batches} unreceipted batch${batches === 1 ? "" : "es"}; ${unsentIds.length} unsent.${exact.length > 0 ? ` Exact job IDs (up to 20): ${exact.join(" ")}` : ""}`;
+}
+
+function buildLatestAsyncShellStatusText(context: Pick<ExtensionContext, "cwd"> & Partial<Pick<ExtensionContext, "sessionManager">>): string {
   const root = jobsRoot(context.cwd);
-  const recentJobs = listJobs(context as ExtensionContext, 20);
-  const running = recentJobs.filter((job) => job.status === "running").length;
-  const terminal = recentJobs.length - running;
+  const state = beginAsyncShellRetentionRefresh(context);
+  if (state.snapshot === undefined) {
+    const progress = state.progress;
+    return [
+      "Async shell status",
+      "",
+      `Job root: ${root}`,
+      `Job root state: ${describePathAccess(root)}`,
+      formatAsyncShellDeliveryBacklog(context),
+      state.lastError !== undefined
+        ? `Storage protection failed closed: ${state.lastError}${state.scan !== undefined ? " A background retry is in progress." : ""}`
+        : progress && progress.total > 0
+          ? `Storage scan in progress: ${progress.scanned}/${progress.total} entries. Run /async:status again for the latest completed snapshot.`
+          : "Storage scan started asynchronously. Run /async:status again for progress or the latest completed snapshot."
+    ].join("\n");
+  }
+  const totals = state.snapshot.totals;
+  const progress = state.progress;
   return [
     "Async shell status",
     "",
     `Job root: ${root}`,
     `Job root state: ${describePathAccess(root)}`,
+    `Latest storage snapshot: ${state.snapshot.scannedAt} (${formatDuration(state.snapshot.durationMs)} scan)`,
+    `Stored entries: ${totals.directories}, ${formatBytes(totals.bytes)}`,
+    `Eligible: ${totals.eligible.count}, ${formatBytes(totals.eligible.bytes)}; ineligible: ${totals.ineligible.count}, ${formatBytes(totals.ineligible.bytes)}; leftovers: ${totals.leftovers.count}, ${formatBytes(totals.leftovers.bytes)}`,
+    `Leftovers: ${totals.pending.count} pending (${formatBytes(totals.pending.bytes)}), ${totals.prune.count} prune (${formatBytes(totals.prune.bytes)}), ${totals.unknownLeftovers.count} unknown (${formatBytes(totals.unknownLeftovers.bytes)})`,
+    formatAsyncShellDeliveryBacklog(context),
+    state.lastError !== undefined
+      ? `Storage protection warning: latest refresh failed closed: ${state.lastError}${state.scan !== undefined ? " A background retry is in progress." : ""}`
+      : progress && progress.total > 0 ? `Refresh in progress: ${progress.scanned}/${progress.total} entries.` : "Refresh started asynchronously."
+  ].join("\n");
+}
+
+export async function buildAsyncShellStatusText(context: Pick<ExtensionContext, "cwd"> & Partial<Pick<ExtensionContext, "sessionManager">>): Promise<string> {
+  const root = jobsRoot(context.cwd);
+  const snapshot = await refreshAsyncShellRetentionSnapshot(context);
+  const recentJobs = jobsFromRetentionSnapshot(context as ExtensionContext, snapshot, 20);
+  const running = recentJobs.filter((job) => job.status === "running").length;
+  const terminal = recentJobs.length - running;
+  const totals = snapshot.totals;
+  return [
+    "Async shell status",
+    "",
+    `Job root: ${root}`,
+    `Job root state: ${describePathAccess(root)}`,
+    `Storage snapshot: ${snapshot.scannedAt} (${formatDuration(snapshot.durationMs)} scan)`,
+    `Stored entries: ${totals.directories}, ${formatBytes(totals.bytes)}`,
+    `Eligible: ${totals.eligible.count}, ${formatBytes(totals.eligible.bytes)}; ineligible: ${totals.ineligible.count}, ${formatBytes(totals.ineligible.bytes)}; leftovers: ${totals.leftovers.count}, ${formatBytes(totals.leftovers.bytes)}`,
+    `Leftovers: ${totals.pending.count} pending (${formatBytes(totals.pending.bytes)}), ${totals.prune.count} prune (${formatBytes(totals.prune.bytes)}), ${totals.unknownLeftovers.count} unknown (${formatBytes(totals.unknownLeftovers.bytes)})`,
+    formatAsyncShellDeliveryBacklog(context),
     `Recent jobs: ${recentJobs.length} (${running} running, ${terminal} terminal or detached)`,
     running > 0 ? "Use /async:view for provider-free human viewing, shell_status without a jobId to list jobs, shell_read for model inspection, or shell_cancel to stop a running job. Do not poll; completion notices will be batched into history and resume the agent." : "No running jobs in the recent async-shell registry. Use /async:view to inspect historical output.",
+    totals.leftovers.count > 0 ? "Inspect bounded exact leftover IDs with /async:prune --leftovers. Recovery or deletion requires exact preview and confirmation." : undefined,
     recentJobs.some((job) => job.status === "unknown") ? "Some jobs were started by a previous Pi process and are no longer attached." : undefined
   ].filter((line): line is string => line !== undefined).join("\n");
 }
@@ -2666,9 +3484,8 @@ function shellStatusText(job: ShellJobStatusFields): string {
   if (job.status === "exited" && (job.exitCode === 0 || job.exitCode === undefined)) {
     return "ok";
   }
-  if (job.status === "failed" && job.exitCode !== undefined && job.exitCode !== null) {
-    return `exit ${job.exitCode}`;
-  }
+  if (job.status === "failed" && job.exitCode === 0) return "failed (process exit 0)";
+  if (job.status === "failed" && job.exitCode !== undefined && job.exitCode !== null) return `exit ${job.exitCode}`;
   if (job.status === "cancelled") {
     return "cancelled";
   }

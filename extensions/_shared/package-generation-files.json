@@ -23,6 +23,7 @@
     "extensions/_shared/worker-job-settlement.js",
     "extensions/_shared/workspace-sandbox.ts",
     "extensions/async-shell/index.ts",
+    "extensions/async-shell/retention.ts",
     "extensions/worker/cache-lineage.ts",
     "extensions/worker/contract.ts",
     "extensions/worker/identity.ts",

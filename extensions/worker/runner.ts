@@ -65,7 +65,8 @@ export function launchWorkerHost(api: ExtensionAPI, context: ExtensionContext, i
       PI_WORKER_WORKSPACE_ROOT: record.workspaceRoot, PI_WORKER_STATE_ROOT: config.stateRoot, PI_WORKER_ASYNC_JOB_ROOT: config.asyncJobRoot,
       PI_WORKER_TASK_IDS: JSON.stringify(record.taskIds), PI_WORKER_ROLE: config.role, PI_WORKER_BD_PATH: config.bdPath,
       PI_WORKER_BEADS_ROUTE: JSON.stringify(config.beadsRoute), ...(config.cacheLineage ? { PI_WORKER_CACHE_LINEAGE: JSON.stringify(config.cacheLineage) } : {}), ...workerShellEnvironment(config.shellExecution) },
-    notifyOnExit: false, settleProcessGroup: true, processToken: hostProcessToken
+    notifyOnExit: false, settleProcessGroup: true, processToken: hostProcessToken,
+    managedBy: { kind: "worker-host", workerId: record.workerId, runId: record.runId }
   });
   return { handle, config, configFile };
 }
