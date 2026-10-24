@@ -25,8 +25,8 @@ test("additional inputs reject sensitive roots, aliases, duplicates, and overlap
     assert.throws(() => validateAdditionalInputs({ values: [workspace], role: "work", workspaceRoot: workspace, runtimeRoot: runtime }), /sensitive/);
     assert.throws(() => validateAdditionalInputs({ values: [data, nested], role: "review", workspaceRoot: workspace, runtimeRoot: runtime }), /overlap/);
     const alias = path.join(root, "alias"); symlinkSync(data, alias); assert.throws(() => validateAdditionalInputs({ values: [data, alias], role: "work", workspaceRoot: workspace, runtimeRoot: runtime }), /Duplicate/);
-    const retained = validateAdditionalInputs({ values: [path.join(data, "a.txt")], role: "integration", workspaceRoot: workspace, runtimeRoot: runtime }); assert.equal(retained[0]?.target, "/integration/inputs/01-a.txt"); assert.equal(inputMounts(retained)[0]?.readOnly, true);
-    const more = path.join(root, "more.txt"); writeFileSync(more, "more"); const resumed = validateAdditionalInputs({ values: [more], existing: retained, role: "integration", workspaceRoot: workspace, runtimeRoot: runtime }); assert.deepEqual(resumed.map((item) => item.target), ["/integration/inputs/01-a.txt", "/integration/inputs/02-more.txt"]);
+    const retained = validateAdditionalInputs({ values: [path.join(data, "a.txt")], role: "integration", workspaceRoot: workspace, runtimeRoot: runtime }); assert.equal(retained[0]?.target, path.join(data, "a.txt")); assert.equal(inputMounts(retained)[0]?.readOnly, true);
+    const more = path.join(root, "more.txt"); writeFileSync(more, "more"); const resumed = validateAdditionalInputs({ values: [more], existing: retained, role: "integration", workspaceRoot: workspace, runtimeRoot: runtime }); assert.deepEqual(resumed.map((item) => item.target), [path.join(data, "a.txt"), more]);
   } finally { rmSync(root, { recursive: true, force: true }); } });
 
 test("trusted Git rejects linked candidate worktrees and gitlinks while accepting inert nested content", () => {

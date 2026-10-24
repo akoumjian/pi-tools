@@ -1262,7 +1262,7 @@ test("shell_cancel transitions a running job to cancelled and suppresses complet
   });
 });
 
-test("managed worker shell launch fails closed without an exact Docker identity", async () => {
+test("managed worker shell launch fails closed outside its Sandbox runtime", async () => {
   await withTempDir(async (dir) => {
     await Promise.all([
       mkdir(path.join(dir, "cache", "config"), { recursive: true }),
@@ -1287,7 +1287,7 @@ test("managed worker shell launch fails closed without an exact Docker identity"
         executable: process.execPath,
         args: ["-e", "process.exit(0)"],
         notifyOnExit: false
-      }), /requires an exact Docker container identity/);
+      }), /requires the in-Sandbox runtime/);
     });
   });
 });

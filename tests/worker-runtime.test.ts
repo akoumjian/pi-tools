@@ -47,13 +47,13 @@ if (args.includes("where")) {
   const values: Record<string, string> = {
     PI_WORKER_ID: "worker_20260101000000_aaaaaaaa", PI_WORKER_RUN_ID: "run_20260101000000_aaaaaaaa", PI_WORKER_ROLE: role,
     PI_WORKER_RESULT_FILE: path.join(root, "state", "result.json"), PI_WORKER_WORKSPACE_ROOT: root,
-    PI_WORKER_STATE_ROOT: path.join(root, "state"), PI_WORKER_ASYNC_JOB_ROOT: path.join(root, "state", "async-shell"),
+    PI_WORKER_STATE_ROOT: root, PI_WORKER_SUPERVISION_ROOT: path.join(root, "state"), PI_WORKER_ASYNC_JOB_ROOT: path.join(root, "state", "async-shell"),
     PI_WORKER_TASK_IDS: JSON.stringify(["personal-test"]), PI_WORKER_AUTHORIZATION_FILE: path.join(root, "state", "host-authorization.json"),
     PI_WORKER_PROCESS_NONCE: "test-nonce", PI_WORKER_PARENT_PID: String(process.pid),
     PI_WORKER_BD_PATH: bdPath, PI_WORKER_BEADS_ROUTE: JSON.stringify(beadsRoute), BEADS_DIR: beadsDir,
     FAKE_BEADS_ROUTE: JSON.stringify(beadsRoute), FAKE_BEADS_TASKS_FILE: beadsTasksFile
   };
-  await writeFile(values.PI_WORKER_AUTHORIZATION_FILE!, JSON.stringify({ version: 1, workerId: values.PI_WORKER_ID, runId: values.PI_WORKER_RUN_ID, processNonce: values.PI_WORKER_PROCESS_NONCE }));
+  await writeFile(values.PI_WORKER_AUTHORIZATION_FILE!, JSON.stringify({ version: 2, workerId: values.PI_WORKER_ID, runId: values.PI_WORKER_RUN_ID, processNonce: values.PI_WORKER_PROCESS_NONCE }));
   const old = new Map(Object.keys(values).map((key) => [key, process.env[key]])); Object.assign(process.env, values);
   try { const api = fakeApi(); workerRuntimeExtension(api); await run(root, api); }
   finally { for (const [key, value] of old) value === undefined ? delete process.env[key] : process.env[key] = value; await rm(root, { recursive: true, force: true }); }
@@ -95,22 +95,15 @@ test("review decisions require a retained report and cannot report repositories"
     const rejected = await tool.execute!("call", { outcome: "approve", summary: "Approved." }, undefined, undefined, undefined as never);
     assert.equal((rejected.details as { status: string }).status, "rejected");
     await mkdir(path.join(root, "reports")); await writeFile(path.join(root, "reports", "review.md"), "# Review\n");
-    const result = await tool.execute!("call", { outcome: "approve", summary: "Approved.", artifacts: ["/workspace/reports/review.md"] }, undefined, undefined, undefined as never);
+    const result = await tool.execute!("call", { outcome: "approve", summary: "Approved.", artifacts: [path.join(root, "reports", "review.md")] }, undefined, undefined, undefined as never);
     assert.equal((result.details as { status: string }).status, "accepted");
   });
 });
 
-test("worker RPC arguments use plain role instructions rather than injected skills", () => {
-  const config = {
-    version: 1, workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_aaaaaaaa", sessionId: "session", sessionFile: "/tmp/session.jsonl", sessionDir: "/tmp",
-    workspaceRoot: "/tmp/workspace", stateRoot: "/tmp/state", asyncJobRoot: "/tmp/jobs", taskIds: ["personal-test"], role: "work", resultFile: "/tmp/result", settledFile: "/tmp/settled",
-    processFile: "/tmp/process", processNonce: "nonce", hostConfigFile: "/tmp/host", authorizationFile: "/tmp/auth", prompt: "prompt",
-    provider: "openai-codex", model: "gpt", thinkingLevel: "xhigh", piCliPath: "/bin/pi", bdPath: "/bin/bd", beadsRoute: { prefix: "personal", path: "/beads", databasePath: "/beads/db" },
-    extensionPaths: ["/worker/runtime.js"], shellExecution: { kind: "native-test" }, rpcArgs: []
-  } satisfies WorkerHostConfig;
+test("worker RPC arguments use immutable extensions and complete built-in tools", () => {
+  const config = { provider: "openai-codex", model: "gpt", thinkingLevel: "xhigh", sessionFile: "/tmp/session.jsonl", sessionDir: "/tmp", sandbox: { extensionPaths: ["/opt/pi-tools/extensions/worker/runtime.ts"] } } as WorkerHostConfig;
   const args = buildWorkerRpcArgs(config);
-  assert.equal(args.includes("--skill"), false);
-  assert.equal(args.includes("--no-skills"), true);
+  assert.equal(args.includes("--skill"), false); assert.equal(args.includes("--no-skills"), true); assert.equal(args.includes("--no-builtin-tools"), false); assert.ok(args.includes("/opt/pi-tools/extensions/worker/runtime.ts"));
 });
 
 test("result submission rejects parent-directory symlink escapes with a coded non-sealing result", async () => {
@@ -137,7 +130,7 @@ test("runtime rejects a result-file parent that resolves outside trusted state",
       await symlink(outside, path.join(root, "state", "escape"));
       process.env.PI_WORKER_RESULT_FILE = path.join(root, "state", "escape", "result.json");
       const tool = api.tools.find((candidate) => candidate.name === "worker_result_submit")!;
-      await assert.rejects(() => tool.execute!("call", { outcome: "completed", summary: "probe" }, undefined, undefined, undefined as never), /state paths must remain beneath/);
+      await assert.rejects(() => tool.execute!("call", { outcome: "completed", summary: "probe" }, undefined, undefined, undefined as never), /supervision\/worker-root boundary/);
       assert.equal(existsSync(path.join(outside, "result.json")), false);
     } finally { if (prior === undefined) delete process.env.PI_WORKER_RESULT_FILE; else process.env.PI_WORKER_RESULT_FILE = prior; await rm(outside, { recursive: true, force: true }); }
   });
@@ -280,4 +273,58 @@ test("Beads design continuation rejects missing, malformed, and stale full-desig
     const restartedText = restarted.content[0]!.type === "text" ? restarted.content[0]!.text : "";
     assert.equal((JSON.parse(restartedText) as { design: { sha256: string } }).design.sha256, sha256(revised));
   });
+});
+
+test("remote result submission does not retry host commit when pre-admission runtime-state publication fails", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-worker-remote-admission-"));
+  const asyncRoot = path.join(root, "async-shell"); await mkdir(asyncRoot, { recursive: true });
+  const values: Record<string, string> = {
+    PI_WORKER_HOST_RPC: "1",
+    PI_WORKER_ID: "worker_20260101000000_bbbbbbbb",
+    PI_WORKER_RUN_ID: "run_20260101000000_bbbbbbbb",
+    PI_WORKER_ROLE: "work",
+    PI_WORKER_WORKSPACE_ROOT: root,
+    PI_WORKER_ASYNC_JOB_ROOT: asyncRoot
+  };
+  const previous = new Map(Object.keys(values).map((key) => [key, process.env[key]])); Object.assign(process.env, values);
+  const services: string[] = []; const tools: ToolDefinition[] = [];
+  const api = {
+    registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, on() {}, sendMessage() {},
+    async requestHost(service: string): Promise<unknown> { services.push(service); if (service === "worker_runtime_state") throw new Error("state transport probe"); throw new Error(`unexpected host request ${service}`); }
+  } as unknown as ExtensionAPI;
+  try {
+    workerRuntimeExtension(api);
+    const tool = tools.find((candidate) => candidate.name === "worker_result_submit")!;
+    const result = await tool.execute!("call", { outcome: "completed", summary: "must not commit" }, undefined, undefined, undefined as never);
+    assert.equal((result.details as { status: string }).status, "rejected");
+    assert.ok(services.length >= 1); assert.ok(services.every((service) => service === "worker_runtime_state"), "a failed pre-admission state publication must never reach result commit");
+  } finally {
+    for (const [key, value] of previous) value === undefined ? delete process.env[key] : process.env[key] = value;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("remote conflicting result replay preserves the accepted guest admission seal", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-worker-remote-replay-")); const asyncRoot = path.join(root, "async-shell"); await mkdir(asyncRoot, { recursive: true });
+  const values: Record<string, string> = { PI_WORKER_HOST_RPC: "1", PI_WORKER_ID: "worker_20260101000000_cccccccc", PI_WORKER_RUN_ID: "run_20260101000000_cccccccc", PI_WORKER_ROLE: "work", PI_WORKER_WORKSPACE_ROOT: root, PI_WORKER_ASYNC_JOB_ROOT: asyncRoot };
+  const previous = new Map(Object.keys(values).map((key) => [key, process.env[key]])); Object.assign(process.env, values);
+  const tools: ToolDefinition[] = []; const handlers = new Map<string, Function[]>(); let submissions = 0; let stateReports = 0; let acceptedStateReports = 0;
+  const api = {
+    registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, sendMessage() {}, on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
+    async requestHost(service: string, payload: unknown): Promise<unknown> {
+      if (service === "worker_runtime_state") { const state = payload as { sequence: number; admissionState: string }; stateReports += 1; if (state.admissionState === "accepted" && ++acceptedStateReports === 1) throw new Error("accepted-state transport probe"); return { accepted: true, sequence: state.sequence }; }
+      if (service === "worker_result_submit" && submissions++ === 0) return { content: [{ type: "text", text: "accepted" }], details: { status: "accepted", outcome: "completed" } };
+      throw new Error("conflicting payload probe");
+    }
+  } as unknown as ExtensionAPI;
+  try {
+    workerRuntimeExtension(api); const tool = tools.find((candidate) => candidate.name === "worker_result_submit")!;
+    const committed = await tool.execute!("first", { outcome: "completed", summary: "first" }, undefined, undefined, undefined as never); assert.equal((committed.details as { status: string }).status, "rejected", "lost accepted-state delivery must report transport failure without reopening");
+    await handlers.get("agent_end")?.[0]?.({}); assert.ok(stateReports >= 2); assert.ok(acceptedStateReports >= 2, "a later state transition must recover the failed accepted-state delivery");
+    const conflicting = await tool.execute!("second", { outcome: "completed", summary: "different" }, undefined, undefined, undefined as never); assert.equal((conflicting.details as { status: string }).status, "rejected");
+    const guard = handlers.get("tool_call")?.[0]?.({ toolName: "shell_start" }); assert.deepEqual(guard, { block: true, reason: "Worker run is sealed during or after result admission." });
+  } finally {
+    for (const [key, value] of previous) value === undefined ? delete process.env[key] : process.env[key] = value;
+    await rm(root, { recursive: true, force: true });
+  }
 });

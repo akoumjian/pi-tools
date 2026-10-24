@@ -10,7 +10,7 @@ const RunId = Type.String({ minLength: 1, maxLength: 128, pattern: "^run_[A-Za-z
 const PreparedId = Type.String({ pattern: "^prepared_[0-9a-f]{24}$", description: "Prepared repository-set identity returned by worker_merge_test." });
 const CompletionDelivery = Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("followUp")], { default: "steer", description: "When to deliver the asynchronous result. Use `steer` as soon as it is ready. Use `followUp` for lower-priority work that can wait until the current agent run would otherwise stop. Defaults to `steer`." }));
 const RepositoryBaseline = Type.Object({
-  path: Type.String({ minLength: 1, maxLength: 4096, description: "Absolute path to a local Git repository readable by the tool and worker container." }),
+  path: Type.String({ minLength: 1, maxLength: 4096, description: "Absolute path to a local Git repository readable by the tool and worker Sandbox." }),
   revision: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "Optional Git revision to pin as the exact baseline commit. Accepts a commit, branch, tag, or other valid revision; defaults to the repository’s current HEAD." }))
 }, { additionalProperties: false });
 
@@ -19,7 +19,7 @@ export const StartWork = Type.Object({
   role: Type.Literal("work", { description: "Perform a substantial implementation, research, analysis, testing, or other self-contained assignment." }),
   taskIds: Type.Array(TaskId, { minItems: 1, maxItems: 32, uniqueItems: true, description: "One or more Beads task IDs assigned to the worker. The worker may read broader task context but may update only its assigned tasks." }),
   instructions: Type.String({ minLength: 1, maxLength: 12 * 1024, description: "Focused instructions for the assignment. State the goal, scope, important decisions or non-goals, and expected checks or result without repeating the full parent transcript." }),
-  repositoryBaselines: Type.Optional(Type.Array(RepositoryBaseline, { maxItems: 16, description: "Provenance-only local Git repositories for the parent to validate and pin at exact commits. Baseline paths are not mounted into or guaranteed reachable from the worker workspace; the worker performs any needed clones using --no-hardlinks. Up to sixteen baselines may be supplied." })),
+  repositoryBaselines: Type.Optional(Type.Array(RepositoryBaseline, { maxItems: 16, description: "Provenance-only local Git repositories for the parent to validate and pin at exact commits. Baseline paths are not mounted into or guaranteed reachable from the worker workspace; the worker performs any needed clones using `git clone --no-local --no-hardlinks`. Up to sixteen baselines may be supplied." })),
   modelSelection: Type.Optional(Type.String({ minLength: 1, maxLength: 512, description: "Optional exact provider/model:thinking override, for example openai-codex/gpt-5.6-sol:xhigh. Normally omit it to use the configured work-role selection. The override is honored exactly or the launch fails. Max thinking and Claude Fable selections are rejected." })),
   completionDelivery: CompletionDelivery
 }, { additionalProperties: false });
@@ -168,8 +168,7 @@ export function normalizeWorkspaceResultPaths(workspaceRoot: string, values: str
   return values.map((value, index) => {
     const fieldPath = `${kind === "repository" ? "repositories" : "artifacts"}[${index}]`;
     if (Buffer.byteLength(value) > 4096) throw new WorkerResultValidationError("unsupported_path_type", fieldPath, `Result path exceeds 4096 UTF-8 bytes: ${value}.`);
-    const workspaceAlias = value === "/workspace" ? root : value.startsWith("/workspace/") ? path.join(root, value.slice("/workspace/".length)) : undefined;
-    const lexical = workspaceAlias ?? path.resolve(root, value);
+    const lexical = path.resolve(root, value);
     const lexicalRelative = path.relative(root, lexical);
     if (!strictlyWithin(root, lexical) || lexicalRelative === "") throw new WorkerResultValidationError("path_outside_workspace", fieldPath, `Result path is outside the workspace: ${value}.`);
     if (!existsSync(lexical)) throw new WorkerResultValidationError("path_not_found", fieldPath, `Result path does not exist: ${value}.`);

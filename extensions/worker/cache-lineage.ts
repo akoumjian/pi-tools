@@ -81,6 +81,7 @@ export type WorkerCacheLineageRecord =
       fallbackFile: string;
       retirementFile: string;
       summaryFile: string;
+      runtimeFingerprint?: string;
     };
 
 type PendingParentHeaders = {
@@ -351,6 +352,7 @@ export function validateWorkerCacheLineageRecord(value: unknown): value is Worke
     typeof value.fallbackFile === "string" && path.isAbsolute(value.fallbackFile) && path.basename(value.fallbackFile) === "cache-lineage-fallback.json" &&
     typeof value.retirementFile === "string" && path.isAbsolute(value.retirementFile) && path.basename(value.retirementFile) === "cache-lineage-retired.json" &&
     typeof value.summaryFile === "string" && path.isAbsolute(value.summaryFile) && path.basename(value.summaryFile) === "cache-lineage-summary.json" &&
+    (value.runtimeFingerprint === undefined || typeof value.runtimeFingerprint === "string" && /^[0-9a-f]{64}$/.test(value.runtimeFingerprint)) &&
     path.dirname(value.snapshotFile) === path.dirname(value.adoptionFile) &&
     path.dirname(value.snapshotFile) === path.dirname(value.fallbackFile) &&
     path.dirname(value.snapshotFile) === path.dirname(value.retirementFile) &&

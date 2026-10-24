@@ -12,6 +12,8 @@ export type WorkerPromptInput = {
 };
 
 export function renderWorkerRuntimePrompt(role: WorkerRole, input: WorkerPromptInput): string {
+  if (role === "review" && (!input.reviewSubjectPath || !input.reviewContextPath)) throw new Error("Review prompts require exact reviewed-workspace and context paths.");
+  if (role === "integration" && !input.integrationContextPath) throw new Error("Integration prompts require an exact context path.");
   const common = input.resumed
     ? `You are worker ${input.workerId}, run ${input.runId}, resuming a prior ${role === "work" ? "session" : `${role} session`}. You are running in a sandboxed environment with modified file access and permissions.`
     : role === "work"
@@ -22,13 +24,13 @@ export function renderWorkerRuntimePrompt(role: WorkerRole, input: WorkerPromptI
   const lines = [common, "", "Writable workspace:", input.workspaceRoot, "", "General read-only access:", input.codeRoot, "", "The complete Code directory is available for your reference as needed."];
   if (role !== "review") lines.push("", "Assigned Beads tasks:", input.taskIds.join(", "));
   if (role === "review") {
-    lines.push("", "Reviewed workspace:", input.reviewSubjectPath ?? "/review/subject", "", "Review context:", input.reviewContextPath ?? "/review/context.json", "");
+    lines.push("", "Reviewed workspace:", input.reviewSubjectPath ?? "<missing reviewed workspace>", "", "Review context:", input.reviewContextPath ?? "<missing review context>", "");
     lines.push(input.resumed
-      ? "The reviewed workspace is a fresh writable disposable view of the same reviewed run. Changes from prior review overlays are not retained; reports and other files in your own writable workspace remain available."
-      : "The reviewed workspace is a writable disposable view. Changes there do not modify the original worker workspace and are removed when this review run settles. Write retained review reports in your own writable workspace.");
+      ? "The reviewed workspace remains read-only. Use your retained writable reviewer workspace for tests, copies, experiments, and reports."
+      : "The reviewed workspace is read-only. Use your separate writable reviewer workspace for tests, copies, experiments, and retained review reports.");
   }
   if (role === "integration") {
-    lines.push("", "Integration context:", input.integrationContextPath ?? "/integration/context.json", "");
+    lines.push("", "Integration context:", input.integrationContextPath!, "");
     lines.push(input.resumed
       ? "The prepared repositories and prior integration work remain in your writable workspace. Use the updated integration context for any new additional inputs."
       : "Resolve the complete prepared repository set described in the integration context. The prepared repositories are already located inside your writable workspace. Conflict details are recorded in the integration context, and each affected repository remains in the ordinary Git conflict state produced by `worker_merge_test`.");

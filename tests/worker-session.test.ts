@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -86,5 +86,16 @@ test("exact worker session verification rejects wrong session, cwd, and parent",
     assert.throws(() => verifyWorkerSession({ ...forked, sessionId: "wrong" }), /session id mismatch/);
     assert.throws(() => verifyWorkerSession({ ...forked, workspaceRoot: otherWorkspace }), /session cwd mismatch/);
     assert.throws(() => verifyWorkerSession({ ...forked, parentSessionFile: otherParent }), /session parent mismatch/);
+  });
+});
+
+
+test("retained worker session verification rejects a worker-planted parent-directory symlink", async () => {
+  await withTempDir(async (directory) => {
+    const parent = path.join(directory, "parent.jsonl"); const workspace = path.join(directory, "workspace"); const sessions = path.join(directory, "sessions");
+    await Promise.all([mkdir(workspace), writeFile(parent, `${JSON.stringify({ type: "session", version: 3, id: "parent", timestamp: new Date().toISOString(), cwd: directory })}\n`)]);
+    const forked = forkWorkerSession({ parentSessionFile: parent, workspaceRoot: workspace, sessionDir: sessions, sessionId: "worker-session" });
+    const retained = path.join(directory, "retained-sessions"); await rename(sessions, retained); await symlink(retained, sessions, "dir");
+    assert.throws(() => verifyWorkerSession(forked), /session directory must be an ordinary directory/);
   });
 });

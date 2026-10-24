@@ -167,6 +167,6 @@ test("pi-tools package files whitelist excludes tests and local runtime artifact
     "scripts/dev-pi.mjs",
     "scripts/review-provider-context.mjs",
     "scripts/worker-host.mjs",
-    "scripts/worker-shell-host.mjs"
+    "scripts/worker-sbx-rpc.mjs"
   ]);
 });

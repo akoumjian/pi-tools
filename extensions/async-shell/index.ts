@@ -21,7 +21,6 @@ import {
 } from "../_shared/completion-delivery.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 import { buildWorkspaceSandboxEnvironment, prepareWorkspaceSandboxProcess } from "../_shared/workspace-sandbox.js";
-import { prepareWorkerContainerProcess, signalWorkerContainerJob, workerContainerFromEnvironment } from "../_shared/worker-container.js";
 import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 import { workerResultAdmissionPath } from "../_shared/worker-contract.js";
@@ -265,7 +264,7 @@ const SHELL_TAIL_MAX_LINES = 500;
 const SHELL_TAIL_MIN_CHARS = 1000;
 const SHELL_TAIL_DEFAULT_MAX_CHARS = 20000;
 const SHELL_TAIL_MAX_CHARS = 120000;
-const COMPLETION_BATCH_FLUSH_DELAY_MS = 100;
+const COMPLETION_BATCH_FLUSH_DELAY_MS = 500;
 const ASYNC_SHELL_VIEWER_MAX_JOBS = 100;
 const ASYNC_SHELL_VIEWER_DEFAULT_TAIL_LINES = SHELL_TAIL_MAX_LINES;
 const ASYNC_SHELL_VIEWER_FOLLOW_INTERVAL_MS = 500;
@@ -350,7 +349,7 @@ const asyncShellRuntime = asyncShellRuntimeHolder();
 const jobs = asyncShellRuntime.jobs;
 const asyncShellActivityListeners = asyncShellRuntime.activityListeners;
 
-function subscribeAsyncShellActivity(listener: AsyncShellActivityListener): () => void {
+export function subscribeAsyncShellActivity(listener: AsyncShellActivityListener): () => void {
   asyncShellActivityListeners.add(listener);
   return () => asyncShellActivityListeners.delete(listener);
 }
@@ -386,6 +385,8 @@ export function getAsyncShellCompletionBarrier(
     .map((job) => job.jobId);
   return { jobIds };
 }
+
+export function hasPendingAsyncShellCompletionFollowUpForOwner(owner: AsyncShellJobOwner): boolean { return Array.from(jobs.values()).some((job) => sameJobOwner(job.owner, owner) && isAsyncShellCompletionBarrierTarget(job)); }
 
 export function isAsyncShellCompletionBarrierTarget(target: {
   status: JobStatus;
@@ -813,6 +814,11 @@ export function unsettledPersistedAsyncShellJobsForOwner(
     .filter((job) => !workerJobIsSettled(job));
 }
 
+export function sealAsyncShellCompletionForOwner(owner: AsyncShellJobOwner): void {
+  for (const job of jobs.values()) { if (!sameJobOwner(job.owner, owner)) continue; job.notifyOnExit = false; job.completionNotified = true; job.completionFollowUpQueued = false; pendingCompletionNotifications.delete(job.jobId); writeMeta(job); }
+  notifyAsyncShellActivity();
+}
+
 export async function cancelAsyncShellJobsForOwner(
   owner: AsyncShellJobOwner,
   signal: NodeJS.Signals = "SIGTERM",
@@ -1111,6 +1117,7 @@ function acknowledgeCompletionMessage(message: unknown, context: ExtensionContex
     pendingCompletionNotifications.delete(job.jobId);
     writeMeta(job);
   }
+  notifyAsyncShellActivity();
 }
 
 function abandonCompletionRuntime(runtime: CompletionDeliveryRuntime): void {
@@ -1663,6 +1670,7 @@ function finishStartGracePeriod(jobsList: JobRuntime[]): void {
   for (const job of jobsList) {
     job.startResultPending = false;
   }
+  notifyAsyncShellActivity();
 }
 
 function acknowledgeObservedJobCompletion(job: JobMeta): void {
@@ -1677,6 +1685,7 @@ function acknowledgeObservedJobCompletion(job: JobMeta): void {
     pendingCompletionNotifications.delete(runtime.jobId);
   }
   writeMeta(target);
+  notifyAsyncShellActivity();
 }
 
 function forgetCompletionDelivery(jobId: string): void {
@@ -2301,12 +2310,16 @@ function hasAccess(targetPath: string, mode: number): boolean {
 
 function assertWorkerRunAcceptsSideEffects(): void {
   if (!workerOwnerFromEnvironment()) return;
+  const inProcessState = Reflect.get(globalThis, Symbol.for("pi.worker.admission-state"));
+  if (inProcessState !== undefined && inProcessState !== "open") throw new Error("Managed worker shell_start is sealed during or after worker_result_submit admission.");
+  if (process.env.PI_WORKER_HOST_RPC === "1") {
+    if (inProcessState === undefined) throw new Error("Managed Sandbox worker runtime admission state is unavailable.");
+    return;
+  }
   const resultFile = process.env.PI_WORKER_RESULT_FILE?.trim();
   if (!resultFile) throw new Error("Managed worker shell_start requires PI_WORKER_RESULT_FILE.");
   const resolvedResultFile = path.resolve(resultFile);
-  if (existsSync(resolvedResultFile) || existsSync(workerResultAdmissionPath(resolvedResultFile))) {
-    throw new Error("Managed worker shell_start is sealed during or after worker_result_submit admission.");
-  }
+  if (existsSync(resolvedResultFile) || existsSync(workerResultAdmissionPath(resolvedResultFile))) throw new Error("Managed worker shell_start is sealed during or after worker_result_submit admission.");
 }
 
 function prepareManagedWorkerProcess(input: {
@@ -2317,30 +2330,14 @@ function prepareManagedWorkerProcess(input: {
   env: NodeJS.ProcessEnv;
   workspaceRoot: string;
 }): { executable: string; args: string[]; env: NodeJS.ProcessEnv; hostCwd?: string; cancellationEffect?: (signal: NodeJS.Signals) => void } {
-  const container = workerContainerFromEnvironment();
-  if (container) {
-    const dockerPath = process.env.PI_WORKER_DOCKER_PATH?.trim();
-    if (!dockerPath) throw new Error("Managed worker Docker execution requires PI_WORKER_DOCKER_PATH.");
-    return {
-      ...prepareWorkerContainerProcess({
-        dockerPath,
-        container,
-        jobId: input.jobId,
-        cwd: input.cwd,
-        executable: input.executable,
-        args: input.args,
-        env: input.env
-      }),
-      cancellationEffect: (signal) => signalWorkerContainerJob(dockerPath, container, input.jobId, signal)
-    };
-  }
+  if (process.env.PI_WORKER_HOST_RPC === "1") return { executable: input.executable, args: input.args, env: input.env };
   if (process.env.PI_WORKER_NATIVE_TEST_SHELL === "1") {
     if (process.platform === "darwin") return prepareWorkspaceSandboxProcess({ executable: input.executable, args: input.args, env: input.env, workspaceRoot: input.workspaceRoot });
     // Explicit test-only backend: preserve ownership metadata and process-group
     // behavior on non-macOS CI without claiming production confinement.
     return { executable: input.executable, args: input.args, env: buildWorkspaceSandboxEnvironment(input.env, input.workspaceRoot) };
   }
-  throw new Error("Managed worker shell execution requires an exact Docker container identity.");
+  throw new Error("Managed worker shell execution requires the in-Sandbox runtime.");
 }
 
 function managedWorkerShellArgs(executable: string, command: string): string[] {

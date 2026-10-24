@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import {
   SessionManager,
@@ -32,8 +32,8 @@ export function createWorkerSession(input: { workspaceRoot: string; sessionDir: 
   const sessionFile = manager.getSessionFile();
   if (!sessionFile) throw new Error("Pi did not allocate the fresh worker session.");
   if (!existsSync(sessionFile)) writeFileSync(sessionFile, `${JSON.stringify(manager.getHeader())}\n`, { mode: 0o600 });
-  const exact = realpathSync(sessionFile);
-  const entries = parseSessionEntries(readFileSync(exact, "utf8"));
+  const exact = path.resolve(sessionFile);
+  const entries = parseSessionEntries(readWorkerSessionText(exact, sessionDir));
   const header = entries.find((entry): entry is SessionHeader => entry.type === "session");
   if (!header || header.id !== input.sessionId || path.resolve(header.cwd) !== workspaceRoot || header.parentSession) {
     throw new Error(`Fresh worker session identity mismatch: ${exact}.`);
@@ -53,6 +53,7 @@ export function forkWorkerSession(input: ForkWorkerSessionInput): WorkerSessionI
 
   return verifyWorkerSession({
     sessionFile,
+    sessionDir,
     sessionId: input.sessionId,
     workspaceRoot,
     parentSessionFile
@@ -61,14 +62,15 @@ export function forkWorkerSession(input: ForkWorkerSessionInput): WorkerSessionI
 
 export function verifyWorkerSession(input: {
   sessionFile: string;
+  sessionDir: string;
   sessionId: string;
   workspaceRoot: string;
   parentSessionFile: string;
 }): WorkerSessionIdentity {
-  const sessionFile = realpathSync(input.sessionFile);
+  const sessionFile = path.resolve(input.sessionFile);
   const workspaceRoot = realpathSync(input.workspaceRoot);
   const parentSessionFile = realpathSync(input.parentSessionFile);
-  const raw = readFileSync(sessionFile, "utf8");
+  const raw = readWorkerSessionText(sessionFile, input.sessionDir);
   const entries = parseSessionEntries(raw);
   const header = entries.find((entry): entry is SessionHeader => entry.type === "session");
   if (!header) throw new Error(`Worker session has no header: ${sessionFile}`);
@@ -90,4 +92,16 @@ export function verifyWorkerSession(input: {
     parentSessionFile,
     entries
   };
+}
+
+export function readWorkerSessionText(sessionFile: string, sessionDir: string, maximumBytes = 128 * 1024 * 1024): string {
+  const rootPath = path.resolve(sessionDir);
+  if (lstatSync(rootPath).isSymbolicLink() || !lstatSync(rootPath).isDirectory()) throw new Error("Worker session directory must be an ordinary directory.");
+  const root = realpathSync(rootPath); const lexical = path.resolve(sessionFile); const relative = path.relative(root, lexical);
+  if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error("Worker session file must remain beneath its retained session directory.");
+  let current = root;
+  for (const component of relative.split(path.sep)) { current = path.join(current, component); if (lstatSync(current).isSymbolicLink()) throw new Error("Worker session file may not traverse symbolic links."); }
+  const descriptor = openSync(lexical, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+  try { const metadata = fstatSync(descriptor); if (!metadata.isFile() || metadata.size > maximumBytes) throw new Error(`Worker session must be an ordinary file no larger than ${maximumBytes} bytes.`); return readFileSync(descriptor, "utf8"); }
+  finally { closeSync(descriptor); }
 }
