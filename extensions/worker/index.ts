@@ -7,8 +7,10 @@ import { defineTool, type AgentToolResult, type ExtensionAPI, type ExtensionCont
 import { resolveExtensionModel, assertChildAgentRouteAllowed, parseModelThinkingPair } from "../_shared/model-spec.js";
 import { throwIfAborted } from "../_shared/cancellation.js";
 import { asyncJobProcessStartToken, createAsyncJobId, isAsyncJobProcessIdentityAlive, signalAsyncJobProcessIdentity } from "../_shared/async-job.js";
-import * as asyncJobPackage from "../_shared/async-job.js";
-import { assertPiToolsPackageGeneration } from "../_shared/package-generation.js";
+import * as asyncJobProcessPackage from "../_shared/async-job-process.js";
+import * as atomicJsonPackage from "../_shared/atomic-json.js";
+import { createPiToolsPackageGenerationGuard } from "../_shared/package-generation.js";
+import * as workerJobSettlementPackage from "../_shared/worker-job-settlement.js";
 import { handleAsyncShellViewerCommand, reconcileTerminatedPersistedAsyncShellJobsForOwner, unsettledPersistedAsyncShellJobsForOwner, type JobMeta, type ManagedAsyncJobHandle } from "../async-shell/index.js";
 import { createWorkerContainerAsync, planWorkerContainer, resolveDockerPath, settleWorkerContainerAsync, type WorkerContainerReference } from "../_shared/worker-container.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
@@ -28,7 +30,6 @@ import {
 import { readWorkerRuntimeResult } from "./runtime.js";
 import { cleanupReviewOverlayAsync, createReviewOverlayAsync, type ReviewOverlayRecord } from "./review-workspace.js";
 import { preferredWorkerModel } from "./settings.js";
-import * as workerSettingsPackage from "./settings.js";
 import { createWorkerId, createWorkerRunId, defaultWorkerRoots, provisionWorkerPaths, workerPaths, type WorkerPaths, type WorkerRoots } from "./identity.js";
 import { createWorkerSession, forkWorkerSession, verifyWorkerSession } from "./session.js";
 import { launchWorkerHost, readWorkerHostProcess, readWorkerHostSettlement, type WorkerLaunchRecord } from "./runner.js";
@@ -90,12 +91,11 @@ export type WorkerExtensionDependencies = {
 export default function workerExtension(api: ExtensionAPI): void { registerWorkerExtension(api); }
 
 export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExtensionDependencies = {}): void {
-  const assertCurrentPackageGeneration = overrides.assertPackageGeneration ?? (() => {
-    assertPiToolsPackageGeneration(import.meta.url, [
-      { name: "async-job", marker: asyncJobPackage.PI_TOOLS_RUNTIME_GENERATION },
-      { name: "worker settings", marker: workerSettingsPackage.PI_TOOLS_RUNTIME_GENERATION }
-    ]);
-  });
+  const assertCurrentPackageGeneration = overrides.assertPackageGeneration ?? createPiToolsPackageGenerationGuard(import.meta.url, [
+    { name: "async-job-process", path: "extensions/_shared/async-job-process.js", fingerprint: asyncJobProcessPackage.PI_TOOLS_MODULE_FINGERPRINT },
+    { name: "atomic-json", path: "extensions/_shared/atomic-json.js", fingerprint: atomicJsonPackage.PI_TOOLS_MODULE_FINGERPRINT },
+    { name: "worker-job-settlement", path: "extensions/_shared/worker-job-settlement.js", fingerprint: workerJobSettlementPackage.PI_TOOLS_MODULE_FINGERPRINT }
+  ]);
   assertCurrentPackageGeneration();
   const roots = overrides.roots ?? defaultWorkerRoots();
   const runtimeRoot = overrides.runtimeRoot ?? path.dirname(roots.stateRoot);
@@ -187,6 +187,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   });
   api.on("input", (_event, context) => repaintWorkerActivity(context));
   api.on("turn_end", (_event, context) => {
+    assertCurrentPackageGeneration();
     const parentFile = context.sessionManager.getSessionFile(); if (!parentFile) return;
     const parent = realpathOrResolve(parentFile); const parentSessionId = context.sessionManager.getSessionId();
     const launches = [...pending.values()].filter((item) => item.parentSessionFile === parent && item.parentSessionId === parentSessionId);
@@ -473,6 +474,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const nonce = claimNonce(); if (!claimWorkerRun(getRegistry(), item.workerId, item.runId, "launch", nonce, ["queued"])) return;
     let handle: ManagedAsyncJobHandle | undefined; let launchAdmission: string | undefined;
     try {
+      assertCurrentPackageGeneration();
       let worker = getWorker(getRegistry(), item.workerId)!; const run = getWorkerRun(getRegistry(), item.workerId, item.runId)!; const paths = workerPaths(roots, item.workerId);
       if ((!worker.sessionId || !worker.sessionFile) && worker.role === "work" && item.runtime.pendingWorkSessionId) {
         const forked = forkWorkerSession({ parentSessionFile: worker.parentSessionFile, workspaceRoot: worker.workspaceRoot, sessionDir: paths.sessionDir, sessionId: item.runtime.pendingWorkSessionId });
@@ -569,6 +571,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   }
 
   async function cancelWorker(worker: WorkerRegistryRecord): Promise<"cancelled" | "not_active"> {
+    assertCurrentPackageGeneration();
     if (!worker.activeRunId) return "not_active"; const runId = worker.activeRunId;
     const recoveringRun = getWorkerRun(getRegistry(), worker.workerId, runId); const recoveringRuntime = recoveringRun?.runtime as RunRuntime | undefined;
     if (worker.recoveryError && recoveringRun?.status === "running" && recoveringRuntime && existsSync(recoveringRuntime.settledFile) && existsSync(recoveringRuntime.resultFile)) {
@@ -640,6 +643,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   }
 
   async function discardWorker(worker: WorkerRegistryRecord): Promise<void> {
+    assertCurrentPackageGeneration();
     const nonce = claimNonce(); claimWorkerDiscard(getRegistry(), worker.workerId, worker.version, nonce, now().toISOString());
     const paths = workerPaths(roots, worker.workerId); const stateTrash = `${paths.stateDir}.discard-${nonce}`; const separateWorkspace = path.resolve(paths.workspaceRoot).startsWith(`${path.resolve(paths.stateDir)}${path.sep}`) ? undefined : `${paths.workspaceRoot}.discard-${nonce}`;
     try {
@@ -667,7 +671,17 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   }
 
   function reconcileActiveRuns(context: ExtensionContext, parentSessionFile: string): void {
-    for (const { worker, run } of activeRunsForParent(getRegistry(), parentSessionFile)) {
+    const activeRuns = activeRunsForParent(getRegistry(), parentSessionFile);
+    if (activeRuns.length === 0) return;
+    try { assertCurrentPackageGeneration(); }
+    catch (error) {
+      const message = sanitizeError(error);
+      for (const { worker, run } of activeRuns) {
+        if (worker.recoveryError !== message) recordRecovery(worker.workerId, run.runId, message);
+      }
+      return;
+    }
+    for (const { worker, run } of activeRuns) {
       const runtime = run.runtime as RunRuntime; if (!runtime || runtime.version !== 2 || run.claimKind) { if (worker.recoveryError) deliverRecovery(worker, run, worker.recoveryError); continue; }
       if (worker.recoveryError) {
         if (run.status === "running" && existsSync(runtime.settledFile) && existsSync(runtime.resultFile)) clearWorkerRecoveryError(getRegistry(), worker.workerId, run.runId, now().toISOString());

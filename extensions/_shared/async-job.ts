@@ -2,7 +2,6 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, openSync, statSync } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { readPiToolsPackageGeneration } from "./package-generation.js";
 import {
   asyncJobTokenProcessIds,
   asyncJobProcessStartToken,
@@ -14,7 +13,6 @@ import {
   signalAsyncJobExecution
 } from "./async-job-process.js";
 
-export const PI_TOOLS_RUNTIME_GENERATION = readPiToolsPackageGeneration(import.meta.url).fingerprint;
 export { asyncJobTokenProcessIds, asyncJobProcessStartToken, captureAsyncJobProcessIdentity, isAsyncJobProcessIdentityAlive, isAsyncJobExecutionAlive, isAsyncJobProcessAlive, isAsyncJobProcessGroupAlive, signalAsyncJobExecution };
 export type AsyncJobProcessIdentity = { pid: number; processToken: string; processStartToken: string };
 

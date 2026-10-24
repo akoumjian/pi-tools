@@ -160,9 +160,11 @@ test("package upgrade guidance requires a full process restart", () => {
   const workerDoc = readText("docs/extensions/worker.md");
   const notificationDoc = readText("docs/extensions/completion-notifications.md");
   assert.match(readme, /Fully restart Pi after installing or updating the package/);
-  assert.match(workerDoc, /Every worker operation rechecks the on-disk fingerprint/);
+  assert.match(workerDoc, /Later tool, deferred launch, reconciliation, cancellation, and discard boundaries first compare cheap metadata stamps/);
   assert.match(workerDoc, /`\/reload` remains supported for same-generation worker delivery/);
+  assert.match(workerDoc, /Default configuration and unrelated untracked development files are outside this executable manifest/);
   assert.match(notificationDoc, /Fully quit and restart Pi after package installation or update/);
+  assert.match(notificationDoc, /`\/reload` retains in-memory package modules and is supported only within the same installed generation/);
   assert.doesNotMatch(notificationDoc, /must `\/reload` or restart after installation or update/);
 });
 

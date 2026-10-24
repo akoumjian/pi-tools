@@ -1,6 +1,8 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
 
+export const PI_TOOLS_MODULE_FINGERPRINT = "cf0ffb8bd4c0d4c44099b22fe039fd64cc27fa3b1192a39c2eef95f328630c66";
+
 export function asyncJobTokenProcessIds(token) {
   if (!token) return [];
   if (process.platform === "linux") {

@@ -671,7 +671,10 @@ test("enforceDefaultTools removes single-file and bash tools while preserving un
 test("enforceDefaultTools fails loudly when required replacements are unavailable", () => {
   const api = createFakeApi(["bash"], ["bash", "read_many", "search_many", "write_many", "edit_many"]);
 
-  assert.throws(() => enforceDefaultTools(api, { strict: true }), /required replacement tools missing: shell_start/);
+  assert.throws(
+    () => enforceDefaultTools(api, { strict: true }),
+    /After package registration, installation, or update, fully quit and restart Pi; if only extension filters changed within the same installed package generation, run \/reload/
+  );
   assert.deepEqual(api.getActiveTools(), ["read_many", "search_many", "write_many", "edit_many"]);
 });
 
@@ -708,6 +711,7 @@ test("native-tools-status reports strict replacement diagnostics", () => {
   assert.match(status, /Strict replacement: ok/);
   assert.match(status, /Active banned stock tools: none/);
   assert.match(status, /Missing required replacements: none/);
+  assert.doesNotMatch(status, /then run \/reload/);
 });
 
 test("native batch tools reject pre-aborted work before reads, searches, or mutations", async () => {

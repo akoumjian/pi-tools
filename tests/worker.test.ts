@@ -13,7 +13,7 @@ import { RetainedToolOutputSchemas } from "../extensions/_shared/tool-output.js"
 import { normalizeWorkerSettings } from "../extensions/worker/settings.js";
 import { validateWorkerResultInput, WorkerResultValidationError } from "../extensions/worker/contract.js";
 import { ASYNC_SHELL_ACTIVITY_STATUS_KEY, renderAsyncShellActivityStatus } from "../extensions/async-shell/index.js";
-import { createWorkerAndRun, openWorkerRegistry, settleWorkerRun, type WorkerRegistry, type WorkerRunRecord } from "../extensions/worker/registry.js";
+import { createWorkerAndRun, getWorker, getWorkerRun, openWorkerRegistry, settleWorkerRun, type WorkerRegistry, type WorkerRunRecord } from "../extensions/worker/registry.js";
 
 const settings = {
   modelPreferences: {
@@ -111,7 +111,7 @@ test("worker package-generation mismatch registers no launchable tools", () => {
   const tools: ToolDefinition[] = [];
   assert.throws(
     () => registerWorkerExtension({ registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, on() {}, sendMessage() {} } as unknown as ExtensionAPI, {
-      assertPackageGeneration() { throw new Error("Fully quit and restart Pi; /reload cannot safely replace cached transitive modules."); }
+      assertPackageGeneration() { throw new Error("Fully quit and restart Pi; /reload cannot activate package-code updates safely."); }
     }),
     /Fully quit and restart Pi/
   );
@@ -124,7 +124,7 @@ test("worker tools fail before lifecycle effects when package generation changes
   registerWorkerExtension({ registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, on() {}, sendMessage() {} } as unknown as ExtensionAPI, {
     assertPackageGeneration() {
       checks += 1;
-      if (checks > 1) throw new Error("Fully quit and restart Pi; /reload cannot safely replace cached transitive modules.");
+      if (checks > 1) throw new Error("Fully quit and restart Pi; /reload cannot activate package-code updates safely.");
     }
   });
   const run = tools.find((tool) => tool.name === "worker_run")!;
@@ -133,6 +133,91 @@ test("worker tools fail before lifecycle effects when package generation changes
     /Fully quit and restart Pi/
   );
   assert.equal(checks, 2, "registration and execution each check the package generation");
+});
+
+test("deferred turn_end launch rechecks generation and settles failed before launching", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-worker-generation-launch-"));
+  try {
+    const sessionFile = path.join(root, "parent.jsonl");
+    await writeFile(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: "parent", timestamp: "2026-01-01T00:00:00.000Z", cwd: root })}\n`);
+    const runtimeRoot = path.join(root, "runtime");
+    const workersRoot = path.join(runtimeRoot, "workers");
+    await mkdir(workersRoot, { recursive: true });
+    const tools: ToolDefinition[] = [];
+    const handlers = new Map<string, Function[]>();
+    let checks = 0;
+    let launches = 0;
+    const api = {
+      registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, sendMessage() {},
+      on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }
+    } as unknown as ExtensionAPI;
+    registerWorkerExtension(api, {
+      runtimeRoot, roots: { stateRoot: workersRoot, workspaceRoot: workersRoot }, codeRoot: root,
+      now: () => new Date("2026-01-01T00:00:00.000Z"), random: () => "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      assertPackageGeneration() { checks += 1; if (checks >= 4) throw new Error("Fully quit and restart Pi; mixed generation."); },
+      launch: () => { launches += 1; throw new Error("launch must not run after generation drift"); }
+    });
+    const model = { id: "gpt-5.6-sol", name: "gpt-5.6-sol", provider: "openai-codex", api: "openai-responses", baseUrl: "https://example.invalid", reasoning: true, thinkingLevelMap: { xhigh: "xhigh" }, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 10000 } as Model<Api>;
+    const context = { cwd: root, sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "parent" }, modelRegistry: { hasConfiguredAuth: () => true, getAll: () => [model] }, isIdle: () => true, hasPendingMessages: () => false, ui: { notify() {} } } as unknown as ExtensionContext;
+    const result = await tools.find((tool) => tool.name === "worker_run")!.execute!("generation-launch", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "Implement." }] }, new AbortController().signal, undefined, context);
+    const receipt = (result.details as { runs: Array<{ workerId: string; runId: string }> }).runs[0]!;
+    for (const handler of handlers.get("turn_end") ?? []) await handler({}, context);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const registry = openWorkerRegistry(runtimeRoot);
+    try {
+      const run = getWorkerRun(registry, receipt.workerId, receipt.runId)!;
+      assert.equal(run.status, "settled");
+      assert.equal(run.outcome, "failed");
+      assert.match(run.errors[0]?.message ?? "", /Fully quit and restart Pi/);
+    } finally { registry.close(); }
+    assert.equal(launches, 0);
+    assert.ok(checks >= 4, `expected registration, tool, turn_end, and launch checks; got ${checks}`);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("reconciliation timer and slash cancel/discard paths recheck package generation", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-worker-generation-boundaries-"));
+  const runtimeRoot = path.join(root, "runtime");
+  const workersRoot = path.join(runtimeRoot, "workers");
+  await mkdir(workersRoot, { recursive: true });
+  const sessionFile = path.join(root, "parent.jsonl");
+  await writeFile(sessionFile, "\n");
+  const handlers = new Map<string, Function[]>();
+  const commands = new Map<string, { handler: Function }>();
+  let checks = 0;
+  let blocked = false;
+  const api = {
+    registerTool() {}, registerMessageRenderer() {}, sendMessage() {},
+    registerCommand(name: string, command: { handler: Function }) { commands.set(name, command); },
+    on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }
+  } as unknown as ExtensionAPI;
+  const context = { cwd: root, mode: "tui", hasUI: true, sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "parent" }, ui: { notify() {}, theme: { fg: (_color: string, text: string) => text }, setStatus() {} }, isIdle: () => true, hasPendingMessages: () => false } as unknown as ExtensionContext;
+  try {
+    registerWorkerExtension(api, {
+      runtimeRoot, roots: { stateRoot: workersRoot, workspaceRoot: workersRoot }, codeRoot: root,
+      assertPackageGeneration() { checks += 1; if (blocked) throw new Error("Fully quit and restart Pi; mixed generation."); }
+    });
+    for (const handler of handlers.get("session_start") ?? []) await handler({}, context);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const registry = openWorkerRegistry(runtimeRoot);
+    const created = addActivityWorker(registry, sessionFile, "guarded", "queued");
+    const beforeTimer = checks;
+    blocked = true;
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    assert.ok(checks > beforeTimer, "the reconciliation timer rechecks generation before queued launch");
+
+    blocked = false;
+    settleWorkerRun(registry, { parentSessionFile: sessionFile, ...created, outcome: "failed", outcomeSource: "system", settledAt: "2026-01-01T00:00:00.000Z" });
+    blocked = true;
+    await assert.rejects(() => commands.get("worker:cancel")!.handler(created.workerId, context), /Fully quit and restart Pi/);
+    await assert.rejects(() => commands.get("worker:discard")!.handler(`${created.workerId} --confirm`, context), /Fully quit and restart Pi/);
+    assert.equal(getWorker(registry, created.workerId)?.status, "idle", "guarded commands do not mutate the worker");
+    registry.close();
+  } finally {
+    blocked = false;
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, context);
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("strict control and beads schemas reject unrelated fields and approved bounds", async () => {
