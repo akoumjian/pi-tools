@@ -18,7 +18,7 @@ const model = (provider: string, id: string) => ({ id, name: id, provider, api: 
 type Launch = { record: any; runtime: any; resolve(job: JobMeta): void; handle: ManagedAsyncJobHandle };
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
-async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolean; removeThrowsOnce?: boolean; removeAlwaysThrows?: boolean; deferContainer?: boolean } = {}) {
+async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolean; removeThrowsOnce?: boolean; removeAlwaysThrows?: boolean; deferContainer?: boolean; probeHostIdentity?: () => "alive" | "dead" | "unknown" } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "pi-worker-v2-lifecycle-"));
   const runtimeRoot = path.join(root, "runtime"); const workersRoot = path.join(runtimeRoot, "workers"); mkdirSync(workersRoot, { recursive: true });
   const session = SessionManager.create(root, path.join(root, "parent-session"), { id: `parent-${Date.now()}` }); writeFileSync(session.getSessionFile()!, `${JSON.stringify(session.getHeader())}\n`, { mode: 0o600 });
@@ -30,6 +30,7 @@ async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolea
   registerWorkerExtension(api, {
     runtimeRoot, roots: { stateRoot: workersRoot, workspaceRoot: workersRoot }, codeRoot: root, preparedRoot: path.join(runtimeRoot, "prepared"), targetRoot: root, dockerPath: "/fake/docker", random, now: () => new Date(`2026-01-01T00:00:${String(counter).padStart(2, "0")}.000Z`),
     waitForHostIdentity: async () => {},
+    ...(options.probeHostIdentity ? { probeHostIdentity: options.probeHostIdentity } : {}),
     createContainer: async (_docker, reference) => { created.push(reference.runId); if (containerGate) await containerGate; return { ...reference, containerId: (++counter).toString(16).padStart(64, "0") }; }, removeContainer: (_docker, reference) => { removed.push(reference.runId); if (options.removeAlwaysThrows || options.removeThrowsOnce && removeFailures++ === 0) throw new Error(options.removeAlwaysThrows ? "persistent container cleanup failure" : "transient container cleanup failure"); },
     createOverlay: (input) => { if (options.overlayThrows) throw new Error("overlay probe failure"); const value: ReviewOverlayRecord = { version: 2, mergedVolume: `merged-${input.workerId}-${input.runId}`, scratchVolume: `scratch-${input.workerId}-${input.runId}`, mounts: [
       { kind: "volume", source: `merged-${input.workerId}-${input.runId}`, target: "/review/subject" }, { kind: "bind", source: input.reviewerWorkspace, target: "/workspace" },
@@ -100,6 +101,35 @@ test("cancellation waits for a deferred launch boundary before proving terminati
     const db = f.registry(); const worker = getWorker(db, started.workerId)!; const run = getWorkerRun(db, started.workerId, started.runId)!; db.close();
     assert.equal(worker.status, "idle"); assert.equal(run.outcome, "cancelled"); assert.equal(f.launches.length, 0);
   } finally { f.releaseContainer(); await f.close(); }
+});
+
+test("ambiguous supervisor identity makes cancellation recovery-required instead of finalizing", async () => {
+  const f = await fixture({ probeHostIdentity: () => "unknown" }); try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "probe ambiguous identity" }] }));
+    await f.event("turn_end");
+    const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; const runtime = run.runtime as any; db.close();
+    writeFileSync(runtime.processFile, `${JSON.stringify({ version: 2, workerId: started.workerId, runId: started.runId, pid: 4242, processToken: "owned", processStartToken: "darwin:expected", nonce: runtime.processNonce, hostConfigFile: path.join(runtime.runDir, "host.json"), startedAt: new Date().toISOString() })}
+`);
+    await assert.rejects(() => f.call("worker_control", { action: "cancel", workerId: started.workerId }), /cancellation requires recovery.*ambiguous/i);
+    const after = f.registry(); const worker = getWorker(after, started.workerId)!; const retainedRun = getWorkerRun(after, started.workerId, started.runId)!; after.close();
+    assert.equal(worker.status, "running"); assert.equal(retainedRun.status, "running"); assert.match(worker.recoveryError ?? "", /ambiguous/i);
+  } finally { await f.close(); }
+});
+
+test("concurrent resume attempts cannot reuse one retained worker session", async () => {
+  const f = await fixture(); try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "initial" }] })); await f.event("turn_end");
+    await complete(f, started);
+    const attempts = await Promise.allSettled([
+      f.call("worker_run", { runs: [{ action: "resume", workerId: started.workerId, instructions: "resume A" }] }),
+      f.call("worker_run", { runs: [{ action: "resume", workerId: started.workerId, instructions: "resume B" }] })
+    ]);
+    assert.equal(attempts.filter((attempt) => attempt.status === "fulfilled").length, 1);
+    assert.equal(attempts.filter((attempt) => attempt.status === "rejected").length, 1);
+    const state = f.registry(); const worker = getWorker(state, started.workerId)!; const queued = Number((state.database.prepare("SELECT COUNT(*) AS count FROM runs WHERE worker_id=? AND status='queued'").get(started.workerId) as any).count); state.close();
+    assert.equal(worker.status, "queued"); assert.equal(queued, 1);
+    await f.call("worker_control", { action: "cancel", workerId: started.workerId });
+  } finally { await f.close(); }
 });
 
 test("worker_control get content exposes complete settled candidates and artifact paths", async () => {
@@ -216,7 +246,7 @@ test("review starts fresh, mounts exact subject session range, cancellation rele
     const header = JSON.parse(readFileSync(reviewer.sessionFile!, "utf8").split("\n")[0]!); assert.equal(header.parentSession, undefined);
     assert.equal(runtime.container.mounts.some((mount: any) => mount.target === "/review/session.jsonl" && mount.readOnly), true);
     const context = JSON.parse(readFileSync(runtime.contextFile, "utf8")); const subjectRun = getWorkerRun(db, subject.workerId, subject.runId)!; assert.deepEqual(context.session.range, { startLine: subjectRun.sessionStartLine, endLine: subjectRun.sessionEndLine }); assert.match(runtime.contextFile, new RegExp(review.runId)); db.close();
-    await f.call("worker_control", { action: "cancel", workerId: review.workerId }); db = f.registry(); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, undefined); db.close();
+    await f.call("worker_control", { action: "cancel", workerId: review.workerId }); db = f.registry(); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, undefined); db.close(); assert.equal(f.cleaned.length, 1, "review cancellation must remove its exact disposable overlay");
     const resumed = receipt(await f.call("worker_run", { runs: [{ action: "resume", workerId: review.workerId, instructions: "continue" }] })); await f.event("turn_end"); db = f.registry(); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, review.workerId); const resumedRuntime = getWorkerRun(db, review.workerId, resumed.runId)!.runtime as any; assert.notEqual(resumedRuntime.overlay.mergedVolume, runtime.overlay.mergedVolume); assert.equal((getWorker(db, review.workerId)!.runtime?.inputs as any[]).length, 1); db.close();
     await f.call("worker_control", { action: "cancel", workerId: review.workerId }); await f.call("worker_control", { action: "discard", workerId: review.workerId }); db = f.registry(); assert.equal(getWorker(db, review.workerId), undefined); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, undefined); db.close();
   } finally { await f.close(); }

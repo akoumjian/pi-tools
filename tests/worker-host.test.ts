@@ -482,6 +482,69 @@ test("worker host fails promptly when a quiescent worker settles without typed r
   });
 });
 
+test("review worker receives one bounded repair turn and submits the required typed result", async () => {
+  await withTempDir(async (directory) => {
+    const parentCwd = path.join(directory, "parent");
+    const workspaceRoot = path.join(directory, "workspace");
+    const stateDir = path.join(directory, "state");
+    const sessionDir = path.join(stateDir, "session");
+    const runDir = path.join(stateDir, "runs", "run-review-repair");
+    const resultFile = path.join(runDir, "result.json");
+    await Promise.all([mkdir(parentCwd, { recursive: true }), mkdir(workspaceRoot, { recursive: true }), mkdir(sessionDir, { recursive: true }), mkdir(path.join(stateDir, "async-shell"), { recursive: true })]);
+    const parent = SessionManager.create(parentCwd, path.join(directory, "parent-sessions"), { id: "parent-session-review-repair" });
+    parent.appendMessage({ role: "user", content: "parent review repair context", timestamp: Date.now() });
+    parent.appendMessage(assistantMessage("Ready for the review repair probe."));
+    const parentSessionFile = parent.getSessionFile(); assert.ok(parentSessionFile);
+    const forked = forkWorkerSession({ parentSessionFile, workspaceRoot, sessionDir, sessionId: "worker-session-review-repair" });
+    const record: WorkerRecord = {
+      version: WORKER_RECORD_VERSION, workerId: "worker_20260925120000_review01", sessionId: forked.sessionId, sessionFile: forked.sessionFile,
+      parentSessionFile, workspaceRoot, taskIds: ["personal-workere2e"], role: "review",
+      route: { provider: "worker-review-repair-faux", model: "worker-review-repair-faux-1", thinkingLevel: "off" }, status: "running",
+      activeRun: { runId: "run-review-repair", jobId: "job_20260925120000_review01", status: "running" }, updatedAt: new Date().toISOString()
+    };
+    const providerExtension = fileURLToPath(new URL("./fixtures/worker-review-repair-faux-provider.js", import.meta.url));
+    const launched = launchWorkerHost({ sendMessage(): void {} } as unknown as ExtensionAPI, {
+      cwd: parentCwd, sessionManager: { getSessionId: () => "parent-session-review-repair" }, isIdle: () => true
+    } as ExtensionContext, {
+      record: launchRecord(record), shellExecution: { kind: "native-test" }, prompt: "Review the candidate and submit a typed verdict.", resultFile, runDir,
+      processFile: path.join(runDir, "host-process.json"), processNonce: "host-process-review-repair", bdPath: process.execPath,
+      beadsRoute: TEST_BEADS_ROUTE, extensionPaths: [...defaultWorkerExtensionPaths(), providerExtension]
+    });
+    const keepAlive = setInterval(() => {}, 100);
+    const job = await launched.handle.completion.finally(() => clearInterval(keepAlive));
+    const repairSession = await readFile(forked.sessionFile, "utf8");
+    assert.equal(job.status, "exited", `${await readFile(job.stderrLog, "utf8")}\nSTDOUT:\n${await readFile(job.stdoutLog, "utf8")}\nSESSION TAIL:\n${repairSession.slice(-12_000)}`);
+    const accepted = readWorkerRuntimeResult(resultFile);
+    assert.equal(accepted.result.outcome, "approve");
+    assert.match(accepted.result.summary, /bounded typed-result repair turn/);
+    assert.deepEqual(accepted.result.artifacts, ["artifacts/review-repair.md"]);
+    assert.equal((repairSession.match(/Do not restate the verdict in prose/g) ?? []).length, 1, "repair instruction must be injected exactly once");
+  });
+});
+
+test("review worker gets only one repair turn before missing typed result fails closed", async () => {
+  await withTempDir(async (directory) => {
+    const parentCwd = path.join(directory, "parent"); const workspaceRoot = path.join(directory, "workspace"); const stateDir = path.join(directory, "state");
+    const sessionDir = path.join(stateDir, "session"); const runDir = path.join(stateDir, "runs", "run-review-no-handoff");
+    await Promise.all([mkdir(parentCwd, { recursive: true }), mkdir(workspaceRoot, { recursive: true }), mkdir(sessionDir, { recursive: true }), mkdir(path.join(stateDir, "async-shell"), { recursive: true })]);
+    const parent = SessionManager.create(parentCwd, path.join(directory, "parent-sessions"), { id: "parent-session-review-no-handoff" });
+    parent.appendMessage({ role: "user", content: "parent review no-handoff context", timestamp: Date.now() }); parent.appendMessage(assistantMessage("Ready for bounded review failure."));
+    const parentSessionFile = parent.getSessionFile(); assert.ok(parentSessionFile); const forked = forkWorkerSession({ parentSessionFile, workspaceRoot, sessionDir, sessionId: "worker-session-review-no-handoff" });
+    const record: WorkerRecord = { version: WORKER_RECORD_VERSION, workerId: "worker_20260925120000_review02", sessionId: forked.sessionId, sessionFile: forked.sessionFile,
+      parentSessionFile, workspaceRoot, taskIds: ["personal-workere2e"], role: "review", route: { provider: "worker-review-no-handoff-faux", model: "worker-review-no-handoff-faux-1", thinkingLevel: "off" }, status: "running",
+      activeRun: { runId: "run-review-no-handoff", jobId: "job_20260925120000_review02", status: "running" }, updatedAt: new Date().toISOString() };
+    const providerExtension = fileURLToPath(new URL("./fixtures/worker-review-no-handoff-faux-provider.js", import.meta.url));
+    const launched = launchWorkerHost({ sendMessage(): void {} } as unknown as ExtensionAPI, { cwd: parentCwd, sessionManager: { getSessionId: () => "parent-session-review-no-handoff" }, isIdle: () => true } as ExtensionContext, {
+      record: launchRecord(record), shellExecution: { kind: "native-test" }, prompt: "Review but omit typed submission twice.", resultFile: path.join(runDir, "result.json"), runDir,
+      processFile: path.join(runDir, "host-process.json"), processNonce: "host-process-review-no-handoff", bdPath: process.execPath, beadsRoute: TEST_BEADS_ROUTE,
+      extensionPaths: [...defaultWorkerExtensionPaths(), providerExtension]
+    });
+    const keepAlive = setInterval(() => {}, 100); const job = await launched.handle.completion.finally(() => clearInterval(keepAlive));
+    assert.equal(job.status, "failed"); assert.match(await readFile(job.stderrLog, "utf8"), /settled quiescent turn without the required typed worker_result_submit/);
+    const sessionText = await readFile(forked.sessionFile, "utf8"); assert.equal((sessionText.match(/Do not restate the verdict in prose/g) ?? []).length, 1);
+  });
+});
+
 test("cancelling a worker host leaves no worker-owned async-shell process alive", async () => {
   await withTempDir(async (directory) => {
     const parentCwd = path.join(directory, "parent");

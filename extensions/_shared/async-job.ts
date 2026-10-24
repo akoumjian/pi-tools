@@ -7,13 +7,15 @@ import {
   asyncJobProcessStartToken,
   captureAsyncJobProcessIdentity,
   isAsyncJobProcessIdentityAlive,
+  probeAsyncJobProcessIdentity,
   isAsyncJobExecutionAlive,
   isAsyncJobProcessAlive,
   isAsyncJobProcessGroupAlive,
   signalAsyncJobExecution
 } from "./async-job-process.js";
 
-export { asyncJobTokenProcessIds, asyncJobProcessStartToken, captureAsyncJobProcessIdentity, isAsyncJobProcessIdentityAlive, isAsyncJobExecutionAlive, isAsyncJobProcessAlive, isAsyncJobProcessGroupAlive, signalAsyncJobExecution };
+export { asyncJobTokenProcessIds, asyncJobProcessStartToken, captureAsyncJobProcessIdentity, isAsyncJobProcessIdentityAlive, probeAsyncJobProcessIdentity, isAsyncJobExecutionAlive, isAsyncJobProcessAlive, isAsyncJobProcessGroupAlive, signalAsyncJobExecution };
+export type AsyncJobProcessIdentityLiveness = "alive" | "dead" | "unknown";
 export type AsyncJobProcessIdentity = { pid: number; processToken: string; processStartToken: string };
 
 export type SpawnAsyncJobProcessInput = {

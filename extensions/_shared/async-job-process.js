@@ -60,11 +60,32 @@ export function captureAsyncJobProcessIdentity(pid, processToken) {
   return { pid, processToken, processStartToken };
 }
 
+export function probeAsyncJobProcessIdentity(identity, probes = {}) {
+  if (!identity || !Number.isInteger(identity.pid) || identity.pid <= 0 || typeof identity.processToken !== "string" || !identity.processToken || typeof identity.processStartToken !== "string" || !identity.processStartToken) return "dead";
+  const probePid = probes.probePid ?? probeAsyncJobPid;
+  const readStartToken = probes.readStartToken ?? asyncJobProcessStartToken;
+  const ownedProcessIds = probes.ownedProcessIds ?? asyncJobTokenProcessIds;
+  const before = probePid(identity.pid);
+  if (before !== "alive") return before;
+  let processStartToken;
+  try { processStartToken = readStartToken(identity.pid); }
+  catch { return probePid(identity.pid) === "dead" ? "dead" : "unknown"; }
+  if (!processStartToken) return probePid(identity.pid) === "dead" ? "dead" : "unknown";
+  if (processStartToken !== identity.processStartToken) return "dead";
+  let processIds;
+  try { processIds = ownedProcessIds(identity.processToken); }
+  catch { return probePid(identity.pid) === "dead" ? "dead" : "unknown"; }
+  if (processIds.includes(identity.pid)) return "alive";
+  return "dead";
+}
+
 export function isAsyncJobProcessIdentityAlive(identity) {
-  if (!identity || !Number.isInteger(identity.pid) || typeof identity.processToken !== "string" || typeof identity.processStartToken !== "string") return false;
-  try {
-    return asyncJobProcessStartToken(identity.pid) === identity.processStartToken && asyncJobTokenProcessIds(identity.processToken).includes(identity.pid);
-  } catch { return false; }
+  return probeAsyncJobProcessIdentity(identity) === "alive";
+}
+
+function probeAsyncJobPid(pid) {
+  try { process.kill(pid, 0); return "alive"; }
+  catch (error) { return error && typeof error === "object" && error.code === "ESRCH" ? "dead" : "unknown"; }
 }
 
 export function isAsyncJobExecutionAlive(pid, token) {

@@ -10,6 +10,8 @@ const configFile = process.argv[2];
 if (!configFile) throw new Error("Usage: worker-host.mjs <host-config.json>");
 const config = JSON.parse(readFileSync(configFile, "utf8"));
 const PROMPT_START_TIMEOUT_MS = 5_000;
+const SETTLED_RESULT_GRACE_MS = 5_000;
+const REVIEW_RESULT_REPAIR_PROMPT = "Your review turn settled without the required typed result. Do not restate the verdict in prose. Call worker_result_submit now with the review outcome, concise summary, and a detailed retained review artifact; use needs_input or blocked if a valid verdict cannot be submitted.";
 const settledOwnedShellJobs = new Set();
 if (config.version !== 1) throw new Error(`Unsupported worker host config version: ${config.version}`);
 if (!Array.isArray(config.rpcArgs) || config.rpcArgs.length === 0) throw new Error("Worker host config requires trusted RPC arguments.");
@@ -247,7 +249,7 @@ function waitForResultSettlement(rpcClient, resultFile, timeoutMs) {
     const reconcileSettledTurn = async () => {
       if (checking || finished) return;
       checking = true;
-      let quiescentSince; let observedOwnedShellWork = false; let requestedSettledFollowUp = false;
+      let quiescentSince; let observedOwnedShellWork = false; let requestedSettledFollowUp = false; let requestedReviewResultRepair = false;
       try {
         while (!finished) {
           const ownedShellState = ownedShellJobState();
@@ -264,7 +266,14 @@ function waitForResultSettlement(rpcClient, resultFile, timeoutMs) {
           if (ownedShellActive || rpcActive) quiescentSince = undefined;
           else {
             quiescentSince ??= Date.now();
-            if (Date.now() - quiescentSince >= 5_000) return finish(new Error("Worker reached a settled quiescent turn without the required typed worker_result_submit."));
+            if (Date.now() - quiescentSince >= SETTLED_RESULT_GRACE_MS) {
+              if (config.role === "review" && !requestedReviewResultRepair) {
+                requestedReviewResultRepair = true; quiescentSince = undefined;
+                await rpcClient.prompt(REVIEW_RESULT_REPAIR_PROMPT);
+                await delay(50); continue;
+              }
+              return finish(new Error("Worker reached a settled quiescent turn without the required typed worker_result_submit."));
+            }
           }
           await delay(rpcActive ? 250 : 50);
         }

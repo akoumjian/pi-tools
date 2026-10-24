@@ -6,7 +6,7 @@ import { Text, stripTerminalSequences, truncateToWidth, visibleWidth, type Compo
 import { defineTool, type AgentToolResult, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { resolveExtensionModel, assertChildAgentRouteAllowed, parseModelThinkingPair } from "../_shared/model-spec.js";
 import { throwIfAborted } from "../_shared/cancellation.js";
-import { asyncJobProcessStartToken, createAsyncJobId, isAsyncJobProcessIdentityAlive, signalAsyncJobProcessIdentity } from "../_shared/async-job.js";
+import { asyncJobProcessStartToken, createAsyncJobId, probeAsyncJobProcessIdentity, signalAsyncJobProcessIdentity, type AsyncJobProcessIdentityLiveness } from "../_shared/async-job.js";
 import { handleAsyncShellViewerCommand, reconcileTerminatedPersistedAsyncShellJobsForOwner, unsettledPersistedAsyncShellJobsForOwner, type JobMeta, type ManagedAsyncJobHandle } from "../async-shell/index.js";
 import { createWorkerContainerAsync, planWorkerContainer, resolveDockerPath, settleWorkerContainerAsync, type WorkerContainerReference } from "../_shared/worker-container.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
@@ -66,6 +66,7 @@ type RunRuntime = {
 type WorkerRuntime = { version: 2; inputs: RetainedInput[]; repositoryBaselines?: Array<{ path: string; resolvedCommit: string }>; cacheLineage?: WorkerCacheLineageRecord };
 type PendingRun = { workerId: string; runId: string; parentSessionFile: string; parentSessionId: string; runtime: RunRuntime };
 type ActiveRun = { runId: string; handle: ManagedAsyncJobHandle };
+class WorkerHostIdentityError extends Error {}
 type PlannedRun = {
   request: WorkerRunInputV2["runs"][number]; role: WorkerRole; workerId: string; runId: string; jobId: string; paths: WorkerPaths;
   taskIds: string[]; modelSelection: string; binding?: WorkerRunRecord["binding"]; workerRuntime: WorkerRuntime; runRuntime: RunRuntime;
@@ -81,6 +82,7 @@ export type WorkerExtensionDependencies = {
   launch?: (api: ExtensionAPI, context: ExtensionContext, input: { record: WorkerLaunchRecord; runtime: RunRuntime }) => ManagedAsyncJobHandle;
   createOverlay?: (input: Parameters<typeof createReviewOverlayAsync>[0]) => ReviewOverlayRecord | Promise<ReviewOverlayRecord>; cleanupOverlay?: (dockerPath: string, overlay: ReviewOverlayRecord) => void | Promise<void>;
   waitForHostIdentity?: (runtime: RunRuntime, workerId: string, runId: string) => Promise<void>;
+  probeHostIdentity?: (identity: ReturnType<typeof readWorkerHostProcess>) => AsyncJobProcessIdentityLiveness;
 };
 
 export default function workerExtension(api: ExtensionAPI): void { registerWorkerExtension(api); }
@@ -97,6 +99,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   const removeContainer = overrides.removeContainer ?? (testLaunch ? (() => {}) : settleWorkerContainerAsync);
   const createOverlay = overrides.createOverlay ?? createReviewOverlayAsync;
   const verifyHostIdentity = overrides.waitForHostIdentity ?? waitForWorkerHostIdentity;
+  const probeHostIdentity = overrides.probeHostIdentity ?? probeAsyncJobProcessIdentity;
   const cleanupOverlay = overrides.cleanupOverlay ?? cleanupReviewOverlayAsync;
   let registry: WorkerRegistry | undefined;
   let runtimeGeneration = 0;
@@ -499,7 +502,13 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
 
   async function waitForWorkerHostIdentity(runtime: RunRuntime, workerId: string, runId: string): Promise<void> {
     for (let attempt = 0; attempt < 200; attempt += 1) {
-      if (existsSync(runtime.processFile)) { const record = readWorkerHostProcess(runtime.processFile); if (record.workerId !== workerId || record.runId !== runId || record.nonce !== runtime.processNonce || !isAsyncJobProcessIdentityAlive(record)) throw new Error("Worker host process identity was invalid during launch."); return; }
+      if (existsSync(runtime.processFile)) {
+        const record = readExactWorkerHostProcess(runtime, workerId, runId, "launch");
+        const liveness = probeHostIdentity(record);
+        if (liveness === "alive") return;
+        if (liveness === "unknown") throw new WorkerHostIdentityError("Worker host process identity could not be verified during launch.");
+        throw new Error("Worker host process identity was not alive during launch.");
+      }
       await delay(25);
     }
     throw new Error(`Worker ${workerId}/${runId} did not publish its host process identity.`);
@@ -518,6 +527,9 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         const accepted = readWorkerRuntimeResult(runtime.resultFile); if (accepted.workerId !== workerId || accepted.runId !== runId) throw new Error("Worker result identity mismatch.");
         outcome = accepted.result.outcome; outcomeSource = "worker"; summary = accepted.result.summary; question = accepted.result.question; reported = accepted.result.repositories ?? []; artifacts = accepted.result.artifacts ?? [];
       } else errors.push({ scope: "run", message: sanitizeError(job.error ?? `Worker host exited with status ${job.status}${job.exitCode === undefined ? "" : ` (${job.exitCode})`}.`) });
+      const authorizationFile = revokeRuntimeAuthorization(runtime);
+      await waitForRuntimeAdmissions(runtime, authorizationFile);
+      await proveWorkerHostExited(runtime, workerId, runId);
       await removeContainer(docker(), runtime.container);
       if (runtime.overlay) await cleanupOverlay(docker(), runtime.overlay);
       const inventory = inventoryWorkerRepositories({ workspaceRoot: worker.workspaceRoot, workerId, runId, reported, before: runtime.repositoryBefore });
@@ -526,6 +538,11 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       if (currentContext?.sessionManager.getSessionFile() && realpathOrResolve(currentContext.sessionManager.getSessionFile()!) === worker.parentSessionFile) deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration);
     } catch (error) {
       const message = sanitizeError(error);
+      if (error instanceof WorkerHostIdentityError) {
+        releaseWorkerRunClaim(getRegistry(), workerId, runId, "settlement", nonce);
+        recordRecovery(workerId, runId, error);
+        return;
+      }
       const attempts = recordWorkerSettlementRecovery(getRegistry(), { workerId, runId, claimNonce: nonce, error: message, now: now().toISOString() });
       let accepted: ReturnType<typeof readWorkerRuntimeResult> | undefined;
       try { if (existsSync(runtime.resultFile)) accepted = readWorkerRuntimeResult(runtime.resultFile); } catch {}
@@ -548,7 +565,19 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
 
   async function failClaimedRun(workerId: string, runId: string, claimKind: "launch" | "settlement", claimNonce: string, error: unknown): Promise<void> {
     const worker = getWorker(getRegistry(), workerId); const run = worker && getWorkerRun(getRegistry(), workerId, runId); if (!worker || !run || run.claimKind !== claimKind || run.claimNonce !== claimNonce) return; const runtime = run.runtime as RunRuntime;
-    try { await removeContainer(docker(), runtime.container); if (runtime.overlay) await cleanupOverlay(docker(), runtime.overlay);
+    try {
+      const authorizationFile = revokeRuntimeAuthorization(runtime);
+      await waitForRuntimeAdmissions(runtime, authorizationFile);
+      const attached = active.get(workerId);
+      if (attached?.runId === runId) attached.handle.cancel("SIGTERM");
+      else await signalDetachedWorkerHost(runtime, workerId, runId, "failed-run cleanup");
+      await removeContainer(docker(), runtime.container);
+      if (attached?.runId === runId) {
+        const terminal = await Promise.race([attached.handle.completion.then((job) => job.status !== "running" && job.status !== "unknown"), delay(5_000).then(() => false)]);
+        if (!terminal) throw new Error("Worker host job did not reach a terminal state during failed-run cleanup.");
+      }
+      await proveWorkerHostExited(runtime, workerId, runId);
+      if (runtime.overlay) await cleanupOverlay(docker(), runtime.overlay);
       finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind, claimNonce, outcome: "failed", outcomeSource: "system", summary: "Worker run failed before accepting a result.", errors: [{ scope: "run", message: sanitizeError(error) }], sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile) : undefined, settledAt: now().toISOString() });
     } catch (cleanupError) { recordRecovery(workerId, runId, cleanupError); }
   }
@@ -565,11 +594,16 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     if (!claimWorkerCancellation(getRegistry(), worker.workerId, runId, nonce, now().toISOString())) return "not_active";
     pending.delete(runId); const run = getWorkerRun(getRegistry(), worker.workerId, runId)!; const runtime = run.runtime as RunRuntime;
     try {
-      const authorizationFile = path.join(runtime.runDir, "host-authorization.json"); rmSync(authorizationFile, { force: true });
+      const authorizationFile = revokeRuntimeAuthorization(runtime);
       await waitForRuntimeAdmissions(runtime, authorizationFile);
       const launching = starting.get(worker.workerId); if (launching?.runId === runId) await launching.completion;
       const attached = active.get(worker.workerId); if (attached?.runId === runId) { attached.handle.cancel("SIGTERM"); }
-      else if (existsSync(runtime.processFile)) { const process = readWorkerHostProcess(runtime.processFile); if (process.workerId !== worker.workerId || process.runId !== runId || process.nonce !== runtime.processNonce) throw new Error("Worker host process identity mismatch during cancellation."); if (isAsyncJobProcessIdentityAlive(process)) signalAsyncJobProcessIdentity(process, "SIGTERM"); }
+      else if (existsSync(runtime.processFile)) {
+        const process = readExactWorkerHostProcess(runtime, worker.workerId, runId, "cancellation");
+        const liveness = probeHostIdentity(process);
+        if (liveness === "unknown") throw new WorkerHostIdentityError("Worker host process identity could not be verified during cancellation.");
+        if (liveness === "alive") signalAsyncJobProcessIdentity(process, "SIGTERM");
+      }
       await removeContainer(docker(), runtime.container);
       if (attached?.runId === runId) { const terminal = await Promise.race([attached.handle.completion.then((job) => job.status !== "running" && job.status !== "unknown"), delay(5_000).then(() => false)]); if (!terminal) throw new Error("Worker host job did not reach a terminal state during cancellation."); }
       await proveWorkerHostExited(runtime, worker.workerId, runId);
@@ -580,6 +614,20 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId: worker.workerId, runId, claimKind: "cancellation", claimNonce: nonce, outcome: "cancelled", outcomeSource: "system", summary: "Worker run was cancelled by its parent.", sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile) : undefined, settledAt: now().toISOString() });
       active.delete(worker.workerId); deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration); return "cancelled";
     } catch (error) { recordRecovery(worker.workerId, runId, error); throw new Error(`Worker ${worker.workerId}/${runId} cancellation requires recovery: ${sanitizeError(error)}`); }
+  }
+
+  function revokeRuntimeAuthorization(runtime: RunRuntime): string {
+    const authorizationFile = path.join(runtime.runDir, "host-authorization.json");
+    rmSync(authorizationFile, { force: true });
+    return authorizationFile;
+  }
+
+  async function signalDetachedWorkerHost(runtime: RunRuntime, workerId: string, runId: string, operation: string): Promise<void> {
+    if (!existsSync(runtime.processFile)) return;
+    const processRecord = readExactWorkerHostProcess(runtime, workerId, runId, operation);
+    const liveness = probeHostIdentity(processRecord);
+    if (liveness === "unknown") throw new WorkerHostIdentityError(`Worker host process identity could not be verified during ${operation}.`);
+    if (liveness === "alive") signalAsyncJobProcessIdentity(processRecord, "SIGTERM");
   }
 
   async function waitForRuntimeAdmissions(runtime: RunRuntime, authorizationFile: string): Promise<void> {
@@ -600,11 +648,32 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
 
   async function proveWorkerHostExited(runtime: RunRuntime, workerId: string, runId: string): Promise<void> {
     if (!existsSync(runtime.processFile)) return;
-    const processRecord = readWorkerHostProcess(runtime.processFile);
-    if (processRecord.workerId !== workerId || processRecord.runId !== runId || processRecord.nonce !== runtime.processNonce) throw new Error("Worker host process identity mismatch during cancellation proof.");
-    for (let attempt = 0; attempt < 50 && isAsyncJobProcessIdentityAlive(processRecord); attempt += 1) await delay(100);
-    if (isAsyncJobProcessIdentityAlive(processRecord)) { signalAsyncJobProcessIdentity(processRecord, "SIGKILL"); for (let attempt = 0; attempt < 30 && isAsyncJobProcessIdentityAlive(processRecord); attempt += 1) await delay(100); }
-    if (isAsyncJobProcessIdentityAlive(processRecord)) throw new Error(`Worker host process group ${processRecord.pid} remained alive after cancellation.`);
+    const processRecord = readExactWorkerHostProcess(runtime, workerId, runId, "termination proof");
+    let liveness = await waitForHostLiveness(processRecord, 50);
+    if (liveness === "unknown") throw new WorkerHostIdentityError("Worker host process identity remained ambiguous during termination proof.");
+    if (liveness === "dead") return;
+    signalAsyncJobProcessIdentity(processRecord, "SIGKILL");
+    liveness = await waitForHostLiveness(processRecord, 30);
+    if (liveness === "unknown") throw new WorkerHostIdentityError("Worker host process identity became ambiguous after forced termination.");
+    if (liveness === "alive") throw new Error(`Worker host process group ${processRecord.pid} remained alive after forced termination.`);
+  }
+
+  async function waitForHostLiveness(processRecord: ReturnType<typeof readWorkerHostProcess>, attempts: number): Promise<AsyncJobProcessIdentityLiveness> {
+    let liveness: AsyncJobProcessIdentityLiveness = "unknown";
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      liveness = probeHostIdentity(processRecord);
+      if (liveness === "dead") return liveness;
+      await delay(100);
+    }
+    return liveness;
+  }
+
+  function readExactWorkerHostProcess(runtime: RunRuntime, workerId: string, runId: string, operation: string): ReturnType<typeof readWorkerHostProcess> {
+    let processRecord: ReturnType<typeof readWorkerHostProcess>;
+    try { processRecord = readWorkerHostProcess(runtime.processFile); }
+    catch (error) { throw new WorkerHostIdentityError(`Worker host process marker could not be read during ${operation}: ${sanitizeError(error)}`); }
+    if (processRecord.workerId !== workerId || processRecord.runId !== runId || processRecord.nonce !== runtime.processNonce) throw new WorkerHostIdentityError(`Worker host process identity mismatched during ${operation}.`);
+    return processRecord;
   }
 
   function recoverInterruptedDiscardFiles(parentSessionFile: string, generation: number): void {
@@ -662,20 +731,29 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       if (run.status === "queued") {
         if (existsSync(runtime.processFile)) {
           try {
-            const processRecord = readWorkerHostProcess(runtime.processFile);
-            if (processRecord.workerId === worker.workerId && processRecord.runId === run.runId && processRecord.nonce === runtime.processNonce && isAsyncJobProcessIdentityAlive(processRecord)) {
+            const processRecord = readExactWorkerHostProcess(runtime, worker.workerId, run.runId, "queued-run reconciliation");
+            const liveness = probeHostIdentity(processRecord);
+            if (liveness === "unknown") { recordRecovery(worker.workerId, run.runId, new WorkerHostIdentityError("Worker host process identity was ambiguous during queued-run reconciliation.")); continue; }
+            if (liveness === "alive") {
               const nonce = claimNonce();
               if (claimWorkerRun(getRegistry(), worker.workerId, run.runId, "launch", nonce, ["queued"])) finalizeWorkerRunLaunch(getRegistry(), { workerId: worker.workerId, runId: run.runId, claimNonce: nonce, modelSelection: worker.modelSelection!, sessionId: worker.sessionId!, sessionFile: worker.sessionFile!, sessionStartLine: run.sessionStartLine ?? countLines(worker.sessionFile!) + 1, jobId: run.jobId!, stdoutLog: run.stdoutLog!, stderrLog: run.stderrLog!, runtime, startedAt: run.startedAt ?? now().toISOString() });
               continue;
             }
-          } catch {}
+          } catch (error) { recordRecovery(worker.workerId, run.runId, error); continue; }
         }
         if (!pending.has(run.runId) && !starting.has(worker.workerId)) { const item = { workerId: worker.workerId, runId: run.runId, parentSessionFile, parentSessionId: context.sessionManager.getSessionId(), runtime }; beginPreparedRun(context, item); }
         continue;
       }
       if (active.get(worker.workerId)?.runId === run.runId) continue;
       if (existsSync(runtime.settledFile) && existsSync(runtime.resultFile)) { void settleCompletedRun(worker.workerId, run.runId, { status: "exited", exitCode: 0 }); continue; }
-      if (existsSync(runtime.processFile)) { try { const process = readWorkerHostProcess(runtime.processFile); if (process.workerId === worker.workerId && process.runId === run.runId && process.nonce === runtime.processNonce && isAsyncJobProcessIdentityAlive(process)) continue; } catch {} }
+      if (existsSync(runtime.processFile)) {
+        try {
+          const process = readExactWorkerHostProcess(runtime, worker.workerId, run.runId, "running-run reconciliation");
+          const liveness = probeHostIdentity(process);
+          if (liveness === "alive") continue;
+          if (liveness === "unknown") { recordRecovery(worker.workerId, run.runId, new WorkerHostIdentityError("Worker host process identity was ambiguous during running-run reconciliation.")); continue; }
+        } catch (error) { recordRecovery(worker.workerId, run.runId, error); continue; }
+      }
       const nonce = claimNonce(); if (claimWorkerRun(getRegistry(), worker.workerId, run.runId, "settlement", nonce, ["running"])) void failClaimedRun(worker.workerId, run.runId, "settlement", nonce, new Error("Worker supervisor exited without a verified result settlement."));
     }
   }
