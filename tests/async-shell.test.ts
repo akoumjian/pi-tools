@@ -114,6 +114,22 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function installAsyncMetaRenameEnospc(): () => void {
+  const originalRenameSync = fs.renameSync;
+  fs.renameSync = ((oldPath: fs.PathLike, newPath: fs.PathLike) => {
+    if (path.basename(String(newPath)) === "meta.json" && String(newPath).includes(`${path.sep}.pi${path.sep}async-shell${path.sep}jobs${path.sep}`)) {
+      const error = Object.assign(new Error("ENOSPC: injected async metadata rename failure"), { code: "ENOSPC" });
+      throw error;
+    }
+    return originalRenameSync(oldPath, newPath);
+  }) as typeof fs.renameSync;
+  syncBuiltinESMExports();
+  return () => {
+    fs.renameSync = originalRenameSync;
+    syncBuiltinESMExports();
+  };
+}
+
 async function waitWithRefTimeout<T>(promise: Promise<T>, timeoutMs = 2_000): Promise<T> {
   let timeout: NodeJS.Timeout | undefined;
   try {
@@ -167,6 +183,7 @@ function viewerSnapshot(overrides: Partial<AsyncShellViewerSnapshot> = {}): Asyn
       startedAt: "2026-08-03T21:00:00.000Z",
       notifyOnExit: true,
       completionNotified: false,
+      reportedInBand: false,
       logDir,
       stdoutLog: path.join(logDir, "stdout.log"),
       stderrLog: path.join(logDir, "stderr.log"),
@@ -256,11 +273,11 @@ test("ordinary retention protects new, legacy-command, and exact-registry manage
 
     const inventory = await listEligibleAsyncShellPrune({ cwd: dir }, undefined, 100, "ineligible");
     assert.deepEqual(inventory.entries.map((entry) => [entry.name, entry.reason]), [
-      [marked, "managed-worker evidence; use worker discard/cleanup"],
-      [legacy, "managed-worker evidence; use worker discard/cleanup"]
+      [marked, "managed-worker evidence; ordinary prune refused; host-log cleanup is separate"],
+      [legacy, "managed-worker evidence; ordinary prune refused; host-log cleanup is separate"]
     ]);
-    assert.throws(() => previewAsyncShellPrune({ cwd: dir }, [marked]), /managed-worker evidence; use worker discard\/cleanup/);
-    assert.throws(() => pruneAsyncShellJobs({ cwd: dir }, [legacy]), /managed-worker evidence; use worker discard\/cleanup/);
+    assert.throws(() => previewAsyncShellPrune({ cwd: dir }, [marked]), /managed-worker evidence; ordinary prune refused/);
+    assert.throws(() => pruneAsyncShellJobs({ cwd: dir }, [legacy]), /managed-worker evidence; ordinary prune refused/);
 
     const runtimeRoot = path.join(dir, "worker-runtime");
     await mkdir(runtimeRoot);
@@ -270,7 +287,7 @@ test("ordinary retention protects new, legacy-command, and exact-registry manage
     database.close();
     const registryIds = readManagedWorkerHostJobIds(runtimeRoot);
     assert.deepEqual([...registryIds], [registryId]);
-    assert.equal(managedWorkerEvidenceReason({ jobId: registryId, command: "edited" }, registryIds), "managed-worker evidence; use worker discard/cleanup");
+    assert.equal(managedWorkerEvidenceReason({ jobId: registryId, command: "edited" }, registryIds), "managed-worker evidence; ordinary prune refused; host-log cleanup is separate");
     const invalidRoot = path.join(dir, "invalid-worker-runtime");
     await mkdir(invalidRoot);
     const invalidDatabase = new DatabaseSync(path.join(invalidRoot, "registry.sqlite"));
@@ -278,7 +295,17 @@ test("ordinary retention protects new, legacy-command, and exact-registry manage
     invalidDatabase.close();
     assert.throws(() => readManagedWorkerHostJobIds(invalidRoot), /evidence registry is unavailable/);
     const directSnapshot = await scanAsyncShellRetention(path.join(dir, ".pi", "async-shell", "jobs"), undefined, registryIds);
-    assert.equal(directSnapshot.entries.find((entry) => entry.name === registryId)?.reason, "managed-worker evidence; use worker discard/cleanup");
+    assert.equal(directSnapshot.entries.find((entry) => entry.name === registryId)?.reason, "managed-worker evidence; ordinary prune refused; host-log cleanup is separate");
+    const root = path.join(dir, ".pi", "async-shell", "jobs");
+    const metadataLessPending = `.pending-${registryId}-123e4567-e89b-42d3-a456-426614174311`;
+    const metadataLessPrune = `.prune-${registryId}-123e4567-e89b-42d3-a456-426614174312`;
+    await mkdir(path.join(root, metadataLessPending));
+    await mkdir(path.join(root, metadataLessPrune));
+    assert.throws(() => previewAsyncShellPrune({ cwd: dir }, [metadataLessPending], registryIds), /managed-worker evidence; ordinary prune refused/);
+    assert.throws(() => previewAsyncShellPrune({ cwd: dir }, [metadataLessPrune], registryIds), /managed-worker evidence; ordinary prune refused/);
+    const leftoverSnapshot = await scanAsyncShellRetention(root, undefined, registryIds);
+    assert.equal(leftoverSnapshot.entries.find((entry) => entry.name === metadataLessPending)?.reason, "managed-worker evidence; ordinary prune refused; host-log cleanup is separate");
+    assert.equal(leftoverSnapshot.entries.find((entry) => entry.name === metadataLessPrune)?.reason, "managed-worker evidence; ordinary prune refused; host-log cleanup is separate");
     assert.equal(existsSync(path.join(dir, ".pi", "async-shell", "jobs", marked)), true);
   });
 });
@@ -301,7 +328,7 @@ test("managed async host marker persists in canonical metadata", async () => {
     await waitWithRefTimeout(handle.completion);
     const persisted = JSON.parse(await readFile(path.join(handle.snapshot().logDir, "meta.json"), "utf8")) as { managedBy?: unknown };
     assert.deepEqual(persisted.managedBy, managedBy);
-    assert.throws(() => previewAsyncShellPrune({ cwd: dir }, [handle.jobId]), /managed-worker evidence; use worker discard\/cleanup/);
+    assert.throws(() => previewAsyncShellPrune({ cwd: dir }, [handle.jobId]), /managed-worker evidence; ordinary prune refused/);
   });
 });
 
@@ -317,6 +344,34 @@ test("retention totals count regular stray root files including pending-shaped n
     assert.equal(snapshot.totals.unknownLeftovers.count, 2);
     assert.equal(snapshot.totals.bytes, Buffer.byteLength("pending-filestray"));
     assert.match(snapshot.entries.find((entry) => entry.name === pendingFile)?.reason ?? "", /not an ordinary directory/);
+  });
+});
+
+test("status and inventory surface corrupt worker-registry protection failures while failing closed", async () => {
+  await withTempDir(async (dir) => {
+    const exercise = async (project: string, command: "async:status" | "async:prune", args: string): Promise<string> => {
+      const invalidRoot = path.join(project, "corrupt-worker-runtime");
+      await mkdir(invalidRoot, { recursive: true });
+      const invalidDatabase = new DatabaseSync(path.join(invalidRoot, "registry.sqlite"));
+      invalidDatabase.exec("CREATE TABLE unrelated(value TEXT)");
+      invalidDatabase.close();
+      await assert.rejects(refreshAsyncShellRetentionSnapshot({ cwd: project }, undefined, invalidRoot), /evidence registry is unavailable/);
+      const api = createFakeApi();
+      asyncShellExtension(api);
+      const notifications: string[] = [];
+      const context = {
+        ...createContext(project),
+        mode: "tui",
+        hasUI: true,
+        ui: { notify(message: string): void { notifications.push(message); } }
+      } as unknown as ExtensionCommandContext;
+      await required(api.commands.get(command), command).handler(args, context);
+      return notifications.join("\n");
+    };
+    const status = await exercise(path.join(dir, "status-project"), "async:status", "");
+    assert.match(status, /protection failed closed: Managed-worker evidence registry is unavailable/);
+    const inventory = await exercise(path.join(dir, "inventory-project"), "async:prune", "--eligible");
+    assert.match(inventory, /inventory protection failed closed: Managed-worker evidence registry is unavailable/);
   });
 });
 
@@ -343,7 +398,7 @@ test("retention inventory uses deletion-stable cursors and reports bounded class
 });
 
 
-test("partial deletion failure leaves complete remaining evidence under recoverable prune names", async () => {
+test("partial deletion failure leaves incomplete residue purge-only and never restores a broken canonical job", async () => {
   await withTempDir(async (dir) => {
     const first = "job_20261024180000_partial01";
     const second = "job_20261024180000_partial02";
@@ -354,13 +409,16 @@ test("partial deletion failure leaves complete remaining evidence under recovera
     fs.rmSync = ((target: fs.PathLike, options?: fs.RmDirOptions) => {
       if (path.basename(String(target)).startsWith(".prune-")) {
         removals += 1;
-        if (removals === 2) throw new Error("injected second removal failure");
+        if (removals === 2) {
+          originalRmSync(path.join(String(target), "stdout.log"), { force: true });
+          throw new Error("injected second partial removal failure");
+        }
       }
       return originalRmSync(target, options as never);
     }) as typeof fs.rmSync;
     syncBuiltinESMExports();
     try {
-      assert.throws(() => pruneAsyncShellJobs({ cwd: dir }, [first, second]), /retained classified recovery targets/);
+      assert.throws(() => pruneAsyncShellJobs({ cwd: dir }, [first, second]), /retained classified purge\/recovery residue/);
     } finally {
       fs.rmSync = originalRmSync;
       syncBuiltinESMExports();
@@ -370,9 +428,10 @@ test("partial deletion failure leaves complete remaining evidence under recovera
     assert.equal(names.includes(first), false);
     assert.equal(names.includes(second), false, "a possibly partial directory is never restored as canonical");
     const retained = required(names.find((name) => name.startsWith(`.prune-${second}-`)), "classified retained prune target");
-    assert.equal(previewAsyncShellPrune({ cwd: dir }, [retained])[0]?.recoveryEligible, true);
-    assert.equal(recoverAsyncShellPruneLeftovers({ cwd: dir }, [retained]).length, 1);
-    assert.equal(existsSync(path.join(root, second)), true);
+    assert.equal(previewAsyncShellPrune({ cwd: dir }, [retained])[0]?.recoveryEligible, false);
+    assert.throws(() => recoverAsyncShellPruneLeftovers({ cwd: dir }, [retained]), /not recoverable/);
+    assert.equal(existsSync(path.join(root, second)), false);
+    assert.equal(pruneAsyncShellJobs({ cwd: dir }, [retained]).length, 1, "purge-only residue remains exactly deletable");
   });
 });
 
@@ -404,6 +463,8 @@ test("pending and prune leftovers are visible, exactly deletable, and prune reco
       outputBytes: { stdout: 0, stderr: 0 }
     })}\n`);
     await writeJobMeta(dir, pruneJob, { status: "exited", notifyOnExit: false, completionNotified: true });
+    await writeFile(path.join(root, pruneJob, "stdout.log"), "complete stdout");
+    await writeFile(path.join(root, pruneJob, "stderr.log"), "complete stderr");
     await rename(path.join(root, pruneJob), path.join(root, prune));
     await mkdir(path.join(root, interruptedDelete), { recursive: true });
     await writeFile(path.join(root, interruptedDelete, "partial"), "trash");
@@ -1279,6 +1340,95 @@ test("shell_start suppresses deferred completion notices when jobs complete in-b
 
     await delay(50);
     assert.equal(api.sentMessages.length, 0);
+  });
+});
+
+test("single late-grace ENOSPC result is explicitly reported in-band and never triggers a duplicate turn across reload", async () => {
+  await withTempDir(async (dir) => {
+    const api = createFakeApi();
+    asyncShellExtension(api);
+    const context = createContext(dir, true);
+    const shellStart = required(api.registeredTools.find((tool) => tool.name === "shell_start"), "shell_start tool");
+    assert.ok(shellStart.execute);
+    let restoreRename: (() => void) | undefined;
+    let started = false;
+    let result;
+    try {
+      result = await shellStart.execute(
+        "single-late-grace-enospc",
+        { commands: [{ command: "sleep 0.5", cwd: dir, job_name: "single-in-band-enospc" }] } as never,
+        new AbortController().signal,
+        () => {
+          if (!started) {
+            started = true;
+            restoreRename = installAsyncMetaRenameEnospc();
+          }
+        },
+        context
+      );
+    } finally {
+      restoreRename?.();
+    }
+    const job = (result!.details as { jobs: Array<{ jobId: string; status: string; reportedInBand: boolean; error?: string }> }).jobs[0]!;
+    assert.equal(job.status, "failed");
+    assert.equal(job.reportedInBand, true);
+    assert.match(job.error ?? "", /ENOSPC/);
+    await api.emit("turn_end", {}, context);
+    await api.emit("agent_end", {}, context);
+    await delay(250);
+    assert.equal(api.sentMessages.length, 0, "timer, queue, and flush paths must suppress the in-band result");
+
+    const reloaded = createFakeApi();
+    asyncShellExtension(reloaded);
+    await reloaded.emit("session_start", { reason: "reload" }, context);
+    await reloaded.emit("turn_end", {}, context);
+    await reloaded.emit("agent_end", {}, context);
+    await delay(250);
+    assert.equal(reloaded.sentMessages.length, 0, "reload reconciliation must retain the holder-backed in-band latch");
+    const shellStatus = required(reloaded.registeredTools.find((tool) => tool.name === "shell_status"), "reloaded shell_status");
+    const status = await shellStatus.execute!("reported-status", { jobId: job.jobId } as never, new AbortController().signal, undefined, context);
+    assert.equal((status.details as { job: { reportedInBand: boolean } }).job.reportedInBand, true);
+  });
+});
+
+test("multi-job late-grace ENOSPC marks every terminal in-band result and sends zero notices", async () => {
+  await withTempDir(async (dir) => {
+    const api = createFakeApi();
+    asyncShellExtension(api);
+    const context = createContext(dir, true);
+    const shellStart = required(api.registeredTools.find((tool) => tool.name === "shell_start"), "shell_start tool");
+    assert.ok(shellStart.execute);
+    let restoreRename: (() => void) | undefined;
+    let started = false;
+    let result;
+    try {
+      result = await shellStart.execute(
+        "multi-late-grace-enospc",
+        { commands: [
+          { command: "sleep 0.4", cwd: dir, job_name: "multi-in-band-one" },
+          { command: "sleep 0.6", cwd: dir, job_name: "multi-in-band-two" }
+        ] } as never,
+        new AbortController().signal,
+        () => {
+          if (!started) {
+            started = true;
+            restoreRename = installAsyncMetaRenameEnospc();
+          }
+        },
+        context
+      );
+    } finally {
+      restoreRename?.();
+    }
+    const jobs = (result!.details as { jobs: Array<{ status: string; reportedInBand: boolean; error?: string }> }).jobs;
+    assert.equal(jobs.length, 2);
+    assert.deepEqual(jobs.map((job) => job.reportedInBand), [true, true]);
+    assert.deepEqual(jobs.map((job) => job.status), ["failed", "failed"]);
+    assert.ok(jobs.every((job) => /ENOSPC/.test(job.error ?? "")));
+    await api.emit("turn_end", {}, context);
+    await api.emit("agent_end", {}, context);
+    await delay(300);
+    assert.equal(api.sentMessages.length, 0, "no in-band member can create a duplicate notice or new turn");
   });
 });
 
@@ -2293,16 +2443,23 @@ test("partial batch startup failure releases earlier job barriers", async () => 
     const shellStart = required(api.registeredTools.find((tool) => tool.name === "shell_start"), "shell_start tool");
     assert.ok(shellStart.execute);
     const context = createContext(dir, true);
-    await assert.rejects(shellStart.execute(
-      "partial-start-failure",
-      { commands: [
-        { command: "sleep 0.5", cwd: dir, job_name: "started-before-failure" },
-        { command: "never", cwd: dir, shell: "bad\0shell", job_name: "invalid-spawn" }
-      ] } as never,
-      new AbortController().signal,
-      undefined,
-      context
-    ), /null bytes|must be a string without null bytes|invalid/i);
+    let startupError: unknown;
+    try {
+      await shellStart.execute(
+        "partial-start-failure",
+        { commands: [
+          { command: "sleep 0.5", cwd: dir, job_name: "started-before-failure" },
+          { command: "never", cwd: dir, shell: "bad\0shell", job_name: "invalid-spawn" }
+        ] } as never,
+        new AbortController().signal,
+        undefined,
+        context
+      );
+    } catch (error) {
+      startupError = error;
+    }
+    assert.match(String(startupError), /null bytes|must be a string without null bytes|invalid/i);
+    assert.match(String(startupError), /already-started async job IDs: job_/);
     for (let attempt = 0; attempt < 160 && api.sentMessages.length === 0; attempt += 1) await delay(25);
     assert.equal(api.sentMessages.length, 1);
     assert.match(JSON.stringify(api.sentMessages[0]?.message), /started-before-failure/);

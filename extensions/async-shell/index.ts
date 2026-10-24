@@ -84,6 +84,8 @@ export type JobMeta = {
   error?: string;
   notifyOnExit: boolean;
   completionNotified: boolean;
+  /** Terminal result was returned directly by shell_start and must never enqueue a notice. */
+  reportedInBand: boolean;
   owner?: AsyncShellJobOwner;
   managedBy?: AsyncShellManagedBy;
   processToken?: string;
@@ -134,6 +136,7 @@ type JobStartDetails = Pick<JobMeta,
   | "stdoutLog"
   | "stderrLog"
   | "outputBytes"
+  | "reportedInBand"
 >;
 
 type CompletionDeliveryContext = {
@@ -263,6 +266,7 @@ type AsyncShellRetentionState = {
   progressListeners?: Set<(progress: AsyncShellRetentionProgress) => void>;
   removedNames?: Set<string>;
   mutationRevision?: number;
+  lastError?: string;
 };
 
 export type AsyncShellViewerStreamSnapshot = {
@@ -305,6 +309,7 @@ type StartUpdate = (partial: AgentToolResult<StartDetails>) => void;
 type CompletionNotificationTarget = {
   notifyOnExit: boolean;
   completionNotified: boolean;
+  reportedInBand: boolean;
 };
 
 type CompletionNotificationOptions = {
@@ -413,6 +418,7 @@ export function migrateAsyncShellRuntimeHolder(existingValue: unknown): AsyncShe
   existing.completionRuntimes ??= new Map<string, CompletionDeliveryRuntime>();
   existing.retentionSnapshots ??= new Map<string, AsyncShellRetentionState>();
   existing.nextCompletionGeneration ??= 0;
+  for (const job of existing.jobs.values()) job.reportedInBand ??= false;
   if (
     !(existing.pendingCompletionNotifications instanceof Map) ||
     !(existing.completionDeliveryBatches instanceof Map) ||
@@ -490,8 +496,9 @@ export function isAsyncShellCompletionBarrierTarget(target: {
   notifyOnExit: boolean;
   completionNotified: boolean;
   completionFollowUpQueued: boolean;
+  reportedInBand?: boolean;
 }): boolean {
-  return target.notifyOnExit && (!target.completionNotified || target.completionFollowUpQueued);
+  return target.reportedInBand !== true && target.notifyOnExit && (!target.completionNotified || target.completionFollowUpQueued);
 }
 
 export default function asyncShellExtension(api: ExtensionAPI): void {
@@ -630,8 +637,9 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
       if (params.jobId === undefined) {
         const hadSnapshot = latestAsyncShellRetentionSnapshot(context) !== undefined;
         const jobsList = await listJobs(context, params.limit ?? 20);
+        const retentionError = retentionState(context).state.lastError;
         return {
-          content: [{ type: "text", text: formatJobList(jobsList, !hadSnapshot) }],
+          content: [{ type: "text", text: formatJobList(jobsList, !hadSnapshot, retentionError) }],
           details: { jobs: jobsList }
         };
       }
@@ -743,7 +751,9 @@ async function startJobs(
     }
   } catch (error) {
     releaseStartResultBarriers(api, runtimes);
-    throw error;
+    const startedIds = runtimes.map((job) => job.jobId);
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${message}${startedIds.length > 0 ? `; already-started async job IDs: ${startedIds.join(", ")}` : ""}`, { cause: error });
   }
 
   try {
@@ -1114,6 +1124,7 @@ function createJobMeta(input: {
     startedAt: new Date(input.startedAtMs).toISOString(),
     notifyOnExit: input.notifyOnExit,
     completionNotified: false,
+    reportedInBand: false,
     owner: input.owner,
     managedBy: input.managedBy,
     processToken: input.processToken,
@@ -1177,7 +1188,7 @@ function scheduleCompletionNotification(api: ExtensionAPI, job: JobRuntime): voi
 
 function scheduleCompletionFollowUp(target: CompletionNotificationTarget, options: CompletionNotificationOptions): void {
   const scheduledJobId = "jobId" in target && typeof target.jobId === "string" ? target.jobId : undefined;
-  if (!target.notifyOnExit || target.completionNotified || (scheduledJobId !== undefined && scheduledCompletionJobIds.has(scheduledJobId))) {
+  if (!target.notifyOnExit || target.completionNotified || target.reportedInBand || (scheduledJobId !== undefined && scheduledCompletionJobIds.has(scheduledJobId))) {
     return;
   }
 
@@ -1189,7 +1200,7 @@ function scheduleCompletionFollowUp(target: CompletionNotificationTarget, option
     // finishStartGracePeriod() continuation have had a chance to suppress an
     // in-band result. The inner latch check is still required because multiple
     // job finalizers can schedule work before any timer callback runs.
-    if (target.completionNotified || !options.isReady()) {
+    if (target.completionNotified || target.reportedInBand || !target.notifyOnExit || !options.isReady()) {
       return;
     }
 
@@ -1198,7 +1209,7 @@ function scheduleCompletionFollowUp(target: CompletionNotificationTarget, option
 }
 
 function queueCompletionNotification(_api: ExtensionAPI, job: JobRuntime): void {
-  if (!job.completionRuntime.active || job.completionNotified) return;
+  if (!job.completionRuntime.active || job.completionNotified || job.reportedInBand || !job.notifyOnExit) return;
   pendingCompletionNotifications.set(job.jobId, job);
   scheduleCompletionBatchFlush(job.completionRuntime);
 }
@@ -1220,11 +1231,16 @@ function flushCompletionNotificationBatch(runtime: CompletionDeliveryRuntime, op
   if (!options.allowActive && !context.isIdle()) return;
   const sessionId = context.sessionId();
   if (!sessionId || runtime.sessionId !== sessionId) return;
+  for (const [jobId, job] of pendingCompletionNotifications) {
+    if (job.reportedInBand || !job.notifyOnExit) pendingCompletionNotifications.delete(jobId);
+  }
   const eligible = Array.from(pendingCompletionNotifications.values()).filter((job) =>
     job.completionRuntime === runtime &&
     job.originSessionId === sessionId &&
     !job.completionNotified &&
-    !job.completionFollowUpQueued
+    !job.completionFollowUpQueued &&
+    !job.reportedInBand &&
+    job.notifyOnExit
   );
   const byMode = new Map<CompletionDelivery, JobRuntime[]>();
   for (const job of eligible) {
@@ -1301,6 +1317,12 @@ function bindCompletionRuntime(api: ExtensionAPI, runtime: CompletionDeliveryRun
     if (job.originProjectCwd !== context.cwd || job.originSessionId !== sessionId) continue;
     if (job.completionRuntime !== runtime && job.completionRuntime.active) continue;
     job.completionRuntime = runtime;
+    if (job.reportedInBand) {
+      job.completionFollowUpQueued = false;
+      pendingCompletionNotifications.delete(job.jobId);
+      forgetCompletionDelivery(job.jobId);
+      continue;
+    }
     if (isTerminal(job.status) && job.notifyOnExit && !job.completionNotified && !job.completionFollowUpQueued) {
       pendingCompletionNotifications.set(job.jobId, job);
     }
@@ -1463,7 +1485,8 @@ function startJobDetails(job: JobMeta): JobStartDetails {
     error: job.error,
     stdoutLog: job.stdoutLog,
     stderrLog: job.stderrLog,
-    outputBytes: asyncJobOutputBytes(job.stdoutLog, job.stderrLog)
+    outputBytes: asyncJobOutputBytes(job.stdoutLog, job.stderrLog),
+    reportedInBand: job.reportedInBand === true
   };
 }
 
@@ -1708,14 +1731,15 @@ function partialStartResult(jobsList: JobRuntime[]): AgentToolResult<StartDetail
   };
 }
 
-function formatJobList(jobsList: JobMeta[], historyRefreshPending = false): string {
+function formatJobList(jobsList: JobMeta[], historyRefreshPending = false, retentionError?: string): string {
+  const protection = retentionError === undefined ? "" : `Async-shell history protection failed closed: ${retentionError}\n\n`;
   if (jobsList.length === 0) {
-    return historyRefreshPending
+    return `${protection}${historyRefreshPending
       ? "No attached async shell jobs. Historical registry refresh started in the background; call shell_status later only if another lifecycle event requires it."
-      : "No async shell jobs for this project.";
+      : "No async shell jobs for this project."}`;
   }
 
-  return jobsList.map((job) => {
+  return protection + jobsList.map((job) => {
     const jobName = job.job_name ? ` (${job.job_name})` : "";
     const outcome = job.exitCode === undefined ? "" : ` exit=${job.exitCode}`;
     return `${job.jobId}${jobName}: ${job.status}${outcome}\n  ${job.command}\n  cwd: ${job.cwd}`;
@@ -1870,6 +1894,7 @@ function publicJob(job: JobMeta): JobMeta {
     error: job.error,
     notifyOnExit: job.notifyOnExit,
     completionNotified: job.completionNotified,
+    reportedInBand: job.reportedInBand === true,
     owner: job.owner ? { ...job.owner } : undefined,
     managedBy: job.managedBy ? { ...job.managedBy } : undefined,
     processToken: job.processToken,
@@ -1907,11 +1932,17 @@ function finishStartGracePeriod(jobsList: JobRuntime[]): void {
   for (const job of jobsList) {
     try {
       if (!isTerminal(job.status)) continue;
-      const persisted = acknowledgeObservedJobCompletion(job);
-      if (!persisted) job.notifyOnExit = false;
+      // This holder-backed latch is authoritative even when the metadata write
+      // below fails. Mark it before shell_start can release the in-band result.
+      job.reportedInBand = true;
+      job.notifyOnExit = false;
+      job.completionFollowUpQueued = false;
+      pendingCompletionNotifications.delete(job.jobId);
+      scheduledCompletionJobIds.delete(job.jobId);
+      forgetCompletionDelivery(job.jobId);
+      acknowledgeObservedJobCompletion(job);
     } catch (cause) {
       recordMetadataPersistenceFailure(job, cause, "Grace finalization failed");
-      job.notifyOnExit = false;
     } finally {
       job.startResultPending = false;
     }
@@ -2159,7 +2190,7 @@ export function buildAsyncShellPruneUsage(): string {
     "Without --confirm, up to 250 exact targets receive a read-only preview. Confirmation revalidates the complete exact set before deletion or recovery.",
     "Inventory discovery is bounded and read-only. Its --after cursor is deletion-stable; it never deletes.",
     "Eligible jobs are terminal ordinary jobs with completed delivery evidence. Active, unknown, worker-owned, managed-worker-host evidence, process-live, or undelivered jobs fail closed.",
-    "Interrupted .pending-* and .prune-* entries are classified as leftovers and require exact preview/revalidation. Only exact .prune-* leftovers can be recovered.",
+    "Interrupted .pending-* and .prune-* entries are classified as leftovers and require exact preview/revalidation. Only exact .prune-* leftovers with intact metadata/stdout/stderr can be recovered; incomplete residue is purge-only.",
     "There is no wildcard, deletion selector, age selector, automatic pruning, or time-based deletion."
   ].join("\n");
 }
@@ -2176,7 +2207,8 @@ function retentionState(context: Pick<ExtensionContext, "cwd">): { root: string;
 
 export async function refreshAsyncShellRetentionSnapshot(
   context: Pick<ExtensionContext, "cwd">,
-  onProgress?: (progress: AsyncShellRetentionProgress) => void
+  onProgress?: (progress: AsyncShellRetentionProgress) => void,
+  managedWorkerRuntimeRoot?: string
 ): Promise<AsyncShellRetentionSnapshot> {
   const { root, state } = retentionState(context);
   state.progressListeners ??= new Set();
@@ -2184,17 +2216,26 @@ export async function refreshAsyncShellRetentionSnapshot(
   if (state.scan === undefined) {
     state.progress = { scanned: 0, total: 0 };
     const scanRevision = state.mutationRevision ?? 0;
-    state.scan = scanAsyncShellRetention(root, (progress) => {
-      state.progress = progress;
-      for (const listener of state.progressListeners ?? []) {
-        try { listener(progress); } catch {}
-      }
+    state.scan = Promise.resolve().then(() => {
+      const managedWorkerJobIds = managedWorkerRuntimeRoot === undefined
+        ? readManagedWorkerHostJobIds()
+        : readManagedWorkerHostJobIds(managedWorkerRuntimeRoot);
+      return scanAsyncShellRetention(root, (progress) => {
+        state.progress = progress;
+        for (const listener of state.progressListeners ?? []) {
+          try { listener(progress); } catch {}
+        }
+      }, managedWorkerJobIds);
     }).then((snapshot) => {
       const removed = state.removedNames;
       const current = removed && removed.size > 0 ? withoutRetentionEntries(snapshot, removed) : snapshot;
       state.removedNames?.clear();
+      state.lastError = undefined;
       if ((state.mutationRevision ?? 0) === scanRevision) state.snapshot = current;
       return current;
+    }).catch((cause) => {
+      state.lastError = cause instanceof Error ? cause.message : String(cause);
+      throw cause;
     }).finally(() => {
       state.scan = undefined;
       state.progress = undefined;
@@ -2260,6 +2301,7 @@ function previewAsyncShellPruneEntry(
   const realLogDir = realpathSync(logDir);
   if (path.dirname(realLogDir) !== realRoot || path.basename(realLogDir) !== target) throw new Error(`Async-shell prune target escapes its registry: ${target}`);
   const leftover = parseAsyncShellLeftoverName(target);
+  if (leftover !== undefined && managedWorkerJobIds.has(leftover.jobId)) throw new Error(`${leftover.jobId}: ${managedWorkerEvidenceReason({ jobId: leftover.jobId }, managedWorkerJobIds)}`);
   if (leftover?.kind === "pending") {
     const maybeJob = readMetaFile(path.join(logDir, "meta.json"), root, leftover.jobId);
     if (maybeJob !== undefined) {
@@ -2290,8 +2332,21 @@ function previewAsyncShellPruneEntry(
     status: job.status,
     bytes: directoryTreeBytes(logDir),
     logDir,
-    recoveryEligible: leftover?.kind === "prune" && !existsSync(path.join(root, jobId))
+    recoveryEligible: leftover?.kind === "prune" && !existsSync(path.join(root, jobId)) && hasRecoverableAsyncShellPruneEvidence(logDir)
   };
+}
+
+function hasRecoverableAsyncShellPruneEvidence(logDir: string): boolean {
+  for (const name of ["meta.json", "stdout.log", "stderr.log"]) {
+    const candidate = path.join(logDir, name);
+    try {
+      const info = lstatSync(candidate);
+      if (!info.isFile() || info.isSymbolicLink()) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
 }
 
 function assertNotManagedWorkerEvidence(job: JobMeta, managedWorkerJobIds: ReadonlySet<string>): void {
@@ -2324,12 +2379,15 @@ function directoryTreeBytes(target: string): number {
   return readdirSync(target, { withFileTypes: true }).reduce((total, entry) => total + directoryTreeBytes(path.join(target, entry.name)), 0);
 }
 
-export function previewAsyncShellPrune(context: Pick<ExtensionContext, "cwd">, targets: string[]): AsyncShellPruneEntry[] {
+export function previewAsyncShellPrune(
+  context: Pick<ExtensionContext, "cwd">,
+  targets: string[],
+  managedWorkerJobIds: ReadonlySet<string> = readManagedWorkerHostJobIds()
+): AsyncShellPruneEntry[] {
   if (targets.length === 0) throw new Error(buildAsyncShellPruneUsage());
   if (targets.length > 250) throw new Error("Prune accepts at most 250 exact targets.");
   const root = path.join(jobsRoot(context.cwd), "jobs");
   const realRoot = realpathSync(root);
-  const managedWorkerJobIds = readManagedWorkerHostJobIds();
   return targets.map((target) => previewAsyncShellPruneEntry(root, realRoot, target, managedWorkerJobIds));
 }
 
@@ -2362,7 +2420,7 @@ export function pruneAsyncShellJobs(context: Pick<ExtensionContext, "cwd">, targ
     // recovered through the exact preview/confirm path.
     invalidateAsyncShellRetentionSnapshot(context);
     const retained = renamed.slice(removed).filter((item) => existsSync(item.trash)).map((item) => path.basename(item.trash));
-    throw new Error(`${error instanceof Error ? error.message : String(error)}${retained.length > 0 ? `; retained classified recovery targets: ${retained.join(", ")}` : ""}`);
+    throw new Error(`${error instanceof Error ? error.message : String(error)}${retained.length > 0 ? `; retained classified purge/recovery residue: ${retained.join(", ")}` : ""}`);
   }
   for (const item of renamed) if (item.entry.kind === "job") forgetAsyncShellJob(item.entry.jobId);
   subtractAsyncShellRetentionEntries(context, entries);
@@ -2443,6 +2501,10 @@ export async function handleAsyncShellPruneCommand(context: ExtensionCommandCont
     if (args.inventory !== undefined) {
       const state = beginAsyncShellRetentionRefresh(context);
       if (state.snapshot === undefined) {
+        if (state.lastError !== undefined) {
+          context.ui.notify(`Async-shell inventory protection failed closed: ${state.lastError}${state.scan !== undefined ? " A background retry is in progress." : ""}`, "error");
+          return;
+        }
         const progress = state.progress;
         context.ui.notify(progress && progress.total > 0
           ? `Async-shell inventory scan in progress: ${progress.scanned}/${progress.total} entries. Run the same command again for the latest completed snapshot.`
@@ -2461,6 +2523,7 @@ export async function handleAsyncShellPruneCommand(context: ExtensionCommandCont
       context.ui.notify([
         `${capitalize(args.inventory)} inventory: ${total.count} total (${formatBytes(total.bytes)}); page ${page.entries.length} (${formatBytes(pageBytes)}). Registry: ${page.snapshot.totals.directories} stored entries, ${formatBytes(page.snapshot.totals.bytes)}.`,
         `Snapshot ${page.snapshot.scannedAt}; ${state.progress && state.progress.total > 0 ? `refresh ${state.progress.scanned}/${state.progress.total}` : "refresh started"}.`,
+        state.lastError === undefined ? undefined : `Protection warning: latest refresh failed closed: ${state.lastError}`,
         `Eligible ${page.snapshot.totals.eligible.count} (${formatBytes(page.snapshot.totals.eligible.bytes)}); ineligible ${page.snapshot.totals.ineligible.count} (${formatBytes(page.snapshot.totals.ineligible.bytes)}); leftovers ${page.snapshot.totals.leftovers.count} (${formatBytes(page.snapshot.totals.leftovers.bytes)}: ${page.snapshot.totals.pending.count} pending, ${page.snapshot.totals.prune.count} prune, ${page.snapshot.totals.unknownLeftovers.count} unknown).`,
         ...page.entries.map((entry) => `${entry.name} · ${entry.kind}${entry.status ? `/${entry.status}` : ""} · ${formatBytes(entry.bytes)} · ${entry.reason}`),
         exactTargets.length > 0 ? `Exact IDs: ${exactTargets.join(" ")}` : "No exact IDs in this page.",
@@ -2475,7 +2538,7 @@ export async function handleAsyncShellPruneCommand(context: ExtensionCommandCont
     const bytes = entries.reduce((sum, entry) => sum + entry.bytes, 0);
     const action = args.recover ? args.confirm ? "Recovered" : "Recovery preview" : args.confirm ? "Pruned" : "Prune preview";
     context.ui.notify(
-      `${action}: ${entries.length} target${entries.length === 1 ? "" : "s"}, ${formatBytes(bytes)}\n${entries.map((entry) => `${entry.target} · ${entry.kind}${entry.status ? `/${entry.status}` : ""} · ${formatBytes(entry.bytes)}`).join("\n")}${args.confirm ? "" : `\nRun the same exact command with --confirm to ${args.recover ? "recover" : "delete"}.`}`,
+      `${action}: ${entries.length} target${entries.length === 1 ? "" : "s"}, ${formatBytes(bytes)}\n${entries.map((entry) => `${entry.target} · ${entry.kind}${entry.status ? `/${entry.status}` : ""}${entry.kind === "prune" ? entry.recoveryEligible ? " · recoverable" : " · purge-only" : ""} · ${formatBytes(entry.bytes)}`).join("\n")}${args.confirm ? "" : `\nRun the same exact command with --confirm to ${args.recover ? "recover" : "delete"}.`}`,
       args.confirm ? "info" : "warning"
     );
   } catch (error) {
@@ -2605,9 +2668,12 @@ async function pickAsyncShellViewerJob(context: ExtensionCommandContext): Promis
   const hadSnapshot = latestAsyncShellRetentionSnapshot(context) !== undefined;
   const recentJobs = await listJobs(context, ASYNC_SHELL_VIEWER_MAX_JOBS);
   if (recentJobs.length === 0) {
-    context.ui.notify(hadSnapshot
-      ? `No async-shell jobs found under ${jobsRoot(context.cwd)}.`
-      : "Async-shell history scan started in the background. Run /async:view again for the latest completed snapshot.", hadSnapshot ? "warning" : "info");
+    const retentionError = retentionState(context).state.lastError;
+    context.ui.notify(retentionError !== undefined
+      ? `Async-shell history protection failed closed: ${retentionError}`
+      : hadSnapshot
+        ? `No async-shell jobs found under ${jobsRoot(context.cwd)}.`
+        : "Async-shell history scan started in the background. Run /async:view again for the latest completed snapshot.", retentionError !== undefined || hadSnapshot ? "warning" : "info");
     return undefined;
   }
 
@@ -2955,7 +3021,7 @@ function formatAsyncShellDeliveryBacklog(
     matching.forEach((jobId) => claimedIds.add(jobId));
   }
   const unsentIds = Array.from(pendingCompletionNotifications.values())
-    .filter((job) => job.originSessionId === sessionId && job.originProjectCwd === context.cwd && !job.completionFollowUpQueued)
+    .filter((job) => job.originSessionId === sessionId && job.originProjectCwd === context.cwd && !job.reportedInBand && job.notifyOnExit && !job.completionFollowUpQueued)
     .map((job) => job.jobId);
   const exact = [...claimedIds, ...unsentIds].slice(0, 20);
   return `Completion delivery backlog: ${claimedIds.size} claimed in ${batches} unreceipted batch${batches === 1 ? "" : "es"}; ${unsentIds.length} unsent.${exact.length > 0 ? ` Exact job IDs (up to 20): ${exact.join(" ")}` : ""}`;
@@ -2972,9 +3038,11 @@ function buildLatestAsyncShellStatusText(context: Pick<ExtensionContext, "cwd"> 
       `Job root: ${root}`,
       `Job root state: ${describePathAccess(root)}`,
       formatAsyncShellDeliveryBacklog(context),
-      progress && progress.total > 0
-        ? `Storage scan in progress: ${progress.scanned}/${progress.total} entries. Run /async:status again for the latest completed snapshot.`
-        : "Storage scan started asynchronously. Run /async:status again for progress or the latest completed snapshot."
+      state.lastError !== undefined
+        ? `Storage protection failed closed: ${state.lastError}${state.scan !== undefined ? " A background retry is in progress." : ""}`
+        : progress && progress.total > 0
+          ? `Storage scan in progress: ${progress.scanned}/${progress.total} entries. Run /async:status again for the latest completed snapshot.`
+          : "Storage scan started asynchronously. Run /async:status again for progress or the latest completed snapshot."
     ].join("\n");
   }
   const totals = state.snapshot.totals;
@@ -2989,7 +3057,9 @@ function buildLatestAsyncShellStatusText(context: Pick<ExtensionContext, "cwd"> 
     `Eligible: ${totals.eligible.count}, ${formatBytes(totals.eligible.bytes)}; ineligible: ${totals.ineligible.count}, ${formatBytes(totals.ineligible.bytes)}; leftovers: ${totals.leftovers.count}, ${formatBytes(totals.leftovers.bytes)}`,
     `Leftovers: ${totals.pending.count} pending (${formatBytes(totals.pending.bytes)}), ${totals.prune.count} prune (${formatBytes(totals.prune.bytes)}), ${totals.unknownLeftovers.count} unknown (${formatBytes(totals.unknownLeftovers.bytes)})`,
     formatAsyncShellDeliveryBacklog(context),
-    progress && progress.total > 0 ? `Refresh in progress: ${progress.scanned}/${progress.total} entries.` : "Refresh started asynchronously."
+    state.lastError !== undefined
+      ? `Storage protection warning: latest refresh failed closed: ${state.lastError}${state.scan !== undefined ? " A background retry is in progress." : ""}`
+      : progress && progress.total > 0 ? `Refresh in progress: ${progress.scanned}/${progress.total} entries.` : "Refresh started asynchronously."
   ].join("\n");
 }
 

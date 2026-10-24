@@ -47,7 +47,7 @@ const TERMINAL = new Set(["exited", "failed", "cancelled"]);
 const SCAN_BATCH_SIZE = 256;
 const DEFAULT_WORKER_RUNTIME_ROOT = path.join(homedir(), ".local", "share", "agent", "worker-runtime");
 const WORKER_HOST_COMMAND_PATTERN = /^Pi worker host (worker_[A-Za-z0-9][A-Za-z0-9_-]{0,127})\/(run_[A-Za-z0-9][A-Za-z0-9_-]{0,127})$/;
-const MANAGED_WORKER_EVIDENCE_REASON = "managed-worker evidence; use worker discard/cleanup";
+const MANAGED_WORKER_EVIDENCE_REASON = "managed-worker evidence; ordinary prune refused; host-log cleanup is separate";
 
 export function parseAsyncShellLeftoverName(name: string): { kind: "pending" | "prune"; jobId: string } | undefined {
   const match = LEFTOVER_PATTERN.exec(name);
@@ -140,7 +140,13 @@ async function classifyEntry(root: string, name: string, managedWorkerJobIds: Re
   }
   const leftover = parseAsyncShellLeftoverName(name);
   if (leftover) {
-    return { entry: { name, kind: leftover.kind, jobId: leftover.jobId, bytes, reason: "interrupted lifecycle directory" } };
+    if (managedWorkerJobIds.has(leftover.jobId)) {
+      return { entry: { name, kind: leftover.kind, jobId: leftover.jobId, bytes, reason: MANAGED_WORKER_EVIDENCE_REASON } };
+    }
+    const reason = leftover.kind === "prune" && !(await hasRequiredPruneEvidence(entryPath))
+      ? "purge-only residue; required job files are incomplete"
+      : "interrupted lifecycle directory";
+    return { entry: { name, kind: leftover.kind, jobId: leftover.jobId, bytes, reason } };
   }
   if (!isCanonicalAsyncShellJobId(name)) {
     return { entry: { name, kind: "unknown-leftover", bytes, reason: "unrecognized registry directory" } };
@@ -159,6 +165,18 @@ async function classifyEntry(root: string, name: string, managedWorkerJobIds: Re
     },
     job
   };
+}
+
+async function hasRequiredPruneEvidence(directory: string): Promise<boolean> {
+  for (const name of ["meta.json", "stdout.log", "stderr.log"]) {
+    try {
+      const info = await lstat(path.join(directory, name));
+      if (!info.isFile() || info.isSymbolicLink()) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
 }
 
 async function readJobMeta(root: string, jobId: string): Promise<Record<string, unknown> | undefined> {

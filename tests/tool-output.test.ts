@@ -15,7 +15,8 @@ const jobStart = {
   signal: null,
   stdoutLog: "/repo/.pi/jobs/job_1/stdout.log",
   stderrLog: "/repo/.pi/jobs/job_1/stderr.log",
-  outputBytes
+  outputBytes,
+  reportedInBand: true
 };
 const jobMeta = {
   ...jobStart,
@@ -25,6 +26,7 @@ const jobMeta = {
   endedAt: "2026-07-21T00:00:00.005Z",
   notifyOnExit: true,
   completionNotified: false,
+  managedBy: { kind: "worker-host" as const, workerId: "worker_1", runId: "run_1" },
   logDir: "/repo/.pi/jobs/job_1"
 };
 const truncation = {

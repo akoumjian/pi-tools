@@ -62,11 +62,18 @@ const JobStartSchema = Type.Object({
   error: Type.Optional(Type.String()),
   stdoutLog: Type.String({ minLength: 1 }),
   stderrLog: Type.String({ minLength: 1 }),
-  outputBytes: OutputBytesSchema
+  outputBytes: OutputBytesSchema,
+  reportedInBand: Type.Boolean()
 }, { additionalProperties: false });
 
 const AsyncShellJobOwnerSchema = Type.Object({
   kind: Type.Literal("worker-run"),
+  workerId: Type.String({ minLength: 1 }),
+  runId: Type.String({ minLength: 1 })
+}, { additionalProperties: false });
+
+const AsyncShellManagedBySchema = Type.Object({
+  kind: Type.Literal("worker-host"),
   workerId: Type.String({ minLength: 1 }),
   runId: Type.String({ minLength: 1 })
 }, { additionalProperties: false });
@@ -87,7 +94,9 @@ const JobMetaSchema = Type.Object({
   error: Type.Optional(Type.String()),
   notifyOnExit: Type.Boolean(),
   completionNotified: Type.Boolean(),
+  reportedInBand: Type.Boolean(),
   owner: Type.Optional(AsyncShellJobOwnerSchema),
+  managedBy: Type.Optional(AsyncShellManagedBySchema),
   processToken: Type.Optional(Type.String({ minLength: 1 })),
   logDir: Type.String({ minLength: 1 }),
   stdoutLog: Type.String({ minLength: 1 }),
