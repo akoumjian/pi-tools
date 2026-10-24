@@ -247,8 +247,8 @@ test("async running refreshes reuse visibility and scan only an appended suffix"
   } finally { f.close(); }
 });
 
-test("running and settled half-written tails stay live and running refresh completes them", async () => {
-  const f = fixture();
+test("running and settled half-written tails stay live and settlement rechecks growth", async () => {
+  const f = fixture(); const asyncClone = fixture(); const syncClone = fixture();
   try {
     const complete = line(message("complete", null, "COMPLETE"));
     const trailing = JSON.stringify(message("partial", "complete", "PARTIAL-COMPLETED"));
@@ -271,8 +271,24 @@ test("running and settled half-written tails stay live and running refresh compl
     const completed = await watchdog(loadWorkerSessionViewSnapshotAsync(running));
     assert.equal(completed.incompleteTrailingEntry, false); assert.equal(completed.blocks.some((block) => block.text === "PARTIAL-COMPLETED"), true);
     const fixedAgain = await watchdog(loadWorkerSessionViewSnapshotAsync(settled));
-    assert.equal(fixedAgain.incompleteTrailingEntry, true, "settled snapshots retain the recorded half-write decision"); assert.deepEqual(fixedAgain.blocks.map((block) => block.text), ["COMPLETE"]);
-  } finally { f.close(); }
+    assert.equal(fixedAgain.incompleteTrailingEntry, false, "settled snapshots must recheck a half-write decision after growth"); assert.deepEqual(fixedAgain.blocks.map((block) => block.text), ["COMPLETE", "PARTIAL-COMPLETED"]);
+    const fixedAgainSync = loadWorkerSessionViewSnapshot(settled);
+    assert.equal(fixedAgainSync.incompleteTrailingEntry, false); assert.equal(fixedAgainSync.blocks.some((block) => block.text === "PARTIAL-COMPLETED"), true);
+
+    const exercisePromotion = async (clone: ReturnType<typeof fixture>, async: boolean) => {
+      const cloneComplete = line(message("complete", null, "CLONE-COMPLETE"));
+      const cloneTrailing = JSON.stringify(message("partial", "complete", "CLONE-PARTIAL-DONE")); const cloneSplit = cloneTrailing.length - 11;
+      writeFileSync(clone.sessionFile, line(header(clone.target)) + cloneComplete + cloneTrailing.slice(0, cloneSplit));
+      const cloneRunning = { ...clone.target, runStatus: "running" as const, workerStatus: "running" as const, outcome: undefined, sessionStartLine: 2, sessionEndLine: undefined };
+      const cloneSettled = { ...cloneRunning, runStatus: "settled" as const, workerStatus: "idle" as const, outcome: "completed", sessionEndLine: 3 };
+      const partial = async ? await watchdog(loadWorkerSessionViewSnapshotAsync(cloneRunning)) : loadWorkerSessionViewSnapshot(cloneRunning);
+      assert.equal(partial.incompleteTrailingEntry, true);
+      writeFileSync(clone.sessionFile, `${cloneTrailing.slice(cloneSplit)}\n`, { flag: "a" });
+      const promoted = async ? await watchdog(loadWorkerSessionViewSnapshotAsync(cloneSettled)) : loadWorkerSessionViewSnapshot(cloneSettled);
+      assert.equal(promoted.incompleteTrailingEntry, false); assert.deepEqual(promoted.blocks.map((block) => block.text), ["CLONE-COMPLETE", "CLONE-PARTIAL-DONE"]);
+    };
+    await exercisePromotion(asyncClone, true); await exercisePromotion(syncClone, false);
+  } finally { f.close(); asyncClone.close(); syncClone.close(); }
 });
 
 test("viewer refresh remains responsive while a session entry is half-written", async () => {
@@ -283,17 +299,22 @@ test("viewer refresh remains responsive while a session entry is half-written", 
     const trailing = JSON.stringify(message("partial", "complete", "VIEWER-PARTIAL")); const split = trailing.length - 9;
     writeFileSync(guard.sessionFile, line(header(guard.target)) + line(message("complete", null, "COMPLETE")));
     assertViewerHalfWriteChildLiveness({ ...target, sessionFile: guard.sessionFile, sessionRoot: guard.sessionRoot, workspaceRoot: guard.target.workspaceRoot, parentSessionFile: guard.target.parentSessionFile }, trailing.slice(0, split));
-    const initial = loadWorkerSessionViewSnapshot(target);
+    let currentTarget: WorkerSessionViewTarget = target;
+    const initial = loadWorkerSessionViewSnapshot(currentTarget);
     writeFileSync(f.sessionFile, trailing.slice(0, split), { flag: "a" });
     let pending: Promise<WorkerSessionViewSnapshot> | undefined; let renders = 0;
     const component = createWorkerSessionViewerComponent({ tui: { terminal: { rows: 30 }, requestRender() { renders += 1; } } as never, getTheme: () => theme, initialSnapshot: initial,
-      loadSnapshot: (request) => pending = loadWorkerSessionViewSnapshotAsync(target, request), done() {} });
+      loadSnapshot: (request) => pending = loadWorkerSessionViewSnapshotAsync(currentTarget, request), done() {} });
     let heartbeats = 0; const heartbeat = setInterval(() => { heartbeats += 1; }, 1);
     component.handleInput!("r"); await tick(); await watchdog(pending!); await tick(); clearInterval(heartbeat);
     assert.ok(heartbeats > 0); assert.ok(renders >= 2); assert.match(component.render(100).join("\n"), /final unterminated session entry/);
 
-    writeFileSync(f.sessionFile, `${trailing.slice(split)}\n`, { flag: "a" }); pending = undefined; component.handleInput!("r"); await tick(); await watchdog(pending!); await tick();
-    assert.match(component.render(100).join("\n"), /VIEWER-PARTIAL/);
+    writeFileSync(f.sessionFile, `${trailing.slice(split)}\n`, { flag: "a" });
+    currentTarget = { ...target, runStatus: "settled", workerStatus: "idle", outcome: "completed", sessionEndLine: 3 };
+    pending = undefined; component.handleInput!("r"); await tick(); await watchdog(pending!); await tick();
+    const settledFrame = component.render(100).join("\n"); assert.match(settledFrame, /VIEWER-PARTIAL/); assert.doesNotMatch(settledFrame, /final unterminated session entry/);
+    component.handleInput!("q");
+    const reopened = loadWorkerSessionViewSnapshot(currentTarget); assert.equal(reopened.incompleteTrailingEntry, false); assert.equal(reopened.blocks.some((block) => block.text === "VIEWER-PARTIAL"), true);
   } finally { f.close(); guard.close(); }
 });
 
@@ -451,7 +472,7 @@ test("production-shaped 310,000-block transcripts keep load and frames bounded",
 });
 
 test("byte-bounded cursor pages make monotonic progress across adjacent multi-MiB entries", () => {
-  const shapes = [[5, 5], [4, 5], [5, 5, 5], [3, 3, 3], [9, 1], [1, 9]];
+  const shapes = [[5, 5], [4, 5], [5, 5, 5], [3, 3, 3], [9, 1], [1, 9], [9, 9, 9], [5, 9, 9, 5]];
   for (const [shapeIndex, sizes] of shapes.entries()) {
     const f = fixture();
     try {
@@ -507,6 +528,20 @@ test("earlier and later counts exclude non-rendering custom entries at run edges
       const frame = buildWorkerSessionViewerFrame(theme, { snapshot: value, topLine: 0, pinnedToEnd: false }, 100, 30).lines.join("\n");
       assert.doesNotMatch(frame, /earlier visible|later visible/);
     }
+  } finally { f.close(); }
+});
+
+test("paging skips windows containing only nondisplayed entries", () => {
+  const f = fixture();
+  try {
+    const hidden = Array.from({ length: 600 }, (_, index) => ({ type: "custom", id: `hidden-${index}`, parentId: index === 0 ? "start" : `hidden-${index - 1}`, timestamp: "now", data: "hidden" }));
+    const entries = [message("start", null, "DISPLAY-START"), ...hidden, message("end", "hidden-599", "DISPLAY-END")];
+    writeFileSync(f.sessionFile, line(header(f.target)) + entries.map(line).join(""));
+    const target = { ...f.target, sessionStartLine: 2, sessionEndLine: entries.length + 1 };
+    const forward = loadWorkerSessionViewSnapshot(target, {}, { mode: "after", line: 2 });
+    assert.deepEqual(forward.blocks.map((block) => block.text), ["DISPLAY-END"]); assert.equal(forward.previousVisibleEntries, 1); assert.equal(forward.nextVisibleEntries, 0);
+    const backward = loadWorkerSessionViewSnapshot(target, {}, { mode: "before", line: entries.length + 1 });
+    assert.deepEqual(backward.blocks.map((block) => block.text), ["DISPLAY-START"]); assert.equal(backward.previousVisibleEntries, 0); assert.equal(backward.nextVisibleEntries, 1);
   } finally { f.close(); }
 });
 
