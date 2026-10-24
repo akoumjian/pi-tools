@@ -147,7 +147,8 @@ test("runtime generations recover only stale lifecycle claims for deterministic 
     createWorkerAndRun(f.registry, { workerId, parentSessionFile: parent, role: "work", status: "queued", activeRunId: runId, taskIds: ["personal-test"], workspaceRoot: "/workspace/recover", createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }, queuedRun(workerId, runId));
     f.registry.database.prepare("UPDATE runs SET claim_kind='launch',claim_nonce='1-old' WHERE run_id=?").run(runId);
     recoverInterruptedClaimsForParent(f.registry, parent, 1, "2026-01-01T00:00:01.000Z"); assert.equal(getWorkerRun(f.registry, workerId, runId)?.claimKind, "launch");
-    recoverInterruptedClaimsForParent(f.registry, parent, 2, "2026-01-01T00:00:02.000Z"); assert.equal(getWorkerRun(f.registry, workerId, runId)?.claimKind, undefined);
+    recoverInterruptedClaimsForParent(f.registry, parent, 2, "2026-01-01T00:00:02.000Z", ["1-old"]); assert.equal(getWorkerRun(f.registry, workerId, runId)?.claimKind, "launch", "a live durable operation token survives runtime replacement");
+    recoverInterruptedClaimsForParent(f.registry, parent, 3, "2026-01-01T00:00:02.500Z"); assert.equal(getWorkerRun(f.registry, workerId, runId)?.claimKind, undefined);
     f.registry.database.prepare("UPDATE runs SET claim_kind='cancellation',claim_nonce='2-old' WHERE run_id=?").run(runId);
     recoverInterruptedClaimsForParent(f.registry, parent, 3, "2026-01-01T00:00:03.000Z");
     assert.equal(getWorkerRun(f.registry, workerId, runId)?.claimKind, undefined); assert.match(getWorker(f.registry, workerId)?.recoveryError ?? "", /cancellation retry/);
@@ -182,12 +183,16 @@ test("batch publication rolls back workers and review leases on a later insert f
   } finally { f.close(); }
 });
 
-test("cancellation CAS revokes an in-flight launch and finalizes one cancelled delivery", () => {
+test("cancellation CAS waits for an in-flight launch token before finalizing one delivery", () => {
   const f = fixture(); try {
     const workerId = "worker_20260101000000_cancel11"; const runId = "run_20260101000000_cancel11"; const parent = "/sessions/parent.jsonl";
     createWorkerAndRun(f.registry, { workerId, parentSessionFile: parent, role: "work", status: "queued", activeRunId: runId, taskIds: ["personal-test"], workspaceRoot: "/workspace/cancel", runtime: {}, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }, queuedRun(workerId, runId));
     const launchNonce = "launch"; assert.equal((awaitableClaim(f.registry, workerId, runId, launchNonce)), true);
-    assert.equal(claimWorkerCancellation(f.registry, workerId, runId, "cancel", "2026-01-01T00:00:01.000Z"), true);
+    assert.equal(claimWorkerCancellation(f.registry, workerId, runId, "cancel", "2026-01-01T00:00:01.000Z"), false, "cancellation cannot steal a live launch operation token");
+    f.registry.database.prepare("UPDATE runs SET claim_kind=NULL,claim_nonce=NULL WHERE worker_id=? AND run_id=? AND claim_kind='launch' AND claim_nonce=?").run(workerId, runId, launchNonce);
+    assert.equal(claimWorkerCancellation(f.registry, workerId, runId, "cancel", "2026-01-01T00:00:01.500Z"), true);
+    f.registry.database.prepare("UPDATE workers SET recovery_error='diagnostic' WHERE worker_id=?").run(workerId);
+    assert.equal(claimWorkerCancellation(f.registry, workerId, runId, "cancel-successor", "2026-01-01T00:00:01.750Z"), false, "even recovery cannot steal a live cancellation token");
     finalizeClaimedWorkerRun(f.registry, { parentSessionFile: parent, workerId, runId, claimKind: "cancellation", claimNonce: "cancel", outcome: "cancelled", outcomeSource: "system", settledAt: "2026-01-01T00:00:02.000Z" });
     assert.equal(getWorkerRun(f.registry, workerId, runId)?.outcome, "cancelled"); assert.equal(pendingWorkerDeliveries(f.registry, parent).length, 1);
     assert.throws(() => finalizeClaimedWorkerRun(f.registry, { parentSessionFile: parent, workerId, runId, claimKind: "cancellation", claimNonce: "cancel", outcome: "cancelled", outcomeSource: "system", settledAt: "2026-01-01T00:00:03.000Z" }), /changed state/);

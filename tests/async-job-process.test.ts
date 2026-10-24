@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { probeAsyncJobProcessIdentity } from "../extensions/_shared/async-job-process.js";
+import { asyncJobTokenProcessIdsFromLinuxProc, probeAsyncJobProcessIdentity } from "../extensions/_shared/async-job-process.js";
 
 const identity = { pid: 4242, processToken: "owned-token", processStartToken: "darwin:expected" };
 
@@ -41,4 +41,12 @@ test("exact process identity probe distinguishes alive, dead, and ambiguous obse
     readStartToken: () => identity.processStartToken,
     ownedProcessIds: () => { throw new Error("cross-user environment remains unreadable"); }
   }), "unknown", "a matching start token with unreadable ownership evidence remains recovery-required");
+});
+
+test("Linux token enumeration ignores proc entries that vanish mid-scan", () => {
+  const error = Object.assign(new Error("vanished"), { code: "ENOENT" });
+  assert.deepEqual(asyncJobTokenProcessIdsFromLinuxProc("exact", ["self", "101", "102"], (pid: string) => {
+    if (pid === "101") throw error;
+    return "A=1\0PI_WORKER_JOB_TOKEN=exact\0";
+  }), [102]);
 });

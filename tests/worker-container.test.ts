@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { chmod, chown, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { execFileSync, spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import {
@@ -173,15 +174,15 @@ process.stderr.write("unsupported fake docker call: " + JSON.stringify(args) + "
 test("async container launch adopts exact create races, parks reuse, and fails closed on disappearance", async () => {
   await withTempDir(async (directory) => {
     const codeRoot = path.join(directory, "Code"); const workspaceRoot = path.join(directory, "workspace"); const fakeDocker = path.join(directory, "docker");
-    const stateFile = path.join(directory, "state.json"); const callsFile = path.join(directory, "calls.jsonl"); const disappearFile = path.join(directory, "disappear-on-start");
+    const stateFile = path.join(directory, "state.json"); const callsFile = path.join(directory, "calls.jsonl"); const disappearFile = path.join(directory, "disappear-on-start"); const revokeFile = path.join(directory, "revoke-on-start"); const authorityFile = path.join(directory, "authority");
     await Promise.all([mkdir(codeRoot), mkdir(workspaceRoot)]);
     await writeFile(fakeDocker, `#!/usr/bin/env node
-const fs=require("node:fs"),args=process.argv.slice(2),stateFile=${JSON.stringify(stateFile)},callsFile=${JSON.stringify(callsFile)},disappearFile=${JSON.stringify(disappearFile)};
+const fs=require("node:fs"),args=process.argv.slice(2),stateFile=${JSON.stringify(stateFile)},callsFile=${JSON.stringify(callsFile)},disappearFile=${JSON.stringify(disappearFile)},revokeFile=${JSON.stringify(revokeFile)},authorityFile=${JSON.stringify(authorityFile)};
 fs.appendFileSync(callsFile,JSON.stringify(args)+"\\n"); const load=()=>fs.existsSync(stateFile)?JSON.parse(fs.readFileSync(stateFile,"utf8")):undefined; const save=(v)=>fs.writeFileSync(stateFile,JSON.stringify(v)); const missing=()=>{process.stderr.write("Error response from daemon: No such container\\n");process.exit(1)};
 if(args[0]==="image"&&args[1]==="inspect")process.exit(0);
 if(args[0]==="container"&&args[1]==="inspect"){const s=load();if(!s)missing();process.stdout.write(JSON.stringify([{Id:s.id,State:{Running:s.running,ExitCode:s.exitCode,Status:s.running?"running":"exited",StartedAt:s.startedAt,FinishedAt:s.finishedAt,OOMKilled:false,Error:""},RestartCount:0,Config:{Labels:s.labels}}]));process.exit(0)}
 if(args[0]==="create"){const labels={};for(let i=0;i<args.length;i++)if(args[i]==="--label"){const [k,v]=args[++i].split("=",2);labels[k]=v}save({id:"b".repeat(64),labels,running:false,exitCode:0,startedAt:"0001-01-01T00:00:00Z",finishedAt:"0001-01-01T00:00:00Z"});process.stderr.write("Conflict. The container name is already in use\\n");process.exit(1)}
-if(args[0]==="start"){const s=load();if(!s)missing();if(fs.existsSync(disappearFile)){fs.unlinkSync(stateFile);missing()}s.running=true;s.startedAt="2026-10-24T00:00:00Z";save(s);process.stdout.write(s.id+"\\n");process.exit(0)}
+if(args[0]==="start"){const s=load();if(!s)missing();if(fs.existsSync(disappearFile)){fs.unlinkSync(stateFile);missing()}if(fs.existsSync(revokeFile)){fs.rmSync(revokeFile);fs.rmSync(authorityFile,{force:true})}s.running=true;s.startedAt="2026-10-24T00:00:00Z";save(s);process.stdout.write(s.id+"\\n");process.exit(0)}
 if(args[0]==="exec")process.exit(0);
 if(args[0]==="stop"||args[0]==="kill"){const s=load();if(!s)missing();s.running=false;s.exitCode=137;s.finishedAt="2026-10-24T00:01:00Z";save(s);process.exit(0)}
 if(args[0]==="wait"){const s=load();if(!s)missing();process.stdout.write(String(s.exitCode)+"\\n");process.exit(0)}
@@ -191,6 +192,10 @@ process.stderr.write("unsupported "+JSON.stringify(args)+"\\n");process.exit(2);
     const planned = planWorkerContainer({ workerId: "worker_20261024000000_raceaaaa", runId: "run_20261024000000_racebbbb", nonce: "race-nonce", codeRoot, workspaceRoot });
     const adopted = await createWorkerContainerAsync(fakeDocker, planned);
     assert.equal(adopted.containerId, "b".repeat(64), "a same-nonce create collision must adopt the exact winner");
+    await Promise.all([writeFile(authorityFile, "owned"), writeFile(revokeFile, "revoke")]); const callsBeforeRevocation = (await readFile(callsFile, "utf8")).trim().split("\n").length;
+    await assert.rejects(() => createWorkerContainerAsync(fakeDocker, adopted, { assertAuthority: () => { if (!existsSync(authorityFile)) throw new Error("launch authority revoked"); } }), /launch authority revoked/);
+    assert.equal(existsSync(stateFile), true, "an unauthorized readiness failure must leave exact removal to current lifecycle authority");
+    const revokedCalls = (await readFile(callsFile, "utf8")).trim().split("\n").slice(callsBeforeRevocation).map((line) => JSON.parse(line) as string[]); assert.equal(revokedCalls.some((args) => args[0] === "rm"), false);
     await writeFile(disappearFile, "yes");
     await assert.rejects(() => createWorkerContainerAsync(fakeDocker, adopted), /disappeared during its exact restart/);
     await assert.rejects(() => createWorkerContainerAsync(fakeDocker, adopted), /disappeared; refusing to replace its exact persisted identity/);

@@ -1,16 +1,17 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Text, stripTerminalSequences, truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
 import { defineTool, type AgentToolResult, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { resolveExtensionModel, assertChildAgentRouteAllowed, parseModelThinkingPair } from "../_shared/model-spec.js";
 import { throwIfAborted } from "../_shared/cancellation.js";
 import { asyncJobProcessStartToken, createAsyncJobId, probeAsyncJobProcessIdentity, signalAsyncJobProcessIdentity, type AsyncJobProcessIdentityLiveness } from "../_shared/async-job.js";
 import { handleAsyncShellViewerCommand, reconcileTerminatedPersistedAsyncShellJobsForOwner, unsettledPersistedAsyncShellJobsForOwner, type JobMeta, type ManagedAsyncJobHandle } from "../async-shell/index.js";
-import { createWorkerContainerAsync, planWorkerContainer, resolveDockerPath, settleWorkerContainerAsync, type WorkerContainerReference } from "../_shared/worker-container.js";
+import { createWorkerContainerAsync, planWorkerContainer, resolveDockerPath, settleWorkerContainerAsync, type WorkerContainerLaunchGuard, type WorkerContainerReference } from "../_shared/worker-container.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 import { workerMutationAdmissionPath, workerResultAdmissionPath } from "../_shared/worker-contract.js";
+import { writeAtomicJson } from "../_shared/atomic-json.js";
 import { workerRoleInstructions } from "../_shared/role-instructions.js";
 import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
 import { WorkerControlParamsV2, WorkerMergeApplyParams, WorkerMergeTestParams, WorkerRunParamsV2, type WorkerControlInputV2, type WorkerRunInputV2 } from "./contract.js";
@@ -20,7 +21,7 @@ import {
   countWorkers, createWorkerRunBatch, finalizeClaimedWorkerRun, finalizeWorkerDiscard, finalizeWorkerRunLaunch, findWorkerRunById, finishPreparedSetApply,
   getWorker, getWorkerRun, listWorkerRuns, listWorkers, markWorkerDeliveryDelivered, openWorkerRegistry, pendingWorkerDeliveries,
   readPreparedSetRecord, recordWorkerSettlementRecovery, recoverInterruptedClaimsForParent, reconcileWorkerDeliveries, registerParentRuntime, releasePreparedSetApply, releaseWorkerDeliveryClaim, releaseWorkerRunClaim, setWorkerRecoveryError, storePreparedSet,
-  subscribeWorkerRegistryChanges, updatePreparedSetStatus, updateWorkerRuntimeMetadata, workerRegistryDataVersion,
+  subscribeWorkerRegistryChanges, updateClaimedWorkerRunRuntime, updatePreparedSetStatus, updateWorkerRuntimeMetadata, workerRegistryDataVersion,
   type WorkerBatchCreateItem, type WorkerRegistry, type WorkerRegistryRecord, type WorkerRepositoryResult, type WorkerRole, type WorkerRunRecord
 } from "./registry.js";
 import { readWorkerRuntimeResult } from "./runtime.js";
@@ -66,6 +67,8 @@ type RunRuntime = {
 type WorkerRuntime = { version: 2; inputs: RetainedInput[]; repositoryBaselines?: Array<{ path: string; resolvedCommit: string }>; cacheLineage?: WorkerCacheLineageRecord };
 type PendingRun = { workerId: string; runId: string; parentSessionFile: string; parentSessionId: string; runtime: RunRuntime };
 type ActiveRun = { runId: string; handle: ManagedAsyncJobHandle };
+type LifecycleClaimKind = "launch" | "settlement" | "cancellation";
+type LifecycleAdmissionRecord = { version: 1; workerId: string; runId: string; claimKind: LifecycleClaimKind; claimNonce: string; pid: number; processStartToken: string; startedAt: string };
 class WorkerHostIdentityError extends Error {}
 class WorkerContainmentError extends Error {}
 type PlannedRun = {
@@ -78,7 +81,7 @@ type WorkerOperationSnapshot =
   | { scope: "worker_merge_apply"; preparedId: string; operation: WorkerOperation };
 export type WorkerExtensionDependencies = {
   runtimeRoot?: string; roots?: WorkerRoots; codeRoot?: string; preparedRoot?: string; targetRoot?: string; now?: () => Date; random?: () => string; dockerPath?: string;
-  createContainer?: (dockerPath: string, reference: WorkerContainerReference) => WorkerContainerReference | Promise<WorkerContainerReference>;
+  createContainer?: (dockerPath: string, reference: WorkerContainerReference, guard: WorkerContainerLaunchGuard) => WorkerContainerReference | Promise<WorkerContainerReference>;
   removeContainer?: (dockerPath: string, reference: WorkerContainerReference) => void | Promise<void>;
   launch?: (api: ExtensionAPI, context: ExtensionContext, input: { record: WorkerLaunchRecord; runtime: RunRuntime }) => ManagedAsyncJobHandle;
   createOverlay?: (input: Parameters<typeof createReviewOverlayAsync>[0]) => ReviewOverlayRecord | Promise<ReviewOverlayRecord>; cleanupOverlay?: (dockerPath: string, overlay: ReviewOverlayRecord) => void | Promise<void>;
@@ -108,7 +111,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   const cleanupOverlay = overrides.cleanupOverlay ?? cleanupReviewOverlayAsync;
   let registry: WorkerRegistry | undefined;
   let runtimeGeneration = 0;
-  const parentRuntimeGenerations = new Map<string, number>();
+  const initializedParentRuntimeGenerations = new Map<string, number>();
   let deliveryTimer: NodeJS.Timeout | undefined;
   let observedDataVersion = 0;
   let currentContext: ExtensionContext | undefined;
@@ -158,13 +161,14 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       currentContext = context;
       const parent = context.sessionManager.getSessionFile(); if (!parent) return;
       const exactParent = realpathOrResolve(parent);
-      const retainedGeneration = parentRuntimeGenerations.get(exactParent);
-      if (retainedGeneration === undefined) {
+      const initializedGeneration = initializedParentRuntimeGenerations.get(exactParent);
+      if (initializedGeneration === undefined) {
+        const preservedClaims = liveLifecycleClaimNonces(exactParent);
         runtimeGeneration = registerParentRuntime(getRegistry(), exactParent, randomUUID(), now().toISOString());
-        parentRuntimeGenerations.set(exactParent, runtimeGeneration);
+        initializedParentRuntimeGenerations.set(exactParent, runtimeGeneration);
         recoverInterruptedDiscardFiles(exactParent, runtimeGeneration);
-        recoverInterruptedClaimsForParent(getRegistry(), exactParent, runtimeGeneration, now().toISOString());
-      } else runtimeGeneration = retainedGeneration;
+        recoverInterruptedClaimsForParent(getRegistry(), exactParent, runtimeGeneration, now().toISOString(), preservedClaims);
+      } else runtimeGeneration = initializedGeneration;
       reconcileWorkerDeliveries(getRegistry(), exactParent, sessionDeliveryIds(context));
       deliveredRecovery.clear();
       observedDataVersion = workerRegistryDataVersion(getRegistry());
@@ -244,10 +248,9 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         for (const plan of planned) if (plan.role === "integration" && plan.consumedPrepared && plan.preparedId) assertIntegrationTargetsCurrent(trustedPreparedSet(getRegistry(), parentSessionFile, plan.preparedId));
         const items: WorkerBatchCreateItem[] = planned.map((plan) => {
           const session = plan.runRuntime.pendingWorkSessionId ? undefined : sessionIdentity(plan.paths);
-          const hostLogDir = path.join(path.resolve(context.cwd), ".pi", "async-shell", "jobs", plan.jobId);
           const run: WorkerRunRecord = { runId: plan.runId, workerId: plan.workerId, status: "queued", taskIds: plan.taskIds, modelSelection: plan.modelSelection,
             completionDelivery: plan.request.completionDelivery ?? "steer", ...(plan.binding ? { binding: plan.binding } : {}), jobId: plan.jobId,
-            stdoutLog: path.join(hostLogDir, "stdout.log"), stderrLog: path.join(hostLogDir, "stderr.log"), ...(session ? { sessionStartLine: countLines(session.sessionFile) + 1 } : {}),
+            stdoutLog: path.join(plan.runRuntime.runDir, "launch-stdout.log"), stderrLog: path.join(plan.runRuntime.runDir, "launch-stderr.log"), ...(session ? { sessionStartLine: countLines(session.sessionFile) + 1 } : {}),
             repositories: [], artifacts: [], errors: [], runtime: plan.runRuntime, createdAt: timestamp };
           if (plan.newWorker) return { kind: "new", worker: { workerId: plan.workerId, parentSessionFile, role: plan.role, status: "queued", activeRunId: plan.runId,
             taskIds: plan.taskIds, modelSelection: plan.modelSelection, ...(session ? { sessionId: session.sessionId, sessionFile: session.sessionFile } : {}),
@@ -465,18 +468,19 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     // the session fork, OverlayFS setup, Docker work, or host launch inline.
     const completion = Promise.resolve().then(() => startPreparedRun(context, item));
     starting.set(item.workerId, { runId: item.runId, completion });
-    void completion.finally(() => { if (starting.get(item.workerId)?.runId === item.runId) starting.delete(item.workerId); });
+    void completion.finally(() => { if (starting.get(item.workerId)?.runId === item.runId) starting.delete(item.workerId); }).catch((error) => recordRecovery(item.workerId, item.runId, error));
   }
 
   async function startPreparedRun(context: ExtensionContext, item: PendingRun): Promise<void> {
-    const nonce = claimNonce(); if (!claimWorkerRun(getRegistry(), item.workerId, item.runId, "launch", nonce, ["queued"])) return;
-    let handle: ManagedAsyncJobHandle | undefined; let launchAdmission: string | undefined;
+    const nonce = lifecycleClaimNonce(); if (!claimWorkerRun(getRegistry(), item.workerId, item.runId, "launch", nonce, ["queued"])) return;
+    let handle: ManagedAsyncJobHandle | undefined; let operationAdmission: string | undefined;
     try {
+      operationAdmission = beginLifecycleAdmission(item.runtime, item.workerId, item.runId, "launch", nonce);
       let worker = getWorker(getRegistry(), item.workerId)!; const run = getWorkerRun(getRegistry(), item.workerId, item.runId)!; const paths = workerPaths(roots, item.workerId);
       if ((!worker.sessionId || !worker.sessionFile) && worker.role === "work" && item.runtime.pendingWorkSessionId) {
-        const forked = forkWorkerSession({ parentSessionFile: worker.parentSessionFile, workspaceRoot: worker.workspaceRoot, sessionDir: paths.sessionDir, sessionId: item.runtime.pendingWorkSessionId });
-        assertRunClaim(item.workerId, item.runId, "launch", nonce);
-        updateWorkerRuntimeMetadata(getRegistry(), worker.workerId, { sessionId: forked.sessionId, sessionFile: forked.sessionFile, updatedAt: now().toISOString() });
+        const pendingSessionId = item.runtime.pendingWorkSessionId;
+        const forked = await launchSideEffect(item.workerId, item.runId, nonce, () => forkWorkerSession({ parentSessionFile: worker.parentSessionFile, workspaceRoot: worker.workspaceRoot, sessionDir: paths.sessionDir, sessionId: pendingSessionId }));
+        await launchSideEffect(item.workerId, item.runId, nonce, () => updateWorkerRuntimeMetadata(getRegistry(), worker.workerId, { sessionId: forked.sessionId, sessionFile: forked.sessionFile, updatedAt: now().toISOString() }));
         worker = getWorker(getRegistry(), item.workerId)!;
       }
       const sessionId = worker.sessionId; const sessionFile = worker.sessionFile;
@@ -484,48 +488,133 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       if (worker.role === "work") verifyWorkerSession({ sessionFile, sessionId, workspaceRoot: worker.workspaceRoot, parentSessionFile: worker.parentSessionFile });
       const sessionStartLine = countLines(sessionFile) + 1;
       const record: WorkerLaunchRecord = { workerId: worker.workerId, runId: run.runId, jobId: run.jobId!, sessionId, sessionFile, workspaceRoot: worker.workspaceRoot, taskIds: run.taskIds, role: worker.role, modelSelection: worker.modelSelection!, ...(worker.runtime?.cacheLineage ? { cacheLineage: worker.runtime.cacheLineage as WorkerCacheLineageRecord } : {}) };
-      assertRunClaim(item.workerId, item.runId, "launch", nonce);
-      if (item.runtime.reviewOverlayPlan) {
-        item.runtime.overlay = await createOverlaySafely({ dockerPath: docker(), ...item.runtime.reviewOverlayPlan });
+      if (item.runtime.reviewOverlayPlan && !item.runtime.overlay) {
+        item.runtime.overlay = await launchSideEffect(item.workerId, item.runId, nonce, () => createOverlaySafely({ dockerPath: docker(), ...item.runtime.reviewOverlayPlan! }));
         item.runtime.container = planWorkerContainer({ workerId: worker.workerId, runId: run.runId, nonce: item.runtime.processNonce, workspaceRoot: worker.workspaceRoot, codeRoot: item.runtime.container.codeRoot, mounts: item.runtime.overlay.mounts });
-        assertRunClaim(item.workerId, item.runId, "launch", nonce);
+        persistClaimedRuntime(item.runtime, item.workerId, item.runId, "launch", nonce); assertRunClaim(item.workerId, item.runId, "launch", nonce);
       }
-      item.runtime.container = await createContainer(docker(), item.runtime.container);
-      launchAdmission = path.join(item.runtime.runDir, "launch-admitting.json"); writeFileSync(launchAdmission, `${JSON.stringify({ version: 2, workerId: item.workerId, runId: item.runId, pid: process.pid, processStartToken: asyncJobProcessStartToken(process.pid), startedAt: now().toISOString() })}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+      item.runtime.container = await createContainer(docker(), item.runtime.container, { assertAuthority: () => assertRunClaim(item.workerId, item.runId, "launch", nonce) });
       assertRunClaim(item.workerId, item.runId, "launch", nonce);
-      handle = launch(context, record, item.runtime); await verifyHostIdentity(item.runtime, item.workerId, item.runId); assertRunClaim(item.workerId, item.runId, "launch", nonce); const snapshot = handle.snapshot();
+      persistClaimedRuntime(item.runtime, item.workerId, item.runId, "launch", nonce); assertRunClaim(item.workerId, item.runId, "launch", nonce);
+      handle = await launchSideEffect(item.workerId, item.runId, nonce, () => launch(context, record, item.runtime));
+      await launchSideEffect(item.workerId, item.runId, nonce, () => verifyHostIdentity(item.runtime, item.workerId, item.runId));
+      const snapshot = handle.snapshot(); assertRunClaim(item.workerId, item.runId, "launch", nonce);
       finalizeWorkerRunLaunch(getRegistry(), { workerId: worker.workerId, runId: run.runId, claimNonce: nonce, modelSelection: worker.modelSelection!, sessionId, sessionFile, sessionStartLine, jobId: snapshot.jobId,
         stdoutLog: snapshot.stdoutLog, stderrLog: snapshot.stderrLog, runtime: item.runtime, startedAt: now().toISOString() });
-      active.set(worker.workerId, { runId: run.runId, handle }); rmSync(launchAdmission, { force: true }); launchAdmission = undefined;
+      active.set(worker.workerId, { runId: run.runId, handle });
       void handle.completion.then((job) => settleCompletedRun(worker.workerId, run.runId, job)).catch((error) => recordRecovery(worker.workerId, run.runId, error)).finally(() => { if (active.get(worker.workerId)?.runId === run.runId) active.delete(worker.workerId); });
     } catch (error) {
       if (handle) {
         try { handle.cancel("SIGTERM"); } catch {}
-        const terminal = await Promise.race([handle.completion.then((job) => job.status !== "running" && job.status !== "unknown"), delay(5_000).then(() => false)]);
-        if (!terminal && launchAdmission) { const marker = launchAdmission; void handle.completion.finally(() => rmSync(marker, { force: true })); launchAdmission = undefined; }
+        await Promise.race([handle.completion, delay(5_000)]);
       }
-      if (launchAdmission) rmSync(launchAdmission, { force: true });
       const claimed = getWorkerRun(getRegistry(), item.workerId, item.runId);
-      if (!handle && claimed) ensureFailedLaunchLogs(claimed, error);
-      if (claimed?.claimKind !== "launch" || claimed.claimNonce !== nonce) {
-        // A successor launch or cancellation now owns the exact container
-        // boundary. Removing it here races that authority between Docker
-        // inspect/create/start. Cancellation waits for this boundary and will
-        // contain it; a successor launch will park and adopt it.
-        if (claimed?.claimKind === "cancellation" && item.runtime.overlay) { try { await cleanupOverlay(docker(), item.runtime.overlay); } catch {} }
-        return;
-      }
+      if (claimed?.claimKind !== "launch" || claimed.claimNonce !== nonce) return;
+      ensureFailedLaunchLogs(claimed, error);
       await failClaimedRun(item.workerId, item.runId, "launch", nonce, error);
+    } finally {
+      if (operationAdmission) endLifecycleAdmission(operationAdmission, nonce);
     }
   }
 
   function ensureFailedLaunchLogs(run: WorkerRunRecord, error: unknown): void {
-    if (!run.stdoutLog || !run.stderrLog) return;
-    const stdoutDir = path.dirname(run.stdoutLog); const stderrDir = path.dirname(run.stderrLog);
-    if (stdoutDir !== stderrDir) throw new Error("Worker launch log paths do not share an exact directory.");
-    mkdirSync(stdoutDir, { recursive: true, mode: 0o700 });
-    writeFileSync(run.stdoutLog, "", { flag: "a", mode: 0o600 });
-    writeFileSync(run.stderrLog, `[worker launch failed before host log publication] ${sanitizeError(error)}\n`, { flag: "a", mode: 0o600 });
+    try {
+      if (!run.stdoutLog || !run.stderrLog) return;
+      const stdoutDir = path.dirname(run.stdoutLog); const stderrDir = path.dirname(run.stderrLog); if (stdoutDir !== stderrDir) return;
+      mkdirSync(stdoutDir, { recursive: true, mode: 0o700 });
+      writeFileSync(run.stdoutLog, "", { flag: "a", mode: 0o600 });
+      writeFileSync(run.stderrLog, `[worker launch failed before host log publication] ${sanitizeError(error)}\n`, { flag: "a", mode: 0o600 });
+    } catch {}
+  }
+  function lifecycleAdmissionPath(runtime: RunRuntime): string { return path.join(runtime.runDir, "lifecycle-admitting.json"); }
+
+  function beginLifecycleAdmission(runtime: RunRuntime, workerId: string, runId: string, claimKind: LifecycleClaimKind, claimNonce: string): string {
+    assertRunClaim(workerId, runId, claimKind, claimNonce);
+    const file = lifecycleAdmissionPath(runtime); const prior = readLifecycleAdmission(file);
+    if (prior) {
+      const state = lifecycleAdmissionLiveness(prior);
+      if (state !== "dead" && prior.workerId === workerId && prior.runId === runId && prior.claimKind === claimKind && prior.claimNonce === claimNonce) return file;
+      if (state !== "dead") throw new WorkerContainmentError(`Another live lifecycle operation still owns ${workerId}/${runId}.`);
+      rmSync(file, { force: true });
+    }
+    const processStartToken = asyncJobProcessStartToken(process.pid);
+    if (!processStartToken) throw new WorkerContainmentError("Unable to capture the parent lifecycle operation start token.");
+    const record: LifecycleAdmissionRecord = { version: 1, workerId, runId, claimKind, claimNonce, pid: process.pid, processStartToken, startedAt: now().toISOString() };
+    writeFileSync(file, `${JSON.stringify(record)}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    try { assertRunClaim(workerId, runId, claimKind, claimNonce); }
+    catch (error) { endLifecycleAdmission(file, claimNonce); throw error; }
+    return file;
+  }
+
+  function endLifecycleAdmission(file: string, claimNonce: string): void {
+    const record = readLifecycleAdmission(file);
+    if (record?.claimNonce === claimNonce) rmSync(file, { force: true });
+  }
+
+  function readLifecycleAdmission(file: string): LifecycleAdmissionRecord | undefined {
+    if (!existsSync(file)) return undefined;
+    try {
+      const value = JSON.parse(readFileSync(file, "utf8")) as Partial<LifecycleAdmissionRecord>;
+      if (value.version !== 1 || typeof value.workerId !== "string" || typeof value.runId !== "string" || !["launch", "settlement", "cancellation"].includes(value.claimKind ?? "") || typeof value.claimNonce !== "string" || !value.claimNonce || !Number.isSafeInteger(value.pid) || value.pid! <= 0 || typeof value.processStartToken !== "string" || !value.processStartToken || typeof value.startedAt !== "string") return undefined;
+      return value as LifecycleAdmissionRecord;
+    } catch { return undefined; }
+  }
+
+  function lifecycleAdmissionLiveness(record: LifecycleAdmissionRecord): AsyncJobProcessIdentityLiveness {
+    const observed = asyncJobProcessStartToken(record.pid);
+    if (observed === record.processStartToken) return "alive";
+    if (observed) return "dead";
+    try { process.kill(record.pid, 0); return "unknown"; }
+    catch (error) { return error && typeof error === "object" && "code" in error && error.code === "ESRCH" ? "dead" : "unknown"; }
+  }
+
+  function liveLifecycleClaimNonces(parentSessionFile: string): string[] {
+    const preserved: string[] = [];
+    for (const { run } of activeRunsForParent(getRegistry(), parentSessionFile)) {
+      if (!run.claimKind || !run.claimNonce) continue;
+      const runtime = run.runtime as RunRuntime; if (!runtime?.runDir) continue;
+      const file = lifecycleAdmissionPath(runtime); const admission = readLifecycleAdmission(file);
+      if (admission && admission.workerId === run.workerId && admission.runId === run.runId && admission.claimKind === run.claimKind && admission.claimNonce === run.claimNonce) {
+        const state = lifecycleAdmissionLiveness(admission);
+        if (state === "dead") endLifecycleAdmission(file, admission.claimNonce);
+        else preserved.push(run.claimNonce);
+        continue;
+      }
+      // The nonce owner closes the synchronous SQLite-claim-to-file-publication
+      // gap during a fresh extension/process initialization.
+      const ownerState = lifecycleClaimNonceLiveness(run.claimNonce);
+      if (ownerState && ownerState !== "dead") preserved.push(run.claimNonce);
+    }
+    return preserved;
+  }
+
+  async function waitForBlockingLifecycleClaim(workerId: string, runId: string, runtime: RunRuntime): Promise<void> {
+    for (let attempt = 0; attempt < 480; attempt += 1) {
+      const run = getWorkerRun(getRegistry(), workerId, runId);
+      if (!run || !run.claimKind || !run.claimNonce) return;
+      const file = lifecycleAdmissionPath(runtime); const admission = readLifecycleAdmission(file);
+      if (admission && admission.workerId === workerId && admission.runId === runId && admission.claimKind === run.claimKind && admission.claimNonce === run.claimNonce) {
+        const state = lifecycleAdmissionLiveness(admission);
+        if (state === "dead") { endLifecycleAdmission(file, admission.claimNonce); releaseWorkerRunClaim(getRegistry(), workerId, runId, run.claimKind, run.claimNonce); return; }
+      } else if (lifecycleClaimNonceLiveness(run.claimNonce) === "dead") {
+        releaseWorkerRunClaim(getRegistry(), workerId, runId, run.claimKind, run.claimNonce); return;
+      }
+      // Missing or ambiguous identity never proves that an owner paused in the
+      // claim-to-marker publication gap is dead; this operation fails closed.
+      await delay(25);
+    }
+    throw new WorkerContainmentError(`Worker ${workerId}/${runId} still has a live lifecycle operation.`);
+  }
+
+  function persistClaimedRuntime(runtime: RunRuntime, workerId: string, runId: string, claimKind: LifecycleClaimKind, claimNonce: string): void {
+    updateClaimedWorkerRunRuntime(getRegistry(), { workerId, runId, claimKind, claimNonce, runtime });
+  }
+
+  async function launchSideEffect<T>(workerId: string, runId: string, claimNonce: string, action: () => T | Promise<T>): Promise<T> {
+    assertRunClaim(workerId, runId, "launch", claimNonce);
+    const value = await action();
+    assertRunClaim(workerId, runId, "launch", claimNonce);
+    return value;
   }
 
   async function waitForWorkerHostIdentity(runtime: RunRuntime, workerId: string, runId: string): Promise<void> {
@@ -545,7 +634,14 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   function assertRunClaim(workerId: string, runId: string, kind: "launch" | "settlement" | "cancellation", nonce: string): void { const run = getWorkerRun(getRegistry(), workerId, runId); if (run?.claimKind !== kind || run.claimNonce !== nonce) throw new Error(`Worker ${workerId}/${runId} ${kind} authority was revoked.`); }
 
   async function settleCompletedRun(workerId: string, runId: string, job: Pick<JobMeta, "status" | "exitCode" | "error">): Promise<void> {
-    const nonce = claimNonce(); if (!claimWorkerRun(getRegistry(), workerId, runId, "settlement", nonce, ["running"])) return;
+    const nonce = lifecycleClaimNonce(); if (!claimWorkerRun(getRegistry(), workerId, runId, "settlement", nonce, ["running"])) return;
+    const runtime = getWorkerRun(getRegistry(), workerId, runId)!.runtime as RunRuntime; let operationAdmission: string | undefined; let releaseClaim = false;
+    try { operationAdmission = beginLifecycleAdmission(runtime, workerId, runId, "settlement", nonce); releaseClaim = await settleClaimedRun(workerId, runId, job, nonce); }
+    catch (error) { releaseClaim = true; recordRecovery(workerId, runId, error); }
+    finally { if (operationAdmission) endLifecycleAdmission(operationAdmission, nonce); if (releaseClaim) releaseWorkerRunClaim(getRegistry(), workerId, runId, "settlement", nonce); }
+  }
+
+  async function settleClaimedRun(workerId: string, runId: string, job: Pick<JobMeta, "status" | "exitCode" | "error">, nonce: string): Promise<boolean> {
     const worker = getWorker(getRegistry(), workerId)!; const run = getWorkerRun(getRegistry(), workerId, runId)!; const runtime = run.runtime as RunRuntime;
     let outcome: any = "failed"; let outcomeSource: "worker" | "system" = "system"; let summary = "Worker run failed before accepting a result."; let question: string | undefined;
     let reported: string[] = []; let artifacts: string[] = []; const errors: Array<{ scope: "run" | "repositories" | "artifacts"; message: string }> = [];
@@ -568,9 +664,8 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     } catch (error) {
       const message = sanitizeError(error);
       if (!containmentProven || error instanceof WorkerHostIdentityError || error instanceof WorkerContainmentError) {
-        releaseWorkerRunClaim(getRegistry(), workerId, runId, "settlement", nonce);
         recordRecovery(workerId, runId, error);
-        return;
+        return true;
       }
       const attempts = recordWorkerSettlementRecovery(getRegistry(), { workerId, runId, claimNonce: nonce, error: message, now: now().toISOString() });
       let accepted: ReturnType<typeof readWorkerRuntimeResult> | undefined;
@@ -585,18 +680,22 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         });
         if (currentContext?.sessionManager.getSessionFile() && realpathOrResolve(currentContext.sessionManager.getSessionFile()!) === worker.parentSessionFile) deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration);
       } else {
-        releaseWorkerRunClaim(getRegistry(), workerId, runId, "settlement", nonce);
         const current = getWorker(getRegistry(), workerId); const currentRun = current && getWorkerRun(getRegistry(), workerId, runId);
         if (current && currentRun) deliverRecovery(current, currentRun, `${message} (settlement attempt ${attempts}/3)`);
+        return true;
       }
     }
+    return false;
   }
   async function failClaimedRun(workerId: string, runId: string, claimKind: "launch" | "settlement", claimNonce: string, error: unknown): Promise<void> {
     const worker = getWorker(getRegistry(), workerId); const run = worker && getWorkerRun(getRegistry(), workerId, runId); if (!worker || !run || run.claimKind !== claimKind || run.claimNonce !== claimNonce) return; const runtime = run.runtime as RunRuntime;
+    let operationAdmission: string | undefined;
     try {
+      operationAdmission = beginLifecycleAdmission(runtime, workerId, runId, claimKind, claimNonce);
       await containWorkerRun(runtime, workerId, runId, "failed-run cleanup", { signalAttached: true });
       finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind, claimNonce, outcome: "failed", outcomeSource: "system", summary: "Worker run failed before accepting a result.", errors: [{ scope: "run", message: sanitizeError(error) }], sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile) : undefined, settledAt: now().toISOString() });
-    } catch (cleanupError) { recordRecovery(workerId, runId, cleanupError); }
+    } catch (cleanupError) { if (operationAdmission) { endLifecycleAdmission(operationAdmission, claimNonce); operationAdmission = undefined; } releaseWorkerRunClaim(getRegistry(), workerId, runId, claimKind, claimNonce); recordRecovery(workerId, runId, cleanupError); }
+    finally { if (operationAdmission) endLifecycleAdmission(operationAdmission, claimNonce); }
   }
 
   async function cancelWorker(worker: WorkerRegistryRecord): Promise<"cancelled" | "not_active"> {
@@ -607,20 +706,24 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       const current = getWorker(getRegistry(), worker.workerId); if (!current?.activeRunId) return "not_active";
       throw new Error(`Worker ${worker.workerId}/${runId} has an accepted result whose settlement still requires recovery; cancellation will not discard it.`);
     }
-    const nonce = claimNonce();
-    if (!claimWorkerCancellation(getRegistry(), worker.workerId, runId, nonce, now().toISOString())) return "not_active";
-    pending.delete(runId); const run = getWorkerRun(getRegistry(), worker.workerId, runId)!; const runtime = run.runtime as RunRuntime;
+    if (!recoveringRuntime) return "not_active";
+    try { await waitForBlockingLifecycleClaim(worker.workerId, runId, recoveringRuntime); }
+    catch (error) { recordRecovery(worker.workerId, runId, error); throw new Error(`Worker ${worker.workerId}/${runId} cancellation requires recovery: ${sanitizeError(error)}`); }
+    const currentWorker = getWorker(getRegistry(), worker.workerId); const currentRun = currentWorker && getWorkerRun(getRegistry(), worker.workerId, runId);
+    if (!currentWorker || currentWorker.activeRunId !== runId || !currentRun || currentRun.status === "settled") return "not_active";
+    const nonce = lifecycleClaimNonce(); if (!claimWorkerCancellation(getRegistry(), worker.workerId, runId, nonce, now().toISOString())) return "not_active";
+    pending.delete(runId); const run = getWorkerRun(getRegistry(), worker.workerId, runId)!; const runtime = run.runtime as RunRuntime; let operationAdmission: string | undefined;
     try {
-      const launching = starting.get(worker.workerId);
-      await containWorkerRun(runtime, worker.workerId, runId, "cancellation", { signalAttached: true, ...(launching?.runId === runId ? { waitForLaunch: launching.completion } : {}) });
+      operationAdmission = beginLifecycleAdmission(runtime, worker.workerId, runId, "cancellation", nonce);
+      await containWorkerRun(runtime, worker.workerId, runId, "cancellation", { signalAttached: true });
       await reconcileTerminatedPersistedAsyncShellJobsForOwner(path.join(workerPaths(roots, worker.workerId).stateDir, "async-shell"), { kind: "worker-run", workerId: worker.workerId, runId }, 250);
       const survivors = await waitForWorkerShellRecords(worker.workerId, runId);
       if (survivors.length) throw new WorkerContainmentError(`Worker-owned process records remain active after container removal: ${survivors.map((job) => job.jobId).join(", ")}.`);
-      finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId: worker.workerId, runId, claimKind: "cancellation", claimNonce: nonce, outcome: "cancelled", outcomeSource: "system", summary: "Worker run was cancelled by its parent.", sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile) : undefined, settledAt: now().toISOString() });
-      active.delete(worker.workerId); deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration); return "cancelled";
-    } catch (error) { recordRecovery(worker.workerId, runId, error); throw new Error(`Worker ${worker.workerId}/${runId} cancellation requires recovery: ${sanitizeError(error)}`); }
+      finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: currentWorker.parentSessionFile, workerId: worker.workerId, runId, claimKind: "cancellation", claimNonce: nonce, outcome: "cancelled", outcomeSource: "system", summary: "Worker run was cancelled by its parent.", sessionEndLine: currentWorker.sessionFile ? countLines(currentWorker.sessionFile) : undefined, settledAt: now().toISOString() });
+      active.delete(worker.workerId); deliverPendingCompletions(api, getRegistry(), currentWorker.parentSessionFile, runtimeGeneration); return "cancelled";
+    } catch (error) { if (operationAdmission) { endLifecycleAdmission(operationAdmission, nonce); operationAdmission = undefined; } releaseWorkerRunClaim(getRegistry(), worker.workerId, runId, "cancellation", nonce); recordRecovery(worker.workerId, runId, error); throw new Error(`Worker ${worker.workerId}/${runId} cancellation requires recovery: ${sanitizeError(error)}`); }
+    finally { if (operationAdmission) endLifecycleAdmission(operationAdmission, nonce); }
   }
-
   async function containWorkerRun(runtime: RunRuntime, workerId: string, runId: string, operation: string, options: { signalAttached?: boolean; waitForLaunch?: Promise<void> } = {}): Promise<void> {
     const failures: string[] = [];
     const capture = async (label: string, action: () => void | Promise<void>): Promise<void> => {
@@ -659,7 +762,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     if (liveness === "alive") signalVerifiedWorkerHost(processRecord, "SIGTERM", operation);
   }
   async function waitForRuntimeAdmissions(runtime: RunRuntime, authorizationFile: string): Promise<void> {
-    const files = [workerResultAdmissionPath(runtime.resultFile), workerMutationAdmissionPath(authorizationFile), path.join(runtime.runDir, "launch-admitting.json")];
+    const files = [workerResultAdmissionPath(runtime.resultFile), workerMutationAdmissionPath(authorizationFile)];
     for (let attempt = 0; attempt < 480 && files.some(runtimeAdmissionActive); attempt += 1) await delay(25);
     const activeFiles = files.filter(runtimeAdmissionActive); if (activeFiles.length) throw new Error(`Worker runtime mutation admission did not settle after revocation: ${activeFiles.join(", ")}.`);
   }
@@ -771,8 +874,11 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
             const liveness = probeHostIdentity(processRecord);
             if (liveness === "unknown") { recordRecovery(worker.workerId, run.runId, new WorkerHostIdentityError("Worker host process identity was ambiguous during queued-run reconciliation.")); continue; }
             if (liveness === "alive") {
-              const nonce = claimNonce();
-              if (claimWorkerRun(getRegistry(), worker.workerId, run.runId, "launch", nonce, ["queued"])) finalizeWorkerRunLaunch(getRegistry(), { workerId: worker.workerId, runId: run.runId, claimNonce: nonce, modelSelection: worker.modelSelection!, sessionId: worker.sessionId!, sessionFile: worker.sessionFile!, sessionStartLine: run.sessionStartLine ?? countLines(worker.sessionFile!) + 1, jobId: run.jobId!, stdoutLog: run.stdoutLog!, stderrLog: run.stderrLog!, runtime, startedAt: run.startedAt ?? now().toISOString() });
+              const nonce = lifecycleClaimNonce();
+              if (claimWorkerRun(getRegistry(), worker.workerId, run.runId, "launch", nonce, ["queued"])) {
+                try { finalizeWorkerRunLaunch(getRegistry(), { workerId: worker.workerId, runId: run.runId, claimNonce: nonce, modelSelection: worker.modelSelection!, sessionId: worker.sessionId!, sessionFile: worker.sessionFile!, sessionStartLine: run.sessionStartLine ?? countLines(worker.sessionFile!) + 1, jobId: run.jobId!, stdoutLog: run.stdoutLog!, stderrLog: run.stderrLog!, runtime, startedAt: run.startedAt ?? now().toISOString() }); }
+                catch (error) { releaseWorkerRunClaim(getRegistry(), worker.workerId, run.runId, "launch", nonce); throw error; }
+              }
               continue;
             }
           } catch (error) { recordRecovery(worker.workerId, run.runId, error); continue; }
@@ -790,7 +896,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
           if (liveness === "unknown") { recordRecovery(worker.workerId, run.runId, new WorkerHostIdentityError("Worker host process identity was ambiguous during running-run reconciliation.")); continue; }
         } catch (error) { recordRecovery(worker.workerId, run.runId, error); continue; }
       }
-      const nonce = claimNonce(); if (claimWorkerRun(getRegistry(), worker.workerId, run.runId, "settlement", nonce, ["running"])) void failClaimedRun(worker.workerId, run.runId, "settlement", nonce, new Error("Worker supervisor exited without a verified result settlement."));
+      const nonce = lifecycleClaimNonce(); if (claimWorkerRun(getRegistry(), worker.workerId, run.runId, "settlement", nonce, ["running"])) void failClaimedRun(worker.workerId, run.runId, "settlement", nonce, new Error("Worker supervisor exited without a verified result settlement."));
     }
   }
 
@@ -809,6 +915,20 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     if (worker.reviewedByWorkerId && worker.reviewedByWorkerId !== reviewerWorkerId) throw new Error(`Worker ${worker.workerId} is leased to reviewer ${worker.reviewedByWorkerId}.`); return found;
   }
   function claimNonce(): string { return `${runtimeGeneration}-${randomUUID()}`; }
+  function lifecycleClaimNonce(): string {
+    const processStartToken = asyncJobProcessStartToken(process.pid);
+    if (!processStartToken) throw new WorkerContainmentError("Unable to capture the parent lifecycle claim owner start token.");
+    const digest = createHash("sha256").update(processStartToken).digest("hex");
+    return `${runtimeGeneration}-${process.pid}-${digest}-${randomUUID()}`;
+  }
+  function lifecycleClaimNonceLiveness(nonce: string): AsyncJobProcessIdentityLiveness | undefined {
+    const match = /^(?:[1-9][0-9]*)-([1-9][0-9]*)-([a-f0-9]{64})-/.exec(nonce);
+    if (!match) return undefined;
+    const pid = Number(match[1]); const expectedDigest = match[2]!; const observed = asyncJobProcessStartToken(pid);
+    if (observed) return createHash("sha256").update(observed).digest("hex") === expectedDigest ? "alive" : "dead";
+    try { process.kill(pid, 0); return "unknown"; }
+    catch (error) { return error && typeof error === "object" && "code" in error && error.code === "ESRCH" ? "dead" : "unknown"; }
+  }
   function managedCandidateWarnings(parentSessionFile: string) { return (candidateRepo: string, candidateCommit: string) => {
     const rows = getRegistry().database.prepare("SELECT r.run_id,r.repositories_json,w.worker_id,w.latest_run_id,w.status,w.workspace_root FROM runs r JOIN workers w ON w.worker_id=r.worker_id WHERE r.status='settled' AND w.parent_session_file=?").all(parentSessionFile) as Array<any>;
     const exactCandidate = realpathOrResolve(candidateRepo);

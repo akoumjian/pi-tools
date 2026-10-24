@@ -622,11 +622,12 @@ export function recordWorkerSettlementRecovery(registry: WorkerRegistry, input: 
   });
 }
 
-export function recoverInterruptedClaimsForParent(registry: WorkerRegistry, parentSessionFile: string, runtimeGeneration: number, now: string): void {
+export function recoverInterruptedClaimsForParent(registry: WorkerRegistry, parentSessionFile: string, runtimeGeneration: number, now: string, preservedClaimNonces: string[] = []): void {
   transaction(registry, () => {
-    const currentPrefix = `${runtimeGeneration}-%`;
+    const currentPrefix = `${runtimeGeneration}-%`; const preserved = new Set(preservedClaimNonces);
     const claimed = registry.database.prepare(`SELECT w.worker_id,w.active_run_id,r.claim_kind,r.claim_nonce FROM workers w JOIN runs r ON r.run_id=w.active_run_id WHERE w.parent_session_file=? AND r.claim_kind IS NOT NULL AND (r.claim_nonce IS NULL OR r.claim_nonce NOT LIKE ?)`).all(parentSessionFile, currentPrefix) as Array<{ worker_id: string; active_run_id: string; claim_kind: string; claim_nonce?: string }>;
     for (const item of claimed) {
+      if (item.claim_nonce && preserved.has(item.claim_nonce)) continue;
       registry.database.prepare("UPDATE runs SET claim_kind=NULL,claim_nonce=NULL WHERE run_id=? AND worker_id=? AND claim_kind=? AND claim_nonce IS ?").run(item.active_run_id, item.worker_id, item.claim_kind, item.claim_nonce ?? null);
       if (item.claim_kind === "cancellation") registry.database.prepare("UPDATE workers SET recovery_error=?,version=version+1,updated_at=? WHERE worker_id=?").run("Interrupted cancellation claim is ready for an exact cancellation retry.", now, item.worker_id);
     }
@@ -693,6 +694,14 @@ export function claimWorkerRun(registry: WorkerRegistry, workerId: string, runId
 export function releaseWorkerRunClaim(registry: WorkerRegistry, workerId: string, runId: string, kind: "launch" | "settlement" | "cancellation", nonce: string): boolean {
   return transaction(registry, () => Number(registry.database.prepare("UPDATE runs SET claim_kind=NULL,claim_nonce=NULL WHERE worker_id=? AND run_id=? AND claim_kind=? AND claim_nonce=?")
     .run(workerId, runId, kind, nonce).changes) === 1);
+}
+
+export function updateClaimedWorkerRunRuntime(registry: WorkerRegistry, input: { workerId: string; runId: string; claimKind: "launch" | "settlement" | "cancellation"; claimNonce: string; runtime: Record<string, unknown> }): void {
+  transaction(registry, () => {
+    const result = registry.database.prepare("UPDATE runs SET runtime_json=? WHERE worker_id=? AND run_id=? AND status IN ('queued','running') AND claim_kind=? AND claim_nonce=?")
+      .run(json(input.runtime), input.workerId, input.runId, input.claimKind, input.claimNonce);
+    if (Number(result.changes) !== 1) throw staleRun(input.workerId, input.runId);
+  });
 }
 
 export function finalizeWorkerRunLaunch(registry: WorkerRegistry, input: {
@@ -797,9 +806,7 @@ export function claimWorkerCancellation(registry: WorkerRegistry, workerId: stri
   return transaction(registry, () => {
     const worker = registry.database.prepare("SELECT recovery_error FROM workers WHERE worker_id=? AND active_run_id=? AND status IN ('queued','running')").get(workerId, runId) as { recovery_error: string | null } | undefined;
     if (!worker) return false;
-    const result = worker.recovery_error
-      ? registry.database.prepare("UPDATE runs SET claim_kind='cancellation',claim_nonce=? WHERE worker_id=? AND run_id=? AND status IN ('queued','running')").run(nonce, workerId, runId)
-      : registry.database.prepare("UPDATE runs SET claim_kind='cancellation',claim_nonce=? WHERE worker_id=? AND run_id=? AND status IN ('queued','running') AND (claim_kind IS NULL OR claim_kind='launch')").run(nonce, workerId, runId);
+    const result = registry.database.prepare("UPDATE runs SET claim_kind='cancellation',claim_nonce=? WHERE worker_id=? AND run_id=? AND status IN ('queued','running') AND claim_kind IS NULL").run(nonce, workerId, runId);
     if (Number(result.changes) === 1) registry.database.prepare("UPDATE workers SET updated_at=? WHERE worker_id=?").run(now, workerId);
     return Number(result.changes) === 1;
   });

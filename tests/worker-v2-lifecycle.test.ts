@@ -18,41 +18,56 @@ const model = (provider: string, id: string) => ({ id, name: id, provider, api: 
 type Launch = { record: any; runtime: any; resolve(job: JobMeta): void; handle: ManagedAsyncJobHandle };
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
-async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolean; removeThrowsOnce?: boolean; removeAlwaysThrows?: boolean; containerThrows?: boolean; deferContainer?: boolean; probeHostIdentity?: () => "alive" | "dead" | "unknown"; beforeCreateRunBatch?: () => void | Promise<void>; signalHostIdentity?: (_identity: any, signal: NodeJS.Signals) => boolean } = {}) {
+async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolean; removeThrowsOnce?: boolean; removeAlwaysThrows?: boolean; containerThrows?: boolean; deferContainer?: boolean; cleanupFailsWhileContainerLive?: boolean; probeHostIdentity?: () => "alive" | "dead" | "unknown"; beforeCreateRunBatch?: () => void | Promise<void>; signalHostIdentity?: (_identity: any, signal: NodeJS.Signals) => boolean } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "pi-worker-v2-lifecycle-"));
   const runtimeRoot = path.join(root, "runtime"); const workersRoot = path.join(runtimeRoot, "workers"); mkdirSync(workersRoot, { recursive: true });
   const session = SessionManager.create(root, path.join(root, "parent-session"), { id: `parent-${Date.now()}` }); writeFileSync(session.getSessionFile()!, `${JSON.stringify(session.getHeader())}\n`, { mode: 0o600 });
-  const tools: ToolDefinition[] = []; const handlers = new Map<string, Function[]>(); const commands = new Map<string, any>(); const renderers = new Map<string, Function>(); const messages: any[] = []; const notifications: string[] = [];
-  const launches: Launch[] = []; const created: string[] = []; const removed: string[] = []; const overlays: ReviewOverlayRecord[] = []; const cleaned: ReviewOverlayRecord[] = []; const cleanupLeaseOwners: Array<string | undefined> = [];
-  let releaseContainer = () => {}; const containerGate = options.deferContainer ? new Promise<void>((resolve) => { releaseContainer = resolve; }) : undefined; let removeFailures = 0; let counter = 0; const random = () => `${(++counter).toString(16).padStart(8, "0")}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`;
-  const api = { registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand(name: string, command: any) { commands.set(name, command); }, registerMessageRenderer(name: string, renderer: Function) { renderers.set(name, renderer); }, on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, sendMessage(message: any) { messages.push(message); } } as unknown as ExtensionAPI;
+  const messages: any[] = []; const notifications: string[] = []; const launches: Launch[] = []; const created: string[] = []; const removed: string[] = [];
+  const overlays: ReviewOverlayRecord[] = []; const cleaned: ReviewOverlayRecord[] = []; const cleanupLeaseOwners: Array<string | undefined> = []; const liveContainers = new Set<string>(); const lifecycleEvents: string[] = []; const overlayRuns = new Map<string, string>();
+  let containerGate: Promise<void> | undefined; let releaseContainer = () => {}; let removeFailures = 0; let counter = 0;
+  const blockContainer = () => { let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; }); containerGate = gate; releaseContainer = () => { release(); if (containerGate === gate) containerGate = undefined; }; return releaseContainer; };
+  if (options.deferContainer) blockContainer();
+  const random = () => `${(++counter).toString(16).padStart(8, "0")}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`;
   const context = { cwd: root, hasUI: false, mode: "rpc", sessionManager: session, modelRegistry: { hasConfiguredAuth: () => true, getAll: () => [model("openai-codex", "gpt-5.6-sol"), model("anthropic", "claude-opus-5-5")] }, thinkingLevel: "xhigh", isIdle: () => true, hasPendingMessages: () => false, ui: { notify(message: string) { notifications.push(message); } } } as unknown as ExtensionContext;
-  registerWorkerExtension(api, {
+  const dependencies = {
     runtimeRoot, roots: { stateRoot: workersRoot, workspaceRoot: workersRoot }, codeRoot: root, preparedRoot: path.join(runtimeRoot, "prepared"), targetRoot: root, dockerPath: "/fake/docker", random, now: () => new Date(`2026-01-01T00:00:${String(counter).padStart(2, "0")}.000Z`),
-    waitForHostIdentity: async () => {},
-    ...(options.probeHostIdentity ? { probeHostIdentity: options.probeHostIdentity } : {}),
-    ...(options.signalHostIdentity ? { signalHostIdentity: options.signalHostIdentity } : {}),
-    hostTerminationGraceAttempts: 2, hostForcedTerminationAttempts: 2, hostProbeDelayMs: 1,
-    ...(options.beforeCreateRunBatch ? { beforeCreateRunBatch: options.beforeCreateRunBatch } : {}),
-    createContainer: async (_docker, reference) => { created.push(reference.runId); if (containerGate) await containerGate; if (options.containerThrows) throw new Error("container disappeared between inspect and start"); return { ...reference, containerId: (++counter).toString(16).padStart(64, "0") }; }, removeContainer: (_docker, reference) => { removed.push(reference.runId); if (options.removeAlwaysThrows || options.removeThrowsOnce && removeFailures++ === 0) throw new Error(options.removeAlwaysThrows ? "persistent container cleanup failure" : "transient container cleanup failure"); },
-    createOverlay: (input) => { if (options.overlayThrows) throw new Error("overlay probe failure"); const value: ReviewOverlayRecord = { version: 2, mergedVolume: `merged-${input.workerId}-${input.runId}`, scratchVolume: `scratch-${input.workerId}-${input.runId}`, mounts: [
+    waitForHostIdentity: async () => {}, ...(options.probeHostIdentity ? { probeHostIdentity: options.probeHostIdentity } : {}), ...(options.signalHostIdentity ? { signalHostIdentity: options.signalHostIdentity } : {}),
+    hostTerminationGraceAttempts: 2, hostForcedTerminationAttempts: 2, hostProbeDelayMs: 1, ...(options.beforeCreateRunBatch ? { beforeCreateRunBatch: options.beforeCreateRunBatch } : {}),
+    createContainer: async (_docker: string, reference: any, guard: { assertAuthority?: () => void }) => {
+      guard.assertAuthority?.(); created.push(reference.runId); liveContainers.add(reference.runId); lifecycleEvents.push(`${reference.runId}:create`); const gate = containerGate; if (gate) await gate; guard.assertAuthority?.();
+      if (options.containerThrows) throw new Error("container disappeared between inspect and start"); return { ...reference, containerId: (++counter).toString(16).padStart(64, "0") };
+    },
+    removeContainer: (_docker: string, reference: any) => { removed.push(reference.runId); lifecycleEvents.push(`${reference.runId}:remove`); if (options.removeAlwaysThrows || options.removeThrowsOnce && removeFailures++ === 0) throw new Error(options.removeAlwaysThrows ? "persistent container cleanup failure" : "transient container cleanup failure"); liveContainers.delete(reference.runId); },
+    createOverlay: (input: any) => { if (options.overlayThrows) throw new Error("overlay probe failure"); const value: ReviewOverlayRecord = { version: 2, mergedVolume: `merged-${input.workerId}-${input.runId}`, scratchVolume: `scratch-${input.workerId}-${input.runId}`, mounts: [
       { kind: "volume", source: `merged-${input.workerId}-${input.runId}`, target: "/review/subject" }, { kind: "bind", source: input.reviewerWorkspace, target: "/workspace" },
       { kind: "bind", source: input.contextFile, target: "/review/context.json", readOnly: true }, { kind: "bind", source: input.reviewedSessionFile, target: "/review/session.jsonl", readOnly: true },
-      ...(input.additionalInputs ?? []).map((item) => ({ kind: "bind" as const, source: item.source, target: item.target, readOnly: true }))
-    ] }; overlays.push(value); return value; }, cleanupOverlay: (_docker, overlay) => {
+      ...(input.additionalInputs ?? []).map((item: any) => ({ kind: "bind" as const, source: item.source, target: item.target, readOnly: true }))
+    ] }; overlayRuns.set(value.mergedVolume, input.runId); lifecycleEvents.push(`${input.runId}:overlay`); overlays.push(value); return value; },
+    cleanupOverlay: (_docker: string, overlay: ReviewOverlayRecord) => {
+      const overlayRun = overlayRuns.get(overlay.mergedVolume)!; if (options.cleanupFailsWhileContainerLive && liveContainers.has(overlayRun)) throw new Error("overlay volume is still in use");
       const db = openWorkerRegistry(runtimeRoot); const row = db.database.prepare("SELECT reviewed_by_worker_id FROM workers WHERE reviewed_by_worker_id IS NOT NULL LIMIT 1").get() as { reviewed_by_worker_id?: string } | undefined; db.close();
-      cleanupLeaseOwners.push(row?.reviewed_by_worker_id); cleaned.push(overlay);
+      cleanupLeaseOwners.push(row?.reviewed_by_worker_id); lifecycleEvents.push(`${overlayRun}:cleanup`); cleaned.push(overlay);
     },
-    launch: (_api, _context, input) => { if (options.launchThrows) throw new Error("launch probe failure"); let resolve!: (job: JobMeta) => void; const completion = new Promise<JobMeta>((done) => { resolve = done; });
+    launch: (_api: ExtensionAPI, _context: ExtensionContext, input: any) => { if (options.launchThrows) throw new Error("launch probe failure"); let resolve!: (job: JobMeta) => void; const completion = new Promise<JobMeta>((done) => { resolve = done; });
       const running = job(input.record.jobId, "running"); const handle: ManagedAsyncJobHandle = { jobId: input.record.jobId, completion, snapshot: () => running, cancel: () => resolve(job(input.record.jobId, "cancelled")) }; launches.push({ ...input, resolve, handle }); return handle; }
-  });
-  for (const handler of handlers.get("session_start") ?? []) await handler({}, context);
-  const call = async (name: string, params: any) => { const tool = tools.find((candidate) => candidate.name === name)!; return tool.execute!("test", params, new AbortController().signal, undefined, context); };
+  };
+  const instances: Array<{ tools: ToolDefinition[]; handlers: Map<string, Function[]>; commands: Map<string, any>; renderers: Map<string, Function>; call(name: string, params: any): Promise<any>; event(name: string): Promise<void> }> = [];
+  const createInstance = async () => {
+    const tools: ToolDefinition[] = []; const handlers = new Map<string, Function[]>(); const commands = new Map<string, any>(); const renderers = new Map<string, Function>();
+    const api = { registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand(name: string, command: any) { commands.set(name, command); }, registerMessageRenderer(name: string, renderer: Function) { renderers.set(name, renderer); }, on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, sendMessage(message: any) { messages.push(message); } } as unknown as ExtensionAPI;
+    registerWorkerExtension(api, dependencies);
+    const call = async (name: string, params: any) => { const tool = tools.find((candidate) => candidate.name === name)!; return tool.execute!("test", params, new AbortController().signal, undefined, context); };
+    const event = async (name: string) => { for (const handler of handlers.get(name) ?? []) await handler({}, context); if (name === "turn_end") await waitFor(() => { const db = openWorkerRegistry(runtimeRoot); const queued = Number((db.database.prepare("SELECT COUNT(*) AS count FROM runs WHERE status='queued'").get() as any).count); db.close(); return queued === 0; }); };
+    const instance = { tools, handlers, commands, renderers, call, event }; instances.push(instance); await event("session_start"); return instance;
+  };
+  let current = await createInstance(); const first = current;
+  const reload = async () => { await current.event("session_shutdown"); current = await createInstance(); return current; };
   const registry = () => openWorkerRegistry(runtimeRoot);
-  const event = async (name: string) => { for (const handler of handlers.get(name) ?? []) await handler({}, context); if (name === "turn_end") await waitFor(() => { const db = registry(); const queued = Number((db.database.prepare("SELECT COUNT(*) AS count FROM runs WHERE status='queued'").get() as any).count); db.close(); return queued === 0; }); };
-  return { root, runtimeRoot, workersRoot, session, tools, handlers, commands, renderers, messages, notifications, launches, releaseContainer, created, removed, overlays, cleaned, cleanupLeaseOwners, context, call, event, registry, async close() { try { await event("session_shutdown"); } catch {} rmSync(root, { recursive: true, force: true }); } };
+  return { root, runtimeRoot, workersRoot, session, messages, notifications, launches, get releaseContainer() { return releaseContainer; }, blockContainer, created, removed, liveContainers, lifecycleEvents, overlays, cleaned, cleanupLeaseOwners, context,
+    tools: first.tools, handlers: first.handlers, commands: first.commands, renderers: first.renderers, call: first.call, event: first.event, registry, reload,
+    async close() { releaseContainer(); for (const instance of instances) { try { await instance.event("session_shutdown"); } catch {} } rmSync(root, { recursive: true, force: true }); }
+  };
 }
-
 function job(jobId: string, status: JobMeta["status"], exitCode = status === "exited" ? 0 : undefined): JobMeta { return { jobId, command: "worker", cwd: "/tmp", status, durationMs: 1, exitCode, signal: null, notifyOnExit: false, completionNotified: true, logDir: "/tmp", stdoutLog: `/tmp/${jobId}.out`, stderrLog: `/tmp/${jobId}.err`, outputBytes: { stdout: 0, stderr: 0 } } as JobMeta; }
 function receipt(result: any) { return result.details.runs[0] as { workerId: string; runId: string; role: string }; }
 async function waitFor(check: () => boolean, timeout = 3_000) { const end = Date.now() + timeout; while (!check()) { if (Date.now() > end) throw new Error("condition timed out"); await new Promise((resolve) => setTimeout(resolve, 10)); } }
@@ -112,6 +127,46 @@ test("concurrent reconciliation cannot revoke or duplicate an in-flight launch a
   } finally { f.releaseContainer(); await f.close(); }
 });
 
+test("G/C: a reloaded extension preserves the live launch owner and never races exact adoption", async () => {
+  const f = await fixture({ deferContainer: true }); try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "reload during readiness" }] }));
+    f.handlers.get("turn_end")![0]!({}, f.context); await waitFor(() => f.created.length === 1 && f.liveContainers.has(started.runId));
+    const reloaded = await f.reload(); await new Promise((resolve) => setTimeout(resolve, 30));
+    let db = f.registry(); let run = getWorkerRun(db, started.workerId, started.runId)!; db.close();
+    assert.equal(run.claimKind, "launch"); assert.match(run.claimNonce!, new RegExp(`^\\d+-${process.pid}-[a-f0-9]{64}-`), "the durable claim itself identifies its exact process owner"); assert.equal(f.created.length, 1); assert.equal(f.removed.length, 0);
+    assert.equal(existsSync(run.stdoutLog!), false, "a stale instance must not reserve the successor async-job directory");
+    f.releaseContainer(); await waitFor(() => f.launches.length === 1); await waitFor(() => { const state = f.registry(); const value = getWorkerRun(state, started.workerId, started.runId); state.close(); return value?.status === "running"; });
+    db = f.registry(); run = getWorkerRun(db, started.workerId, started.runId)!; db.close(); assert.equal(run.status, "running"); assert.equal(f.created.length, 1); assert.equal(f.liveContainers.has(started.runId), true);
+    await reloaded.call("worker_control", { action: "cancel", workerId: started.workerId }); assert.equal(f.liveContainers.has(started.runId), false);
+  } finally { f.releaseContainer(); await f.close(); }
+});
+
+test("H: cancellation from a reloaded extension waits for launch and leaves no live containment", async () => {
+  const f = await fixture({ deferContainer: true }); try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "cancel after reload" }] }));
+    f.handlers.get("turn_end")![0]!({}, f.context); await waitFor(() => f.created.length === 1 && f.liveContainers.has(started.runId));
+    const reloaded = await f.reload(); let resolved = false; const cancelling = reloaded.call("worker_control", { action: "cancel", workerId: started.workerId }).then((value) => { resolved = true; return value; });
+    await new Promise((resolve) => setTimeout(resolve, 40)); assert.equal(resolved, false); assert.equal(f.liveContainers.has(started.runId), true);
+    f.releaseContainer(); await cancelling; const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; const worker = getWorker(db, started.workerId)!; db.close();
+    assert.equal(run.outcome, "cancelled"); assert.equal(worker.status, "idle"); assert.equal(f.liveContainers.has(started.runId), false); assert.deepEqual(f.removed.filter((runId) => runId === started.runId), [started.runId]);
+  } finally { f.releaseContainer(); await f.close(); }
+});
+
+test("review cancellation during launch removes exact containment before exact overlay cleanup", async () => {
+  const f = await fixture({ cleanupFailsWhileContainerLive: true }); try {
+    const subject = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "subject" }] })); await f.event("turn_end"); await complete(f, subject);
+    f.blockContainer(); const review = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "review", reviewedRunId: subject.runId }] }));
+    f.handlers.get("turn_end")![0]!({}, f.context); await waitFor(() => f.overlays.some((overlay) => overlay.mergedVolume.endsWith(review.runId)) && f.liveContainers.has(review.runId));
+    const exactOverlay = f.overlays.find((overlay) => overlay.mergedVolume.endsWith(review.runId))!; const reloaded = await f.reload();
+    let resolved = false; const cancelling = reloaded.call("worker_control", { action: "cancel", workerId: review.workerId }).then((value) => { resolved = true; return value; });
+    await new Promise((resolve) => setTimeout(resolve, 40)); assert.equal(resolved, false); assert.equal(f.cleaned.some((overlay) => overlay.mergedVolume === exactOverlay.mergedVolume), false);
+    f.releaseContainer(); await cancelling;
+    const events = f.lifecycleEvents.filter((event) => event.startsWith(`${review.runId}:`)); const removeIndex = events.indexOf(`${review.runId}:remove`); const cleanupIndex = events.indexOf(`${review.runId}:cleanup`);
+    assert.ok(removeIndex >= 0 && cleanupIndex > removeIndex, events.join(",")); assert.equal(f.liveContainers.has(review.runId), false); assert.equal(f.cleaned.filter((overlay) => overlay.mergedVolume === exactOverlay.mergedVolume).length, 1);
+    const db = f.registry(); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, undefined); db.close();
+  } finally { f.releaseContainer(); await f.close(); }
+});
+
 test("pre-host container failure publishes the reported diagnostic log paths", async () => {
   const f = await fixture({ containerThrows: true }); try {
     const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "fail before host logs" }] }));
@@ -121,6 +176,16 @@ test("pre-host container failure publishes the reported diagnostic log paths", a
   } finally { await f.close(); }
 });
 
+test("failed-launch diagnostic logs are best-effort and never escape the lifecycle promise", async () => {
+  const f = await fixture({ containerThrows: true }); const unhandled: unknown[] = []; const onUnhandled = (error: unknown) => { unhandled.push(error); }; process.on("unhandledRejection", onUnhandled);
+  try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "unwritable diagnostics" }] }));
+    const blocked = path.join(f.root, "not-a-directory"); writeFileSync(blocked, "blocked"); const db0 = f.registry(); db0.database.prepare("UPDATE runs SET stdout_log=?,stderr_log=? WHERE run_id=?").run(path.join(blocked, "stdout.log"), path.join(blocked, "stderr.log"), started.runId); db0.close();
+    await f.event("turn_end"); await new Promise((resolve) => setTimeout(resolve, 25)); const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; db.close();
+    assert.equal(run.outcome, "failed"); assert.equal(unhandled.length, 0, unhandled.map(String).join("\n")); assert.equal(f.liveContainers.has(started.runId), false);
+  } finally { process.off("unhandledRejection", onUnhandled); await f.close(); }
+});
+
 test("cancellation waits for a deferred launch boundary before proving termination", async () => {
   const f = await fixture({ deferContainer: true }); try {
     const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "cancel during readiness" }] }));
@@ -128,8 +193,8 @@ test("cancellation waits for a deferred launch boundary before proving terminati
     let resolved = false; const cancelling = f.call("worker_control", { action: "cancel", workerId: started.workerId }).then((value) => { resolved = true; return value; });
     await new Promise((resolve) => setTimeout(resolve, 20)); assert.equal(resolved, false); f.releaseContainer(); await cancelling;
     const db = f.registry(); const worker = getWorker(db, started.workerId)!; const run = getWorkerRun(db, started.workerId, started.runId)!; db.close();
-    assert.equal(worker.status, "idle"); assert.equal(run.outcome, "cancelled"); assert.equal(f.launches.length, 0);
-    assert.deepEqual(f.removed, [started.runId], "the revoked launcher must leave exact-container removal to cancellation authority");
+    assert.equal(worker.status, "idle"); assert.equal(run.outcome, "cancelled"); assert.equal(f.launches.length, 1, "cancellation waits for the durable launch owner before containing it");
+    assert.deepEqual(f.removed, [started.runId], "cancellation removes the exact launched containment once");
   } finally { f.releaseContainer(); await f.close(); }
 });
 

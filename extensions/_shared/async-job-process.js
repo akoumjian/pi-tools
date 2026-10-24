@@ -6,15 +6,11 @@ export function asyncJobTokenProcessIds(token) {
   if (process.platform === "linux") {
     const marker = `PI_WORKER_JOB_TOKEN=${token}`;
     let entries;
-    try { entries = readdirSync("/proc", { withFileTypes: true }); }
+    // Read names only. Dirent mode may lstat DT_UNKNOWN procfs entries inside
+    // readdirSync and abort the whole scan when an unrelated process exits.
+    try { entries = readdirSync("/proc"); }
     catch (cause) { throw new Error(`Unable to enumerate async-job ownership tokens: ${cause instanceof Error ? cause.message : String(cause)}`); }
-    return entries.flatMap((entry) => {
-      if (!entry.isDirectory() || !/^[1-9][0-9]*$/.test(entry.name)) return [];
-      try {
-        const environment = readFileSync(`/proc/${entry.name}/environ`, "utf8").split("\0");
-        return environment.includes(marker) ? [Number(entry.name)] : [];
-      } catch { return []; }
-    });
+    return asyncJobTokenProcessIdsFromLinuxProc(token, entries, (pid) => readFileSync(`/proc/${pid}/environ`, "utf8"));
   }
   if (process.platform !== "darwin") return [];
   let output;
@@ -30,6 +26,16 @@ export function asyncJobTokenProcessIds(token) {
     if (!line.includes(marker)) return [];
     const pid = Number.parseInt(line.trimStart().split(/\s+/, 1)[0] ?? "", 10);
     return Number.isInteger(pid) && pid > 0 ? [pid] : [];
+  });
+}
+
+export function asyncJobTokenProcessIdsFromLinuxProc(token, entries, readEnvironment) {
+  if (!token) return [];
+  const marker = `PI_WORKER_JOB_TOKEN=${token}`;
+  return entries.flatMap((entry) => {
+    if (typeof entry !== "string" || !/^[1-9][0-9]*$/.test(entry)) return [];
+    try { return String(readEnvironment(entry)).split("\0").includes(marker) ? [Number(entry)] : []; }
+    catch { return []; }
   });
 }
 
