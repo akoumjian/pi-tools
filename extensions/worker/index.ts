@@ -116,6 +116,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   let currentContext: ExtensionContext | undefined;
   let unsubscribeActivity: (() => void) | undefined;
   let activityGeneration = 0;
+  let generationMismatchNotifiedForRuntime = -1;
   const pending = new Map<string, PendingRun>();
   const active = new Map<string, ActiveRun>();
   const starting = new Map<string, { runId: string; completion: Promise<void> }>();
@@ -675,9 +676,9 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     if (activeRuns.length === 0) return;
     try { assertCurrentPackageGeneration(); }
     catch (error) {
-      const message = sanitizeError(error);
-      for (const { worker, run } of activeRuns) {
-        if (worker.recoveryError !== message) recordRecovery(worker.workerId, run.runId, message);
+      if (generationMismatchNotifiedForRuntime !== runtimeGeneration) {
+        generationMismatchNotifiedForRuntime = runtimeGeneration;
+        try { context.ui.notify(sanitizeError(error), "error"); } catch {}
       }
       return;
     }
