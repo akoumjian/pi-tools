@@ -20,9 +20,11 @@ import {
   listWorkerRuns,
   listWorkers,
   markWorkerDeliveryDelivered,
+  markWorkerDeliverySendStarted,
   markWorkerRunRunning,
   openWorkerRegistry,
   pendingWorkerDeliveries,
+  promoteParentRuntime,
   reconcileWorkerDeliveries,
   recoverInterruptedClaimsForParent,
   registerParentRuntime,
@@ -190,15 +192,41 @@ test("terminal cleanup intent survives claim release and blocks every launch rec
   } finally { f.close(); }
 });
 
-test("delivery reconciliation marks session-observed IDs and requeues uncertain claims", () => {
+test("delivery reconciliation marks observed IDs without replaying an unconfirmed send", () => {
   const f = fixture();
   try {
     const workerId = "worker_20260101000000_11111111"; const runId = "run_20260101000000_11111111"; const parent = "/sessions/parent.jsonl";
     createWorkerAndRun(f.registry, { workerId, parentSessionFile: parent, role: "work", status: "queued", activeRunId: runId, taskIds: ["personal-test"], workspaceRoot: "/workspace/1", createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }, queuedRun(workerId, runId));
     const deliveryId = settleWorkerRun(f.registry, { parentSessionFile: parent, workerId, runId, outcome: "completed", outcomeSource: "worker", settledAt: "2026-01-01T00:00:01.000Z" });
     const generation = registerParentRuntime(f.registry, parent, "runtime", "2026-01-01T00:00:02.000Z"); assert.equal(claimWorkerDelivery(f.registry, deliveryId, parent, generation), true);
-    reconcileWorkerDeliveries(f.registry, parent, []); assert.equal(pendingWorkerDeliveries(f.registry, parent)[0]?.state, "pending");
+    assert.equal(markWorkerDeliverySendStarted(f.registry, deliveryId, generation, "2026-01-01T00:00:03.000Z"), true);
+    reconcileWorkerDeliveries(f.registry, parent, []); const ambiguous = pendingWorkerDeliveries(f.registry, parent)[0]!; assert.equal(ambiguous.state, "claimed"); assert.equal(ambiguous.sendStartedAt, "2026-01-01T00:00:03.000Z");
+    releaseWorkerDeliveryClaim(f.registry, deliveryId, generation); assert.equal(pendingWorkerDeliveries(f.registry, parent)[0]?.state, "claimed", "a started send cannot be released for replay");
     reconcileWorkerDeliveries(f.registry, parent, [deliveryId]); assert.equal(pendingWorkerDeliveries(f.registry, parent).length, 0);
+  } finally { f.close(); }
+});
+
+
+test("runtime promotion requeues only the dead owner's pre-send delivery claim", () => {
+  const f = fixture(); try {
+    const parent = "/sessions/delivery-promotion.jsonl";
+    const createSettled = (suffix: string) => {
+      const workerId = `worker_20260101000000_${suffix}`; const runId = `run_20260101000000_${suffix}`;
+      createWorkerAndRun(f.registry, { workerId, parentSessionFile: parent, role: "work", status: "queued", activeRunId: runId, taskIds: ["personal-test"], workspaceRoot: `/workspace/${suffix}`, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }, queuedRun(workerId, runId));
+      return settleWorkerRun(f.registry, { parentSessionFile: parent, workerId, runId, outcome: "completed", outcomeSource: "worker", settledAt: "2026-01-01T00:00:01.000Z" });
+    };
+    const preSend = createSettled("delivery1"); const attempted = createSettled("delivery2");
+    registerParentRuntime(f.registry, parent, "survivor", "2026-01-01T00:00:02.000Z", { pid: 101, processStartToken: "survivor-token" });
+    const ownerGeneration = registerParentRuntime(f.registry, parent, "dead-owner", "2026-01-01T00:00:03.000Z", { pid: 202, processStartToken: "dead-token" });
+    assert.equal(claimWorkerDelivery(f.registry, preSend, parent, ownerGeneration), true);
+    const survivorGeneration = promoteParentRuntime(f.registry, { parentSessionFile: parent, expectedGeneration: ownerGeneration, expectedRuntimeId: "dead-owner", identity: { runtimeId: "survivor", pid: 101, processStartToken: "survivor-token" }, now: "2026-01-01T00:00:04.000Z" })!;
+    assert.equal(pendingWorkerDeliveries(f.registry, parent).find((item) => item.deliveryId === preSend)?.state, "pending");
+    assert.equal(claimWorkerDelivery(f.registry, attempted, parent, survivorGeneration), true);
+    assert.equal(markWorkerDeliverySendStarted(f.registry, attempted, survivorGeneration, "2026-01-01T00:00:05.000Z"), true);
+    const next = promoteParentRuntime(f.registry, { parentSessionFile: parent, expectedGeneration: survivorGeneration, expectedRuntimeId: "survivor", identity: { runtimeId: "dead-owner", pid: 202, processStartToken: "dead-token" }, now: "2026-01-01T00:00:06.000Z" });
+    assert.equal(next, survivorGeneration + 1);
+    const retained = pendingWorkerDeliveries(f.registry, parent).find((item) => item.deliveryId === attempted)!;
+    assert.equal(retained.state, "claimed"); assert.equal(retained.sendStartedAt, "2026-01-01T00:00:05.000Z");
   } finally { f.close(); }
 });
 
@@ -255,18 +283,35 @@ test("v3 migration converts an interrupted cancellation claim into durable non-l
   } finally { registry?.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
+test("v4 migration preserves every legacy claimed delivery as send-ambiguous", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "pi-worker-registry-v4-delivery-"));
+  let registry: ReturnType<typeof openWorkerRegistry> | undefined;
+  try {
+    registry = openWorkerRegistry(root);
+    const parent = "/sessions/v4-delivery.jsonl"; const workerId = "worker_20260101000000_v4deliver"; const runId = "run_20260101000000_v4deliver";
+    createWorkerAndRun(registry, { workerId, parentSessionFile: parent, role: "work", status: "queued", activeRunId: runId, taskIds: ["personal-test"], workspaceRoot: "/workspace/v4-delivery", createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }, queuedRun(workerId, runId));
+    const deliveryId = settleWorkerRun(registry, { parentSessionFile: parent, workerId, runId, outcome: "completed", outcomeSource: "worker", settledAt: "2026-01-01T00:00:01.000Z" });
+    const generation = registerParentRuntime(registry, parent, "legacy-v4", "2026-01-01T00:00:02.000Z"); assert.equal(claimWorkerDelivery(registry, deliveryId, parent, generation), true);
+    registry.database.exec("ALTER TABLE deliveries DROP COLUMN send_started_at"); registry.database.prepare("UPDATE registry_meta SET value='4' WHERE key='schema_version'").run(); registry.database.exec("PRAGMA user_version = 4"); registry.close(); registry = undefined;
+    registry = openWorkerRegistry(root); const migrated = pendingWorkerDeliveries(registry, parent)[0]!;
+    assert.equal(migrated.state, "claimed"); assert.equal(migrated.sendStartedAt, "2026-01-01T00:00:01.000Z");
+    releaseWorkerDeliveryClaim(registry, deliveryId, generation); assert.equal(pendingWorkerDeliveries(registry, parent)[0]?.state, "claimed");
+  } finally { registry?.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
 test("registry applies an ordered idempotent v2 migration while mixed live openers ignore diagnostic fingerprints", () => {
   const root = mkdtempSync(path.join(tmpdir(), "pi-worker-registry-migration-"));
   let oldOpener: ReturnType<typeof openWorkerRegistry> | undefined; let migrated: ReturnType<typeof openWorkerRegistry> | undefined;
   try {
     oldOpener = openWorkerRegistry(root);
     oldOpener.database.exec("ALTER TABLE prepared_sets DROP COLUMN apply_nonce");
+    oldOpener.database.exec("ALTER TABLE deliveries DROP COLUMN send_started_at");
     oldOpener.database.prepare("UPDATE registry_meta SET value='2' WHERE key='schema_version'").run();
     oldOpener.database.prepare("UPDATE registry_meta SET value='old-live-build-fingerprint' WHERE key='schema_hash'").run();
     migrated = openWorkerRegistry(root);
     const version = migrated.database.prepare("SELECT value FROM registry_meta WHERE key='schema_version'").get() as { value: string };
-    const columns = migrated.database.prepare("PRAGMA table_info(prepared_sets)").all() as Array<{ name: string }>; const runColumns = migrated.database.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>;
-    assert.equal(version.value, "4"); assert.equal(columns.some((column) => column.name === "apply_nonce"), true); assert.equal(runColumns.some((column) => column.name === "terminal_intent"), true);
+    const columns = migrated.database.prepare("PRAGMA table_info(prepared_sets)").all() as Array<{ name: string }>; const runColumns = migrated.database.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>; const deliveryColumns = migrated.database.prepare("PRAGMA table_info(deliveries)").all() as Array<{ name: string }>;
+    assert.equal(version.value, "5"); assert.equal(columns.some((column) => column.name === "apply_nonce"), true); assert.equal(runColumns.some((column) => column.name === "terminal_intent"), true); assert.equal(deliveryColumns.some((column) => column.name === "send_started_at"), true);
     const legacyHash = migrated.database.prepare("SELECT value FROM registry_meta WHERE key='schema_hash'").get() as { value: string };
     assert.equal(legacyHash.value, "old-live-build-fingerprint", "migration must not overwrite another live build's diagnostic hash");
     oldOpener.database.prepare("UPDATE registry_meta SET value='old-opener-still-live' WHERE key='schema_hash'").run();

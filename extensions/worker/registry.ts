@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import type { DatabaseSync as SQLiteDatabaseSync, SQLInputValue } from "node:sqlite";
 
-export const WORKER_REGISTRY_SCHEMA_VERSION = 4;
+export const WORKER_REGISTRY_SCHEMA_VERSION = 5;
 export const DEFAULT_WORKER_RUNTIME_ROOT = path.join(homedir(), ".local", "share", "agent", "worker-runtime");
 
 export type WorkerRole = "work" | "review" | "integration";
@@ -105,6 +105,7 @@ export type WorkerDeliveryRecord = {
   state: "pending" | "claimed" | "delivered";
   runtimeGeneration?: number;
   createdAt: string;
+  sendStartedAt?: string;
   deliveredAt?: string;
 };
 
@@ -207,6 +208,7 @@ CREATE TABLE IF NOT EXISTS deliveries (
   state TEXT NOT NULL CHECK (state IN ('pending','claimed','delivered')),
   runtime_generation INTEGER,
   created_at TEXT NOT NULL,
+  send_started_at TEXT,
   delivered_at TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS deliveries_parent_state ON deliveries(parent_session_file, state, created_at);
@@ -309,6 +311,13 @@ function migrateWorkerRegistry(database: SQLiteDatabaseSync, fromVersion: number
       // though v3 had no owner-independent intent column. Never migrate that
       // interrupted operation back into a launchable queued run.
       database.exec("UPDATE runs SET terminal_intent='cancellation',terminal_error=NULL WHERE status IN ('queued','running') AND claim_kind='cancellation' AND terminal_intent IS NULL");
+    },
+    4: () => {
+      addColumnIfMissing(database, "deliveries", "send_started_at", "TEXT");
+      // v4 did not persist the send boundary, so every legacy claimed delivery
+      // may already have been attempted or accepted. Conservatively classify it
+      // as unconfirmed rather than replaying a possible duplicate.
+      database.exec("UPDATE deliveries SET send_started_at=COALESCE(delivered_at,created_at) WHERE state='claimed' AND send_started_at IS NULL");
     }
   };
   for (let version = fromVersion; version < WORKER_REGISTRY_SCHEMA_VERSION; version += 1) {
@@ -348,6 +357,12 @@ export function currentParentRuntime(registry: WorkerRegistry, parentSessionFile
     .get(parentSessionFile) as { generation: number; runtimeId: string } | undefined;
 }
 
+export function parentRuntimeMemberForGeneration(registry: WorkerRegistry, parentSessionFile: string, generation: number): ParentRuntimeMember | undefined {
+  const row = registry.database.prepare(`SELECT generation,runtime_id,owner_pid,owner_start_token,retired_at FROM parent_runtime_members
+    WHERE parent_session_file=? AND generation=?`).get(parentSessionFile, generation) as { generation: number; runtime_id: string; owner_pid: number | null; owner_start_token: string | null; retired_at: string | null } | undefined;
+  return row === undefined ? undefined : { generation: row.generation, runtimeId: row.runtime_id, pid: row.owner_pid ?? 0, processStartToken: row.owner_start_token ?? "", retired: row.retired_at !== null };
+}
+
 export function latestParentRuntimeMembers(registry: WorkerRegistry, parentSessionFile: string, afterGeneration: number, throughGeneration: number): ParentRuntimeMember[] {
   const rows = registry.database.prepare(`SELECT m.generation,m.runtime_id,m.owner_pid,m.owner_start_token,m.retired_at
     FROM parent_runtime_members m
@@ -368,6 +383,12 @@ export function promoteParentRuntime(registry: WorkerRegistry, input: { parentSe
     if (Number(updated.changes) !== 1) return undefined;
     registry.database.prepare(`INSERT INTO parent_runtime_members(parent_session_file,generation,runtime_id,owner_pid,owner_start_token,registered_at,retired_at)
       VALUES(?,?,?,?,?,?,NULL)`).run(input.parentSessionFile, next, input.identity.runtimeId, input.identity.pid, input.identity.processStartToken, input.now);
+    // The caller proved the exact superseded runtime dead or retired before the
+    // generation CAS. Only a claim that had not crossed the send boundary is
+    // safe to replay; a started send is intentionally left unconfirmed.
+    registry.database.prepare(`UPDATE deliveries SET state='pending',runtime_generation=NULL
+      WHERE parent_session_file=? AND state='claimed' AND runtime_generation=? AND send_started_at IS NULL`)
+      .run(input.parentSessionFile, input.expectedGeneration);
     return next;
   });
 }
@@ -484,6 +505,11 @@ export function pendingWorkerDeliveries(registry: WorkerRegistry, parentSessionF
   return rows.map(decodeDelivery);
 }
 
+export function getWorkerDeliveryForRun(registry: WorkerRegistry, workerId: string, runId: string): WorkerDeliveryRecord | undefined {
+  const row = registry.database.prepare("SELECT * FROM deliveries WHERE worker_id=? AND run_id=?").get(workerId, runId) as DeliveryRow | undefined;
+  return row === undefined ? undefined : decodeDelivery(row);
+}
+
 export function claimWorkerDelivery(registry: WorkerRegistry, deliveryId: string, parentSessionFile: string, runtimeGeneration: number): boolean {
   return transaction(registry, () => {
     const active = registry.database.prepare("SELECT generation FROM parent_runtimes WHERE parent_session_file=?").get(parentSessionFile) as { generation: number } | undefined;
@@ -494,10 +520,31 @@ export function claimWorkerDelivery(registry: WorkerRegistry, deliveryId: string
   });
 }
 
+/** Releases an exact pre-send claim after its runtime member was proved dead. */
+export function recoverProvablyDeadWorkerDeliveryClaim(registry: WorkerRegistry, input: { deliveryId: string; parentSessionFile: string; ownerGeneration: number; runtimeGeneration: number }): boolean {
+  return transaction(registry, () => {
+    if (!parentRuntimeGenerationMatches(registry, input.parentSessionFile, input.runtimeGeneration)) return false;
+    const result = registry.database.prepare(`UPDATE deliveries SET state='pending',runtime_generation=NULL
+      WHERE delivery_id=? AND parent_session_file=? AND state='claimed' AND runtime_generation=? AND send_started_at IS NULL`)
+      .run(input.deliveryId, input.parentSessionFile, input.ownerGeneration);
+    return Number(result.changes) === 1;
+  });
+}
+
 export function releaseWorkerDeliveryClaim(registry: WorkerRegistry, deliveryId: string, runtimeGeneration: number): void {
   transaction(registry, () => {
-    registry.database.prepare("UPDATE deliveries SET state='pending',runtime_generation=NULL WHERE delivery_id=? AND state='claimed' AND runtime_generation=?")
+    registry.database.prepare("UPDATE deliveries SET state='pending',runtime_generation=NULL WHERE delivery_id=? AND state='claimed' AND runtime_generation=? AND send_started_at IS NULL")
       .run(deliveryId, runtimeGeneration);
+  });
+}
+
+/** Durably crosses the no-replay boundary immediately before sendMessage. */
+export function markWorkerDeliverySendStarted(registry: WorkerRegistry, deliveryId: string, runtimeGeneration: number, now: string): boolean {
+  return transaction(registry, () => {
+    const result = registry.database.prepare(`UPDATE deliveries SET send_started_at=?
+      WHERE delivery_id=? AND state='claimed' AND runtime_generation=? AND send_started_at IS NULL`)
+      .run(now, deliveryId, runtimeGeneration);
+    return Number(result.changes) === 1;
   });
 }
 
@@ -578,7 +625,7 @@ type RunRow = {
 };
 type DeliveryRow = {
   delivery_id: string; parent_session_file: string; worker_id: string; run_id: string; completion_delivery: "steer" | "followUp"; state: "pending" | "claimed" | "delivered";
-  runtime_generation: number | null; created_at: string; delivered_at: string | null;
+  runtime_generation: number | null; created_at: string; send_started_at: string | null; delivered_at: string | null;
 };
 
 function decodeWorker(row: WorkerRow): WorkerRegistryRecord {
@@ -609,7 +656,7 @@ function decodeDelivery(row: DeliveryRow): WorkerDeliveryRecord {
   return {
     deliveryId: row.delivery_id, parentSessionFile: row.parent_session_file, workerId: row.worker_id, runId: row.run_id,
     completionDelivery: row.completion_delivery, state: row.state, ...(row.runtime_generation === null ? {} : { runtimeGeneration: row.runtime_generation }),
-    createdAt: row.created_at, ...(row.delivered_at === null ? {} : { deliveredAt: row.delivered_at })
+    createdAt: row.created_at, ...(row.send_started_at === null ? {} : { sendStartedAt: row.send_started_at }), ...(row.delivered_at === null ? {} : { deliveredAt: row.delivered_at })
   };
 }
 
@@ -763,7 +810,8 @@ export function reconcileWorkerDeliveries(registry: WorkerRegistry, parentSessio
     const mark = registry.database.prepare("UPDATE deliveries SET state='delivered',delivered_at=COALESCE(delivered_at,?) WHERE parent_session_file=? AND delivery_id=?");
     const now = new Date().toISOString();
     for (const deliveryId of deliveredIds) mark.run(now, parentSessionFile, deliveryId);
-    registry.database.prepare("UPDATE deliveries SET state='pending',runtime_generation=NULL WHERE parent_session_file=? AND state='claimed'").run(parentSessionFile);
+    // Unobserved sends are ambiguous: registration alone is not proof that the
+    // owning runtime died before attempting the send, so they are never replayed.
   });
 }
 

@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { SessionManager, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { registerWorkerExtension } from "../extensions/worker/index.js";
-import { currentParentRuntime, getWorker, getWorkerRun, listWorkers, openWorkerRegistry, registerParentRuntime, storePreparedSet } from "../extensions/worker/registry.js";
+import { currentParentRuntime, getWorker, getWorkerRun, listWorkers, openWorkerRegistry, registerParentRuntime, settleWorkerRun, storePreparedSet } from "../extensions/worker/registry.js";
 import type { ManagedAsyncJobHandle, JobMeta } from "../extensions/async-shell/index.js";
 import type { ReviewOverlayRecord } from "../extensions/worker/review-workspace.js";
 import { prepareWorkerMerges } from "../extensions/worker/merge.js";
@@ -21,15 +21,16 @@ const model = (provider: string, id: string) => ({ id, name: id, provider, api: 
 type Launch = { record: any; runtime: any; resolve(job: JobMeta): void; handle: ManagedAsyncJobHandle };
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
-async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolean; removeThrowsOnce?: boolean; removeAlwaysThrows?: boolean; containerThrows?: boolean; deferContainer?: boolean; cleanupFailsWhileContainerLive?: boolean; staleOnReload?: boolean; launchReadsContext?: boolean; revokeClaimDuringLaunchOnce?: boolean; dockerOutage?: boolean; ownerWaitTimeoutMs?: number; ownerProbeIntervalMs?: number; readProcessStartToken?: (pid: number) => string | undefined; probeHostIdentity?: () => "alive" | "dead" | "unknown"; beforeCreateRunBatch?: () => void | Promise<void>; signalHostIdentity?: (_identity: any, signal: NodeJS.Signals) => boolean } = {}) {
+async function fixture(options: { sendMessageThrows?: boolean; launchThrows?: boolean; overlayThrows?: boolean; removeThrowsOnce?: boolean; removeAlwaysThrows?: boolean; deferRemove?: boolean; containerThrows?: boolean; deferContainer?: boolean; cleanupFailsWhileContainerLive?: boolean; staleOnReload?: boolean; launchReadsContext?: boolean; revokeClaimDuringLaunchOnce?: boolean; dockerOutage?: boolean; ownerWaitTimeoutMs?: number; ownerProbeIntervalMs?: number; readProcessStartToken?: (pid: number) => string | undefined; probeHostIdentity?: () => "alive" | "dead" | "unknown"; beforeCreateRunBatch?: () => void | Promise<void>; signalHostIdentity?: (_identity: any, signal: NodeJS.Signals) => boolean } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "pi-worker-v2-lifecycle-"));
   const runtimeRoot = path.join(root, "runtime"); const workersRoot = path.join(runtimeRoot, "workers"); mkdirSync(workersRoot, { recursive: true });
   const session = SessionManager.create(root, path.join(root, "parent-session"), { id: `parent-${Date.now()}` }); writeFileSync(session.getSessionFile()!, `${JSON.stringify(session.getHeader())}\n`, { mode: 0o600 });
-  const messages: any[] = []; const notifications: string[] = []; const launches: Launch[] = []; const created: string[] = []; const removed: string[] = [];
+  const messages: any[] = []; const messageAttempts: any[] = []; const notifications: string[] = []; const launches: Launch[] = []; const created: string[] = []; const removed: string[] = [];
   const overlays: ReviewOverlayRecord[] = []; const cleaned: ReviewOverlayRecord[] = []; const cleanupLeaseOwners: Array<string | undefined> = []; const liveContainers = new Set<string>(); const lifecycleEvents: string[] = []; const overlayRuns = new Map<string, string>();
-  let containerGate: Promise<void> | undefined; let releaseContainer = () => {}; let removeFailures = 0; let counter = 0; let dockerOutage = options.dockerOutage ?? false; let revokeOnLaunch = options.revokeClaimDuringLaunchOnce ?? false; let cancelledHandles = 0;
+  let containerGate: Promise<void> | undefined; let releaseContainer = () => {}; let removeGate: Promise<void> | undefined; let releaseRemove = () => {}; let removeFailures = 0; let counter = 0; let dockerOutage = options.dockerOutage ?? false; let revokeOnLaunch = options.revokeClaimDuringLaunchOnce ?? false; let cancelledHandles = 0;
   const blockContainer = () => { let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; }); containerGate = gate; releaseContainer = () => { release(); if (containerGate === gate) containerGate = undefined; }; return releaseContainer; };
   if (options.deferContainer) blockContainer();
+  if (options.deferRemove) removeGate = new Promise<void>((resolve) => { releaseRemove = resolve; });
   const random = () => `${(++counter).toString(16).padStart(8, "0")}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`;
   const baseContext = { cwd: root, hasUI: false, mode: "rpc", sessionManager: session, modelRegistry: { hasConfiguredAuth: () => true, getAll: () => [model("openai-codex", "gpt-5.6-sol"), model("anthropic", "claude-opus-5-5")] }, thinkingLevel: "xhigh", isIdle: () => true, hasPendingMessages: () => false, ui: { notify(message: string) { notifications.push(message); } } } as unknown as ExtensionContext;
   const dependencies = {
@@ -41,7 +42,7 @@ async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolea
       guard.assertAuthority?.(); created.push(reference.runId); liveContainers.add(reference.runId); lifecycleEvents.push(`${reference.runId}:create`); const gate = containerGate; if (gate) await gate; guard.assertAuthority?.();
       if (dockerOutage || options.containerThrows) throw new Error(dockerOutage ? "Docker daemon unavailable" : "container disappeared between inspect and start"); return { ...reference, containerId: (++counter).toString(16).padStart(64, "0") };
     },
-    removeContainer: (_docker: string, reference: any) => { removed.push(reference.runId); lifecycleEvents.push(`${reference.runId}:remove`); if (dockerOutage || options.removeAlwaysThrows || options.removeThrowsOnce && removeFailures++ === 0) throw new Error(dockerOutage ? "Docker daemon unavailable" : options.removeAlwaysThrows ? "persistent container cleanup failure" : "transient container cleanup failure"); liveContainers.delete(reference.runId); },
+    removeContainer: async (_docker: string, reference: any) => { removed.push(reference.runId); lifecycleEvents.push(`${reference.runId}:remove`); if (removeGate) { await removeGate; removeGate = undefined; } if (dockerOutage || options.removeAlwaysThrows || options.removeThrowsOnce && removeFailures++ === 0) throw new Error(dockerOutage ? "Docker daemon unavailable" : options.removeAlwaysThrows ? "persistent container cleanup failure" : "transient container cleanup failure"); liveContainers.delete(reference.runId); },
     createOverlay: (input: any) => { if (options.overlayThrows) throw new Error("overlay probe failure"); const value: ReviewOverlayRecord = { version: 2, mergedVolume: `merged-${input.workerId}-${input.runId}`, scratchVolume: `scratch-${input.workerId}-${input.runId}`, mounts: [
       { kind: "volume", source: `merged-${input.workerId}-${input.runId}`, target: "/review/subject" }, { kind: "bind", source: input.reviewerWorkspace, target: "/workspace" },
       { kind: "bind", source: input.contextFile, target: "/review/context.json", readOnly: true }, { kind: "bind", source: input.reviewedSessionFile, target: "/review/session.jsonl", readOnly: true },
@@ -64,7 +65,7 @@ async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolea
     Object.defineProperty(context, "cwd", { get: () => { if (invalidated && options.staleOnReload) throw new Error("This extension ctx is stale after session replacement or reload."); return root; } });
     Object.defineProperty(context, "sessionManager", { get: () => { if (invalidated && options.staleOnReload) throw new Error("This extension ctx is stale after session replacement or reload."); return session; } });
     const tools: ToolDefinition[] = []; const handlers = new Map<string, Function[]>(); const commands = new Map<string, any>(); const renderers = new Map<string, Function>();
-    const api = { registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand(name: string, command: any) { commands.set(name, command); }, registerMessageRenderer(name: string, renderer: Function) { renderers.set(name, renderer); }, on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, sendMessage(message: any) { messages.push(message); } } as unknown as ExtensionAPI;
+    const api = { registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand(name: string, command: any) { commands.set(name, command); }, registerMessageRenderer(name: string, renderer: Function) { renderers.set(name, renderer); }, on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, sendMessage(message: any) { messageAttempts.push(message); if (options.sendMessageThrows) throw new Error("send acceptance unavailable"); messages.push(message); } } as unknown as ExtensionAPI;
     registerWorkerExtension(api, dependencies);
     const call = async (name: string, params: any) => { const tool = tools.find((candidate) => candidate.name === name)!; return tool.execute!("test", params, new AbortController().signal, undefined, context); };
     const event = async (name: string) => { for (const handler of handlers.get(name) ?? []) await handler({}, context); if (name === "turn_end") await waitFor(() => { const db = openWorkerRegistry(runtimeRoot); const queued = Number((db.database.prepare("SELECT COUNT(*) AS count FROM runs WHERE status='queued'").get() as any).count); db.close(); return queued === 0; }); };
@@ -73,9 +74,9 @@ async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolea
   let current = await createInstance(); const first = current;
   const reload = async () => { await current.event("session_shutdown"); current.invalidate(); current = await createInstance(); return current; };
   const registry = () => openWorkerRegistry(runtimeRoot);
-  return { root, runtimeRoot, workersRoot, session, messages, notifications, launches, get releaseContainer() { return releaseContainer; }, blockContainer, created, removed, liveContainers, lifecycleEvents, overlays, cleaned, cleanupLeaseOwners, context: baseContext, get cancelledHandles() { return cancelledHandles; }, setDockerOutage(value: boolean) { dockerOutage = value; },
+  return { root, runtimeRoot, workersRoot, session, messages, messageAttempts, notifications, launches, get releaseContainer() { return releaseContainer; }, releaseRemove, blockContainer, created, removed, liveContainers, lifecycleEvents, overlays, cleaned, cleanupLeaseOwners, context: baseContext, get cancelledHandles() { return cancelledHandles; }, setDockerOutage(value: boolean) { dockerOutage = value; },
     tools: first.tools, handlers: first.handlers, commands: first.commands, renderers: first.renderers, call: first.call, event: first.event, registry, reload, createInstance,
-    async close() { releaseContainer(); for (const instance of instances) { try { await instance.event("session_shutdown"); } catch {} } rmSync(root, { recursive: true, force: true }); }
+    async close() { releaseContainer(); releaseRemove(); for (const instance of instances) { try { await instance.event("session_shutdown"); } catch {} } rmSync(root, { recursive: true, force: true }); }
   };
 }
 const lifecycleOwnerFixture = fileURLToPath(new URL("./fixtures/worker-lifecycle-claim-owner.js", import.meta.url));
@@ -90,6 +91,20 @@ async function spawnLifecycleClaimOwner(f: Fixture, item: { workerId: string; ru
     child.on("message", (message: any) => { if (message?.event === "claimed") { clearTimeout(timer); resolve(message); } });
   });
   return { child, claimed };
+}
+
+async function spawnDeliveryClaimOwner(f: Fixture, item: { workerId: string; runId: string }) {
+  const parent = realpathSync(f.session.getSessionFile()!);
+  const child = spawn(process.execPath, [lifecycleOwnerFixture, f.runtimeRoot, parent, item.workerId, item.runId, "delivery", "wait"], { stdio: ["ignore", "ignore", "pipe", "ipc"] });
+  let stderr = ""; child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+  const receive = (event: string) => new Promise<any>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`delivery owner did not emit ${event}: ${stderr}`)), 4_000);
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => { clearTimeout(timer); reject(new Error(`delivery owner exited before ${event} (${code}/${signal}): ${stderr}`)); };
+    const onMessage = (message: any) => { if (message?.event !== event) return; clearTimeout(timer); child.off("exit", onExit); child.off("message", onMessage); resolve(message); };
+    child.once("exit", onExit); child.on("message", onMessage);
+  });
+  const registered = await receive("registered");
+  return { child, registered, claim: async () => { const claimed = receive("claimed"); child.send({ action: "claim" }); return claimed; } };
 }
 
 async function stopLifecycleClaimOwner(child: ReturnType<typeof spawn>, signal: NodeJS.Signals = "SIGKILL"): Promise<void> {
@@ -371,6 +386,71 @@ test("K3c: cancel after settlement-owner death settles accepted completion inste
     const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; db.close(); assert.equal(run.outcome, "completed"); assert.equal(run.summary, "accepted K3c"); assert.equal(run.terminalIntent, undefined);
     assert.equal(f.removed.filter((id) => id === started.runId).length, 1); assert.equal(f.messages.filter((message) => message.details?.runId === started.runId && message.details?.outcome === "completed").length, 1);
   } finally { if (owner) await stopLifecycleClaimOwner(owner.child); await f.close(); }
+});
+
+test("D1: promotion reclaims a crashed process pre-send delivery claim and notifies once", async () => {
+  const f = await fixture(); let owner: Awaited<ReturnType<typeof spawnDeliveryClaimOwner>> | undefined; try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "D1 delivery owner" }] })); await f.event("turn_end");
+    owner = await spawnDeliveryClaimOwner(f, started);
+    const db = f.registry(); settleWorkerRun(db, { parentSessionFile: realpathSync(f.session.getSessionFile()!), workerId: started.workerId, runId: started.runId, outcome: "completed", outcomeSource: "worker", summary: "D1 settled", settledAt: new Date().toISOString() }); db.close();
+    const claimed = await owner.claim();
+    let state = f.registry(); let delivery = state.database.prepare("SELECT state,send_started_at FROM deliveries WHERE run_id=?").get(started.runId) as any; state.close(); assert.equal(delivery.state, "claimed"); assert.equal(delivery.send_started_at, null);
+    await stopLifecycleClaimOwner(owner.child);
+    await waitFor(() => f.messages.filter((message) => message.details?.event === "worker_settled" && message.details?.runId === started.runId).length === 1, 4_000);
+    state = f.registry(); delivery = state.database.prepare("SELECT state,runtime_generation,send_started_at FROM deliveries WHERE run_id=?").get(started.runId) as any; const current = currentParentRuntime(state, realpathSync(f.session.getSessionFile()!)); state.close();
+    assert.equal(delivery.state, "claimed"); assert.ok(delivery.send_started_at); assert.ok(current!.generation > claimed.generation); assert.equal(f.messageAttempts.filter((message) => message.details?.runId === started.runId).length, 1);
+    const launch = f.launches.find((candidate) => candidate.record.runId === started.runId); if (launch) launch.resolve(job(launch.record.jobId, "exited", 0));
+  } finally { if (owner) await stopLifecycleClaimOwner(owner.child); await f.close(); }
+});
+
+test("a started completion send is surfaced as unconfirmed and never replayed", async () => {
+  const f = await fixture({ sendMessageThrows: true }); try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "ambiguous completion send" }] })); await f.event("turn_end"); await complete(f, started);
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    assert.equal(f.messageAttempts.filter((message) => message.details?.runId === started.runId).length, 1, "an attempted send cannot be replayed after acceptance becomes ambiguous");
+    const shown = await f.call("worker_control", { action: "get", workerId: started.workerId, runId: started.runId });
+    assert.equal((shown.details as any).notification.state, "send_started_unconfirmed"); assert.ok((shown.details as any).notification.sendStartedAt);
+    const db = f.registry(); const delivery = db.database.prepare("SELECT state,send_started_at FROM deliveries WHERE run_id=?").get(started.runId) as any; db.close(); assert.equal(delivery.state, "claimed"); assert.ok(delivery.send_started_at);
+  } finally { await f.close(); }
+});
+
+test("cancel during a live accepted settlement returns result-preserved superseded without intent", async () => {
+  const f = await fixture(); let owner: Awaited<ReturnType<typeof spawnLifecycleClaimOwner>> | undefined; try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "live accepted settlement" }] })); await f.event("turn_end");
+    owner = await spawnLifecycleClaimOwner(f, started, "settlement");
+    const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: "accepted before cancellation" }); launch.resolve(job(launch.record.jobId, "exited", 0));
+    const result = await f.call("worker_control", { action: "cancel", workerId: started.workerId }); assert.equal((result.details as any).cancellation, "superseded");
+    let db = f.registry(); let run = getWorkerRun(db, started.workerId, started.runId)!; db.close(); assert.equal(run.status, "running"); assert.equal(run.terminalIntent, undefined); assert.equal(run.claimKind, "settlement");
+    await stopLifecycleClaimOwner(owner.child);
+    await waitFor(() => { const state = f.registry(); const current = getWorkerRun(state, started.workerId, started.runId); state.close(); return current?.outcome === "completed"; }, 4_000);
+    db = f.registry(); run = getWorkerRun(db, started.workerId, started.runId)!; db.close(); assert.equal(run.summary, "accepted before cancellation"); assert.equal(run.outcomeSource, "worker");
+  } finally { if (owner) await stopLifecycleClaimOwner(owner.child); await f.close(); }
+});
+
+test("cancel during this runtime's live accepted settlement returns superseded and preserves the result", async () => {
+  const f = await fixture({ deferRemove: true }); try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "own live settlement" }] })); await f.event("turn_end");
+    const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: "own accepted settlement" }); launch.resolve(job(launch.record.jobId, "exited", 0));
+    await waitFor(() => { const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId); db.close(); return run?.claimKind === "settlement"; });
+    const result = await f.call("worker_control", { action: "cancel", workerId: started.workerId }); assert.equal((result.details as any).cancellation, "superseded");
+    let db = f.registry(); let run = getWorkerRun(db, started.workerId, started.runId)!; db.close(); assert.equal(run.terminalIntent, undefined); assert.equal(run.status, "running");
+    f.releaseRemove(); await waitFor(() => { const state = f.registry(); const current = getWorkerRun(state, started.workerId, started.runId); state.close(); return current?.status === "settled"; });
+    db = f.registry(); run = getWorkerRun(db, started.workerId, started.runId)!; db.close(); assert.equal(run.outcome, "completed"); assert.equal(run.summary, "own accepted settlement");
+  } finally { f.releaseRemove(); await f.close(); }
+});
+
+test("an attached host may exit more than five seconds after accepted evidence without recovery noise", async () => {
+  const f = await fixture(); try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "slow healthy host stop" }] })); await f.event("turn_end");
+    const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: "healthy delayed exit" });
+    await new Promise((resolve) => setTimeout(resolve, 5_200));
+    let db = f.registry(); assert.equal(getWorkerRun(db, started.workerId, started.runId)!.status, "running"); assert.equal(getWorker(db, started.workerId)!.recoveryError, undefined); db.close();
+    assert.equal(f.messages.filter((message) => message.details?.event === "worker_recovery_required" && message.details?.runId === started.runId).length, 0); assert.equal(f.removed.length, 0);
+    launch.resolve(job(launch.record.jobId, "exited", 0));
+    await waitFor(() => { const state = f.registry(); const run = getWorkerRun(state, started.workerId, started.runId); state.close(); return run?.status === "settled"; }, 4_000);
+    db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; const worker = getWorker(db, started.workerId)!; db.close(); assert.equal(run.outcome, "completed"); assert.equal(worker.recoveryError, undefined); assert.equal(f.removed.length, 1);
+    assert.equal(f.messages.filter((message) => message.details?.event === "worker_recovery_required" && message.details?.runId === started.runId).length, 0);
+  } finally { await f.close(); }
 });
 
 test("K4: current newer registration automatically reclaims an older owner after its later death", async () => {
