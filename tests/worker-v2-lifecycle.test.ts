@@ -360,3 +360,14 @@ test("resume rejects a worker-planted symlink in a fixed writable storage direct
     assert.deepEqual(readdirSync(target), []);
   } finally { await f.close(); }
 });
+
+test("post-containment storage-policy violations system-finalize and remain discardable", async () => {
+  const f=await fixture(); try {
+    const started=receipt(await f.call("worker_run",{runs:[{action:"start",role:"work",taskIds:["personal-test"],instructions:"storage violation after containment"}]})); await f.event("turn_end");
+    const launch=writeCompletionEvidence(f,started,{outcome:"completed",summary:"must become trusted system failure"}); const db=f.registry(); const workspace=getWorker(db,started.workerId)!.workspaceRoot; db.close();
+    const scratch=path.join(workspace,"scratch"), outside=path.join(f.root,"outside"); mkdirSync(outside); rmSync(scratch,{recursive:true,force:true}); symlinkSync(outside,scratch);
+    launch.resolve(job(launch.record.jobId,"exited",0)); await waitFor(()=>{const check=f.registry();const run=getWorkerRun(check,started.workerId,started.runId);check.close();return run?.status==="settled";});
+    const settled=f.registry(); const worker=getWorker(settled,started.workerId)!, run=getWorkerRun(settled,started.workerId,started.runId)!; settled.close(); assert.equal(worker.activeRunId,undefined); assert.equal(run.outcome,"failed"); assert.equal(run.outcomeSource,"system"); assert.match(run.errors[0]!.message,/storage policy violation/i);
+    const cancelled=await f.call("worker_control",{action:"cancel",workerId:started.workerId}); assert.equal((cancelled.details as any).cancellation,"not_active"); await f.call("worker_control",{action:"discard",workerId:started.workerId}); const after=f.registry(); assert.equal(getWorker(after,started.workerId),undefined); after.close();
+  } finally { await f.close(); }
+});

@@ -2,7 +2,8 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { validateToolArguments, type Tool, type ToolCall } from "@earendil-works/pi-ai";
+import { Check } from "typebox/value";
+import type { TSchema } from "typebox";
 import { defineTool, type AgentToolResult, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { activeAsyncShellJobsForOwner, cancelAsyncShellJobsForOwner, cancelPersistedAsyncShellJobsForOwner, hasPendingAsyncShellCompletionFollowUpForOwner, sealAsyncShellCompletionForOwner, subscribeAsyncShellActivity, unsettledPersistedAsyncShellJobsForOwner, type AsyncShellJobOwner } from "../async-shell/index.js";
 import { createWorkerCacheLineageRuntime, registerWorkerCacheLineageRuntimeHooks, validateWorkerCacheLineageRecord, type WorkerCacheLineageRecord } from "./cache-lineage.js";
@@ -146,10 +147,7 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
 
 export async function executeWorkerBeadsHostRequest(payload: unknown): Promise<AgentToolResult<unknown>> {
   assertRuntimeOpen("worker_beads_tasks");
-  const params = validateToolArguments(
-    { name: "worker_beads_tasks", description: "Validate a host-side worker Beads request.", parameters: workerRuntimeRole() === "review" ? WorkerBeadsTasksReadParams : WorkerBeadsTasksParams } as Tool,
-    { type: "toolCall", id: "host-worker-beads", name: "worker_beads_tasks", arguments: payload } as ToolCall
-  ) as any;
+  const params = strictHostPayload(workerRuntimeRole() === "review" ? WorkerBeadsTasksReadParams : WorkerBeadsTasksParams, payload, "worker_beads_tasks") as any;
   validateBeadsAction(params);
   if (params.action === "update") return executeTaskUpdate({ taskId: params.taskId!, note: params.note!, status: params.status });
   if (params.action === "design") return executeTaskDesignRead(params.taskId!, params.offset, params.limit, params.expectedSha256);
@@ -162,10 +160,7 @@ export async function executeWorkerBeadsHostRequest(payload: unknown): Promise<A
 export async function executeWorkerResultHostRequest(payload: unknown): Promise<AgentToolResult<WorkerResultDetails>> {
   const identity = workerRuntimeIdentity();
   assertRuntimeAuthorization(identity, "worker_result_submit");
-  const params = validateToolArguments(
-    { name: "worker_result_submit", description: "Validate a host-side worker result.", parameters: workerRuntimeRole() === "review" ? WorkerReviewResultSubmitParams : WorkerWorkResultSubmitParams } as Tool,
-    { type: "toolCall", id: "host-worker-result", name: "worker_result_submit", arguments: payload } as ToolCall
-  ) as WorkerResultSubmitInput;
+  const params = strictHostPayload(workerRuntimeRole() === "review" ? WorkerReviewResultSubmitParams : WorkerWorkResultSubmitParams, payload, "worker_result_submit") as WorkerResultSubmitInput;
   const validation = validateAndNormalizeWorkerResult(params, identity.workspaceRoot);
   if (validation.errors.length) return rejectedResult(validation.errors);
   const normalizedResult = { ...params, ...(validation.repositories.length ? { repositories: validation.repositories } : {}), ...(validation.artifacts.length ? { artifacts: validation.artifacts } : {}) } as AcceptedWorkerResult["result"];
@@ -219,10 +214,7 @@ function workerGuestIdentity(): { workerId: string; runId: string; workspaceRoot
 export function readWorkerRuntimeResult(resultFile: string): AcceptedWorkerResult {
   const value = JSON.parse(readFileSync(resultFile, "utf8")) as Partial<AcceptedWorkerResult>;
   if (value.version !== 2 || typeof value.workerId !== "string" || typeof value.runId !== "string" || typeof value.acceptedAt !== "string" || !value.result) throw new Error(`Invalid worker result: ${resultFile}`);
-  const result = validateToolArguments(
-    { name: "worker_result_submit", description: "Validate a persisted worker result.", parameters: WorkerResultSubmitParams } as Tool,
-    { type: "toolCall", id: "persisted-worker-result", name: "worker_result_submit", arguments: value.result } as ToolCall
-  ) as WorkerResultSubmitInput;
+  const result = strictHostPayload(WorkerResultSubmitParams, value.result, "persisted worker result") as WorkerResultSubmitInput;
   if (value.payloadSha256 !== undefined && (!/^[0-9a-f]{64}$/.test(value.payloadSha256) || value.payloadSha256 !== createHash("sha256").update(canonicalJson(result)).digest("hex"))) throw new Error(`Invalid worker result payload digest: ${resultFile}`);
   if (value.submissionId !== undefined && value.submissionId !== `${value.workerId}:${value.runId}:${value.payloadSha256}`) throw new Error(`Invalid worker result submission identity: ${resultFile}`);
   return { version: 2, workerId: value.workerId, runId: value.runId, acceptedAt: value.acceptedAt, ...(value.submissionId ? { submissionId: value.submissionId } : {}), ...(value.payloadSha256 ? { payloadSha256: value.payloadSha256 } : {}), result };
@@ -232,6 +224,11 @@ function canonicalJson(value: unknown): string { if (Array.isArray(value)) retur
 
 function rejectedResult(errors: WorkerResultError[]): AgentToolResult<WorkerResultDetails> {
   return { content: [{ type: "text", text: `Worker result rejected: ${errors.map((error) => `${error.code} at ${error.path}: ${error.message}`).join("; ")}` }], details: { status: "rejected", errors } };
+}
+
+function strictHostPayload(schema: TSchema, payload: unknown, label: string): unknown {
+  if (!Check(schema, payload)) throw new Error(`${label} payload failed strict schema validation.`);
+  return payload;
 }
 
 function validateBeadsAction(params: any): void {
@@ -322,7 +319,7 @@ async function executeTaskUpdate(params: WorkerTaskUpdate): Promise<AgentToolRes
   try { assertRuntimeAuthorization(identity, "worker_beads_tasks"); execFileSync(runtime.bdPath, args, { cwd: runtime.workspaceRoot, env: process.env, encoding: "utf8", maxBuffer: MAX_WORKER_BEADS_OUTPUT_BYTES, timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] }); }
   catch (error) { if (error instanceof Error && error.message.includes("revoked")) throw error; throw new Error(`worker_beads_tasks could not record an update for ${params.taskId}.`); }
   finally { rmSync(admissionFile, { force: true }); }
-  return { content: [{ type: "text", text: `Recorded a durable worker note on ${params.taskId}${params.status ? ` and set status ${params.status}` : ""}.` }], details: { taskId: params.taskId, status: params.status, recorded: true } };
+  return { content: [{ type: "text", text: `Recorded a durable worker note on ${params.taskId}${params.status ? ` and set status ${params.status}` : ""}.` }], details: { taskId: params.taskId, ...(params.status ? { status: params.status } : {}), recorded: true } };
 }
 
 function assignedTaskIds(): Set<string> {

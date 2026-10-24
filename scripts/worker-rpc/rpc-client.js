@@ -113,18 +113,16 @@ export class RpcClient {
      * Closes RPC stdin first and allows five seconds for graceful session cleanup.
      * A stuck child receives SIGTERM, then SIGKILL after one more second.
      */
-    async stop() {
-        if (this.stopPromise)
-            return this.stopPromise;
-        const childProcess = this.process;
-        if (!childProcess)
-            return;
-        this.stopPromise = this.stopProcess(childProcess).finally(() => {
-            this.stopPromise = null;
-        });
+    async stop() { return this.stopWithEscalation(true); }
+    /** Close RPC stdin and wait without ever signalling the child; an outer containment owner may escalate its exact boundary. */
+    async closeInputAndWait() { return this.stopWithEscalation(false); }
+    async stopWithEscalation(signalEscalation) {
+        if (this.stopPromise) return this.stopPromise;
+        const childProcess = this.process; if (!childProcess) return;
+        this.stopPromise = this.stopProcess(childProcess, signalEscalation).finally(() => { this.stopPromise = null; });
         return this.stopPromise;
     }
-    async stopProcess(childProcess) {
+    async stopProcess(childProcess, signalEscalation) {
         this.stopping = true;
         this.rejectPendingStart(new Error("RPC client stopped"));
         this.cancelActiveHostRequests(HOST_FAILURE_STOPPING);
@@ -136,13 +134,12 @@ export class RpcClient {
         catch {
             // Continue to bounded signal escalation below.
         }
-        if (!(await this.waitForProcessExit(childProcess, 5000))) {
-            this.signalProcess(childProcess, "SIGTERM");
-            if (!(await this.waitForProcessExit(childProcess, 1000))) {
-                this.signalProcess(childProcess, "SIGKILL");
-                await this.waitForProcessExit(childProcess);
+        if (signalEscalation) {
+            if (!(await this.waitForProcessExit(childProcess, 5000))) {
+                this.signalProcess(childProcess, "SIGTERM");
+                if (!(await this.waitForProcessExit(childProcess, 1000))) { this.signalProcess(childProcess, "SIGKILL"); await this.waitForProcessExit(childProcess); }
             }
-        }
+        } else await this.waitForProcessExit(childProcess);
         this.stopReadingStdout?.();
         this.stopReadingStdout = null;
         if (this.process === childProcess)

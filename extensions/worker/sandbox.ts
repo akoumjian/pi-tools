@@ -22,9 +22,9 @@ export type WorkerSandboxRelease = {
 export type WorkerSandboxReference = {
   kind: "docker-sandbox"; sandboxName: string; creationNonce: string; workerId: string; runId: string;
   kitReference: string; kitSha256: string; imageReference: string; imageDigest: string; protocolVersion: 1; releaseOrdinal: number;
-  workspaceRoot: string; codeRoot: string; mounts: WorkerSandboxMount[]; piCli: string; rpcLauncher: string; codingAgentDir: string;
+  workspaceRoot: string; workingDirectory: string; codeRoot: string; mounts: WorkerSandboxMount[]; piCli: string; rpcLauncher: string; codingAgentDir: string;
   resourceManifestSha256: string; extensionPaths: string[]; searxngUrl: string; revisions: WorkerSandboxRelease["revisions"];
-  createEvidenceSha256?: string; observedCpu?: number; observedMemoryBytes?: number; observedSandboxId?: string; observedRuntimeSha256?: string;
+  createEvidenceSha256?: string; observedCpu?: number; observedMemoryBytes?: number; observedSandboxId?: string; observedImageReference?: string; observedKitReference?: string; observedRuntimeSha256?: string;
 };
 
 export function readApprovedWorkerSandboxRelease(): WorkerSandboxRelease {
@@ -45,15 +45,17 @@ export function readApprovedWorkerSandboxRelease(): WorkerSandboxRelease {
   return { schemaVersion: 1, protocolVersion: 1, releaseOrdinal: releaseOrdinal!, status: "approved", kit: { reference: kitReference, sha256: kit.sha256 }, image: { reference: image.reference, digest: image.digest }, revisions: { ...revisions }, guest: { ...guest, extensionPaths: [...guest.extensionPaths] } };
 }
 
-export function planWorkerSandbox(input: { workerId: string; runId: string; creationNonce: string; workerRoot: string; codeRoot: string; mounts: WorkerSandboxMount[]; release?: WorkerSandboxRelease }): WorkerSandboxReference {
+export function planWorkerSandbox(input: { workerId: string; runId: string; creationNonce: string; workerRoot: string; workingDirectory?: string; codeRoot: string; mounts: WorkerSandboxMount[]; release?: WorkerSandboxRelease }): WorkerSandboxReference {
   if (!isWorkerId(input.workerId) || !/^run_[A-Za-z0-9_-]+$/.test(input.runId)) throw new Error("Invalid Worker Sandbox identity.");
-  if (!/^[a-f0-9-]{16,64}$/.test(input.creationNonce)) throw new Error("Invalid Worker Sandbox creation nonce.");
+  if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(input.creationNonce)) throw new Error("Invalid Worker Sandbox creation nonce.");
   const release = input.release ?? readApprovedWorkerSandboxRelease();
-  const sandboxName = `pi-${input.workerId}-${input.runId}-${input.creationNonce.slice(0, 8)}`.toLowerCase().replaceAll(/[^a-z0-9]+/g, "-").replaceAll(/-+/g, "-").slice(0, 63).replace(/-$/, "");
+  const identityHash = createHash("sha256").update(`${input.workerId}\0${input.runId}`).digest("hex").slice(0, 20);
+  const sandboxName = `pi-${identityHash}-${input.creationNonce}`;
   if (!SANDBOX_NAME.test(sandboxName)) throw new Error("Invalid Worker Sandbox name.");
-  const workspaceRoot = realpathSync(input.workerRoot); const codeRoot = realpathSync(input.codeRoot);
+  const workspaceRoot = realpathSync(input.workerRoot); const workingDirectory = realpathSync(input.workingDirectory ?? workspaceRoot); const codeRoot = realpathSync(input.codeRoot);
+  if (!pathWithin(workspaceRoot, workingDirectory)) throw new Error("Worker Sandbox working directory must remain beneath its worker root.");
   const mounts = deduplicateMounts(input.mounts.map((mount) => ({ source: realpathSync(mount.source), ...(mount.readOnly ? { readOnly: true } : {}) })));
-  const reference: WorkerSandboxReference = { kind: "docker-sandbox", sandboxName, creationNonce: input.creationNonce, workerId: input.workerId, runId: input.runId, kitReference: release.kit.reference, kitSha256: release.kit.sha256, imageReference: release.image.reference, imageDigest: release.image.digest, protocolVersion: release.protocolVersion, releaseOrdinal: release.releaseOrdinal, workspaceRoot, codeRoot, mounts, piCli: release.guest.piCli, rpcLauncher: release.guest.rpcLauncher, codingAgentDir: release.guest.codingAgentDir, resourceManifestSha256: release.guest.resourceManifestSha256, extensionPaths: [...release.guest.extensionPaths], searxngUrl: release.guest.searxngUrl, revisions: { ...release.revisions } };
+  const reference: WorkerSandboxReference = { kind: "docker-sandbox", sandboxName, creationNonce: input.creationNonce, workerId: input.workerId, runId: input.runId, kitReference: release.kit.reference, kitSha256: release.kit.sha256, imageReference: release.image.reference, imageDigest: release.image.digest, protocolVersion: release.protocolVersion, releaseOrdinal: release.releaseOrdinal, workspaceRoot, workingDirectory, codeRoot, mounts, piCli: release.guest.piCli, rpcLauncher: release.guest.rpcLauncher, codingAgentDir: release.guest.codingAgentDir, resourceManifestSha256: release.guest.resourceManifestSha256, extensionPaths: [...release.guest.extensionPaths], searxngUrl: release.guest.searxngUrl, revisions: { ...release.revisions } };
   assertWorkerSandboxReference(reference); return reference;
 }
 
@@ -63,16 +65,17 @@ export async function createWorkerSandboxAsync(sbxPath: string, reference: Worke
   const { stdout, stderr } = await execFileAsync(sbxPath, args, { encoding: "utf8", maxBuffer: 1024 * 1024, timeout: 120_000 });
   const listed = await execFileAsync(sbxPath, ["ls"], { encoding: "utf8", maxBuffer: 1024 * 1024, timeout: 5_000 });
   if (!sandboxListContains(listed.stdout, reference.sandboxName)) throw new Error(`Sandbox creation did not confirm exact identity for ${reference.sandboxName}.`);
-  const observedSandboxId = parseSandboxId(stdout, listed.stdout, reference.sandboxName);
-  if (!observedSandboxId) throw new Error("Sandbox creation did not report a stable exact Sandbox ID.");
+  const listedJson = await execFileAsync(sbxPath, ["ls", "--json"], { encoding: "utf8", maxBuffer: 1024 * 1024, timeout: 5_000 });
+  const observedIdentity = parseObservedSandboxIdentity(listedJson.stdout, reference);
+  const observedSandboxId = observedIdentity.id;
   const resourceScript = "cpu=$(getconf _NPROCESSORS_ONLN); memoryKb=$(awk '/MemTotal:/ {print $2}' /proc/meminfo); runtime=$(cat /opt/pi-worker/runtime-provenance.json); resource=$(cat /opt/pi-worker/resource-manifest.sha256); printf 'cpu=%s\\nmemoryBytes=%s\\nruntime=%s\\nresource=%s\\n' \"$cpu\" \"$((memoryKb*1024))\" \"$runtime\" \"$resource\"";
-  const observed = await execFileAsync(sbxPath, ["exec", "--workdir", reference.workspaceRoot, reference.sandboxName, "/bin/sh", "-c", resourceScript], { encoding: "utf8", maxBuffer: 64 * 1024, timeout: 10_000 });
+  const observed = await execFileAsync(sbxPath, ["exec", "--workdir", reference.workingDirectory, reference.sandboxName, "/bin/sh", "-c", resourceScript], { encoding: "utf8", maxBuffer: 64 * 1024, timeout: 10_000 });
   const cpu = observed.stdout.match(/^cpu=(\d+)$/m)?.[1]; const memory = observed.stdout.match(/^memoryBytes=(\d+)$/m)?.[1]; const resource = observed.stdout.match(/^resource=([a-f0-9]{64})$/m)?.[1]; const runtimeText = observed.stdout.match(/^runtime=(\{.*\})$/m)?.[1];
   if (!cpu || !memory || Number(cpu) < 1 || Number(memory) < 1 || resource !== reference.resourceManifestSha256 || !runtimeText) throw new Error("Sandbox did not report its exact approved resources and effective allocation.");
   const runtime = JSON.parse(runtimeText) as Record<string, unknown>; const expectedRuntime = { protocolVersion: reference.protocolVersion, piRevision: reference.revisions.pi, profileRevision: reference.revisions.profile, piToolsRevision: reference.revisions.piTools, piDocparserRevision: reference.revisions.piDocparser, resourceManifestSha256: reference.resourceManifestSha256, extensionPaths: reference.extensionPaths };
   if (JSON.stringify(runtime) !== JSON.stringify(expectedRuntime)) throw new Error("Sandbox embedded runtime provenance does not match the approved release.");
-  const evidence = `${stdout}\n${stderr}\n${listed.stdout}\n${listed.stderr}\n${observed.stdout}\n${observed.stderr}`;
-  return { ...reference, createEvidenceSha256: createHash("sha256").update(evidence).digest("hex"), observedCpu: Number(cpu), observedMemoryBytes: Number(memory), observedSandboxId, observedRuntimeSha256: createHash("sha256").update(runtimeText).digest("hex") };
+  const evidence = `${stdout}\n${stderr}\n${listed.stdout}\n${listed.stderr}\n${listedJson.stdout}\n${listedJson.stderr}\n${observed.stdout}\n${observed.stderr}`;
+  return { ...reference, createEvidenceSha256: createHash("sha256").update(evidence).digest("hex"), observedCpu: Number(cpu), observedMemoryBytes: Number(memory), observedSandboxId, observedImageReference: observedIdentity.image, observedKitReference: observedIdentity.kit, observedRuntimeSha256: createHash("sha256").update(runtimeText).digest("hex") };
 }
 
 export async function settleWorkerSandboxAsync(sbxPath: string, reference: WorkerSandboxReference): Promise<void> {
@@ -86,15 +89,26 @@ export async function settleWorkerSandboxAsync(sbxPath: string, reference: Worke
 export function resolveSbxPath(): string { return resolveExecutable("sbx"); }
 export function assertWorkerSandboxReference(value: WorkerSandboxReference): void {
   const revisions = value.revisions;
-  if (value.kind !== "docker-sandbox" || !SANDBOX_NAME.test(value.sandboxName) || !isWorkerId(value.workerId) || !/^run_[A-Za-z0-9_-]+$/.test(value.runId) || !/^[a-f0-9-]{16,64}$/.test(value.creationNonce) || !SHA256.test(value.kitSha256) || !OCI_DIGEST.test(value.imageReference) || !SHA256.test(value.imageDigest) || !value.imageReference.endsWith(`@sha256:${value.imageDigest}`) || value.protocolVersion !== 1 || !Number.isSafeInteger(value.releaseOrdinal) || value.releaseOrdinal < 1 || !SHA256.test(value.resourceManifestSha256) || !Array.isArray(value.extensionPaths) || value.extensionPaths.length < 1 || !value.extensionPaths.every(isImmutableGuestExtensionPath) || new Set(value.extensionPaths).size !== value.extensionPaths.length || typeof value.searxngUrl !== "string" || !isCredentialFreeHttpUrl(value.searxngUrl) || !revisions || ![revisions.pi, revisions.profile, revisions.piTools, revisions.piDocparser].every((item) => /^[a-f0-9]{40}$/.test(item))) throw new Error("Invalid exact Worker Sandbox reference.");
+  if (value.kind !== "docker-sandbox" || !SANDBOX_NAME.test(value.sandboxName) || !isWorkerId(value.workerId) || !/^run_[A-Za-z0-9_-]+$/.test(value.runId) || !/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value.creationNonce) || !SHA256.test(value.kitSha256) || !OCI_DIGEST.test(value.imageReference) || !SHA256.test(value.imageDigest) || !value.imageReference.endsWith(`@sha256:${value.imageDigest}`) || value.protocolVersion !== 1 || !Number.isSafeInteger(value.releaseOrdinal) || value.releaseOrdinal < 1 || !SHA256.test(value.resourceManifestSha256) || !Array.isArray(value.extensionPaths) || value.extensionPaths.length < 1 || !value.extensionPaths.every(isImmutableGuestExtensionPath) || new Set(value.extensionPaths).size !== value.extensionPaths.length || typeof value.searxngUrl !== "string" || !isCredentialFreeHttpUrl(value.searxngUrl) || !revisions || ![revisions.pi, revisions.profile, revisions.piTools, revisions.piDocparser].every((item) => /^[a-f0-9]{40}$/.test(item))) throw new Error("Invalid exact Worker Sandbox reference.");
+  if (!value.sandboxName.endsWith(`-${value.creationNonce}`)) throw new Error("Worker Sandbox name does not retain its full creation nonce.");
   if (value.observedSandboxId !== undefined && (value.observedSandboxId.length < 8 || value.observedSandboxId.length > 256)) throw new Error("Invalid observed Sandbox ID.");
+  if (value.observedImageReference !== undefined && value.observedImageReference !== value.imageReference) throw new Error("Observed Sandbox image differs from the approved digest reference.");
+  if (value.observedKitReference !== undefined && value.observedKitReference !== value.kitReference) throw new Error("Observed Sandbox kit differs from the approved kit reference.");
   if (value.observedRuntimeSha256 !== undefined && !SHA256.test(value.observedRuntimeSha256)) throw new Error("Invalid observed runtime digest.");
-  if (![value.workspaceRoot, value.codeRoot].every((source) => path.isAbsolute(source)) || ![value.piCli, value.rpcLauncher, value.codingAgentDir].every((guestPath) => path.posix.isAbsolute(guestPath) && path.posix.normalize(guestPath) === guestPath)) throw new Error("Invalid exact Worker Sandbox runtime paths.");
+  if (![value.workspaceRoot, value.workingDirectory, value.codeRoot].every((source) => path.isAbsolute(source)) || !pathWithin(value.workspaceRoot, value.workingDirectory) || ![value.piCli, value.rpcLauncher, value.codingAgentDir].every((guestPath) => path.posix.isAbsolute(guestPath) && path.posix.normalize(guestPath) === guestPath)) throw new Error("Invalid exact Worker Sandbox runtime paths.");
   const protectedGuestPaths = [value.piCli, value.rpcLauncher, value.codingAgentDir, ...value.extensionPaths];
   if ([value.workspaceRoot, value.codeRoot].some((source) => protectedGuestPaths.some((protectedPath) => pathsOverlap(source, protectedPath)))) throw new Error("Worker Sandbox primary mount overlaps immutable guest runtime state.");
   for (const mount of value.mounts) { if (!path.isAbsolute(mount.source) || mount.readOnly !== true) throw new Error("Invalid exact Worker Sandbox read-only evidence mount."); if (protectedGuestPaths.some((protectedPath) => pathsOverlap(mount.source, protectedPath))) throw new Error("Worker Sandbox evidence mount overlaps immutable guest runtime state."); }
 }
-function parseSandboxId(create: string, list: string, name: string): string | undefined { const explicit = create.match(/(?:^|\n)(?:Sandbox )?ID:\s*([A-Za-z0-9_.:-]{8,256})/i)?.[1]; if (explicit) return explicit; for (const line of list.split(/\r?\n/)) { const columns = line.trim().split(/\s+/); const nameIndex = columns.indexOf(name); if (nameIndex > 0 && /^[A-Za-z0-9_.:-]{8,256}$/.test(columns[0]!)) return columns[0]; } return undefined; }
+function parseObservedSandboxIdentity(output: string, reference: WorkerSandboxReference): { id: string; image: string; kit: string } {
+  let value: unknown; try { value = JSON.parse(output); } catch { throw new Error("Sandbox list JSON was malformed."); }
+  const rows = Array.isArray(value) ? value : value && typeof value === "object" && Array.isArray((value as any).sandboxes) ? (value as any).sandboxes : [];
+  const row = rows.find((item: any) => item && typeof item === "object" && (item.name === reference.sandboxName || item.Name === reference.sandboxName));
+  const id = row?.id ?? row?.ID; const image = row?.image ?? row?.Image; const kit = row?.kit ?? row?.Kit;
+  if (typeof id !== "string" || !/^[A-Za-z0-9_.:-]{8,256}$/.test(id) || image !== reference.imageReference || kit !== reference.kitReference) throw new Error("Sandbox JSON did not prove exact ID, image and kit identity.");
+  return { id, image, kit };
+}
+function pathWithin(root: string, candidate: string): boolean { const relative = path.relative(root, candidate); return relative === "" || relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative); }
 function pathsOverlap(left: string, right: string): boolean { const a = path.resolve(left); const b = path.resolve(right); return a === b || a.startsWith(`${b}${path.sep}`) || b.startsWith(`${a}${path.sep}`); }
 function isImmutableGuestExtensionPath(value: string): boolean { return path.posix.isAbsolute(value) && path.posix.normalize(value) === value && value.startsWith("/opt/"); }
 function isCredentialFreeHttpUrl(value: string): boolean { try { const parsed = new URL(value); return ["http:", "https:"].includes(parsed.protocol) && !parsed.username && !parsed.password; } catch { return false; } }

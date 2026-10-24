@@ -20,6 +20,7 @@ import {
 import {
   MANAGED_WORKER_TOOL_NAMES,
   WORKER_CACHE_LINEAGE_MAX_BYTES,
+  continueWorkerCacheLineage,
   createWorkerCacheLineageRuntime,
   prepareWorkerCacheLineage,
   registerParentCacheLineageCapture,
@@ -376,6 +377,12 @@ test("Codex lineage restores the exact parent prefix and appends only managed-wo
       "preAssignmentItemsSha256"
     ]) assert.match(String(adoption[field]), /^[0-9a-f]{64}$/);
     assert.deepEqual(summarizeWorkerCacheLineage(record), { mode: "adopted" });
+    record.runtimeFingerprint = "a".repeat(64);
+    const continued = continueWorkerCacheLineage(record, path.join(root, "run-two"), "run_20260924120002_bbbbbbbb");
+    assert.equal(continued?.mode, "eligible");
+    if (continued?.mode !== "eligible") throw new Error("Expected continued eligible lineage.");
+    assert.notEqual(continued.snapshotFile, record.snapshotFile); assert.equal(continued.marker, record.marker); assert.equal(continued.runtimeFingerprint, record.runtimeFingerprint); assert.equal(continued.hostGeneration, "run_20260924120002_bbbbbbbb");
+    assert.deepEqual(summarizeWorkerCacheLineage(continued), { mode: "adopted" }); assert.equal(existsSync(continued.adoptionFile), true);
 
     const headers: Record<string, string> = {
       "session-id": "child-local-session",

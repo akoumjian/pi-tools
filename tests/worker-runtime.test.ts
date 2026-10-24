@@ -155,6 +155,14 @@ test("review runtime exposes only read-only Beads branches with four-item bounds
   });
 });
 
+test("status-less Beads updates remain JSON-safe and omit the optional status field", async () => {
+  await fixture("work", async () => {
+    const result = await executeWorkerBeadsHostRequest({ action: "update", taskId: "personal-test", note: "durable status-less note" });
+    assert.deepEqual(result.details, { taskId: "personal-test", recorded: true }); assert.equal(JSON.stringify(result).includes('"status"'), false);
+    await assert.rejects(() => executeWorkerBeadsHostRequest({ action: "update", taskId: "personal-test", note: 12345 }), /strict schema/);
+  });
+});
+
 test("worker_result_submit returns the approved accepted/rejected semantic union", async () => {
   await fixture("work", async (_root, api) => {
     const tool = api.tools.find((candidate) => candidate.name === "worker_result_submit")!;

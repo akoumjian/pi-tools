@@ -20,7 +20,7 @@ export type WorkerRuntimeProvenance = { protocolVersion: 1; sandboxName: string;
 export type WorkerHostConfig = {
   version: 2; backend: "docker-sandbox"; workerId: string; runId: string; sessionId: string; sessionFile: string; sessionDir: string;
   workerRoot: string; workspaceRoot: string; supervisionRoot: string; asyncJobRoot: string; taskIds: string[]; role: WorkerRole; cacheLineage?: WorkerCacheLineageRecord;
-  resultFile: string; settledFile: string; helloFile: string; stateFile: string; processFile: string; processNonce: string; hostConfigFile: string;
+  resultFile: string; settledFile: string; helloFile: string; stateFile: string; processFile: string; processNonce: string; hostConfigFile: string; cancellationFile: string;
   authorizationFile: string; launchManifestFile: string; launchManifestSha256: string; prompt: string; provider: string; model: string; thinkingLevel: string;
   bdPath: string; beadsRoute: WorkerBeadsRoute; sandbox: WorkerSandboxReference; sandboxShimPath: string; sbxPath: string;
   runtimeProvenance: WorkerRuntimeProvenance; rpcArgs: string[]; timeoutMs?: number;
@@ -48,7 +48,7 @@ export function launchWorkerHost(api: ExtensionAPI, context: ExtensionContext, i
     sessionFile: record.sessionFile, sessionDir: path.dirname(record.sessionFile), workerRoot: record.workerRoot, workspaceRoot: record.workspaceRoot,
     supervisionRoot, asyncJobRoot: path.join(record.workerRoot, "async-shell"), taskIds: [...record.taskIds], role: record.role, ...(record.cacheLineage ? { cacheLineage: record.cacheLineage } : {}),
     resultFile: input.resultFile, settledFile: path.join(input.runDir, "settled.json"), helloFile: path.join(input.runDir, "runtime-hello.json"), stateFile: path.join(input.runDir, "runtime-state.json"), processFile: input.processFile,
-    processNonce: input.processNonce, hostConfigFile: configFile, authorizationFile, launchManifestFile, launchManifestSha256: "", prompt: input.prompt,
+    processNonce: input.processNonce, hostConfigFile: configFile, cancellationFile: path.join(input.runDir, "cancel-request.json"), authorizationFile, launchManifestFile, launchManifestSha256: "", prompt: input.prompt,
     provider: route.provider, model: route.model, thinkingLevel: route.thinkingLevel, bdPath, beadsRoute: input.beadsRoute ?? resolveBeadsRoute(bdPath, context.cwd),
     sandbox: input.sandbox, sandboxShimPath: resolveSandboxShimScript(), sbxPath: input.sbxPath, runtimeProvenance, rpcArgs: [], ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs })
   };
@@ -56,7 +56,7 @@ export function launchWorkerHost(api: ExtensionAPI, context: ExtensionContext, i
   const authorization = { version: 2, workerId: config.workerId, runId: config.runId, processNonce: config.processNonce, sandboxName: config.sandbox.sandboxName, creationNonce: config.sandbox.creationNonce };
   writeFileSync(authorizationFile, `${JSON.stringify(authorization, null, 2)}\n`, { mode: 0o600 });
   const guestEnvironment: Record<string, string> = {
-    HOME: "/home/agent", PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", SHELL: "/bin/bash", GIT_OPTIONAL_LOCKS: "0", SEARXNG_URL: config.sandbox.searxngUrl, PI_CODING_AGENT_DIR: config.sandbox.codingAgentDir,
+    HOME: "/home/agent", ANTHROPIC_OAUTH_TOKEN: "sk-ant-oat01-abcdefghijklmnop", PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", SHELL: "/bin/bash", GIT_OPTIONAL_LOCKS: "0", SEARXNG_URL: config.sandbox.searxngUrl, PI_CODING_AGENT_DIR: config.sandbox.codingAgentDir,
     PI_WORKER_HOST_RPC: "1", PI_WORKER_ID: config.workerId, PI_WORKER_RUN_ID: config.runId, PI_WORKER_WORKSPACE_ROOT: config.workspaceRoot,
     PI_WORKER_STATE_ROOT: config.workerRoot, PI_WORKER_ASYNC_JOB_ROOT: config.asyncJobRoot, PI_WORKER_TASK_IDS: JSON.stringify(config.taskIds), PI_WORKER_ROLE: config.role,
     PI_WORKER_RUNTIME_PROVENANCE: JSON.stringify(runtimeProvenance), ...(config.cacheLineage ? { PI_WORKER_CACHE_LINEAGE: JSON.stringify(config.cacheLineage) } : {})

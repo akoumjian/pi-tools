@@ -1,9 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
+  constants,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   renameSync,
   realpathSync,
@@ -67,6 +71,7 @@ export type WorkerCacheLineageRecord =
       version: 1;
       mode: "fresh";
       reason: string;
+      hostGeneration?: string;
     }
   | {
       version: 1;
@@ -82,6 +87,7 @@ export type WorkerCacheLineageRecord =
       retirementFile: string;
       summaryFile: string;
       runtimeFingerprint?: string;
+      hostGeneration?: string;
     };
 
 type PendingParentHeaders = {
@@ -336,10 +342,27 @@ export function prepareWorkerCacheLineage(input: {
   writeLineageSummary(record, "eligible");
   return record;
 }
+export function continueWorkerCacheLineage(record: WorkerCacheLineageRecord, workerStateDir: string, hostGeneration: string): WorkerCacheLineageRecord | undefined {
+  if (!/^run_[A-Za-z0-9_-]+$/.test(hostGeneration) || record.mode !== "eligible" || !validateWorkerCacheLineageRecord(record)) return undefined;
+  let status: WorkerCacheLineageSummary; try { status = readLineageSummary(record); } catch { return undefined; }
+  if (status.mode !== "eligible" && status.mode !== "adopted") return undefined;
+  const snapshot = readNoFollowBounded(record.snapshotFile, WORKER_CACHE_LINEAGE_MAX_BYTES);
+  if (sha256(snapshot) !== record.snapshotSha256) return undefined;
+  mkdirSync(workerStateDir, { recursive: true, mode: 0o700 });
+  const clone: Extract<WorkerCacheLineageRecord, { mode: "eligible" }> = { ...record, hostGeneration, snapshotFile: path.join(workerStateDir, "cache-lineage.json"), adoptionFile: path.join(workerStateDir, "cache-lineage-adopted.json"), fallbackFile: path.join(workerStateDir, "cache-lineage-fallback.json"), retirementFile: path.join(workerStateDir, "cache-lineage-retired.json"), summaryFile: path.join(workerStateDir, "cache-lineage-summary.json") };
+  writePrivateText(clone.snapshotFile, snapshot);
+  if (status.mode === "adopted") {
+    readAdoption(record.adoptionFile, record, readWorkerSnapshot(record));
+    writePrivateText(clone.adoptionFile, readNoFollowBounded(record.adoptionFile, 4096));
+  }
+  writeLineageSummary(clone, status.mode);
+  return clone;
+}
+
 export function validateWorkerCacheLineageRecord(value: unknown): value is WorkerCacheLineageRecord {
   if (!isJsonObject(value) || value.version !== 1) return false;
   if (value.mode === "fresh") {
-    return typeof value.reason === "string" && value.reason.length > 0 && Buffer.byteLength(value.reason, "utf8") <= 512;
+    return typeof value.reason === "string" && value.reason.length > 0 && Buffer.byteLength(value.reason, "utf8") <= 512 && (value.hostGeneration === undefined || typeof value.hostGeneration === "string" && /^run_[A-Za-z0-9_-]+$/.test(value.hostGeneration));
   }
   return value.mode === "eligible" &&
     value.provider === CODEX_CACHE_LINEAGE_PROVIDER &&
@@ -353,6 +376,7 @@ export function validateWorkerCacheLineageRecord(value: unknown): value is Worke
     typeof value.retirementFile === "string" && path.isAbsolute(value.retirementFile) && path.basename(value.retirementFile) === "cache-lineage-retired.json" &&
     typeof value.summaryFile === "string" && path.isAbsolute(value.summaryFile) && path.basename(value.summaryFile) === "cache-lineage-summary.json" &&
     (value.runtimeFingerprint === undefined || typeof value.runtimeFingerprint === "string" && /^[0-9a-f]{64}$/.test(value.runtimeFingerprint)) &&
+    (value.hostGeneration === undefined || typeof value.hostGeneration === "string" && /^run_[A-Za-z0-9_-]+$/.test(value.hostGeneration)) &&
     path.dirname(value.snapshotFile) === path.dirname(value.adoptionFile) &&
     path.dirname(value.snapshotFile) === path.dirname(value.fallbackFile) &&
     path.dirname(value.snapshotFile) === path.dirname(value.retirementFile) &&
@@ -1180,6 +1204,12 @@ function routeDriftReason(
   return undefined;
 }
 
+
+function readNoFollowBounded(file: string, maximumBytes: number): string {
+  const descriptor = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try { const metadata = fstatSync(descriptor); if (!metadata.isFile() || metadata.size <= 0 || metadata.size > maximumBytes) throw new Error("Cache-lineage file is not a bounded ordinary file."); return readFileSync(descriptor, "utf8"); }
+  finally { closeSync(descriptor); }
+}
 
 function freshLineage(reason: string): WorkerCacheLineageRecord {
   return { version: 1, mode: "fresh", reason: truncateUtf8(reason, 512) };

@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { chmodSync, closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -32,8 +33,8 @@ import { launchWorkerHost, readWorkerHostProcess, readWorkerHostSettlement, type
 import { renderWorkerRuntimePrompt } from "./prompts.js";
 import { contextInputs, inputMounts, validateAdditionalInputs, type RetainedInput } from "./inputs.js";
 import { inspectInterruptedGitState, inventoryWorkerRepositories, snapshotWorkerRepositories, type RepositorySnapshot } from "./inventory.js";
-import { canonicalPathWithin, canonicalRepository, trustedGit } from "./trusted-git.js";
-import { prepareWorkerCacheLineage, registerParentCacheLineageCapture, type WorkerCacheLineageRecord } from "./cache-lineage.js";
+import { canonicalPathWithin, canonicalRepository, trustedGit, trustedGitArgs, trustedGitEnvironment } from "./trusted-git.js";
+import { continueWorkerCacheLineage, prepareWorkerCacheLineage, registerParentCacheLineageCapture, type WorkerCacheLineageRecord } from "./cache-lineage.js";
 
 export { WorkerRunParamsV2 as WorkerRunParams, WorkerControlParamsV2 as WorkerControlParams, WorkerMergeTestParams, WorkerMergeApplyParams };
 export type WorkerRunInput = WorkerRunInputV2;
@@ -344,7 +345,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
             if (!binding || !("reviewedRunId" in binding)) throw new Error(`Review worker ${worker.workerId} lost its reviewed-run binding.`);
             const subject = reviewSubject(binding.reviewedRunId, parentSessionFile, worker.workerId); reviewedRunId = binding.reviewedRunId;
             contextFile = writeReviewContext(runEvidenceDirectory(paths, reservedRunId), workerPaths(roots, subject.worker.workerId), request.workerId, reservedRunId, subject.worker, subject.run, inputs);
-            mounts.splice(0, mounts.length, { source: subject.worker.workspaceRoot, readOnly: true }, { source: path.dirname(contextFile), readOnly: true });
+            mounts.splice(0, mounts.length, { source: path.dirname(contextFile), readOnly: true });
           } else if (role === "integration") {
             if (!binding || !("preparedId" in binding)) throw new Error(`Integration worker ${worker.workerId} lost its prepared-set binding.`); preparedId = binding.preparedId;
             const trustedSet = trustedPreparedSet(getRegistry(), parentSessionFile, preparedId, paths.workspaceRoot); operationRepositories = snapshotOperationRepositories(trustedSet.repositories);
@@ -352,8 +353,10 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
           }
           const retained = retainedWorkerRuntime(worker);
           if (role === "work") {
-            const priorFingerprint = retained.cacheLineage?.mode === "eligible" ? retained.cacheLineage.runtimeFingerprint : undefined;
-            retained.cacheLineage = prepareWorkerCacheLineage({ stateRoot: roots.stateRoot, workerStateDir: path.join(paths.stateDir, "cache-lineage", reservedRunId), parentSessionFile, parentSessionId: context.sessionManager.getSessionId(), route: parseWorkerModelSelection(worker.modelSelection!), now: now() });
+            const prior = retained.cacheLineage; const priorFingerprint = prior?.mode === "eligible" ? prior.runtimeFingerprint : undefined; const lineageDir = prepareCacheLineageDirectory(paths, reservedRunId);
+            if (prior?.mode === "eligible") for (const file of [prior.snapshotFile, prior.summaryFile, ...(existsSync(prior.adoptionFile) ? [prior.adoptionFile] : [])]) assertContainedPathWithoutSymlinks(paths.stateDir, file, "retained cache-lineage evidence");
+            retained.cacheLineage = prior ? continueWorkerCacheLineage(prior, lineageDir, reservedRunId) : undefined;
+            retained.cacheLineage ??= { ...prepareWorkerCacheLineage({ stateRoot: roots.stateRoot, workerStateDir: lineageDir, parentSessionFile, parentSessionId: context.sessionManager.getSessionId(), route: parseWorkerModelSelection(worker.modelSelection!), now: now() }), hostGeneration: reservedRunId };
             if (retained.cacheLineage.mode === "eligible" && priorFingerprint) retained.cacheLineage.runtimeFingerprint = priorFingerprint;
           }
           const plan = finishPlanSafely({ request, role, workerId: worker.workerId, ...(reservedRunId ? { runId: reservedRunId } : {}), paths, taskIds: unique([...worker.taskIds, ...(request.additionalTaskIds ?? [])]), modelSelection: worker.modelSelection!, binding, workerRuntime: { version: 2, inputs: retainedInputs, ...retained }, newWorker: false, expectedVersion: worker.version, contextFile, reviewedRunId, preparedId, operationRepositories, pendingWorkSessionId, mounts, parentSessionFile, context });
@@ -372,7 +375,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         else if (role === "review") { subject = reviewSubject(request.reviewedRunId, parentSessionFile); inputs = validateAdditionalInputs({ values: request.additionalInputs, role, workspaceRoot: paths.workspaceRoot, runtimeRoot }); }
         else { integrationSet = trustedPreparedSet(getRegistry(), parentSessionFile, request.preparedId); inputs = validateAdditionalInputs({ values: request.additionalInputs, role, workspaceRoot: paths.workspaceRoot, runtimeRoot }); }
         provisionWorkerPaths(paths);
-        try { if (role === "work") cacheLineage = prepareWorkerCacheLineage({ stateRoot: roots.stateRoot, workerStateDir: path.join(paths.stateDir, "cache-lineage", reservedRunId), parentSessionFile, parentSessionId: context.sessionManager.getSessionId(), route: parseWorkerModelSelection(modelSelection), now: now() }); }
+        try { if (role === "work") cacheLineage = { ...prepareWorkerCacheLineage({ stateRoot: roots.stateRoot, workerStateDir: prepareCacheLineageDirectory(paths, reservedRunId), parentSessionFile, parentSessionId: context.sessionManager.getSessionId(), route: parseWorkerModelSelection(modelSelection), now: now() }), hostGeneration: reservedRunId }; }
         catch (error) { rmSync(paths.stateDir, { recursive: true, force: true }); throw error; }
         let binding: WorkerRunRecord["binding"]; let reviewedRunId: string | undefined; let preparedId: string | undefined; let consumedPrepared = false;
         let contextFile: string | undefined; let mounts: WorkerSandboxMount[] = [];
@@ -383,7 +386,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
             reviewedRunId = request.reviewedRunId; binding = { reviewedWorkerId: subject!.worker.workerId, reviewedRunId };
             createWorkerSession({ workspaceRoot: paths.workspaceRoot, sessionDir: paths.sessionDir, sessionId: randomUUID() });
             contextFile = writeReviewContext(runEvidenceDirectory(paths, reservedRunId), workerPaths(roots, subject!.worker.workerId), workerId, reservedRunId, subject!.worker, subject!.run, mountedInputs);
-            mounts = [{ source: subject!.worker.workspaceRoot, readOnly: true }, { source: path.dirname(contextFile), readOnly: true }];
+            mounts = [{ source: path.dirname(contextFile), readOnly: true }];
           } else if (role === "integration") {
             preparedId = request.preparedId; const trustedSet = integrationSet!; const moved = consumePreparedMergeSet(parentSessionFile, preparedId, workerId, paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, trustedSet }); consumedPrepared = true; binding = { preparedId };
             createWorkerSession({ workspaceRoot: paths.workspaceRoot, sessionDir: paths.sessionDir, sessionId: randomUUID() });
@@ -416,15 +419,16 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const runDir = path.join(input.paths.supervisionDir, "runs", runId); mkdirSync(runDir, { recursive: true, mode: 0o700 });
     const nonce = randomUUID();
     const codeRoot = overrides.codeRoot ?? (testLaunch ? input.context.cwd : path.join(homedir(), "Code"));
-    const sandbox = planWorkerSandbox({ workerId: input.workerId, runId, creationNonce: nonce, workerRoot: input.paths.stateDir, codeRoot, mounts: input.mounts.map((mount) => ({ source: mount.source, ...(mount.readOnly ? { readOnly: true } : {}) })), ...(sandboxRelease ? { release: sandboxRelease } : {}) });
+    const sandbox = planWorkerSandbox({ workerId: input.workerId, runId, creationNonce: nonce, workerRoot: input.paths.stateDir, workingDirectory: input.paths.workspaceRoot, codeRoot, mounts: input.mounts.map((mount) => ({ source: mount.source, ...(mount.readOnly ? { readOnly: true } : {}) })), ...(sandboxRelease ? { release: sandboxRelease } : {}) });
     const runtimeFingerprint = createHash("sha256").update(JSON.stringify({ imageDigest: sandbox.imageDigest, kitSha256: sandbox.kitSha256, resourceManifestSha256: sandbox.resourceManifestSha256, revisions: sandbox.revisions })).digest("hex");
     const roleInstructions = roleInstructionsFor(input.role);
     const cacheBoundaryFingerprint = createHash("sha256").update(JSON.stringify({ runtimeFingerprint, role: input.role, modelSelection: input.modelSelection, roleInstructions, taskIds: [...input.taskIds].sort(), repositoryBaselines: input.workerRuntime.repositoryBaselines ?? [] })).digest("hex");
-    if (input.workerRuntime.cacheLineage?.mode === "eligible") input.workerRuntime.cacheLineage = input.workerRuntime.cacheLineage.runtimeFingerprint && input.workerRuntime.cacheLineage.runtimeFingerprint !== cacheBoundaryFingerprint ? { version: 1, mode: "fresh", reason: "Trusted runtime, tool, role, model, assignment, or fork boundary changed; prior cache generation was retired." } : { ...input.workerRuntime.cacheLineage, runtimeFingerprint: cacheBoundaryFingerprint };
+    if (input.workerRuntime.cacheLineage?.mode === "eligible") input.workerRuntime.cacheLineage = input.workerRuntime.cacheLineage.runtimeFingerprint && input.workerRuntime.cacheLineage.runtimeFingerprint !== cacheBoundaryFingerprint ? { version: 1, mode: "fresh", reason: "Trusted runtime, tool, role, model, assignment, or fork boundary changed; prior cache generation was retired.", hostGeneration: runId } : { ...input.workerRuntime.cacheLineage, runtimeFingerprint: cacheBoundaryFingerprint };
     const request = input.request;
     const previousRun = !input.newWorker ? getWorkerRun(getRegistry(), input.workerId, getWorker(getRegistry(), input.workerId)?.latestRunId ?? "") : undefined;
     const previousRuntime = previousRun?.runtime as RunRuntime | undefined;
     if (previousRuntime?.releaseOrdinal !== undefined && sandbox.releaseOrdinal < previousRuntime.releaseOrdinal) throw new Error(`Worker runtime downgrade refused: release ${sandbox.releaseOrdinal} is older than retained release ${previousRuntime.releaseOrdinal}.`);
+    const legacyRuntimeTransition = Boolean(previousRun && (!previousRuntime || previousRuntime.version !== 4));
     const runtimeChanged = Boolean(previousRuntime?.runtimeFingerprint && previousRuntime.runtimeFingerprint !== runtimeFingerprint);
     const interruptedPreviously = previousRun?.outcome === "cancelled" || (previousRun?.outcome === "failed" && previousRun.outcomeSource === "system");
     const interruptionWarnings = interruptedPreviously ? inspectInterruptedGitState(input.paths.workspaceRoot) : [];
@@ -433,7 +437,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       instructions: request.instructions, repositoryBaselines: input.workerRuntime.repositoryBaselines, additionalInputs: contextInputs(input.workerRuntime.inputs),
       reviewSubjectPath: input.contextFile && input.role === "review" ? (JSON.parse(readFileSync(input.contextFile, "utf8")) as { subjectWorkspace: string }).subjectWorkspace : undefined, reviewContextPath: input.role === "review" ? input.contextFile : undefined, integrationContextPath: input.role === "integration" ? input.contextFile : undefined, resumed: !input.newWorker,
       cacheLineageMarker: input.workerRuntime.cacheLineage?.mode === "eligible" ? input.workerRuntime.cacheLineage.marker : undefined, initialSession: Boolean(input.pendingWorkSessionId),
-      cancelledPreviously: interruptedPreviously, interruptionWarnings, runtimeChange: runtimeChanged ? `Approved runtime changed from ${previousRuntime!.runtimeFingerprint.slice(0, 12)} to ${runtimeFingerprint.slice(0, 12)} (release ${previousRuntime!.releaseOrdinal} -> ${sandbox.releaseOrdinal}); executable contracts were refreshed and cache lineage is fresh.` : undefined });
+      cancelledPreviously: interruptedPreviously, interruptionWarnings, runtimeChange: legacyRuntimeTransition ? "This is the first version-4 Docker Sandbox run after retained legacy metadata; the old runtime was not reattached or trusted, a fresh immutable Sandbox was created, and executable contracts were refreshed." : runtimeChanged ? `Approved runtime changed from ${previousRuntime!.runtimeFingerprint.slice(0, 12)} to ${runtimeFingerprint.slice(0, 12)} (release ${previousRuntime!.releaseOrdinal} -> ${sandbox.releaseOrdinal}); executable contracts were refreshed and cache lineage is fresh.` : undefined });
     const runRuntime: RunRuntime = { version: 4, prompt, runDir, resultFile: path.join(runDir, "result.json"), settledFile: path.join(runDir, "settled.json"), processFile: path.join(runDir, "host-process.json"), processNonce: nonce,
       sandbox, runtimeFingerprint, releaseOrdinal: sandbox.releaseOrdinal, ...(input.contextFile ? { contextFile: input.contextFile } : {}), inputs: input.workerRuntime.inputs,
       repositoryBefore: snapshotWorkerRepositories(input.paths.workspaceRoot), ...(input.pendingWorkSessionId ? { pendingWorkSessionId: input.pendingWorkSessionId } : {}), ...(interruptionWarnings.length ? { interruptionWarnings } : {}) };
@@ -521,7 +525,14 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       } else errors.push({ scope: "run", message: sanitizeError(job.error ?? `Worker host exited with status ${job.status}${job.exitCode === undefined ? "" : ` (${job.exitCode})`}.`) });
       await removeSandbox(sbx(), runtime.sandbox);
 
-      const workerStorage = workerPaths(roots, workerId); assertWorkerStoragePaths(workerStorage);
+      const workerStorage = workerPaths(roots, workerId);
+      try { assertWorkerStoragePaths(workerStorage); }
+      catch (storageError) {
+        const message = `Worker storage policy violation after exact Sandbox absence was proven: ${sanitizeError(storageError)}`;
+        finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind: "settlement", claimNonce: nonce, outcome: "failed", outcomeSource: "system", summary: "Worker result evidence was retained, but the run failed trusted storage-policy validation after containment.", errors: [{ scope: "run", message }], settledAt: now().toISOString() });
+        if (currentContext?.sessionManager.getSessionFile() && realpathOrResolve(currentContext.sessionManager.getSessionFile()!) === worker.parentSessionFile) deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration);
+        return;
+      }
       const inventory = inventoryWorkerRepositories({ workspaceRoot: worker.workspaceRoot, workerId, runId, reported, before: runtime.repositoryBefore });
       errors.push(...inventory.errors.map((message) => ({ scope: "repositories" as const, message: sanitizeError(message) })));
       finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind: "settlement", claimNonce: nonce, outcome, outcomeSource, summary: summary.slice(0, 2048), ...(question ? { question } : {}), repositories: inventory.repositories, artifacts, errors, sessionEndLine: worker.sessionFile ? safeCountLines(worker.sessionFile, workerPaths(roots, worker.workerId).sessionDir) : undefined, settledAt: now().toISOString() });
@@ -573,9 +584,11 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         await settleCompletedRun(worker.workerId, runId, { status: "exited", exitCode: 0 });
         return "not_active";
       }
-      const launching = starting.get(worker.workerId); if (launching?.runId === runId) await launching.completion; if (attached?.runId === runId) { attached.handle.cancel("SIGTERM"); }
-      else if (existsSync(runtime.processFile)) { const process = readWorkerHostProcess(runtime.processFile); if (process.workerId !== worker.workerId || process.runId !== runId || process.nonce !== runtime.processNonce) throw new Error("Worker host process identity mismatch during cancellation."); if (isAsyncJobProcessIdentityAlive(process)) signalAsyncJobProcessIdentity(process, "SIGTERM"); }
-      if (attached?.runId === runId) await Promise.race([attached.handle.completion, delay(5_000)]);
+      const launching = starting.get(worker.workerId); if (launching?.runId === runId) await launching.completion;
+      const liveAttached = active.get(worker.workerId); let supervisedProcess: ReturnType<typeof readWorkerHostProcess> | undefined;
+      if (existsSync(runtime.processFile)) { supervisedProcess = readWorkerHostProcess(runtime.processFile); if (supervisedProcess.workerId !== worker.workerId || supervisedProcess.runId !== runId || supervisedProcess.nonce !== runtime.processNonce) throw new Error("Worker host process identity mismatch during cancellation."); if (isAsyncJobProcessIdentityAlive(supervisedProcess)) writeFileSync(path.join(runtime.runDir, "cancel-request.json"), `${JSON.stringify({ version: 1, workerId: worker.workerId, runId, requestedAt: now().toISOString() })}\n`, { flag: "wx", mode: 0o600 }); }
+      if (liveAttached?.runId === runId) await Promise.race([liveAttached.handle.completion, delay(12_000)]);
+      else if (supervisedProcess) for (let attempt = 0; attempt < 120 && isAsyncJobProcessIdentityAlive(supervisedProcess); attempt += 1) await delay(100);
       await removeSandbox(sbx(), runtime.sandbox);
       await proveWorkerHostExited(runtime, worker.workerId, runId);
 
@@ -722,12 +735,18 @@ function ensureContainedOrdinaryDirectory(root: string, directory: string, label
   assertContainedOrdinaryDirectory(root, directory, label);
 }
 
+function prepareCacheLineageDirectory(paths: WorkerPaths, runId: string): string {
+  const root = path.join(paths.stateDir, "cache-lineage"); ensureContainedOrdinaryDirectory(paths.stateDir, root, "worker cache-lineage root"); const generation = path.join(root, runId);
+  if (existsSync(generation)) throw new Error(`Worker cache-lineage generation already exists: ${runId}.`); mkdirSync(generation, { mode: 0o700 }); assertContainedOrdinaryDirectory(root, generation, "worker cache-lineage generation"); return generation;
+}
 function runEvidenceDirectory(paths: WorkerPaths, runId: string): string { return path.join(paths.evidenceDir, "runs", runId, "inputs"); }
 export function snapshotAdditionalInputs(directory: string, inputs: RetainedInput[]): RetainedInput[] {
   const root = path.join(directory, "additional"); rmSync(root, { recursive: true, force: true }); mkdirSync(root, { recursive: true, mode: 0o700 });
   const budget = { nodes: 0, bytes: 0 };
   return inputs.map((item, index) => {
     const original = realpathSync(item.sourcePath); const name = `${String(index + 1).padStart(3, "0")}-${createHash("sha256").update(original).digest("hex").slice(0, 12)}-${path.basename(original)}`; const target = path.join(root, name);
+    const metadata = lstatSync(original);
+    if (metadata.isFile()) { mkdirSync(target, { mode: 0o700 }); const mountedPath = path.join(target, path.basename(original)); snapshotOrdinaryNode(original, mountedPath, budget); chmodSync(target, 0o500); return { ...item, source: target, target, mountedPath }; }
     snapshotOrdinaryNode(original, target, budget);
     return { ...item, source: target, target, mountedPath: target };
   });
@@ -752,9 +771,29 @@ function writeReviewContext(directory: string, subjectPaths: WorkerPaths, review
   if (!Number.isSafeInteger(startLine) || !Number.isSafeInteger(endLine) || startLine < 1 || endLine < startLine || endLine > sourceLineCount) throw new Error("Review subject session range is invalid.");
   const selected = lines.slice(startLine - 1, endLine).join("\n");
   writeFileSync(sessionFile, `${selected}${selected && !selected.endsWith("\n") ? "\n" : ""}`, { mode: 0o400 });
+  const subjectWorkspace = path.join(directory, "subject"); mkdirSync(subjectWorkspace, { mode: 0o700 });
+  const materializedRepositories = subjectRun.repositories.map((repository, index) => {
+    const source = path.join(subjectWorker.workspaceRoot, repository.path); assertContainedOrdinaryDirectory(subjectWorker.workspaceRoot, source, "review candidate repository");
+    if (trustedGit(source, ["rev-parse", `${repository.commit}^{commit}`]).trim() !== repository.commit) throw new Error("Review candidate commit is unavailable from its reported repository.");
+    const bundle = path.join(directory, `.candidate-${index + 1}.bundle`); const target = path.join(subjectWorkspace, `${String(index + 1).padStart(3, "0")}-${repository.candidateId}`);
+    trustedGit(source, ["bundle", "create", bundle, repository.commit], { maxBuffer: 128 * 1024 * 1024 });
+    try { execFileSync("git", trustedGitArgs(["clone", "--no-checkout", "--", bundle, target]), { env: trustedGitEnvironment(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 16 * 1024 * 1024 }); trustedGit(target, ["checkout", "--detach", repository.commit]); } finally { rmSync(bundle, { force: true }); }
+    if (trustedGit(target, ["rev-parse", "HEAD"]).trim() !== repository.commit) throw new Error("Materialized review candidate commit mismatch.");
+    makeReadonlyTree(target, { nodes: 0, bytes: 0 }); return { ...repository, path: path.relative(subjectWorkspace, target) };
+  });
+  chmodSync(subjectWorkspace, 0o500);
+  const artifactRoot = path.join(directory, "artifacts"); mkdirSync(artifactRoot, { mode: 0o700 }); const artifactBudget = { nodes: 0, bytes: 0 };
+  const materializedArtifacts = subjectRun.artifacts.map((artifact, index) => { const source = path.resolve(subjectWorker.workspaceRoot, artifact); assertContainedPathWithoutSymlinks(subjectWorker.workspaceRoot, source, "review subject artifact"); const target = path.join(artifactRoot, `${String(index + 1).padStart(3, "0")}-${createHash("sha256").update(source).digest("hex").slice(0, 12)}-${path.basename(source)}`); snapshotOrdinaryNode(source, target, artifactBudget); return target; }); chmodSync(artifactRoot, 0o500);
   const file = path.join(directory, "context.json");
-  const value = { version: 2, reviewerWorkerId, reviewedWorkerId: subjectWorker.workerId, reviewedRunId: subjectRun.runId, subjectWorkspace: subjectWorker.workspaceRoot, session: { path: sessionFile, sourceRange: { startLine, endLine }, snapshotRange: { startLine: 1, endLine: endLine - startLine + 1 } }, repositories: subjectRun.repositories, artifacts: subjectRun.artifacts, candidates: subjectRun.repositories.map(({ candidateId, path, reported, changed, dirty, eligible, issues }) => ({ candidateId, path, reported, changed, dirty, eligible, ...(issues ? { issues } : {}) })), additionalInputs: contextInputs(inputs) };
+  const value = { version: 2, reviewerWorkerId, reviewedWorkerId: subjectWorker.workerId, reviewedRunId: subjectRun.runId, subjectWorkspace, session: { path: sessionFile, sourceRange: { startLine, endLine }, snapshotRange: { startLine: 1, endLine: endLine - startLine + 1 } }, repositories: materializedRepositories, artifacts: materializedArtifacts, candidates: materializedRepositories.map(({ candidateId, path, reported, changed, dirty, eligible, issues }) => ({ candidateId, path, reported, changed, dirty, eligible, ...(issues ? { issues } : {}) })), additionalInputs: contextInputs(inputs) };
   writeReadonlyJson(file, value); return file;
+}
+function makeReadonlyTree(root: string, budget: { nodes: number; bytes: number }): void {
+  if (++budget.nodes > 250_000) throw new Error("Review candidate snapshot exceeds 250000 filesystem nodes.");
+  const metadata = lstatSync(root); if (metadata.isSymbolicLink()) throw new Error(`Review candidate snapshots reject symbolic links: ${root}.`);
+  if (metadata.isDirectory()) { for (const name of readdirSync(root).sort()) makeReadonlyTree(path.join(root, name), budget); chmodSync(root, 0o500); }
+  else if (metadata.isFile()) { if ((budget.bytes += metadata.size) > 2 * 1024 * 1024 * 1024) throw new Error("Review candidate snapshot exceeds 2 GiB."); chmodSync(root, 0o400); }
+  else throw new Error(`Review candidate contains an unsupported filesystem node: ${root}.`);
 }
 function reviewSessionFile(contextFile: string): string { return path.join(path.dirname(contextFile), "session.jsonl"); }
 function readBoundedNoFollowFile(file: string, trustedRoot: string, maximumBytes: number, label: string): Buffer {

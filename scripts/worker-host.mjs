@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFile } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import path from "node:path";
@@ -17,6 +17,7 @@ const PROMPT_START_TIMEOUT_MS = 5_000;
 if (config.version !== 2 || config.backend !== "docker-sandbox") throw new Error(`Unsupported worker host config: ${config.version}/${config.backend}`);
 if (!Array.isArray(config.rpcArgs) || config.rpcArgs.length === 0) throw new Error("Worker host config requires trusted RPC arguments.");
 if (typeof config.authorizationFile !== "string" || !path.isAbsolute(config.authorizationFile)) throw new Error("Worker host config requires exact launch authorization.");
+if (typeof config.cancellationFile !== "string" || !path.isAbsolute(config.cancellationFile) || path.dirname(config.cancellationFile) !== path.dirname(config.authorizationFile)) throw new Error("Worker host config requires an exact host-only cancellation request path.");
 if (typeof config.launchManifestFile !== "string" || !path.isAbsolute(config.launchManifestFile) || !/^[a-f0-9]{64}$/.test(config.launchManifestSha256 ?? "")) throw new Error("Worker host config requires an exact Sandbox launch manifest.");
 if (createHash("sha256").update(readFileSync(config.launchManifestFile)).digest("hex") !== config.launchManifestSha256) throw new Error("Worker Sandbox launch manifest hash mismatch.");
 if (config.timeoutMs !== undefined && (!Number.isSafeInteger(config.timeoutMs) || config.timeoutMs <= 0)) throw new Error("Worker host timeoutMs must be a positive safe integer when explicitly configured.");
@@ -84,8 +85,13 @@ const client = new RpcClient({
   }
 });
 
-let stopping;
-const stop = () => stopping ??= (async () => { revoked = true; await drainAdmittedMutations(); await client.stop(); })();
+let stopping; let cancellationStarted = false;
+const stop = () => stopping ??= (async () => { revoked = true; await drainAdmittedMutations(); await client.closeInputAndWait(); })();
+const cancellationWatcher = setInterval(() => {
+  if (cancellationStarted || !existsSync(config.cancellationFile)) return; cancellationStarted = true; rmSync(config.cancellationFile, { force: true }); revoked = true;
+  void stopBoundedly().then(() => process.exit(143), (error) => { console.error(error); process.exit(1); });
+}, 25);
+cancellationWatcher.unref();
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(signal, () => { const exitCode = signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143; void stopBoundedly().then(() => process.exit(exitCode), (error) => { console.error(error); process.exit(1); }); });
 client.onEvent((event) => {
   const summary = { type: event.type };
@@ -109,6 +115,7 @@ try {
   completedSuccessfully = true;
   process.stdout.write(`${JSON.stringify({ type: "worker_host_result", workerId: config.workerId, runId: config.runId, sessionId: state.sessionId, resultFile: config.resultFile })}\n`);
 } finally {
+  clearInterval(cancellationWatcher);
   try { await stopBoundedly(); }
   catch (error) { if (!completedSuccessfully) throw error; console.error(`Worker RPC graceful shutdown failed after settled evidence: ${error instanceof Error ? error.message : String(error)}`); }
 }
