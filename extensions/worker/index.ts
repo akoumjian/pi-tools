@@ -109,6 +109,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   const active = new Map<string, ActiveRun>();
   const starting = new Map<string, { runId: string; completion: Promise<void> }>();
   const deliveredRecovery = new Set<string>();
+  const deliveryAttempts = new Map<string, number>();
   const getRegistry = () => registry ??= openWorkerRegistry(runtimeRoot);
   const operationSnapshots = new Map<string, WorkerOperationSnapshot>();
   const clearOperationSnapshot = (toolCallId: string): void => { if (toolCallId) operationSnapshots.delete(toolCallId); };
@@ -153,9 +154,10 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       recoverInterruptedDiscardFiles(exactParent, runtimeGeneration);
       recoverInterruptedClaimsForParent(getRegistry(), exactParent, runtimeGeneration, now().toISOString());
       reconcileWorkerDeliveries(getRegistry(), exactParent, sessionDeliveryIds(context));
+      deliveryAttempts.clear();
       deliveredRecovery.clear();
       observedDataVersion = workerRegistryDataVersion(getRegistry());
-      deliverPendingCompletions(api, getRegistry(), exactParent, runtimeGeneration);
+      deliverPendingCompletions(api, getRegistry(), exactParent, runtimeGeneration, deliveryAttempts);
       void Promise.resolve().then(() => reconcileActiveRuns(context, exactParent));
       if (deliveryTimer) clearInterval(deliveryTimer);
       deliveryTimer = setInterval(() => {
@@ -165,7 +167,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
             observedDataVersion = current;
             repaintWorkerActivity(context);
           }
-          deliverPendingCompletions(api, getRegistry(), exactParent, runtimeGeneration);
+          deliverPendingCompletions(api, getRegistry(), exactParent, runtimeGeneration, deliveryAttempts);
           void reconcileActiveRuns(context, exactParent);
         } catch {}
       }, 1_000);
@@ -182,11 +184,17 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     for (const item of launches) pending.delete(item.runId);
     for (const item of launches) beginPreparedRun(context, item);
   });
+  api.on("agent_end", (_event, context) => {
+    const parentFile = context.sessionManager.getSessionFile(); if (!parentFile) return;
+    reconcileSameGenerationWorkerDeliveries(api, getRegistry(), realpathOrResolve(parentFile), runtimeGeneration, context, deliveryAttempts);
+  });
   api.on("message_end", (event, context) => {
     const deliveryId = (event.message as any)?.details?.deliveryId;
     if (typeof deliveryId !== "string" || !deliveryId.startsWith("worker-run:")) return;
     const parent = context.sessionManager.getSessionFile(); if (!parent) return;
-    try { markWorkerDeliveryDelivered(getRegistry(), deliveryId, runtimeGeneration, now().toISOString()); } catch {}
+    try {
+      if (markWorkerDeliveryDelivered(getRegistry(), deliveryId, runtimeGeneration, now().toISOString())) deliveryAttempts.delete(deliveryId);
+    } catch {}
   });
   api.on("session_shutdown", (_event, context) => {
     activityGeneration += 1;
@@ -523,7 +531,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       const inventory = inventoryWorkerRepositories({ workspaceRoot: worker.workspaceRoot, workerId, runId, reported, before: runtime.repositoryBefore });
       errors.push(...inventory.errors.map((message) => ({ scope: "repositories" as const, message: sanitizeError(message) })));
       finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind: "settlement", claimNonce: nonce, outcome, outcomeSource, summary: summary.slice(0, 2048), ...(question ? { question } : {}), repositories: inventory.repositories, artifacts, errors, sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile) : undefined, settledAt: now().toISOString() });
-      if (currentContext?.sessionManager.getSessionFile() && realpathOrResolve(currentContext.sessionManager.getSessionFile()!) === worker.parentSessionFile) deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration);
+      if (currentContext?.sessionManager.getSessionFile() && realpathOrResolve(currentContext.sessionManager.getSessionFile()!) === worker.parentSessionFile) deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration, deliveryAttempts);
     } catch (error) {
       const message = sanitizeError(error);
       const attempts = recordWorkerSettlementRecovery(getRegistry(), { workerId, runId, claimNonce: nonce, error: message, now: now().toISOString() });
@@ -537,7 +545,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
           artifacts: accepted?.result.artifacts ?? [], errors: [{ scope: "run", message: `${message}${retained}` }],
           sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile) : undefined, settledAt: now().toISOString()
         });
-        if (currentContext?.sessionManager.getSessionFile() && realpathOrResolve(currentContext.sessionManager.getSessionFile()!) === worker.parentSessionFile) deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration);
+        if (currentContext?.sessionManager.getSessionFile() && realpathOrResolve(currentContext.sessionManager.getSessionFile()!) === worker.parentSessionFile) deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration, deliveryAttempts);
       } else {
         releaseWorkerRunClaim(getRegistry(), workerId, runId, "settlement", nonce);
         const current = getWorker(getRegistry(), workerId); const currentRun = current && getWorkerRun(getRegistry(), workerId, runId);
@@ -578,7 +586,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       const survivors = await waitForWorkerShellRecords(worker.workerId, runId);
       if (survivors.length) throw new Error(`Worker-owned process records remain active after container removal: ${survivors.map((job) => job.jobId).join(", ")}.`);
       finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId: worker.workerId, runId, claimKind: "cancellation", claimNonce: nonce, outcome: "cancelled", outcomeSource: "system", summary: "Worker run was cancelled by its parent.", sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile) : undefined, settledAt: now().toISOString() });
-      active.delete(worker.workerId); deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration); return "cancelled";
+      active.delete(worker.workerId); deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration, deliveryAttempts); return "cancelled";
     } catch (error) { recordRecovery(worker.workerId, runId, error); throw new Error(`Worker ${worker.workerId}/${runId} cancellation requires recovery: ${sanitizeError(error)}`); }
   }
 
@@ -968,4 +976,50 @@ function workerControlCallLabel(input: unknown): string {
 }
 function publicPreparedSet(set: any) { return { preparedId: set.preparedId, status: set.status, order: set.order, repositories: set.repositories.map((item: any) => ({ id: item.id, candidateRepo: item.candidateRepo, candidateCommit: item.candidateCommit, targetRepo: item.targetRepo, targetRef: item.targetRef, method: item.method, status: item.status, expectedCommit: item.expectedCommit, ...(item.desiredCommit ? { desiredCommit: item.desiredCommit } : {}), preparedPath: item.preparedPath, overlapCount: item.overlapCount, dependsOn: item.dependsOn, ...(item.source ? { source: item.source } : {}), ...(item.warnings ? { warnings: item.warnings } : {}) })), ...(set.resolutionCases ? { resolutionCases: set.resolutionCases } : {}) }; }
 function sessionDeliveryIds(context: ExtensionContext): string[] { const ids = new Set<string>(); const visit = (value: unknown): void => { if (!value || typeof value !== "object") return; const record = value as Record<string, unknown>; if (typeof record.deliveryId === "string" && record.deliveryId.startsWith("worker-run:")) ids.add(record.deliveryId); for (const child of Object.values(record)) Array.isArray(child) ? child.forEach(visit) : visit(child); }; try { for (const entry of context.sessionManager.getEntries()) visit(entry); } catch {} return [...ids]; }
-function deliverPendingCompletions(api: ExtensionAPI, registry: WorkerRegistry, parent: string, generation: number): void { for (const delivery of pendingWorkerDeliveries(registry, parent)) { if (!claimWorkerDelivery(registry, delivery.deliveryId, parent, generation)) continue; const worker = getWorker(registry, delivery.workerId); const run = getWorkerRun(registry, delivery.workerId, delivery.runId); if (!worker || !run?.outcome || !run.outcomeSource) { releaseWorkerDeliveryClaim(registry, delivery.deliveryId, generation); continue; } const event = { event: "worker_settled", workerId: worker.workerId, runId: run.runId, role: worker.role, outcome: run.outcome, outcomeSource: run.outcomeSource, ...(run.summary ? { summary: run.summary } : {}), ...(run.question ? { question: run.question } : {}), repositoryCount: run.repositories.length, artifactCount: run.artifacts.length, ...(run.errors.length ? { errors: run.errors } : {}) }; try { api.sendMessage({ customType: "worker-run", content: JSON.stringify(event), display: true, details: { ...event, deliveryId: delivery.deliveryId } }, { triggerTurn: true, deliverAs: delivery.completionDelivery }); } catch { releaseWorkerDeliveryClaim(registry, delivery.deliveryId, generation); } } }
+function deliverPendingCompletions(
+  api: ExtensionAPI,
+  registry: WorkerRegistry,
+  parent: string,
+  generation: number,
+  attempts?: Map<string, number>
+): void {
+  for (const delivery of pendingWorkerDeliveries(registry, parent)) {
+    if (!claimWorkerDelivery(registry, delivery.deliveryId, parent, generation)) continue;
+    const worker = getWorker(registry, delivery.workerId);
+    const run = getWorkerRun(registry, delivery.workerId, delivery.runId);
+    if (!worker || !run?.outcome || !run.outcomeSource) {
+      releaseWorkerDeliveryClaim(registry, delivery.deliveryId, generation);
+      continue;
+    }
+    const event = { event: "worker_settled", workerId: worker.workerId, runId: run.runId, role: worker.role, outcome: run.outcome, outcomeSource: run.outcomeSource, ...(run.summary ? { summary: run.summary } : {}), ...(run.question ? { question: run.question } : {}), repositoryCount: run.repositories.length, artifactCount: run.artifacts.length, ...(run.errors.length ? { errors: run.errors } : {}) };
+    try {
+      api.sendMessage({ customType: "worker-run", content: JSON.stringify(event), display: true, details: { ...event, deliveryId: delivery.deliveryId } }, { triggerTurn: true, deliverAs: delivery.completionDelivery });
+      attempts?.set(delivery.deliveryId, (attempts.get(delivery.deliveryId) ?? 0) + 1);
+    } catch {
+      releaseWorkerDeliveryClaim(registry, delivery.deliveryId, generation);
+    }
+  }
+}
+
+function reconcileSameGenerationWorkerDeliveries(
+  api: ExtensionAPI,
+  registry: WorkerRegistry,
+  parent: string,
+  generation: number,
+  context: ExtensionContext,
+  attempts: Map<string, number>
+): void {
+  const observed = new Set(sessionDeliveryIds(context));
+  let released = false;
+  for (const delivery of pendingWorkerDeliveries(registry, parent)) {
+    if (delivery.state !== "claimed" || delivery.runtimeGeneration !== generation) continue;
+    if (observed.has(delivery.deliveryId)) {
+      if (markWorkerDeliveryDelivered(registry, delivery.deliveryId, generation, new Date().toISOString())) attempts.delete(delivery.deliveryId);
+      continue;
+    }
+    if (attempts.get(delivery.deliveryId) !== 1) continue;
+    releaseWorkerDeliveryClaim(registry, delivery.deliveryId, generation);
+    released = true;
+  }
+  if (released) deliverPendingCompletions(api, registry, parent, generation, attempts);
+}

@@ -15,7 +15,8 @@ LLM-callable tools:
 
 Commands:
 
-- `/async:status` — reports job-root state and recent-job diagnostics.
+- `/async:status` — reports job-root state, total stored-directory count, and recent-job diagnostics.
+- `/async:prune <job-id> [job-id ...] [--confirm]` — previews or explicitly removes at most 100 exact terminal ordinary jobs; it refuses active, unknown, worker-owned, or undelivered jobs and never selects by wildcard or age.
 - `/async:view [job-id] [--stream both|stdout|stderr] [--tail 1..500] [--follow]` — opens a provider-free, read-only TUI over canonical live or historical job logs. Without a job id, it presents up to 100 recent jobs from the current project registry.
 
 Side effects:
@@ -101,8 +102,8 @@ The built-in Pi footer uses the extension status surface for one compact theme-a
    ```
    `shell_start` deliberately does not return stdout/stderr samples. Use `shell_read` with `mode: "tail"` for recent output, `shell_read` with `mode: "range"` for exact log lines, or `search_many`/`read_many` on log paths for targeted file inspection.
 4. For each background job that finishes later (with `notifyOnExit !== false`), the extension queues a completion notice. A ~100 ms debounce coalesces near-simultaneous completions with the same delivery mode into one batch.
-5. The batch is delivered as a custom message of type `async-shell` with `triggerTurn: true` and the command's selected `completionDelivery`. `steer` is the default. When the agent is active, Pi applies its normal safe queue ordering for the selected mode.
-6. Calling `sendMessage` is only a delivery attempt. The job remains unacknowledged until Pi emits the exact same-session custom `message_end` receipt carrying the batch's unique delivery ID. The extension never scans or replays session history on reload; an ambiguous cross-lifecycle attempt remains pending rather than risking a duplicate turn.
+5. The batch is delivered as a custom message of type `async-shell` with `triggerTurn: true` and the command's selected `completionDelivery`. `steer` is the default. Delivery queues and accepted-but-unreceipted batches live in the process-global runtime holder, so a same-session `/reload` rebinds them to the newest extension API, reconciles delivery IDs already present in session history, and requeues only absent work.
+6. Calling `sendMessage` is only a delivery attempt. The job remains unacknowledged until Pi emits the exact same-session custom `message_end` receipt carrying the batch's unique delivery ID. On reload, the extension reads only exact delivery IDs from the current session: an observed ID is acknowledged, while an absent ID is requeued once through the new runtime rather than abandoned or replayed across sessions.
 7. `shell_read` acknowledges an explicitly observed completion: if you read a job after it finished, no further notice is sent for that job. `shell_status` remains metadata-only and does not acknowledge delivery.
 8. The optional default-off `completion-notifications` extension reads only in-memory origin and delivery state for jobs from the same session. Related `notifyOnExit:true` jobs defer one generic terminal toast until their completion follow-up settles; in-band, observed, and `notifyOnExit:false` jobs do not block. This coordination never changes job metadata, logs, cancellation, or delivery behavior.
 
@@ -180,13 +181,13 @@ Defaults (constants, not configurable):
 - `shell_read` tail mode cap: max **500 lines / 120 KB** per selected stream. Range mode uses explicit `offset`/`limit` and has no fixed line cap.
 - Maximum commands per call: **12**.
 
-If you need to inspect storage health, run `/async:status`. To inspect output yourself without adding it to model context, run `/async:view`.
+If you need to inspect storage health, run `/async:status`. To inspect output yourself without adding it to model context, run `/async:view`. To reclaim selected ordinary-job storage, preview `/async:prune <exact-job-ids>` and repeat the identical set with `--confirm`; there is no automatic or time-based pruning.
 
 ## Notes
 
 - There is intentionally no model-facing `shell_wait` or polling tool. Continue useful work while jobs run; if there is no useful work, stop after reporting that jobs are running. Completion notices will resume the agent.
 - Do not paste raw stdout/stderr unless the user explicitly asks. Use `shell_read` tail mode for recent inspection after a completion notice, `shell_read` range mode for exact line ranges/continuation, and `search_many`/`read_many` on `stdout_log` or `stderr_log` for targeted file inspection.
-- Tests cover spawn, durable logs, pre-start interruption, interruption during the grace period without job termination, batched completions, `notifyOnExit:false`, cancel suppression, `shell_read` tail/range reads, compact rendering, error fallback, viewer parsing/bounds/history/sanitization/headless behavior, and live-follow cleanup (`tests/async-shell.test.ts`, `tests/native-tools.test.ts`).
+- Tests cover spawn, fail-closed pre-spawn metadata, durable logs, pre-start interruption, interruption during the grace period without job termination, reload-stable batched completions, exact previewed pruning, `notifyOnExit:false`, cancel suppression, `shell_read` tail/range reads, compact rendering, error fallback, viewer parsing/bounds/history/sanitization/headless behavior, and live-follow cleanup (`tests/async-shell.test.ts`, `tests/native-tools.test.ts`).
 
 ## Live-process boundary
 

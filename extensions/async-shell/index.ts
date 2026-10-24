@@ -1,6 +1,6 @@
 import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { accessSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { Type, type Static } from "@earendil-works/pi-ai";
@@ -124,6 +124,7 @@ type CompletionDeliveryContext = {
 
 type CompletionDeliveryRuntime = {
   active: boolean;
+  generation: number;
 };
 
 type AsyncShellActivityListener = () => void;
@@ -200,6 +201,19 @@ export type AsyncShellViewerArgs = {
   stream: AsyncShellViewerStream;
   tailLines: number;
   follow: boolean;
+};
+
+export type AsyncShellPruneArgs = {
+  help: boolean;
+  confirm: boolean;
+  jobIds: string[];
+};
+
+export type AsyncShellPruneEntry = {
+  jobId: string;
+  status: JobStatus;
+  bytes: number;
+  logDir: string;
 };
 
 export type AsyncShellViewerStreamSnapshot = {
@@ -315,12 +329,20 @@ type ReadInput = Static<typeof ReadParams>;
 type CancelInput = Static<typeof CancelParams>;
 
 const ASYNC_SHELL_RUNTIME_HOLDER_KEY = Symbol.for("@akoumjian/pi-tools/async-shell-runtime");
-const ASYNC_SHELL_RUNTIME_HOLDER_VERSION = 1;
+const ASYNC_SHELL_RUNTIME_HOLDER_VERSION = 2;
 
 type AsyncShellRuntimeHolder = {
   version: typeof ASYNC_SHELL_RUNTIME_HOLDER_VERSION;
   jobs: Map<string, JobRuntime>;
   activityListeners: Set<AsyncShellActivityListener>;
+  pendingCompletionNotifications: Map<string, JobRuntime>;
+  completionDeliveryBatches: Map<string, CompletionDeliveryBatch>;
+  scheduledCompletionJobIds: Set<string>;
+  completionBatchFlushTimer?: NodeJS.Timeout;
+  latestCompletionContext?: CompletionDeliveryContext;
+  activeCompletionRuntime?: CompletionDeliveryRuntime;
+  activeCompletionApi?: ExtensionAPI;
+  nextCompletionGeneration: number;
 };
 
 function asyncShellRuntimeHolder(): AsyncShellRuntimeHolder {
@@ -331,7 +353,11 @@ function asyncShellRuntimeHolder(): AsyncShellRuntimeHolder {
       typeof existing !== "object" ||
       existing.version !== ASYNC_SHELL_RUNTIME_HOLDER_VERSION ||
       !(existing.jobs instanceof Map) ||
-      !(existing.activityListeners instanceof Set)
+      !(existing.activityListeners instanceof Set) ||
+      !(existing.pendingCompletionNotifications instanceof Map) ||
+      !(existing.completionDeliveryBatches instanceof Map) ||
+      !(existing.scheduledCompletionJobIds instanceof Set) ||
+      typeof existing.nextCompletionGeneration !== "number"
     ) {
       throw new Error(`Incompatible async-shell runtime holder for version ${ASYNC_SHELL_RUNTIME_HOLDER_VERSION}.`);
     }
@@ -340,7 +366,11 @@ function asyncShellRuntimeHolder(): AsyncShellRuntimeHolder {
   const created: AsyncShellRuntimeHolder = {
     version: ASYNC_SHELL_RUNTIME_HOLDER_VERSION,
     jobs: new Map<string, JobRuntime>(),
-    activityListeners: new Set<AsyncShellActivityListener>()
+    activityListeners: new Set<AsyncShellActivityListener>(),
+    pendingCompletionNotifications: new Map<string, JobRuntime>(),
+    completionDeliveryBatches: new Map<string, CompletionDeliveryBatch>(),
+    scheduledCompletionJobIds: new Set<string>(),
+    nextCompletionGeneration: 0
   };
   Reflect.set(globalThis, ASYNC_SHELL_RUNTIME_HOLDER_KEY, created);
   return created;
@@ -349,6 +379,9 @@ function asyncShellRuntimeHolder(): AsyncShellRuntimeHolder {
 const asyncShellRuntime = asyncShellRuntimeHolder();
 const jobs = asyncShellRuntime.jobs;
 const asyncShellActivityListeners = asyncShellRuntime.activityListeners;
+const pendingCompletionNotifications = asyncShellRuntime.pendingCompletionNotifications;
+const completionDeliveryBatches = asyncShellRuntime.completionDeliveryBatches;
+const scheduledCompletionJobIds = asyncShellRuntime.scheduledCompletionJobIds;
 
 function subscribeAsyncShellActivity(listener: AsyncShellActivityListener): () => void {
   asyncShellActivityListeners.add(listener);
@@ -365,11 +398,6 @@ function notifyAsyncShellActivity(): void {
   }
 }
 
-const scheduledCompletionNotifications = new WeakSet<CompletionNotificationTarget>();
-const pendingCompletionNotifications = new Map<string, JobRuntime>();
-const completionDeliveryBatches = new Map<string, CompletionDeliveryBatch>();
-let completionBatchFlushTimer: NodeJS.Timeout | undefined;
-let latestCompletionContext: CompletionDeliveryContext | undefined;
 
 export function getAsyncShellCompletionBarrier(
   context: Pick<ExtensionContext, "cwd" | "sessionManager">,
@@ -397,10 +425,18 @@ export function isAsyncShellCompletionBarrierTarget(target: {
 }
 
 export default function asyncShellExtension(api: ExtensionAPI): void {
-  const completionRuntime: CompletionDeliveryRuntime = { active: true };
+  const completionRuntime: CompletionDeliveryRuntime = {
+    active: true,
+    generation: ++asyncShellRuntime.nextCompletionGeneration
+  };
+  const priorCompletionRuntime = asyncShellRuntime.activeCompletionRuntime;
+  if (priorCompletionRuntime !== undefined) priorCompletionRuntime.active = false;
+  asyncShellRuntime.activeCompletionRuntime = completionRuntime;
+  asyncShellRuntime.activeCompletionApi = api;
   let unsubscribeActivity: (() => void) | undefined;
 
   api.on("session_start", (_event, context) => {
+    bindCompletionRuntime(api, completionRuntime, context);
     unsubscribeActivity?.();
     unsubscribeActivity = undefined;
     if (context.mode !== "tui" || !context.hasUI) return;
@@ -420,6 +456,18 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
       description: "Show async-shell job storage and recent job diagnostics",
       handler: async (_args, context) => {
         context.ui.notify(buildAsyncShellStatusText(context), "info");
+      }
+    },
+    []
+  );
+
+  registerCommandWithAliases(
+    api,
+    "async:prune",
+    {
+      description: "Preview or explicitly prune exact terminal ordinary async-shell jobs",
+      handler: async (args, context) => {
+        handleAsyncShellPruneCommand(context, args);
       }
     },
     []
@@ -457,8 +505,7 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     if (context.mode === "tui" && context.hasUI && typeof context.ui?.setStatus === "function") context.ui.setStatus(ASYNC_SHELL_ACTIVITY_STATUS_KEY, undefined);
     unsubscribeActivity?.();
     unsubscribeActivity = undefined;
-    completionRuntime.active = false;
-    abandonCompletionRuntime(completionRuntime);
+    detachCompletionRuntime(completionRuntime);
     const owner = workerOwnerFromEnvironment();
     if (owner) await cancelAsyncShellJobsForOwner(owner);
   });
@@ -693,8 +740,18 @@ function startJob(
     throw error;
   }
 
+  const pid = child.pid;
+  const failedBeforeSpawn = pid === undefined;
   const runtime: JobRuntime = {
     ...job,
+    ...(failedBeforeSpawn
+      ? {
+          status: "failed" as const,
+          endedAt: new Date().toISOString(),
+          durationMs: Date.now() - startedAtMs,
+          error: `Unable to spawn async job process: ${processInput.executable} did not receive a process id.`
+        }
+      : {}),
     process: child,
     waiters: [],
     activeWaiters: 0,
@@ -704,32 +761,40 @@ function startJob(
     originProjectCwd: context.cwd,
     originSessionId: context.sessionManager.getSessionId(),
     completionDelivery: resolveCompletionDelivery(input.completionDelivery),
-    completionRuntime: input.completionRuntime ?? { active: true },
+    completionRuntime: input.completionRuntime ?? { active: true, generation: 0 },
     completionFollowUpQueued: false,
     settleProcessGroup: input.settleProcessGroup ?? false,
     showInActivity: input.showInActivity ?? true,
     pendingLogDir,
     cancellationEffect: processInput.cancellationEffect,
-    pid: child.pid
+    pid
   };
 
-  jobs.set(jobId, runtime);
-  notifyAsyncShellActivity();
-  child.on("error", (error) => finalizeJob(api, runtime, "failed", undefined, undefined, error.message));
-  child.on("close", (code, signal) => {
-    finalizeJobAfterProcessGroupExit(api, runtime, code, signal);
+  child.on("error", (error) => {
+    if (failedBeforeSpawn) {
+      runtime.error = error.message;
+      try { writeMeta(runtime); } catch {}
+      return;
+    }
+    finalizeJob(api, runtime, "failed", undefined, undefined, error.message);
   });
+  child.on("close", (code, signal) => {
+    if (!failedBeforeSpawn) finalizeJobAfterProcessGroupExit(api, runtime, code, signal);
+  });
+  jobs.set(jobId, runtime);
   try {
-    input.persistSpawnedMetadata?.(runtime);
+    if (!failedBeforeSpawn) input.persistSpawnedMetadata?.(runtime);
     writeMeta(runtime);
   } catch (cause) {
     runtime.startupError = `Unable to persist spawned async job metadata: ${cause instanceof Error ? cause.message : String(cause)}`;
     runtime.notifyOnExit = false;
-    try {
-      signalAsyncJobExecution(runtime.pid, runtime.processToken, "SIGKILL");
-    } catch {}
+    if (!failedBeforeSpawn) {
+      try {
+        signalAsyncJobExecution(runtime.pid, runtime.processToken, "SIGKILL");
+      } catch {}
+    }
   }
-
+  notifyAsyncShellActivity();
   child.unref();
 
   return runtime;
@@ -1006,13 +1071,14 @@ function scheduleCompletionNotification(api: ExtensionAPI, job: JobRuntime): voi
 }
 
 function scheduleCompletionFollowUp(target: CompletionNotificationTarget, options: CompletionNotificationOptions): void {
-  if (!target.notifyOnExit || target.completionNotified || scheduledCompletionNotifications.has(target)) {
+  const scheduledJobId = "jobId" in target && typeof target.jobId === "string" ? target.jobId : undefined;
+  if (!target.notifyOnExit || target.completionNotified || (scheduledJobId !== undefined && scheduledCompletionJobIds.has(scheduledJobId))) {
     return;
   }
 
-  scheduledCompletionNotifications.add(target);
+  if (scheduledJobId !== undefined) scheduledCompletionJobIds.add(scheduledJobId);
   setTimeout(() => {
-    scheduledCompletionNotifications.delete(target);
+    if (scheduledJobId !== undefined) scheduledCompletionJobIds.delete(scheduledJobId);
 
     // The timer intentionally runs after waiter promises and shell_start's
     // finishStartGracePeriod() continuation have had a chance to suppress an
@@ -1026,21 +1092,20 @@ function scheduleCompletionFollowUp(target: CompletionNotificationTarget, option
   }, 0);
 }
 
-function queueCompletionNotification(api: ExtensionAPI, job: JobRuntime): void {
+function queueCompletionNotification(_api: ExtensionAPI, job: JobRuntime): void {
   if (!job.completionRuntime.active || job.completionNotified) return;
   pendingCompletionNotifications.set(job.jobId, job);
-  scheduleCompletionBatchFlush(api, job.completionContext);
+  const activeApi = asyncShellRuntime.activeCompletionApi;
+  if (activeApi !== undefined) scheduleCompletionBatchFlush(activeApi, job.completionContext);
 }
 
 function scheduleCompletionBatchFlush(api: ExtensionAPI, context: CompletionDeliveryContext): void {
-  latestCompletionContext = context;
-  if (completionBatchFlushTimer !== undefined) {
-    return;
-  }
+  asyncShellRuntime.latestCompletionContext = context;
+  if (asyncShellRuntime.completionBatchFlushTimer !== undefined) return;
 
-  completionBatchFlushTimer = setTimeout(() => {
-    completionBatchFlushTimer = undefined;
-    flushCompletionNotificationBatch(api, latestCompletionContext, { allowActive: false });
+  asyncShellRuntime.completionBatchFlushTimer = setTimeout(() => {
+    asyncShellRuntime.completionBatchFlushTimer = undefined;
+    flushCompletionNotificationBatch(api, asyncShellRuntime.latestCompletionContext, { allowActive: false });
   }, COMPLETION_BATCH_FLUSH_DELAY_MS);
 }
 
@@ -1101,7 +1166,61 @@ function acknowledgeCompletionMessage(message: unknown, context: ExtensionContex
     batch.originSessionId !== context.sessionManager.getSessionId() ||
     details.originSessionId !== batch.originSessionId
   ) return;
+  acknowledgeCompletionBatch(batch);
+}
 
+function bindCompletionRuntime(api: ExtensionAPI, runtime: CompletionDeliveryRuntime, context: ExtensionContext): void {
+  const prior = asyncShellRuntime.activeCompletionRuntime;
+  if (prior !== undefined && prior !== runtime) prior.active = false;
+  runtime.active = true;
+  runtime.generation = ++asyncShellRuntime.nextCompletionGeneration;
+  asyncShellRuntime.activeCompletionRuntime = runtime;
+  asyncShellRuntime.activeCompletionApi = api;
+
+  const sessionId = context.sessionManager.getSessionId();
+  if (!sessionId) return;
+  const deliveryContext = createCompletionDeliveryContext(context);
+  const observedDeliveryIds = asyncShellSessionDeliveryIds(context);
+  for (const [deliveryId, batch] of completionDeliveryBatches) {
+    if (batch.originSessionId !== sessionId) continue;
+    if (observedDeliveryIds.has(deliveryId)) {
+      acknowledgeCompletionBatch(batch);
+      continue;
+    }
+    completionDeliveryBatches.delete(deliveryId);
+    for (const jobId of batch.jobIds) {
+      const job = jobs.get(jobId);
+      if (!job || job.originSessionId !== sessionId || job.originProjectCwd !== context.cwd || job.completionNotified) continue;
+      job.completionFollowUpQueued = false;
+      pendingCompletionNotifications.set(jobId, job);
+    }
+  }
+
+  for (const job of jobs.values()) {
+    if (job.originProjectCwd !== context.cwd || job.originSessionId !== sessionId) continue;
+    job.completionRuntime = runtime;
+    job.completionContext = deliveryContext;
+    if (isTerminal(job.status) && job.notifyOnExit && !job.completionNotified && !job.completionFollowUpQueued) {
+      pendingCompletionNotifications.set(job.jobId, job);
+    }
+  }
+  if (pendingCompletionNotifications.size > 0) scheduleCompletionBatchFlush(api, deliveryContext);
+}
+
+function asyncShellSessionDeliveryIds(context: ExtensionContext): Set<string> {
+  const ids = new Set<string>();
+  const visit = (value: unknown): void => {
+    if (!isRecord(value)) return;
+    if (typeof value.deliveryId === "string" && value.deliveryId.startsWith("async-shell:")) ids.add(value.deliveryId);
+    for (const child of Object.values(value)) Array.isArray(child) ? child.forEach(visit) : visit(child);
+  };
+  try {
+    for (const entry of context.sessionManager.getEntries()) visit(entry);
+  } catch {}
+  return ids;
+}
+
+function acknowledgeCompletionBatch(batch: CompletionDeliveryBatch): void {
   completionDeliveryBatches.delete(batch.deliveryId);
   for (const jobId of batch.jobIds) {
     const job = jobs.get(jobId);
@@ -1113,22 +1232,16 @@ function acknowledgeCompletionMessage(message: unknown, context: ExtensionContex
   }
 }
 
-function abandonCompletionRuntime(runtime: CompletionDeliveryRuntime): void {
-  if (completionBatchFlushTimer !== undefined) {
-    clearTimeout(completionBatchFlushTimer);
-    completionBatchFlushTimer = undefined;
-    latestCompletionContext = undefined;
+function detachCompletionRuntime(runtime: CompletionDeliveryRuntime): void {
+  runtime.active = false;
+  if (asyncShellRuntime.activeCompletionRuntime !== runtime) return;
+  asyncShellRuntime.activeCompletionRuntime = undefined;
+  asyncShellRuntime.activeCompletionApi = undefined;
+  if (asyncShellRuntime.completionBatchFlushTimer !== undefined) {
+    clearTimeout(asyncShellRuntime.completionBatchFlushTimer);
+    asyncShellRuntime.completionBatchFlushTimer = undefined;
   }
-  for (const [jobId, job] of pendingCompletionNotifications) {
-    if (job.completionRuntime !== runtime) continue;
-    job.completionFollowUpQueued = false;
-    pendingCompletionNotifications.delete(jobId);
-  }
-  for (const [deliveryId, batch] of completionDeliveryBatches) {
-    if (Array.from(batch.jobIds).some((jobId) => jobs.get(jobId)?.completionRuntime === runtime)) {
-      completionDeliveryBatches.delete(deliveryId);
-    }
-  }
+  asyncShellRuntime.latestCompletionContext = undefined;
 }
 
 function createCompletionDeliveryContext(
@@ -1804,6 +1917,122 @@ function resolveCwd(context: ExtensionContext, requestedCwd: string | undefined)
   return path.resolve(base, expandHome(requestedCwd));
 }
 
+export function parseAsyncShellPruneArgs(rawArgs: string): AsyncShellPruneArgs {
+  const tokens = rawArgs.trim() === "" ? [] : rawArgs.trim().split(/\s+/);
+  const jobIds: string[] = [];
+  let help = false;
+  let confirm = false;
+  for (const token of tokens) {
+    if (token === "--help" || token === "-h") {
+      help = true;
+      continue;
+    }
+    if (token === "--confirm") {
+      confirm = true;
+      continue;
+    }
+    if (token.startsWith("-")) throw new Error(`${buildAsyncShellPruneUsage()}\n\nUnknown option: ${token}`);
+    assertValidAsyncJobId(token);
+    if (!jobIds.includes(token)) jobIds.push(token);
+  }
+  if (jobIds.length > 100) throw new Error("Prune accepts at most 100 exact job ids.");
+  return { help, confirm, jobIds };
+}
+
+export function buildAsyncShellPruneUsage(): string {
+  return [
+    "Usage: /async:prune <job-id> [job-id ...] [--confirm]",
+    "",
+    "Without --confirm, performs a read-only preview. Confirmation revalidates the complete exact set before deletion.",
+    "Only terminal ordinary jobs with completed delivery evidence are eligible; active, unknown, worker-owned, or undelivered jobs fail closed.",
+    "There is no wildcard, age selector, automatic pruning, or time-based deletion."
+  ].join("\n");
+}
+
+export function previewAsyncShellPrune(context: Pick<ExtensionContext, "cwd">, jobIds: string[]): AsyncShellPruneEntry[] {
+  if (jobIds.length === 0) throw new Error(buildAsyncShellPruneUsage());
+  const root = path.join(jobsRoot(context.cwd), "jobs");
+  return jobIds.map((jobId) => {
+    assertValidAsyncJobId(jobId);
+    const logDir = path.join(root, jobId);
+    if (!existsSync(logDir)) throw new Error(`Async shell job does not exist: ${jobId}`);
+    const entryStat = lstatSync(logDir);
+    if (!entryStat.isDirectory() || entryStat.isSymbolicLink()) throw new Error(`Async shell job path is not an ordinary directory: ${jobId}`);
+    const realRoot = realpathSync(root);
+    const realLogDir = realpathSync(logDir);
+    if (path.dirname(realLogDir) !== realRoot || path.basename(realLogDir) !== jobId) throw new Error(`Async shell job path escapes its registry: ${jobId}`);
+    const job = readMetaFile(path.join(realLogDir, "meta.json"), realRoot, jobId);
+    if (!job) throw new Error(`Async shell job metadata is missing or invalid: ${jobId}`);
+    const live = jobs.get(jobId);
+    if (job.owner !== undefined) throw new Error(`Worker-owned async job must be removed through worker cleanup: ${jobId}`);
+    if (!isTerminal(job.status) || job.status === "unknown") throw new Error(`Async shell job is not terminal: ${jobId} (${job.status})`);
+    if (live !== undefined && (!isTerminal(live.status) || live.activeWaiters > 0)) throw new Error(`Async shell job is still active: ${jobId}`);
+    if (job.notifyOnExit && !job.completionNotified) throw new Error(`Async shell job still has undelivered completion evidence: ${jobId}`);
+    if (live?.completionFollowUpQueued) throw new Error(`Async shell job still has a queued completion follow-up: ${jobId}`);
+    if (isAsyncJobExecutionAlive(job.pid, job.processToken)) throw new Error(`Async shell job process identity is still alive: ${jobId}`);
+    const outputBytes = asyncJobOutputBytes(job.stdoutLog, job.stderrLog);
+    const metaBytes = existsSync(path.join(realLogDir, "meta.json")) ? statSync(path.join(realLogDir, "meta.json")).size : 0;
+    return { jobId, status: job.status, bytes: outputBytes.stdout + outputBytes.stderr + metaBytes, logDir: realLogDir };
+  });
+}
+
+export function pruneAsyncShellJobs(context: Pick<ExtensionContext, "cwd">, jobIds: string[]): AsyncShellPruneEntry[] {
+  const entries = previewAsyncShellPrune(context, jobIds);
+  const renamed: Array<{ entry: AsyncShellPruneEntry; trash: string }> = [];
+  try {
+    for (const entry of entries) {
+      const trash = path.join(path.dirname(entry.logDir), `.prune-${entry.jobId}-${randomUUID()}`);
+      renameSync(entry.logDir, trash);
+      renamed.push({ entry, trash });
+    }
+  } catch (error) {
+    for (const item of renamed.reverse()) {
+      try { renameSync(item.trash, item.entry.logDir); } catch {}
+    }
+    throw error;
+  }
+  for (const item of renamed) {
+    rmSync(item.trash, { recursive: true, force: true });
+    forgetAsyncShellJob(item.entry.jobId);
+  }
+  return entries;
+}
+
+function forgetAsyncShellJob(jobId: string): void {
+  jobs.delete(jobId);
+  pendingCompletionNotifications.delete(jobId);
+  scheduledCompletionJobIds.delete(jobId);
+  for (const [deliveryId, batch] of completionDeliveryBatches) {
+    batch.jobIds.delete(jobId);
+    if (batch.jobIds.size === 0) completionDeliveryBatches.delete(deliveryId);
+  }
+  notifyAsyncShellActivity();
+}
+
+export function handleAsyncShellPruneCommand(context: ExtensionCommandContext, rawArgs: string): void {
+  let args: AsyncShellPruneArgs;
+  try {
+    args = parseAsyncShellPruneArgs(rawArgs);
+  } catch (error) {
+    context.ui.notify(error instanceof Error ? error.message : String(error), "error");
+    return;
+  }
+  if (args.help) {
+    context.ui.notify(buildAsyncShellPruneUsage(), "info");
+    return;
+  }
+  try {
+    const entries = args.confirm ? pruneAsyncShellJobs(context, args.jobIds) : previewAsyncShellPrune(context, args.jobIds);
+    const bytes = entries.reduce((sum, entry) => sum + entry.bytes, 0);
+    context.ui.notify(
+      `${args.confirm ? "Pruned" : "Prune preview"}: ${entries.length} job${entries.length === 1 ? "" : "s"}, ${formatBytes(bytes)}\n${entries.map((entry) => `${entry.jobId} · ${entry.status} · ${formatBytes(entry.bytes)}`).join("\n")}${args.confirm ? "" : "\nRun the same exact command with --confirm to delete."}`,
+      args.confirm ? "info" : "warning"
+    );
+  } catch (error) {
+    context.ui.notify(error instanceof Error ? error.message : String(error), "error");
+  }
+}
+
 export function parseAsyncShellViewerArgs(rawArgs: string): AsyncShellViewerArgs {
   const tokens = rawArgs.trim() === "" ? [] : rawArgs.trim().split(/\s+/);
   const result: AsyncShellViewerArgs = {
@@ -2253,9 +2482,16 @@ function statusColor(status: JobStatus): "success" | "error" | "warning" | "mute
   return "muted";
 }
 
+function countStoredAsyncShellJobDirectories(projectCwd: string): number {
+  const root = path.join(jobsRoot(projectCwd), "jobs");
+  if (!existsSync(root)) return 0;
+  return readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory() && isValidAsyncJobId(entry.name)).length;
+}
+
 export function buildAsyncShellStatusText(context: Pick<ExtensionContext, "cwd">): string {
   const root = jobsRoot(context.cwd);
   const recentJobs = listJobs(context as ExtensionContext, 20);
+  const storedJobCount = countStoredAsyncShellJobDirectories(context.cwd);
   const running = recentJobs.filter((job) => job.status === "running").length;
   const terminal = recentJobs.length - running;
   return [
@@ -2263,6 +2499,7 @@ export function buildAsyncShellStatusText(context: Pick<ExtensionContext, "cwd">
     "",
     `Job root: ${root}`,
     `Job root state: ${describePathAccess(root)}`,
+    `Stored job directories: ${storedJobCount}`,
     `Recent jobs: ${recentJobs.length} (${running} running, ${terminal} terminal or detached)`,
     running > 0 ? "Use /async:view for provider-free human viewing, shell_status without a jobId to list jobs, shell_read for model inspection, or shell_cancel to stop a running job. Do not poll; completion notices will be batched into history and resume the agent." : "No running jobs in the recent async-shell registry. Use /async:view to inspect historical output.",
     recentJobs.some((job) => job.status === "unknown") ? "Some jobs were started by a previous Pi process and are no longer attached." : undefined

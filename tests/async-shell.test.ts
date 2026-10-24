@@ -11,6 +11,7 @@ import asyncShellExtension, {
   ASYNC_SHELL_ACTIVITY_STATUS_KEY,
   activeAsyncShellJobCount,
   activeAsyncShellJobsForOwner,
+  buildAsyncShellPruneUsage,
   buildAsyncShellStatusText,
   buildAsyncShellViewerFrame,
   buildAsyncShellViewerUsage,
@@ -18,7 +19,10 @@ import asyncShellExtension, {
   cancelPersistedAsyncShellJobsForOwner,
   createAsyncShellViewerComponent,
   loadAsyncShellViewerSnapshot,
+  parseAsyncShellPruneArgs,
   parseAsyncShellViewerArgs,
+  previewAsyncShellPrune,
+  pruneAsyncShellJobs,
   sanitizeAsyncShellViewerText,
   renderAsyncShellActivityStatus,
   startManagedAsyncJob,
@@ -188,6 +192,29 @@ async function writeJobMeta(contextDir: string, jobId: string, meta: Record<stri
   }, null, 2)}\n`);
 }
 
+test("async-shell pruning is exact, previewed, terminal-only, and separate from worker cleanup", async () => {
+  await withTempDir(async (dir) => {
+    const eligible = "job_20261024180000_prune001";
+    const undelivered = "job_20261024180000_prune002";
+    const workerOwned = "job_20261024180000_prune003";
+    await writeJobMeta(dir, eligible, { status: "exited", notifyOnExit: false, completionNotified: true });
+    await writeJobMeta(dir, undelivered, { status: "failed", notifyOnExit: true, completionNotified: false });
+    await writeJobMeta(dir, workerOwned, { status: "cancelled", owner: { kind: "worker-run", workerId: "worker_20261024180000_prune01", runId: "run_20261024180000_prune01" } });
+
+    assert.deepEqual(parseAsyncShellPruneArgs(`${eligible} ${eligible}`), { help: false, confirm: false, jobIds: [eligible] });
+    assert.match(buildAsyncShellPruneUsage(), /no wildcard/i);
+    assert.throws(() => parseAsyncShellPruneArgs("*"), /Invalid async shell job id/);
+    const preview = previewAsyncShellPrune({ cwd: dir }, [eligible]);
+    assert.equal(preview[0]?.jobId, eligible);
+    assert.ok(existsSync(preview[0]!.logDir), "preview is read-only");
+    assert.throws(() => previewAsyncShellPrune({ cwd: dir }, [undelivered]), /undelivered completion evidence/);
+    assert.throws(() => previewAsyncShellPrune({ cwd: dir }, [workerOwned]), /worker cleanup/);
+    const deleted = pruneAsyncShellJobs({ cwd: dir }, [eligible]);
+    assert.equal(deleted.length, 1);
+    assert.equal(existsSync(preview[0]!.logDir), false);
+  });
+});
+
 test("async-shell activity status is compact, themed, exact-session scoped, and lifecycle driven", async () => {
   await withTempDir(async (dir) => {
     const api = createFakeApi();
@@ -328,6 +355,89 @@ test("async-shell activity survives a fresh module reload and old completion cle
   });
 });
 
+test("ordinary async-shell completion rebinds to the fresh extension runtime after reload", async () => {
+  await withTempDir(async (dir) => {
+    const originalApi = createFakeApi();
+    asyncShellExtension(originalApi);
+    const sessionId = "reload-delivery-session";
+    const originalContext = {
+      ...createContext(dir),
+      sessionManager: { getSessionId: () => sessionId, getEntries: () => [] }
+    } as unknown as ExtensionContext;
+    await originalApi.emit("session_start", { reason: "startup" }, originalContext);
+    const handle = startManagedAsyncJob(originalApi, originalContext, {
+      command: "reload delivery probe",
+      cwd: dir,
+      executable: process.execPath,
+      args: ["-e", "setTimeout(() => {}, 180)"],
+      notifyOnExit: true
+    });
+    await delay(30);
+    await originalApi.emit("session_shutdown", { reason: "reload" }, originalContext);
+
+    const freshModule = await import(`../extensions/async-shell/index.js?delivery-reload=${Date.now()}`);
+    const freshApi = createFakeApi();
+    freshModule.default(freshApi);
+    const freshContext = {
+      ...createContext(dir),
+      sessionManager: { getSessionId: () => sessionId, getEntries: () => [] }
+    } as unknown as ExtensionContext;
+    await freshApi.emit("session_start", { reason: "reload" }, freshContext);
+    await waitWithRefTimeout(handle.completion);
+    await delay(200);
+    await freshApi.emit("agent_end", {}, freshContext);
+    assert.equal(originalApi.sentMessages.length, 0, "the detached runtime never delivers completion");
+    assert.equal(freshApi.sentMessages.length, 1, "the latest same-session runtime delivers completion");
+    const delivered = freshApi.sentMessages[0]!.message as { customType?: string; details?: { originSessionId?: string } };
+    assert.equal(delivered.customType, "async-shell");
+    assert.equal(delivered.details?.originSessionId, sessionId);
+    await freshApi.emit("session_shutdown", { reason: "quit" }, freshContext);
+  });
+});
+
+test("reload acknowledges an accepted async-shell delivery already present in the same session", async () => {
+  await withTempDir(async (dir) => {
+    const originalApi = createFakeApi();
+    asyncShellExtension(originalApi);
+    const sessionId = "reload-observed-delivery-session";
+    const originalContext = {
+      ...createContext(dir),
+      sessionManager: { getSessionId: () => sessionId, getEntries: () => [] }
+    } as unknown as ExtensionContext;
+    await originalApi.emit("session_start", { reason: "startup" }, originalContext);
+    const handle = startManagedAsyncJob(originalApi, originalContext, {
+      command: "observed reload delivery probe",
+      cwd: dir,
+      executable: process.execPath,
+      args: ["-e", "setTimeout(() => {}, 80)"],
+      notifyOnExit: true
+    });
+    const completed = await waitWithRefTimeout(handle.completion);
+    await delay(200);
+    assert.equal(originalApi.sentMessages.length, 1);
+    const recordedMessage = originalApi.sentMessages[0]!.message;
+    await originalApi.emit("session_shutdown", { reason: "reload" }, originalContext);
+
+    const freshModule = await import(`../extensions/async-shell/index.js?observed-delivery-reload=${Date.now()}`);
+    const freshApi = createFakeApi();
+    freshModule.default(freshApi);
+    const freshContext = {
+      ...createContext(dir),
+      sessionManager: {
+        getSessionId: () => sessionId,
+        getEntries: () => [{ type: "message", message: recordedMessage }]
+      }
+    } as unknown as ExtensionContext;
+    await freshApi.emit("session_start", { reason: "reload" }, freshContext);
+    await delay(150);
+    await freshApi.emit("agent_end", {}, freshContext);
+    assert.equal(freshApi.sentMessages.length, 0, "session-recorded delivery is acknowledged rather than replayed");
+    const persisted = JSON.parse(await readFile(path.join(completed.logDir, "meta.json"), "utf8")) as { completionNotified: boolean };
+    assert.equal(persisted.completionNotified, true);
+    await freshApi.emit("session_shutdown", { reason: "quit" }, freshContext);
+  });
+});
+
 test("async-shell rejects an incompatible process-global runtime holder", () => {
   const moduleUrl = new URL("../extensions/async-shell/index.js", import.meta.url).href;
   const script = [
@@ -407,6 +517,7 @@ test("async-shell-status reports job root and recent jobs", async () => {
     asyncShellExtension(api);
 
     assert.ok(api.commands.has("async:status"));
+    assert.ok(api.commands.has("async:prune"));
     assert.equal(api.commands.has("async-shell-status"), false, "deprecated kebab alias removed");
     const text = buildAsyncShellStatusText(createContext(dir));
     assert.match(text, /Async shell status/);
@@ -1030,9 +1141,14 @@ test("shell_start reports spawn errors for missing shells", async () => {
       createContext(dir)
     );
 
-    const details = result.details as { jobs: Array<{ status: string; error?: string }> };
+    const details = result.details as { jobs: Array<{ status: string; error?: string; pid?: number; stdoutLog: string }> };
     assert.equal(details.jobs[0].status, "failed");
-    assert.match(details.jobs[0].error ?? "", /ENOENT|no such/i);
+    assert.match(details.jobs[0].error ?? "", /ENOENT|no such|process id/i);
+    assert.equal((details.jobs[0] as { pid?: number }).pid, undefined);
+    const persisted = JSON.parse(await readFile(path.join(path.dirname(details.jobs[0].stdoutLog), "meta.json"), "utf8")) as { status: string; pid?: number };
+    assert.equal(persisted.status, "failed");
+    assert.equal(persisted.pid, undefined);
+    assert.deepEqual((await readdir(path.join(dir, ".pi", "async-shell", "jobs"))).filter((entry) => entry.startsWith(".pending-")), []);
   });
 });
 
@@ -1577,7 +1693,7 @@ test("managed process-group settlement waits when the host leader exits before i
     asyncShellExtension(api);
     const marker = path.join(dir, "managed-host-descendant.pid");
     const childSource = "setInterval(()=>{},1000)";
-    const source = `const{spawn}=require('node:child_process'),fs=require('node:fs');const child=spawn(process.execPath,['-e',${JSON.stringify(childSource)}],{stdio:'ignore'});fs.writeFileSync(${JSON.stringify(marker)},String(child.pid));`;
+    const source = `const{spawn}=require('node:child_process'),fs=require('node:fs');const child=spawn(process.execPath,['-e',${JSON.stringify(childSource)}],{stdio:'ignore'});child.unref();fs.writeFileSync(${JSON.stringify(marker)},String(child.pid));setImmediate(()=>process.exit(0));`;
     const handle = startManagedAsyncJob(api, createContext(dir), {
       jobId: "job_20260910193000_hostgroup",
       command: "managed host descendant settlement probe",
@@ -1589,10 +1705,16 @@ test("managed process-group settlement waits when the host leader exits before i
     });
     for (let attempt = 0; attempt < 200 && !existsSync(marker); attempt += 1) await delay(10);
     assert.ok(existsSync(marker));
+    const leaderPid = required(handle.snapshot().pid, "managed host leader pid");
+    let leaderAlive = true;
+    for (let attempt = 0; attempt < 200 && leaderAlive; attempt += 1) {
+      try { process.kill(leaderPid, 0); await delay(10); } catch { leaderAlive = false; }
+    }
+    assert.equal(leaderAlive, false, "the command leader must exit before descendant settlement is tested");
     let completed = false;
     void handle.completion.then(() => { completed = true; });
     await delay(100);
-    assert.equal(completed, false, "managed host completion must wait for its original process group");
+    assert.equal(completed, false, "managed host completion must wait for its original process group descendant");
     handle.cancel("SIGTERM");
     const keepAlive = setInterval(() => {}, 20);
     const job = await handle.completion.finally(() => clearInterval(keepAlive));
