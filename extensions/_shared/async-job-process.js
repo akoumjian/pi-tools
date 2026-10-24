@@ -66,7 +66,10 @@ export function probeAsyncJobProcessIdentity(identity, probes = {}) {
   const readStartToken = probes.readStartToken ?? asyncJobProcessStartToken;
   const ownedProcessIds = probes.ownedProcessIds ?? asyncJobTokenProcessIds;
   const before = probePid(identity.pid);
-  if (before !== "alive") return before;
+  if (before === "dead") return "dead";
+  // Permission ambiguity is not identity ambiguity when the immutable start
+  // token is still observable. Compare it before deciding whether this exact
+  // process requires recovery so a reused cross-user PID cannot pin a job.
   let processStartToken;
   try { processStartToken = readStartToken(identity.pid); }
   catch { return probePid(identity.pid) === "dead" ? "dead" : "unknown"; }

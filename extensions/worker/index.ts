@@ -67,6 +67,7 @@ type WorkerRuntime = { version: 2; inputs: RetainedInput[]; repositoryBaselines?
 type PendingRun = { workerId: string; runId: string; parentSessionFile: string; parentSessionId: string; runtime: RunRuntime };
 type ActiveRun = { runId: string; handle: ManagedAsyncJobHandle };
 class WorkerHostIdentityError extends Error {}
+class WorkerContainmentError extends Error {}
 type PlannedRun = {
   request: WorkerRunInputV2["runs"][number]; role: WorkerRole; workerId: string; runId: string; jobId: string; paths: WorkerPaths;
   taskIds: string[]; modelSelection: string; binding?: WorkerRunRecord["binding"]; workerRuntime: WorkerRuntime; runRuntime: RunRuntime;
@@ -83,6 +84,9 @@ export type WorkerExtensionDependencies = {
   createOverlay?: (input: Parameters<typeof createReviewOverlayAsync>[0]) => ReviewOverlayRecord | Promise<ReviewOverlayRecord>; cleanupOverlay?: (dockerPath: string, overlay: ReviewOverlayRecord) => void | Promise<void>;
   waitForHostIdentity?: (runtime: RunRuntime, workerId: string, runId: string) => Promise<void>;
   probeHostIdentity?: (identity: ReturnType<typeof readWorkerHostProcess>) => AsyncJobProcessIdentityLiveness;
+  beforeCreateRunBatch?: () => void | Promise<void>;
+  signalHostIdentity?: (identity: ReturnType<typeof readWorkerHostProcess>, signal: NodeJS.Signals) => boolean;
+  hostTerminationGraceAttempts?: number; hostForcedTerminationAttempts?: number; hostProbeDelayMs?: number;
 };
 
 export default function workerExtension(api: ExtensionAPI): void { registerWorkerExtension(api); }
@@ -100,9 +104,11 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   const createOverlay = overrides.createOverlay ?? createReviewOverlayAsync;
   const verifyHostIdentity = overrides.waitForHostIdentity ?? waitForWorkerHostIdentity;
   const probeHostIdentity = overrides.probeHostIdentity ?? probeAsyncJobProcessIdentity;
+  const signalHostIdentity = overrides.signalHostIdentity ?? signalAsyncJobProcessIdentity;
   const cleanupOverlay = overrides.cleanupOverlay ?? cleanupReviewOverlayAsync;
   let registry: WorkerRegistry | undefined;
   let runtimeGeneration = 0;
+  const parentRuntimeGenerations = new Map<string, number>();
   let deliveryTimer: NodeJS.Timeout | undefined;
   let observedDataVersion = 0;
   let currentContext: ExtensionContext | undefined;
@@ -152,9 +158,13 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       currentContext = context;
       const parent = context.sessionManager.getSessionFile(); if (!parent) return;
       const exactParent = realpathOrResolve(parent);
-      runtimeGeneration = registerParentRuntime(getRegistry(), exactParent, randomUUID(), now().toISOString());
-      recoverInterruptedDiscardFiles(exactParent, runtimeGeneration);
-      recoverInterruptedClaimsForParent(getRegistry(), exactParent, runtimeGeneration, now().toISOString());
+      const retainedGeneration = parentRuntimeGenerations.get(exactParent);
+      if (retainedGeneration === undefined) {
+        runtimeGeneration = registerParentRuntime(getRegistry(), exactParent, randomUUID(), now().toISOString());
+        parentRuntimeGenerations.set(exactParent, runtimeGeneration);
+        recoverInterruptedDiscardFiles(exactParent, runtimeGeneration);
+        recoverInterruptedClaimsForParent(getRegistry(), exactParent, runtimeGeneration, now().toISOString());
+      } else runtimeGeneration = retainedGeneration;
       reconcileWorkerDeliveries(getRegistry(), exactParent, sessionDeliveryIds(context));
       deliveredRecovery.clear();
       observedDataVersion = workerRegistryDataVersion(getRegistry());
@@ -244,6 +254,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
             workspaceRoot: plan.paths.workspaceRoot, runtime: plan.workerRuntime, createdAt: timestamp, updatedAt: timestamp }, run };
           return { kind: "resume", workerId: plan.workerId, expectedVersion: plan.expectedVersion!, taskIds: plan.taskIds, runtime: plan.workerRuntime, run };
         });
+        await overrides.beforeCreateRunBatch?.();
         createWorkerRunBatch(getRegistry(), {
           items,
           reviewLeases: planned.filter((plan) => plan.role === "review").map((plan) => ({ subjectWorkerId: (plan.binding as any).reviewedWorkerId as string, reviewerWorkerId: plan.workerId, reviewedRunId: plan.reviewedRunId! })),
@@ -495,9 +506,26 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       }
       if (launchAdmission) rmSync(launchAdmission, { force: true });
       const claimed = getWorkerRun(getRegistry(), item.workerId, item.runId);
-      if (claimed?.claimKind !== "launch" || claimed.claimNonce !== nonce) { try { await removeContainer(docker(), item.runtime.container); } catch {} if (item.runtime.overlay) { try { await cleanupOverlay(docker(), item.runtime.overlay); } catch {} } }
+      if (!handle && claimed) ensureFailedLaunchLogs(claimed, error);
+      if (claimed?.claimKind !== "launch" || claimed.claimNonce !== nonce) {
+        // A successor launch or cancellation now owns the exact container
+        // boundary. Removing it here races that authority between Docker
+        // inspect/create/start. Cancellation waits for this boundary and will
+        // contain it; a successor launch will park and adopt it.
+        if (claimed?.claimKind === "cancellation" && item.runtime.overlay) { try { await cleanupOverlay(docker(), item.runtime.overlay); } catch {} }
+        return;
+      }
       await failClaimedRun(item.workerId, item.runId, "launch", nonce, error);
     }
+  }
+
+  function ensureFailedLaunchLogs(run: WorkerRunRecord, error: unknown): void {
+    if (!run.stdoutLog || !run.stderrLog) return;
+    const stdoutDir = path.dirname(run.stdoutLog); const stderrDir = path.dirname(run.stderrLog);
+    if (stdoutDir !== stderrDir) throw new Error("Worker launch log paths do not share an exact directory.");
+    mkdirSync(stdoutDir, { recursive: true, mode: 0o700 });
+    writeFileSync(run.stdoutLog, "", { flag: "a", mode: 0o600 });
+    writeFileSync(run.stderrLog, `[worker launch failed before host log publication] ${sanitizeError(error)}\n`, { flag: "a", mode: 0o600 });
   }
 
   async function waitForWorkerHostIdentity(runtime: RunRuntime, workerId: string, runId: string): Promise<void> {
@@ -521,24 +549,25 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const worker = getWorker(getRegistry(), workerId)!; const run = getWorkerRun(getRegistry(), workerId, runId)!; const runtime = run.runtime as RunRuntime;
     let outcome: any = "failed"; let outcomeSource: "worker" | "system" = "system"; let summary = "Worker run failed before accepting a result."; let question: string | undefined;
     let reported: string[] = []; let artifacts: string[] = []; const errors: Array<{ scope: "run" | "repositories" | "artifacts"; message: string }> = [];
-    try {
-      if (job.status === "exited" && job.exitCode === 0) {
+    let evidenceError: unknown; let containmentProven = false;
+    if (job.status === "exited" && job.exitCode === 0) {
+      try {
         const settled = readWorkerHostSettlement(runtime.settledFile); if (settled.workerId !== workerId || settled.runId !== runId || settled.sessionId !== worker.sessionId || path.resolve(settled.resultFile) !== path.resolve(runtime.resultFile)) throw new Error("Worker host settlement identity mismatch.");
         const accepted = readWorkerRuntimeResult(runtime.resultFile); if (accepted.workerId !== workerId || accepted.runId !== runId) throw new Error("Worker result identity mismatch.");
         outcome = accepted.result.outcome; outcomeSource = "worker"; summary = accepted.result.summary; question = accepted.result.question; reported = accepted.result.repositories ?? []; artifacts = accepted.result.artifacts ?? [];
-      } else errors.push({ scope: "run", message: sanitizeError(job.error ?? `Worker host exited with status ${job.status}${job.exitCode === undefined ? "" : ` (${job.exitCode})`}.`) });
-      const authorizationFile = revokeRuntimeAuthorization(runtime);
-      await waitForRuntimeAdmissions(runtime, authorizationFile);
-      await proveWorkerHostExited(runtime, workerId, runId);
-      await removeContainer(docker(), runtime.container);
-      if (runtime.overlay) await cleanupOverlay(docker(), runtime.overlay);
+      } catch (error) { evidenceError = error; }
+    } else errors.push({ scope: "run", message: sanitizeError(job.error ?? `Worker host exited with status ${job.status}${job.exitCode === undefined ? "" : ` (${job.exitCode})`}.`) });
+    try {
+      await containWorkerRun(runtime, workerId, runId, "result settlement");
+      containmentProven = true;
+      if (evidenceError) throw evidenceError;
       const inventory = inventoryWorkerRepositories({ workspaceRoot: worker.workspaceRoot, workerId, runId, reported, before: runtime.repositoryBefore });
       errors.push(...inventory.errors.map((message) => ({ scope: "repositories" as const, message: sanitizeError(message) })));
       finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind: "settlement", claimNonce: nonce, outcome, outcomeSource, summary: summary.slice(0, 2048), ...(question ? { question } : {}), repositories: inventory.repositories, artifacts, errors, sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile) : undefined, settledAt: now().toISOString() });
       if (currentContext?.sessionManager.getSessionFile() && realpathOrResolve(currentContext.sessionManager.getSessionFile()!) === worker.parentSessionFile) deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration);
     } catch (error) {
       const message = sanitizeError(error);
-      if (error instanceof WorkerHostIdentityError) {
+      if (!containmentProven || error instanceof WorkerHostIdentityError || error instanceof WorkerContainmentError) {
         releaseWorkerRunClaim(getRegistry(), workerId, runId, "settlement", nonce);
         recordRecovery(workerId, runId, error);
         return;
@@ -562,22 +591,10 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       }
     }
   }
-
   async function failClaimedRun(workerId: string, runId: string, claimKind: "launch" | "settlement", claimNonce: string, error: unknown): Promise<void> {
     const worker = getWorker(getRegistry(), workerId); const run = worker && getWorkerRun(getRegistry(), workerId, runId); if (!worker || !run || run.claimKind !== claimKind || run.claimNonce !== claimNonce) return; const runtime = run.runtime as RunRuntime;
     try {
-      const authorizationFile = revokeRuntimeAuthorization(runtime);
-      await waitForRuntimeAdmissions(runtime, authorizationFile);
-      const attached = active.get(workerId);
-      if (attached?.runId === runId) attached.handle.cancel("SIGTERM");
-      else await signalDetachedWorkerHost(runtime, workerId, runId, "failed-run cleanup");
-      await removeContainer(docker(), runtime.container);
-      if (attached?.runId === runId) {
-        const terminal = await Promise.race([attached.handle.completion.then((job) => job.status !== "running" && job.status !== "unknown"), delay(5_000).then(() => false)]);
-        if (!terminal) throw new Error("Worker host job did not reach a terminal state during failed-run cleanup.");
-      }
-      await proveWorkerHostExited(runtime, workerId, runId);
-      if (runtime.overlay) await cleanupOverlay(docker(), runtime.overlay);
+      await containWorkerRun(runtime, workerId, runId, "failed-run cleanup", { signalAttached: true });
       finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind, claimNonce, outcome: "failed", outcomeSource: "system", summary: "Worker run failed before accepting a result.", errors: [{ scope: "run", message: sanitizeError(error) }], sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile) : undefined, settledAt: now().toISOString() });
     } catch (cleanupError) { recordRecovery(workerId, runId, cleanupError); }
   }
@@ -594,26 +611,38 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     if (!claimWorkerCancellation(getRegistry(), worker.workerId, runId, nonce, now().toISOString())) return "not_active";
     pending.delete(runId); const run = getWorkerRun(getRegistry(), worker.workerId, runId)!; const runtime = run.runtime as RunRuntime;
     try {
-      const authorizationFile = revokeRuntimeAuthorization(runtime);
-      await waitForRuntimeAdmissions(runtime, authorizationFile);
-      const launching = starting.get(worker.workerId); if (launching?.runId === runId) await launching.completion;
-      const attached = active.get(worker.workerId); if (attached?.runId === runId) { attached.handle.cancel("SIGTERM"); }
-      else if (existsSync(runtime.processFile)) {
-        const process = readExactWorkerHostProcess(runtime, worker.workerId, runId, "cancellation");
-        const liveness = probeHostIdentity(process);
-        if (liveness === "unknown") throw new WorkerHostIdentityError("Worker host process identity could not be verified during cancellation.");
-        if (liveness === "alive") signalAsyncJobProcessIdentity(process, "SIGTERM");
-      }
-      await removeContainer(docker(), runtime.container);
-      if (attached?.runId === runId) { const terminal = await Promise.race([attached.handle.completion.then((job) => job.status !== "running" && job.status !== "unknown"), delay(5_000).then(() => false)]); if (!terminal) throw new Error("Worker host job did not reach a terminal state during cancellation."); }
-      await proveWorkerHostExited(runtime, worker.workerId, runId);
-      if (runtime.overlay) await cleanupOverlay(docker(), runtime.overlay);
+      const launching = starting.get(worker.workerId);
+      await containWorkerRun(runtime, worker.workerId, runId, "cancellation", { signalAttached: true, ...(launching?.runId === runId ? { waitForLaunch: launching.completion } : {}) });
       await reconcileTerminatedPersistedAsyncShellJobsForOwner(path.join(workerPaths(roots, worker.workerId).stateDir, "async-shell"), { kind: "worker-run", workerId: worker.workerId, runId }, 250);
       const survivors = await waitForWorkerShellRecords(worker.workerId, runId);
-      if (survivors.length) throw new Error(`Worker-owned process records remain active after container removal: ${survivors.map((job) => job.jobId).join(", ")}.`);
+      if (survivors.length) throw new WorkerContainmentError(`Worker-owned process records remain active after container removal: ${survivors.map((job) => job.jobId).join(", ")}.`);
       finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId: worker.workerId, runId, claimKind: "cancellation", claimNonce: nonce, outcome: "cancelled", outcomeSource: "system", summary: "Worker run was cancelled by its parent.", sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile) : undefined, settledAt: now().toISOString() });
       active.delete(worker.workerId); deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration); return "cancelled";
     } catch (error) { recordRecovery(worker.workerId, runId, error); throw new Error(`Worker ${worker.workerId}/${runId} cancellation requires recovery: ${sanitizeError(error)}`); }
+  }
+
+  async function containWorkerRun(runtime: RunRuntime, workerId: string, runId: string, operation: string, options: { signalAttached?: boolean; waitForLaunch?: Promise<void> } = {}): Promise<void> {
+    const failures: string[] = [];
+    const capture = async (label: string, action: () => void | Promise<void>): Promise<void> => {
+      try { await action(); } catch (error) { failures.push(`${label}: ${sanitizeError(error)}`); }
+    };
+    const authorizationFile = path.join(runtime.runDir, "host-authorization.json");
+    await capture("authorization revocation", () => { revokeRuntimeAuthorization(runtime); });
+    await capture("runtime admission drain", () => waitForRuntimeAdmissions(runtime, authorizationFile));
+    if (options.waitForLaunch) await capture("launch boundary", () => options.waitForLaunch!);
+    const attached = active.get(workerId)?.runId === runId ? active.get(workerId)!.handle : undefined;
+    if (options.signalAttached && attached) await capture("attached host SIGTERM", () => { attached.cancel("SIGTERM"); });
+    else if (!attached) await capture("detached host SIGTERM", () => signalDetachedWorkerHost(runtime, workerId, runId, operation));
+    // The exact container is an independent containment boundary. Always
+    // remove and verify it even when host-process identity remains ambiguous.
+    await capture("exact container removal", () => removeContainer(docker(), runtime.container));
+    if (attached) await capture("attached host settlement", async () => {
+      const terminal = await Promise.race([attached.completion.then((job) => job.status !== "running" && job.status !== "unknown"), delay(5_000).then(() => false)]);
+      if (!terminal) throw new Error(`Worker host job did not reach a terminal state during ${operation}.`);
+    });
+    await capture("host termination proof", () => proveWorkerHostExited(runtime, workerId, runId));
+    if (runtime.overlay) await capture("review overlay cleanup", () => cleanupOverlay(docker(), runtime.overlay!));
+    if (failures.length) throw new WorkerContainmentError(`Worker ${workerId}/${runId} ${operation} requires recovery; ${failures.join(" | ")}`);
   }
 
   function revokeRuntimeAuthorization(runtime: RunRuntime): string {
@@ -627,9 +656,8 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const processRecord = readExactWorkerHostProcess(runtime, workerId, runId, operation);
     const liveness = probeHostIdentity(processRecord);
     if (liveness === "unknown") throw new WorkerHostIdentityError(`Worker host process identity could not be verified during ${operation}.`);
-    if (liveness === "alive") signalAsyncJobProcessIdentity(processRecord, "SIGTERM");
+    if (liveness === "alive") signalVerifiedWorkerHost(processRecord, "SIGTERM", operation);
   }
-
   async function waitForRuntimeAdmissions(runtime: RunRuntime, authorizationFile: string): Promise<void> {
     const files = [workerResultAdmissionPath(runtime.resultFile), workerMutationAdmissionPath(authorizationFile), path.join(runtime.runDir, "launch-admitting.json")];
     for (let attempt = 0; attempt < 480 && files.some(runtimeAdmissionActive); attempt += 1) await delay(25);
@@ -649,13 +677,21 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   async function proveWorkerHostExited(runtime: RunRuntime, workerId: string, runId: string): Promise<void> {
     if (!existsSync(runtime.processFile)) return;
     const processRecord = readExactWorkerHostProcess(runtime, workerId, runId, "termination proof");
-    let liveness = await waitForHostLiveness(processRecord, 50);
+    let liveness = await waitForHostLiveness(processRecord, overrides.hostTerminationGraceAttempts ?? 50);
     if (liveness === "unknown") throw new WorkerHostIdentityError("Worker host process identity remained ambiguous during termination proof.");
     if (liveness === "dead") return;
-    signalAsyncJobProcessIdentity(processRecord, "SIGKILL");
-    liveness = await waitForHostLiveness(processRecord, 30);
+    signalVerifiedWorkerHost(processRecord, "SIGKILL", "forced termination");
+    liveness = await waitForHostLiveness(processRecord, overrides.hostForcedTerminationAttempts ?? 30);
     if (liveness === "unknown") throw new WorkerHostIdentityError("Worker host process identity became ambiguous after forced termination.");
-    if (liveness === "alive") throw new Error(`Worker host process group ${processRecord.pid} remained alive after forced termination.`);
+    if (liveness === "alive") throw new WorkerContainmentError(`Worker host process group ${processRecord.pid} remained alive after forced termination.`);
+  }
+
+  function signalVerifiedWorkerHost(processRecord: ReturnType<typeof readWorkerHostProcess>, signal: NodeJS.Signals, operation: string): void {
+    if (signalHostIdentity(processRecord, signal)) return;
+    const after = probeHostIdentity(processRecord);
+    if (after === "dead") return;
+    if (after === "unknown") throw new WorkerHostIdentityError(`Worker host process identity became ambiguous before ${signal} during ${operation}.`);
+    throw new WorkerContainmentError(`Worker host process ${processRecord.pid} remained alive without accepting ${signal} during ${operation}.`);
   }
 
   async function waitForHostLiveness(processRecord: ReturnType<typeof readWorkerHostProcess>, attempts: number): Promise<AsyncJobProcessIdentityLiveness> {
@@ -663,7 +699,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       liveness = probeHostIdentity(processRecord);
       if (liveness === "dead") return liveness;
-      await delay(100);
+      await delay(overrides.hostProbeDelayMs ?? 100);
     }
     return liveness;
   }

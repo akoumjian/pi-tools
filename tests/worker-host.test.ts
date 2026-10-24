@@ -219,7 +219,9 @@ test("worker host fails when the initial prompt is rejected before an agent turn
     const keepAlive = setInterval(() => {}, 100);
     const job = await launched.handle.completion.finally(() => clearInterval(keepAlive));
     assert.equal(job.status, "failed");
-    assert.match(await readFile(job.stderrLog, "utf8"), /prompt response did not begin an agent turn/);
+    const stderr = await readFile(job.stderrLog, "utf8");
+    assert.match(stderr, /No API key found for worker-faux|Intentionally unavailable worker test credential/);
+    assert.doesNotMatch(stderr, /prompt response did not begin an agent turn/, "the checked response must preserve the immediate rejection cause");
     assert.equal(existsSync(resultFile), false);
   });
 });

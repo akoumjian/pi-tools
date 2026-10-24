@@ -100,7 +100,7 @@ try {
   assertSessionIdentity(initialState);
   const resultSettlement = waitForResultSettlement(client, config.resultFile, config.timeoutMs);
   const promptStart = observePromptStart(client);
-  const promptAttempt = client.prompt(config.prompt).then(
+  const promptAttempt = checkedPrompt(client, config.prompt).then(
     () => promptStart.acknowledge(),
     (error) => {
       if (isPromptResponseTimeout(error) && promptStart.sawCompaction()) return;
@@ -230,6 +230,21 @@ function observePromptStart(rpcClient) {
   };
 }
 
+async function checkedPrompt(rpcClient, message) {
+  // Pi 0.84.4's public prompt() awaits the response but discards its
+  // success:false disposition. Use the pinned client's request path so the
+  // host retains the exact rejection cause for initial, follow-up, and repair
+  // prompts. Fail closed if that internal response contract drifts.
+  if (typeof rpcClient.send !== "function") throw new Error("Worker RPC client cannot issue a checked prompt.");
+  const response = await rpcClient.send({ type: "prompt", message });
+  if (response?.type !== "response" || response.command !== "prompt") {
+    throw new Error("Worker RPC returned an invalid prompt response.");
+  }
+  if (response.success !== true) {
+    throw new Error(typeof response.error === "string" && response.error ? response.error : "Worker RPC prompt was rejected.");
+  }
+}
+
 function isPromptResponseTimeout(error) {
   return error instanceof Error && error.message.startsWith("Timeout waiting for response to prompt.");
 }
@@ -260,7 +275,7 @@ function waitForResultSettlement(rpcClient, resultFile, timeoutMs) {
           if (existsSync(resultFile) && !ownedShellActive && !rpcActive) return finish();
           if (!ownedShellActive && !rpcActive && observedOwnedShellWork && !requestedSettledFollowUp) {
             requestedSettledFollowUp = true; quiescentSince = undefined;
-            await rpcClient.prompt("Owned asynchronous work has settled. Inspect its retained completion notification and continue the assignment; submit worker_result_submit only when the run is ready to return control.");
+            await checkedPrompt(rpcClient, "Owned asynchronous work has settled. Inspect its retained completion notification and continue the assignment; submit worker_result_submit only when the run is ready to return control.");
             await delay(50); continue;
           }
           if (ownedShellActive || rpcActive) quiescentSince = undefined;
@@ -269,7 +284,7 @@ function waitForResultSettlement(rpcClient, resultFile, timeoutMs) {
             if (Date.now() - quiescentSince >= SETTLED_RESULT_GRACE_MS) {
               if (config.role === "review" && !requestedReviewResultRepair) {
                 requestedReviewResultRepair = true; quiescentSince = undefined;
-                await rpcClient.prompt(REVIEW_RESULT_REPAIR_PROMPT);
+                await checkedPrompt(rpcClient, REVIEW_RESULT_REPAIR_PROMPT);
                 await delay(50); continue;
               }
               return finish(new Error("Worker reached a settled quiescent turn without the required typed worker_result_submit."));

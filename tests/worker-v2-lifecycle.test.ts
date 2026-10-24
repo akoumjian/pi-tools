@@ -18,12 +18,12 @@ const model = (provider: string, id: string) => ({ id, name: id, provider, api: 
 type Launch = { record: any; runtime: any; resolve(job: JobMeta): void; handle: ManagedAsyncJobHandle };
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
-async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolean; removeThrowsOnce?: boolean; removeAlwaysThrows?: boolean; deferContainer?: boolean; probeHostIdentity?: () => "alive" | "dead" | "unknown" } = {}) {
+async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolean; removeThrowsOnce?: boolean; removeAlwaysThrows?: boolean; containerThrows?: boolean; deferContainer?: boolean; probeHostIdentity?: () => "alive" | "dead" | "unknown"; beforeCreateRunBatch?: () => void | Promise<void>; signalHostIdentity?: (_identity: any, signal: NodeJS.Signals) => boolean } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "pi-worker-v2-lifecycle-"));
   const runtimeRoot = path.join(root, "runtime"); const workersRoot = path.join(runtimeRoot, "workers"); mkdirSync(workersRoot, { recursive: true });
   const session = SessionManager.create(root, path.join(root, "parent-session"), { id: `parent-${Date.now()}` }); writeFileSync(session.getSessionFile()!, `${JSON.stringify(session.getHeader())}\n`, { mode: 0o600 });
   const tools: ToolDefinition[] = []; const handlers = new Map<string, Function[]>(); const commands = new Map<string, any>(); const renderers = new Map<string, Function>(); const messages: any[] = []; const notifications: string[] = [];
-  const launches: Launch[] = []; const created: string[] = []; const removed: string[] = []; const overlays: ReviewOverlayRecord[] = []; const cleaned: ReviewOverlayRecord[] = [];
+  const launches: Launch[] = []; const created: string[] = []; const removed: string[] = []; const overlays: ReviewOverlayRecord[] = []; const cleaned: ReviewOverlayRecord[] = []; const cleanupLeaseOwners: Array<string | undefined> = [];
   let releaseContainer = () => {}; const containerGate = options.deferContainer ? new Promise<void>((resolve) => { releaseContainer = resolve; }) : undefined; let removeFailures = 0; let counter = 0; const random = () => `${(++counter).toString(16).padStart(8, "0")}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`;
   const api = { registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand(name: string, command: any) { commands.set(name, command); }, registerMessageRenderer(name: string, renderer: Function) { renderers.set(name, renderer); }, on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, sendMessage(message: any) { messages.push(message); } } as unknown as ExtensionAPI;
   const context = { cwd: root, hasUI: false, mode: "rpc", sessionManager: session, modelRegistry: { hasConfiguredAuth: () => true, getAll: () => [model("openai-codex", "gpt-5.6-sol"), model("anthropic", "claude-opus-5-5")] }, thinkingLevel: "xhigh", isIdle: () => true, hasPendingMessages: () => false, ui: { notify(message: string) { notifications.push(message); } } } as unknown as ExtensionContext;
@@ -31,12 +31,18 @@ async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolea
     runtimeRoot, roots: { stateRoot: workersRoot, workspaceRoot: workersRoot }, codeRoot: root, preparedRoot: path.join(runtimeRoot, "prepared"), targetRoot: root, dockerPath: "/fake/docker", random, now: () => new Date(`2026-01-01T00:00:${String(counter).padStart(2, "0")}.000Z`),
     waitForHostIdentity: async () => {},
     ...(options.probeHostIdentity ? { probeHostIdentity: options.probeHostIdentity } : {}),
-    createContainer: async (_docker, reference) => { created.push(reference.runId); if (containerGate) await containerGate; return { ...reference, containerId: (++counter).toString(16).padStart(64, "0") }; }, removeContainer: (_docker, reference) => { removed.push(reference.runId); if (options.removeAlwaysThrows || options.removeThrowsOnce && removeFailures++ === 0) throw new Error(options.removeAlwaysThrows ? "persistent container cleanup failure" : "transient container cleanup failure"); },
+    ...(options.signalHostIdentity ? { signalHostIdentity: options.signalHostIdentity } : {}),
+    hostTerminationGraceAttempts: 2, hostForcedTerminationAttempts: 2, hostProbeDelayMs: 1,
+    ...(options.beforeCreateRunBatch ? { beforeCreateRunBatch: options.beforeCreateRunBatch } : {}),
+    createContainer: async (_docker, reference) => { created.push(reference.runId); if (containerGate) await containerGate; if (options.containerThrows) throw new Error("container disappeared between inspect and start"); return { ...reference, containerId: (++counter).toString(16).padStart(64, "0") }; }, removeContainer: (_docker, reference) => { removed.push(reference.runId); if (options.removeAlwaysThrows || options.removeThrowsOnce && removeFailures++ === 0) throw new Error(options.removeAlwaysThrows ? "persistent container cleanup failure" : "transient container cleanup failure"); },
     createOverlay: (input) => { if (options.overlayThrows) throw new Error("overlay probe failure"); const value: ReviewOverlayRecord = { version: 2, mergedVolume: `merged-${input.workerId}-${input.runId}`, scratchVolume: `scratch-${input.workerId}-${input.runId}`, mounts: [
       { kind: "volume", source: `merged-${input.workerId}-${input.runId}`, target: "/review/subject" }, { kind: "bind", source: input.reviewerWorkspace, target: "/workspace" },
       { kind: "bind", source: input.contextFile, target: "/review/context.json", readOnly: true }, { kind: "bind", source: input.reviewedSessionFile, target: "/review/session.jsonl", readOnly: true },
       ...(input.additionalInputs ?? []).map((item) => ({ kind: "bind" as const, source: item.source, target: item.target, readOnly: true }))
-    ] }; overlays.push(value); return value; }, cleanupOverlay: (_docker, overlay) => { cleaned.push(overlay); },
+    ] }; overlays.push(value); return value; }, cleanupOverlay: (_docker, overlay) => {
+      const db = openWorkerRegistry(runtimeRoot); const row = db.database.prepare("SELECT reviewed_by_worker_id FROM workers WHERE reviewed_by_worker_id IS NOT NULL LIMIT 1").get() as { reviewed_by_worker_id?: string } | undefined; db.close();
+      cleanupLeaseOwners.push(row?.reviewed_by_worker_id); cleaned.push(overlay);
+    },
     launch: (_api, _context, input) => { if (options.launchThrows) throw new Error("launch probe failure"); let resolve!: (job: JobMeta) => void; const completion = new Promise<JobMeta>((done) => { resolve = done; });
       const running = job(input.record.jobId, "running"); const handle: ManagedAsyncJobHandle = { jobId: input.record.jobId, completion, snapshot: () => running, cancel: () => resolve(job(input.record.jobId, "cancelled")) }; launches.push({ ...input, resolve, handle }); return handle; }
   });
@@ -44,7 +50,7 @@ async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolea
   const call = async (name: string, params: any) => { const tool = tools.find((candidate) => candidate.name === name)!; return tool.execute!("test", params, new AbortController().signal, undefined, context); };
   const registry = () => openWorkerRegistry(runtimeRoot);
   const event = async (name: string) => { for (const handler of handlers.get(name) ?? []) await handler({}, context); if (name === "turn_end") await waitFor(() => { const db = registry(); const queued = Number((db.database.prepare("SELECT COUNT(*) AS count FROM runs WHERE status='queued'").get() as any).count); db.close(); return queued === 0; }); };
-  return { root, runtimeRoot, workersRoot, session, tools, handlers, commands, renderers, messages, notifications, launches, releaseContainer, created, removed, overlays, cleaned, context, call, event, registry, async close() { try { await event("session_shutdown"); } catch {} rmSync(root, { recursive: true, force: true }); } };
+  return { root, runtimeRoot, workersRoot, session, tools, handlers, commands, renderers, messages, notifications, launches, releaseContainer, created, removed, overlays, cleaned, cleanupLeaseOwners, context, call, event, registry, async close() { try { await event("session_shutdown"); } catch {} rmSync(root, { recursive: true, force: true }); } };
 }
 
 function job(jobId: string, status: JobMeta["status"], exitCode = status === "exited" ? 0 : undefined): JobMeta { return { jobId, command: "worker", cwd: "/tmp", status, durationMs: 1, exitCode, signal: null, notifyOnExit: false, completionNotified: true, logDir: "/tmp", stdoutLog: `/tmp/${jobId}.out`, stderrLog: `/tmp/${jobId}.err`, outputBytes: { stdout: 0, stderr: 0 } } as JobMeta; }
@@ -92,6 +98,29 @@ test("turn_end returns without awaiting deferred container readiness", async () 
 });
 
 
+test("concurrent reconciliation cannot revoke or duplicate an in-flight launch authority", async () => {
+  const f = await fixture({ deferContainer: true }); try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "reconcile during create" }] }));
+    f.handlers.get("turn_end")![0]!({}, f.context); await waitFor(() => f.created.length === 1);
+    for (const handler of f.handlers.get("session_start") ?? []) { await handler({}, f.context); await handler({}, f.context); }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(f.created.length, 1); assert.equal(f.removed.length, 0, "reconciliation must not remove a container from the retained local launch generation");
+    f.releaseContainer(); await waitFor(() => f.launches.length === 1);
+    const db = f.registry(); assert.equal(getWorkerRun(db, started.workerId, started.runId)!.status, "running"); db.close();
+    assert.equal(f.created.length, 1, "one CAS owner creates exactly one container");
+    await f.call("worker_control", { action: "cancel", workerId: started.workerId });
+  } finally { f.releaseContainer(); await f.close(); }
+});
+
+test("pre-host container failure publishes the reported diagnostic log paths", async () => {
+  const f = await fixture({ containerThrows: true }); try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "fail before host logs" }] }));
+    await f.event("turn_end"); const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; db.close();
+    assert.equal(run.status, "settled"); assert.equal(run.outcome, "failed"); assert.ok(run.stdoutLog && existsSync(run.stdoutLog)); assert.ok(run.stderrLog && existsSync(run.stderrLog));
+    assert.match(readFileSync(run.stderrLog!, "utf8"), /container disappeared between inspect and start/);
+  } finally { await f.close(); }
+});
+
 test("cancellation waits for a deferred launch boundary before proving termination", async () => {
   const f = await fixture({ deferContainer: true }); try {
     const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "cancel during readiness" }] }));
@@ -100,6 +129,7 @@ test("cancellation waits for a deferred launch boundary before proving terminati
     await new Promise((resolve) => setTimeout(resolve, 20)); assert.equal(resolved, false); f.releaseContainer(); await cancelling;
     const db = f.registry(); const worker = getWorker(db, started.workerId)!; const run = getWorkerRun(db, started.workerId, started.runId)!; db.close();
     assert.equal(worker.status, "idle"); assert.equal(run.outcome, "cancelled"); assert.equal(f.launches.length, 0);
+    assert.deepEqual(f.removed, [started.runId], "the revoked launcher must leave exact-container removal to cancellation authority");
   } finally { f.releaseContainer(); await f.close(); }
 });
 
@@ -113,23 +143,34 @@ test("ambiguous supervisor identity makes cancellation recovery-required instead
     await assert.rejects(() => f.call("worker_control", { action: "cancel", workerId: started.workerId }), /cancellation requires recovery.*ambiguous/i);
     const after = f.registry(); const worker = getWorker(after, started.workerId)!; const retainedRun = getWorkerRun(after, started.workerId, started.runId)!; after.close();
     assert.equal(worker.status, "running"); assert.equal(retainedRun.status, "running"); assert.match(worker.recoveryError ?? "", /ambiguous/i);
+    assert.deepEqual(f.removed, [started.runId], "the exact container must be removed and verified despite ambiguous host identity");
   } finally { await f.close(); }
 });
 
-test("concurrent resume attempts cannot reuse one retained worker session", async () => {
-  const f = await fixture(); try {
+test("concurrent resume attempts cross the same CAS boundary without reusing one retained session", async () => {
+  let armed = false; let arrivals = 0; let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const f = await fixture({ beforeCreateRunBatch: async () => {
+    if (!armed) return;
+    arrivals += 1;
+    if (arrivals === 2) release();
+    await gate;
+  } });
+  try {
     const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "initial" }] })); await f.event("turn_end");
-    await complete(f, started);
+    await complete(f, started); armed = true;
     const attempts = await Promise.allSettled([
       f.call("worker_run", { runs: [{ action: "resume", workerId: started.workerId, instructions: "resume A" }] }),
       f.call("worker_run", { runs: [{ action: "resume", workerId: started.workerId, instructions: "resume B" }] })
     ]);
+    assert.equal(arrivals, 2, "both resumes must finish preflight before either reaches createWorkerRunBatch");
     assert.equal(attempts.filter((attempt) => attempt.status === "fulfilled").length, 1);
-    assert.equal(attempts.filter((attempt) => attempt.status === "rejected").length, 1);
+    const rejected = attempts.find((attempt): attempt is PromiseRejectedResult => attempt.status === "rejected"); assert.ok(rejected);
+    assert.match(String(rejected.reason), /changed state/i, "the loser must fail the version/status CAS, not preflight");
     const state = f.registry(); const worker = getWorker(state, started.workerId)!; const queued = Number((state.database.prepare("SELECT COUNT(*) AS count FROM runs WHERE worker_id=? AND status='queued'").get(started.workerId) as any).count); state.close();
     assert.equal(worker.status, "queued"); assert.equal(queued, 1);
     await f.call("worker_control", { action: "cancel", workerId: started.workerId });
-  } finally { await f.close(); }
+  } finally { release(); await f.close(); }
 });
 
 test("worker_control get content exposes complete settled candidates and artifact paths", async () => {
@@ -246,7 +287,10 @@ test("review starts fresh, mounts exact subject session range, cancellation rele
     const header = JSON.parse(readFileSync(reviewer.sessionFile!, "utf8").split("\n")[0]!); assert.equal(header.parentSession, undefined);
     assert.equal(runtime.container.mounts.some((mount: any) => mount.target === "/review/session.jsonl" && mount.readOnly), true);
     const context = JSON.parse(readFileSync(runtime.contextFile, "utf8")); const subjectRun = getWorkerRun(db, subject.workerId, subject.runId)!; assert.deepEqual(context.session.range, { startLine: subjectRun.sessionStartLine, endLine: subjectRun.sessionEndLine }); assert.match(runtime.contextFile, new RegExp(review.runId)); db.close();
-    await f.call("worker_control", { action: "cancel", workerId: review.workerId }); db = f.registry(); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, undefined); db.close(); assert.equal(f.cleaned.length, 1, "review cancellation must remove its exact disposable overlay");
+    await f.call("worker_control", { action: "cancel", workerId: review.workerId }); db = f.registry(); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, undefined); db.close();
+    assert.equal(f.cleaned.length, 1, "review cancellation must remove its exact disposable overlay");
+    assert.equal(f.cleaned[0]!.mergedVolume, runtime.overlay.mergedVolume, "cleanup must target the exact run overlay identity");
+    assert.equal(f.cleanupLeaseOwners[0], review.workerId, "overlay cleanup must occur before finalization releases the exact review lease");
     const resumed = receipt(await f.call("worker_run", { runs: [{ action: "resume", workerId: review.workerId, instructions: "continue" }] })); await f.event("turn_end"); db = f.registry(); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, review.workerId); const resumedRuntime = getWorkerRun(db, review.workerId, resumed.runId)!.runtime as any; assert.notEqual(resumedRuntime.overlay.mergedVolume, runtime.overlay.mergedVolume); assert.equal((getWorker(db, review.workerId)!.runtime?.inputs as any[]).length, 1); db.close();
     await f.call("worker_control", { action: "cancel", workerId: review.workerId }); await f.call("worker_control", { action: "discard", workerId: review.workerId }); db = f.registry(); assert.equal(getWorker(db, review.workerId), undefined); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, undefined); db.close();
   } finally { await f.close(); }
@@ -331,14 +375,45 @@ test("verified accepted result settlement retries after transient cleanup recove
 
 
 
-test("persistent accepted-result settlement failure is bounded, retained, and system-failed without cancellation", async () => {
+test("post-containment evidence failure alone uses the bounded failed settlement path", async () => {
+  const f = await fixture(); try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "corrupt settled evidence" }] })); await f.event("turn_end");
+    const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: "accepted but mismatched settlement" });
+    const settled = JSON.parse(readFileSync(launch.runtime.settledFile, "utf8")); writeFileSync(launch.runtime.settledFile, `${JSON.stringify({ ...settled, workerId: "worker_mismatch" })}\n`);
+    launch.resolve(job(launch.record.jobId, "exited", 0));
+    await waitFor(() => { const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId); db.close(); return run?.status === "settled"; }, 6_000);
+    const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; const worker = getWorker(db, started.workerId)!; db.close();
+    assert.equal(run.outcome, "failed"); assert.equal(run.outcomeSource, "system"); assert.equal(worker.status, "idle"); assert.equal((run.runtime as any).settlementRecoveryAttempts, 3);
+    assert.match(run.errors[0]!.message, /Accepted result completed remains retained/); assert.equal(f.removed.length, 3, "each deterministic attempt must first repeat exact containment proof");
+  } finally { await f.close(); }
+});
+
+test("persistent exact-container cleanup failure retains recovery authority without aging into finalization", async () => {
   const f = await fixture({ removeAlwaysThrows: true }); try {
     const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "settle persistently" }] })); await f.event("turn_end");
-    const db0 = f.registry(); const workspace = getWorker(db0, started.workerId)!.workspaceRoot; db0.close(); const repo = path.join(workspace, "repos", "interrupted"); gitInit(repo); writeFileSync(path.join(repo, "dirty.txt"), "dirty\n"); writeFileSync(path.join(repo, ".git", "index.lock"), "retained\n");
-    await complete(f, started, { outcome: "completed", summary: "accepted before cleanup failure", repositories: ["repos/interrupted"] });
-    let db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; const worker = getWorker(db, started.workerId)!; const runtime = run.runtime as any; db.close();
-    assert.equal(run.outcome, "failed"); assert.equal(run.outcomeSource, "system"); assert.equal(worker.status, "idle"); assert.equal(runtime.settlementRecoveryAttempts, 3); assert.match(run.errors[0]!.message, /Accepted result completed remains retained/); assert.equal(existsSync(runtime.resultFile), true); assert.equal(JSON.parse(readFileSync(runtime.resultFile, "utf8")).result.outcome, "completed"); assert.equal(f.removed.length, 3);
-    const resumed = receipt(await f.call("worker_run", { runs: [{ action: "resume", workerId: started.workerId, instructions: "inspect retained failure" }] })); db = f.registry(); const resumedRun = getWorkerRun(db, resumed.workerId, resumed.runId)!; db.close(); assert.match((resumedRun.runtime as any).prompt, /system-failed/); assert.match(((resumedRun.runtime as any).interruptionWarnings ?? []).join(" "), /index.lock/);
+    const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: "accepted before cleanup failure" }); launch.resolve(job(launch.record.jobId, "exited", 0));
+    await waitFor(() => f.removed.length >= 3, 8_000);
+    const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; const worker = getWorker(db, started.workerId)!; const runtime = run.runtime as any; db.close();
+    assert.equal(run.status, "running"); assert.equal(run.outcome, undefined); assert.equal(worker.status, "running");
+    assert.equal(runtime.settlementRecoveryAttempts, undefined, "containment failures must not increment the finalizable settlement-attempt counter");
+    assert.equal(existsSync(runtime.resultFile), true); assert.equal(JSON.parse(readFileSync(runtime.resultFile, "utf8")).result.outcome, "completed");
+    assert.equal(existsSync(path.join(runtime.runDir, "host-authorization.json")), false, "every retry must keep launch authority revoked");
+    await assert.rejects(() => f.call("worker_run", { runs: [{ action: "resume", workerId: started.workerId, instructions: "must not overlap" }] }), /not idle/);
+  } finally { await f.close(); }
+});
+
+test("a provably live host is SIGKILLed before probing and never finalizes while it survives", async () => {
+  const events: string[] = [];
+  const f = await fixture({ probeHostIdentity: () => { events.push("probe"); return "alive"; }, signalHostIdentity: (_identity, signal) => { events.push(signal); return true; } }); try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "retain live host" }] })); await f.event("turn_end");
+    const db0 = f.registry(); const runtime = getWorkerRun(db0, started.workerId, started.runId)!.runtime as any; db0.close();
+    writeFileSync(runtime.processFile, `${JSON.stringify({ version: 2, workerId: started.workerId, runId: started.runId, pid: 4242, processToken: "owned", processStartToken: "darwin:expected", nonce: runtime.processNonce, hostConfigFile: path.join(runtime.runDir, "host.json"), startedAt: new Date().toISOString() })}\n`);
+    const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: "accepted while host survives" }); launch.resolve(job(launch.record.jobId, "exited", 0));
+    await waitFor(() => events.includes("SIGKILL") && f.removed.length >= 1, 3_000); await new Promise((resolve) => setTimeout(resolve, 25));
+    const firstKill = events.indexOf("SIGKILL"); assert.ok(firstKill >= 2, `grace probes must precede SIGKILL: ${events.join(",")}`); assert.ok(events.slice(firstKill + 1).includes("probe"), `post-SIGKILL absence probes must follow the signal: ${events.join(",")}`);
+    const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; const worker = getWorker(db, started.workerId)!; db.close();
+    assert.equal(run.status, "running"); assert.equal(run.outcome, undefined); assert.equal(worker.status, "running"); assert.match(worker.recoveryError ?? "", /remained alive/i);
+    assert.equal((run.runtime as any).settlementRecoveryAttempts, undefined); assert.ok(f.removed.length >= 1);
   } finally { await f.close(); }
 });
 

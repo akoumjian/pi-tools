@@ -148,15 +148,12 @@ export async function createWorkerContainerAsync(
   assertWorkerContainerReference(reference);
   assertExecutable(dockerPath, "Docker CLI");
   const existing = await inspectWorkerContainerAsync(dockerPath, reference);
-  if (existing) {
-    if (!existing.state.Running) await execDockerAsync(dockerPath, ["start", existing.id]);
-    await waitForWorkerContainerReadyAsync(dockerPath, existing.id, reference);
-    return { ...reference, containerId: existing.id };
-  }
+  if (existing) return restartExistingWorkerContainerAsync(dockerPath, reference, existing);
   if (reference.containerId) throw new Error(`Docker worker container ${reference.name} disappeared; refusing to replace its exact persisted identity.`);
   try { await execDockerAsync(dockerPath, ["image", "inspect", reference.image]); }
   catch { throw new Error(`Required worker image is unavailable for the native Docker platform. Run: docker pull ${reference.image}`); }
-  let containerId: string | undefined;
+
+  let containerId: string;
   try {
     containerId = (await execDockerAsync(dockerPath, [
       "create",
@@ -181,15 +178,66 @@ export async function createWorkerContainerAsync(
       "-c", CONTAINER_BOOTSTRAP
     ])).trim();
     if (!/^[a-f0-9]{64}$/.test(containerId)) throw new Error(`Docker returned an invalid worker container id: ${containerId || "(empty)"}.`);
+  } catch (cause) {
+    // A stale launcher can win Docker create after our initial inspection. A
+    // name collision is adoptable only when its exact run/nonce labels match;
+    // park it before reuse so no prior job survives into this authority.
+    const raced = await inspectWorkerContainerAsync(dockerPath, reference);
+    if (raced) return restartExistingWorkerContainerAsync(dockerPath, reference, raced);
+    throw new Error(`Unable to create Docker worker container ${reference.name}: ${cause instanceof Error ? cause.message : String(cause)}`);
+  }
+
+  try {
     await execDockerAsync(dockerPath, ["start", containerId]);
     await waitForWorkerContainerReadyAsync(dockerPath, containerId, reference);
     return { ...reference, containerId };
   } catch (cause) {
-    if (containerId) { try { await execDockerAsync(dockerPath, ["rm", "--force", containerId]); } catch {} }
+    try { await execDockerAsync(dockerPath, ["rm", "--force", containerId]); } catch {}
     throw new Error(`Unable to start Docker worker container ${reference.name}: ${cause instanceof Error ? cause.message : String(cause)}`);
   }
 }
 
+async function restartExistingWorkerContainerAsync(
+  dockerPath: string,
+  reference: WorkerContainerReference,
+  existing: NonNullable<Awaited<ReturnType<typeof inspectWorkerContainerAsync>>>
+): Promise<WorkerContainerReference & { containerId: string }> {
+  const exact = { ...reference, containerId: existing.id };
+  if (existing.state.Running) await parkWorkerContainerAsync(dockerPath, exact, existing);
+  const stopped = await inspectWorkerContainerAsync(dockerPath, exact);
+  if (!stopped) throw new Error(`Docker worker container ${reference.name} disappeared before its exact restart.`);
+  if (stopped.state.Running) throw new Error(`Docker worker container ${reference.name} remained running before its exact restart.`);
+  try { await execDockerAsync(dockerPath, ["start", existing.id]); }
+  catch (cause) {
+    if (!await inspectWorkerContainerAsync(dockerPath, exact)) throw new Error(`Docker worker container ${reference.name} disappeared during its exact restart.`);
+    throw cause;
+  }
+  await waitForWorkerContainerReadyAsync(dockerPath, existing.id, exact);
+  return exact;
+}
+
+async function parkWorkerContainerAsync(
+  dockerPath: string,
+  reference: WorkerContainerReference & { containerId: string },
+  inspected?: NonNullable<Awaited<ReturnType<typeof inspectWorkerContainerAsync>>>
+): Promise<void> {
+  let current = inspected ?? await inspectWorkerContainerAsync(dockerPath, reference);
+  if (!current) throw new Error(`Docker worker container ${reference.name} disappeared before it could be parked.`);
+  if (current.state.Running) {
+    try { await execDockerAsync(dockerPath, ["stop", "--signal", "SIGTERM", "--timeout", String(WORKER_CONTAINER_STOP_TIMEOUT_SECONDS), current.id], 15_000); }
+    catch {
+      current = await inspectWorkerContainerAsync(dockerPath, reference);
+      if (!current) throw new Error(`Docker worker container ${reference.name} disappeared while it was being parked.`);
+      if (current.state.Running) await execDockerAsync(dockerPath, ["kill", "--signal", "SIGKILL", current.id]);
+    }
+  }
+  current = await inspectWorkerContainerAsync(dockerPath, reference);
+  if (!current) throw new Error(`Docker worker container ${reference.name} disappeared while it was being parked.`);
+  if (current.state.Running) await execDockerAsync(dockerPath, ["kill", "--signal", "SIGKILL", current.id]);
+  await execDockerAsync(dockerPath, ["wait", current.id]);
+  const parked = await inspectWorkerContainerAsync(dockerPath, reference);
+  if (!parked || parked.state.Running) throw new Error(`Docker worker container ${reference.name} did not reach a verified stopped state.`);
+}
 export function parkWorkerContainer(dockerPath: string, reference: WorkerContainerReference): void {
   assertWorkerContainerReference(reference);
   assertExecutable(dockerPath, "Docker CLI");

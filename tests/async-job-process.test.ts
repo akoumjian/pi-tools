@@ -30,4 +30,15 @@ test("exact process identity probe distinguishes alive, dead, and ambiguous obse
     readStartToken: () => "darwin:replacement",
     ownedProcessIds: () => [identity.pid]
   }), "dead", "a reused pid with another start token is not the exact supervisor");
+
+  assert.equal(probeAsyncJobProcessIdentity(identity, {
+    probePid: () => "unknown",
+    readStartToken: () => "darwin:replacement",
+    ownedProcessIds: () => { throw new Error("must not enumerate a reused pid"); }
+  }), "dead", "an EPERM-like PID probe still compares the start token and rejects a stale cross-user identity");
+  assert.equal(probeAsyncJobProcessIdentity(identity, {
+    probePid: () => "unknown",
+    readStartToken: () => identity.processStartToken,
+    ownedProcessIds: () => { throw new Error("cross-user environment remains unreadable"); }
+  }), "unknown", "a matching start token with unreadable ownership evidence remains recovery-required");
 });
