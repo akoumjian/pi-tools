@@ -9,7 +9,7 @@ import path from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { SessionManager, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { registerWorkerExtension } from "../extensions/worker/index.js";
-import { getWorker, getWorkerRun, listWorkers, openWorkerRegistry, storePreparedSet } from "../extensions/worker/registry.js";
+import { currentParentRuntime, getWorker, getWorkerRun, listWorkers, openWorkerRegistry, registerParentRuntime, storePreparedSet } from "../extensions/worker/registry.js";
 import type { ManagedAsyncJobHandle, JobMeta } from "../extensions/async-shell/index.js";
 import type { ReviewOverlayRecord } from "../extensions/worker/review-workspace.js";
 import { prepareWorkerMerges } from "../extensions/worker/merge.js";
@@ -73,7 +73,7 @@ async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolea
   const reload = async () => { await current.event("session_shutdown"); current.invalidate(); current = await createInstance(); return current; };
   const registry = () => openWorkerRegistry(runtimeRoot);
   return { root, runtimeRoot, workersRoot, session, messages, notifications, launches, get releaseContainer() { return releaseContainer; }, blockContainer, created, removed, liveContainers, lifecycleEvents, overlays, cleaned, cleanupLeaseOwners, context: baseContext, get cancelledHandles() { return cancelledHandles; }, setDockerOutage(value: boolean) { dockerOutage = value; },
-    tools: first.tools, handlers: first.handlers, commands: first.commands, renderers: first.renderers, call: first.call, event: first.event, registry, reload,
+    tools: first.tools, handlers: first.handlers, commands: first.commands, renderers: first.renderers, call: first.call, event: first.event, registry, reload, createInstance,
     async close() { releaseContainer(); for (const instance of instances) { try { await instance.event("session_shutdown"); } catch {} } rmSync(root, { recursive: true, force: true }); }
   };
 }
@@ -257,6 +257,54 @@ test("RD: Docker outage preserves cancellation intent until exact containment ca
   } finally { await f.close(); }
 });
 
+test("a superseded runtime records cancellation while only the newest live runtime performs containment", async () => {
+  const f = await fixture({ deferContainer: true }); try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "two live runtimes" }] }));
+    f.handlers.get("turn_end")![0]!({}, f.context); await waitFor(() => f.created.length === 1);
+    await f.createInstance();
+    await assert.rejects(() => f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-other"], instructions: "stale start" }] }), /runtime was superseded.*reload/i);
+    const accepted = await f.call("worker_control", { action: "cancel", workerId: started.workerId });
+    assert.equal((accepted.details as any).cancellation, "accepted_pending");
+    let state = f.registry(); const recorded = getWorkerRun(state, started.workerId, started.runId)!; assert.equal(recorded.terminalIntent, "cancellation", "intent remains durable until the current runtime finalizes it"); state.close();
+    f.releaseContainer();
+    await waitFor(() => { const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId); db.close(); return run?.outcome === "cancelled"; }, 4_000);
+    assert.deepEqual(f.removed, [started.runId], "only the current runtime performs exact containment");
+  } finally { f.releaseContainer(); await f.close(); }
+});
+
+test("the latest remaining live runtime is elected after a newer process exits", async () => {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  const f = await fixture({ deferContainer: true }); try {
+    assert.ok(child.pid); let childToken: string | undefined; await waitFor(() => Boolean(childToken = asyncJobProcessStartToken(child.pid!)));
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "latest remaining owner" }] }));
+    f.handlers.get("turn_end")![0]!({}, f.context); await waitFor(() => f.created.length === 1);
+    await f.createInstance();
+    const parent = realpathSync(f.session.getSessionFile()!); let db = f.registry();
+    const newest = registerParentRuntime(db, parent, "exited-newest", new Date().toISOString(), { pid: child.pid!, processStartToken: childToken! }); assert.equal(newest, 3); db.close();
+    child.kill("SIGKILL"); await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    const accepted = await f.call("worker_control", { action: "cancel", workerId: started.workerId });
+    assert.equal((accepted.details as any).cancellation, "accepted_pending", "the oldest runtime must not jump ahead of a newer live runtime");
+    f.releaseContainer();
+    await waitFor(() => { const state = f.registry(); const run = getWorkerRun(state, started.workerId, started.runId); const current = currentParentRuntime(state, parent); state.close(); return run?.outcome === "cancelled" && current?.generation === 4; }, 4_000);
+  } finally { f.releaseContainer(); if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await f.close(); }
+});
+
+test("first cancellation behind a dead newest owner promotes, reclaims, and finishes in the same call", async () => {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  const f = await fixture({ ownerWaitTimeoutMs: 500, ownerProbeIntervalMs: 20 }); try {
+    assert.ok(child.pid); let childToken: string | undefined; await waitFor(() => Boolean(childToken = asyncJobProcessStartToken(child.pid!)));
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "dead newest owner" }] }));
+    const parent = realpathSync(f.session.getSessionFile()!); const digest = createHash("sha256").update(childToken!).digest("hex"); let db = f.registry();
+    const foreignGeneration = registerParentRuntime(db, parent, "dead-newer-runtime", new Date().toISOString(), { pid: child.pid!, processStartToken: childToken! });
+    db.database.prepare("UPDATE runs SET claim_kind='launch',claim_nonce=? WHERE worker_id=? AND run_id=?").run(`${foreignGeneration}-${child.pid}-${digest}-${randomUUID()}`, started.workerId, started.runId); db.close();
+    child.kill("SIGKILL"); await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    const cancelled = await f.call("worker_control", { action: "cancel", workerId: started.workerId });
+    assert.equal((cancelled.details as any).cancellation, "cancelled");
+    db = f.registry(); assert.equal(getWorkerRun(db, started.workerId, started.runId)!.outcome, "cancelled"); assert.equal(currentParentRuntime(db, parent)!.runtimeId !== "dead-newer-runtime", true); db.close();
+    assert.equal(f.launches.length, 0);
+  } finally { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await f.close(); }
+});
+
 test("foreign-process claim survives while live and is recovered after exact owner death", async () => {
   const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
   const f = await fixture({ ownerWaitTimeoutMs: 80, ownerProbeIntervalMs: 20 }); try {
@@ -267,8 +315,8 @@ test("foreign-process claim survives while live and is recovered after exact own
     await assert.rejects(() => f.call("worker_control", { action: "cancel", workerId: started.workerId }), /cancellation remains pending/i);
     let state = f.registry(); assert.equal(getWorkerRun(state, started.workerId, started.runId)!.claimNonce, foreignNonce); assert.equal(getWorker(state, started.workerId)!.recoveryError, undefined); state.close();
     child.kill("SIGKILL"); await new Promise<void>((resolve) => child.once("exit", () => resolve()));
-    const cancelled = await f.call("worker_control", { action: "cancel", workerId: started.workerId }); assert.equal((cancelled.details as any).cancellation, "cancelled");
-    state = f.registry(); assert.equal(getWorkerRun(state, started.workerId, started.runId)!.outcome, "cancelled"); state.close();
+    await waitFor(() => { const current = f.registry(); const outcome = getWorkerRun(current, started.workerId, started.runId)?.outcome; current.close(); return outcome === "cancelled"; }, 4_000);
+    state = f.registry(); assert.equal(getWorkerRun(state, started.workerId, started.runId)!.outcome, "cancelled", "the current runtime must drive pending intent after exact foreign-owner death without a second cancel"); state.close();
   } finally { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await f.close(); }
 });
 

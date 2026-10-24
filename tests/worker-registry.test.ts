@@ -156,7 +156,7 @@ test("runtime generations recover only stale lifecycle claims for deterministic 
     recoverInterruptedClaimsForParent(f.registry, parent, 3, "2026-01-01T00:00:02.500Z"); assert.equal(getWorkerRun(f.registry, workerId, runId)?.claimKind, undefined);
     f.registry.database.prepare("UPDATE runs SET claim_kind='cancellation',claim_nonce='2-old' WHERE run_id=?").run(runId);
     recoverInterruptedClaimsForParent(f.registry, parent, 3, "2026-01-01T00:00:03.000Z");
-    assert.equal(getWorkerRun(f.registry, workerId, runId)?.claimKind, undefined); assert.match(getWorker(f.registry, workerId)?.recoveryError ?? "", /containment recovery/);
+    assert.equal(getWorkerRun(f.registry, workerId, runId)?.claimKind, undefined); assert.equal(getWorkerRun(f.registry, workerId, runId)?.terminalIntent, "cancellation"); assert.match(getWorker(f.registry, workerId)?.recoveryError ?? "", /containment recovery/);
     f.registry.database.prepare("UPDATE workers SET status='idle',active_run_id=NULL,operation_kind='discard',operation_nonce='2-old' WHERE worker_id=?").run(workerId);
     recoverInterruptedClaimsForParent(f.registry, parent, 3, "2026-01-01T00:00:04.000Z"); assert.equal(getWorker(f.registry, workerId)?.operationKind, undefined);
   } finally { f.close(); }
@@ -237,6 +237,23 @@ function awaitableClaim(registry: ReturnType<typeof openWorkerRegistry>, workerI
   const result = registry.database.prepare("UPDATE runs SET claim_kind='launch',claim_nonce=? WHERE worker_id=? AND run_id=? AND claim_kind IS NULL").run(nonce, workerId, runId);
   return Number(result.changes) === 1;
 }
+
+test("v3 migration converts an interrupted cancellation claim into durable non-launchable intent", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "pi-worker-registry-v3-cancel-"));
+  let registry: ReturnType<typeof openWorkerRegistry> | undefined;
+  try {
+    registry = openWorkerRegistry(root);
+    const parent = "/sessions/v3-cancel.jsonl"; const workerId = "worker_20260101000000_v3cancel"; const runId = "run_20260101000000_v3cancel";
+    createWorkerAndRun(registry, { workerId, parentSessionFile: parent, role: "work", status: "queued", activeRunId: runId, taskIds: ["personal-test"], workspaceRoot: "/workspace/v3-cancel", createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }, queuedRun(workerId, runId));
+    registry.database.prepare("UPDATE runs SET claim_kind='cancellation',claim_nonce='legacy-v3',terminal_intent=NULL WHERE run_id=?").run(runId);
+    registry.database.prepare("UPDATE registry_meta SET value='3' WHERE key='schema_version'").run(); registry.database.exec("PRAGMA user_version = 3"); registry.close(); registry = undefined;
+    registry = openWorkerRegistry(root);
+    assert.equal(getWorkerRun(registry, workerId, runId)!.terminalIntent, "cancellation", "migration must preserve the accepted v3 cancellation authority");
+    const generation = registerParentRuntimeAndRecoverClaims(registry, parent, "v4", "2026-01-01T00:00:01.000Z", () => false);
+    const migrated = getWorkerRun(registry, workerId, runId)!; assert.equal(migrated.claimKind, undefined); assert.equal(migrated.terminalIntent, "cancellation");
+    assert.equal(claimWorkerRun(registry, workerId, runId, "launch", "relaunch", ["queued"], generation), false);
+  } finally { registry?.close(); rmSync(root, { recursive: true, force: true }); }
+});
 
 test("registry applies an ordered idempotent v2 migration while mixed live openers ignore diagnostic fingerprints", () => {
   const root = mkdtempSync(path.join(tmpdir(), "pi-worker-registry-migration-"));

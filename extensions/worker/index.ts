@@ -20,9 +20,9 @@ import {
   abandonWorkerDiscard, activeRunsForParent, claimPreparedSetApply, clearWorkerRecoveryError, claimWorkerDiscard, claimWorkerDelivery, claimWorkerRun, claimWorkerTerminalIntent,
   countWorkers, createWorkerRunBatch, finalizeClaimedWorkerRun, finalizeWorkerDiscard, finalizeWorkerRunLaunch, findWorkerRunById, finishPreparedSetApply,
   getWorker, getWorkerRun, listWorkerRuns, listWorkers, markWorkerDeliveryDelivered, openWorkerRegistry, pendingWorkerDeliveries,
-  readPreparedSetRecord, recordWorkerSettlementRecovery, reconcileWorkerDeliveries, registerParentRuntimeAndRecoverClaims, releasePreparedSetApply, releaseWorkerDeliveryClaim, releaseWorkerRunClaim, requestWorkerCancellation, requestWorkerFailure, setClaimedWorkerTerminalIntent, setWorkerRecoveryError, storePreparedSet,
+  currentParentRuntime, latestParentRuntimeMembers, promoteParentRuntime, readPreparedSetRecord, recordWorkerSettlementRecovery, reconcileWorkerDeliveries, registerParentRuntimeAndRecoverClaims, releasePreparedSetApply, releaseWorkerDeliveryClaim, releaseWorkerRunClaim, requestWorkerCancellation, requestWorkerFailure, retireParentRuntime, setClaimedWorkerTerminalIntent, setWorkerRecoveryError, storePreparedSet,
   subscribeWorkerRegistryChanges, updateClaimedWorkerRunRuntime, updatePreparedSetStatus, updateWorkerRuntimeMetadata, workerRegistryDataVersion,
-  type WorkerBatchCreateItem, type WorkerLifecycleClaimRecoveryCandidate, type WorkerRegistry, type WorkerRegistryRecord, type WorkerRepositoryResult, type WorkerRole, type WorkerRunRecord, type WorkerTerminalIntent
+  type ParentRuntimeIdentity, type ParentRuntimeMember, type WorkerBatchCreateItem, type WorkerLifecycleClaimRecoveryCandidate, type WorkerRegistry, type WorkerRegistryRecord, type WorkerRepositoryResult, type WorkerRole, type WorkerRunRecord, type WorkerTerminalIntent
 } from "./registry.js";
 import { readWorkerRuntimeResult } from "./runtime.js";
 import { cleanupReviewOverlayAsync, createReviewOverlayAsync, type ReviewOverlayRecord } from "./review-workspace.js";
@@ -118,7 +118,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   const cleanupOverlay = overrides.cleanupOverlay ?? cleanupReviewOverlayAsync;
   let registry: WorkerRegistry | undefined;
   let runtimeGeneration = 0;
-  const initializedParentRuntimeGenerations = new Map<string, number>();
+  const parentRuntimeRegistrations = new Map<string, { runtimeId: string; generation: number }>();
   let deliveryTimer: NodeJS.Timeout | undefined;
   let observedDataVersion = 0;
   let currentContext: ExtensionContext | undefined;
@@ -169,12 +169,14 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       currentContext = context;
       const parent = context.sessionManager.getSessionFile(); if (!parent) return;
       const exactParent = realpathOrResolve(parent); const launchInputs = snapshotLaunchInputs(context);
-      const initializedGeneration = initializedParentRuntimeGenerations.get(exactParent);
-      if (initializedGeneration === undefined) {
-        runtimeGeneration = registerParentRuntimeAndRecoverClaims(getRegistry(), exactParent, randomUUID(), now().toISOString(), lifecycleClaimIsLive);
-        initializedParentRuntimeGenerations.set(exactParent, runtimeGeneration);
+      const initialized = parentRuntimeRegistrations.get(exactParent);
+      if (initialized === undefined) {
+        const runtimeId = randomUUID();
+        runtimeGeneration = registerParentRuntimeAndRecoverClaims(getRegistry(), exactParent, runtimeId, now().toISOString(), lifecycleClaimIsLive,
+          parentProcessStartToken ? { pid: process.pid, processStartToken: parentProcessStartToken } : undefined);
+        parentRuntimeRegistrations.set(exactParent, { runtimeId, generation: runtimeGeneration });
         recoverInterruptedDiscardFiles(exactParent, runtimeGeneration);
-      } else runtimeGeneration = initializedGeneration;
+      } else runtimeGeneration = initialized.generation;
       reconcileWorkerDeliveries(getRegistry(), exactParent, sessionDeliveryIds(context));
       deliveredRecovery.clear();
       observedDataVersion = workerRegistryDataVersion(getRegistry());
@@ -218,6 +220,11 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     unsubscribeActivity = undefined;
     currentContext = undefined;
     if (deliveryTimer) clearInterval(deliveryTimer); deliveryTimer = undefined;
+    const parentFile = context.sessionManager.getSessionFile();
+    if (parentFile) {
+      const parent = realpathOrResolve(parentFile); const registration = parentRuntimeRegistrations.get(parent);
+      if (registration) { try { retireParentRuntime(getRegistry(), parent, registration.runtimeId, now().toISOString()); } catch {} parentRuntimeRegistrations.delete(parent); }
+    }
     if (active.size === 0) { registry?.close(); registry = undefined; }
   });
 
@@ -247,6 +254,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       clearOperationSnapshot(toolCallId);
       throwIfAborted(signal);
       const parentSessionFile = requireParentSession(context);
+      assertCurrentRuntimeAuthority(parentSessionFile);
       const planned = preflightBatch(params, context, parentSessionFile);
       const operation = plannedRunOperation(planned);
       const timestamp = now().toISOString();
@@ -268,7 +276,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
           items,
           reviewLeases: planned.filter((plan) => plan.role === "review").map((plan) => ({ subjectWorkerId: (plan.binding as any).reviewedWorkerId as string, reviewerWorkerId: plan.workerId, reviewedRunId: plan.reviewedRunId! })),
           consumedPrepared: planned.filter((plan) => plan.consumedPrepared).map((plan) => ({ preparedId: plan.preparedId!, parentSessionFile })),
-          now: timestamp
+          authority: { parentSessionFile, runtimeGeneration }, now: timestamp
         });
       } catch (error) { rollbackPlans(planned, parentSessionFile); throw error; }
       for (const plan of planned) pending.set(plan.runId, { workerId: plan.workerId, runId: plan.runId, parentSessionFile, parentSessionId: context.sessionManager.getSessionId(), runtime: plan.runRuntime });
@@ -466,6 +474,48 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       if (plan.newWorker) rmSync(plan.paths.stateDir, { recursive: true, force: true });
       else { rmSync(plan.runRuntime.runDir, { recursive: true, force: true }); if (plan.runRuntime.contextFile) rmSync(plan.runRuntime.contextFile, { force: true }); }
     }
+  }
+
+  function parentRuntimeMemberLiveness(member: ParentRuntimeMember): AsyncJobProcessIdentityLiveness {
+    if (member.retired) return "dead";
+    if (member.pid <= 0 || !member.processStartToken) return "unknown";
+    const observed = member.pid === process.pid ? parentProcessStartToken : readProcessStartToken(member.pid);
+    if (observed === member.processStartToken) return "alive";
+    if (observed) return "dead";
+    try { process.kill(member.pid, 0); return "unknown"; }
+    catch (error) { return error && typeof error === "object" && "code" in error && error.code === "ESRCH" ? "dead" : "unknown"; }
+  }
+
+  function ensureCurrentRuntimeAuthority(parentSessionFile: string): "current" | "superseded" | "unknown" {
+    const registration = parentRuntimeRegistrations.get(parentSessionFile);
+    if (!registration) return "superseded";
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const current = currentParentRuntime(getRegistry(), parentSessionFile);
+      if (!current) return "unknown";
+      if (current.generation === registration.generation && current.runtimeId === registration.runtimeId) { runtimeGeneration = registration.generation; return "current"; }
+      if (!parentProcessStartToken) return "unknown";
+      let uncertain = false;
+      const observed = latestParentRuntimeMembers(getRegistry(), parentSessionFile, registration.generation, current.generation);
+      if (current.runtimeId !== registration.runtimeId && !observed.some((member) => member.generation === current.generation && member.runtimeId === current.runtimeId)) return "unknown";
+      const newer = observed.filter((member) => member.runtimeId !== registration.runtimeId);
+      for (const member of newer) {
+        const state = parentRuntimeMemberLiveness(member);
+        if (state === "alive") return "superseded";
+        if (state === "unknown") uncertain = true;
+      }
+      if (uncertain) return "unknown";
+      const identity: ParentRuntimeIdentity = { runtimeId: registration.runtimeId, pid: process.pid, processStartToken: parentProcessStartToken };
+      const promoted = promoteParentRuntime(getRegistry(), { parentSessionFile, expectedGeneration: current.generation, expectedRuntimeId: current.runtimeId, identity, now: now().toISOString() });
+      if (promoted !== undefined) { registration.generation = promoted; runtimeGeneration = promoted; return "current"; }
+    }
+    return "superseded";
+  }
+
+  function assertCurrentRuntimeAuthority(parentSessionFile: string): void {
+    const authority = ensureCurrentRuntimeAuthority(parentSessionFile);
+    if (authority === "current") return;
+    if (authority === "unknown") throw new Error("Parent runtime authority is uncertain; restart or reload this session before starting workers.");
+    throw new Error("Parent runtime was superseded; reload this session to regain worker lifecycle authority.");
   }
 
   function snapshotLaunchInputs(context: ExtensionContext): { projectCwd: string; parentSessionId: string } {
@@ -764,18 +814,28 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     } finally { if (operationAdmission) endLifecycleAdmission(operationAdmission, nonce); }
   }
 
-  async function cancelWorker(worker: WorkerRegistryRecord): Promise<"cancelled" | "not_active"> {
+  async function cancelWorker(worker: WorkerRegistryRecord): Promise<"cancelled" | "accepted_pending" | "superseded" | "not_active"> {
     if (!worker.activeRunId) return "not_active"; const runId = worker.activeRunId;
     const recoveringRun = getWorkerRun(getRegistry(), worker.workerId, runId); const recoveringRuntime = recoveringRun?.runtime as RunRuntime | undefined;
     if (worker.recoveryError && recoveringRun?.status === "running" && !recoveringRun.terminalIntent && recoveringRuntime && existsSync(recoveringRuntime.settledFile) && existsSync(recoveringRuntime.resultFile)) {
       await settleCompletedRun(worker.workerId, runId, { status: "exited", exitCode: 0 });
-      const current = getWorker(getRegistry(), worker.workerId); if (!current?.activeRunId) return "not_active";
+      const current = getWorker(getRegistry(), worker.workerId); if (!current?.activeRunId) return "superseded";
       throw new Error(`Worker ${worker.workerId}/${runId} has an accepted result whose settlement still requires recovery; cancellation will not discard it.`);
     }
-    if (!recoveringRun || !recoveringRuntime || !requestWorkerCancellation(getRegistry(), worker.workerId, runId, now().toISOString(), runtimeGeneration)) return "not_active";
+    if (!recoveringRun || !recoveringRuntime) return "superseded";
+    if (!requestWorkerCancellation(getRegistry(), worker.workerId, runId, now().toISOString())) {
+      const after = getWorkerRun(getRegistry(), worker.workerId, runId);
+      return after?.outcome === "cancelled" ? "cancelled" : "superseded";
+    }
+    const requested = getWorkerRun(getRegistry(), worker.workerId, runId);
+    if (requested?.terminalIntent !== "cancellation") return requested?.outcome === "cancelled" ? "cancelled" : "superseded";
+    const authority = ensureCurrentRuntimeAuthority(worker.parentSessionFile);
+    if (authority !== "current") return "accepted_pending";
     try {
       const result = await beginTerminalRecovery(worker.workerId, runId);
-      return result === "cancelled" ? "cancelled" : "not_active";
+      if (result === "cancelled") return "cancelled";
+      const after = getWorkerRun(getRegistry(), worker.workerId, runId);
+      return after?.terminalIntent === "cancellation" && after.status !== "settled" ? "accepted_pending" : after?.outcome === "cancelled" ? "cancelled" : "superseded";
     } catch (error) {
       if (error instanceof WorkerLifecycleOwnerBusyError) throw new Error(`Worker ${worker.workerId}/${runId} cancellation remains pending behind its live lifecycle owner.`);
       throw new Error(`Worker ${worker.workerId}/${runId} cancellation requires recovery: ${sanitizeError(error)}`);
@@ -913,16 +973,17 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const worker = ownedWorker(params.workerId, parent);
     if (params.action === "runs") { const page = listWorkerRuns(db, worker.workerId, params.limit, params.offset); return resultText(`${page.runs.length} retained runs`, { workerId: worker.workerId, runs: page.runs.map(slimRun), total: page.total, ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset }) }); }
     if (params.action === "get") { const run = getWorkerRun(db, worker.workerId, params.runId); if (!run) throw new Error(`Unknown run ${params.runId} for worker ${worker.workerId}.`); const details = exactRun(worker, run); return resultText(`${run.outcome ?? run.status} · ${worker.role} · ${worker.workerId.slice(-8)}`, details); }
-    if (params.action === "cancel") { const cancellation = await cancelWorker(worker); const current = getWorker(db, worker.workerId) ?? worker; return resultText(`${cancellation.replace("_", " ")} · ${worker.workerId.slice(-8)}`, { cancellation, worker: workerListItem(current) }); }
+    if (params.action === "cancel") { const cancellation = await cancelWorker(worker); const current = getWorker(db, worker.workerId) ?? worker; return resultText(`${cancellation.replaceAll("_", " ")} · ${worker.workerId.slice(-8)}`, { cancellation, worker: workerListItem(current) }); }
     await discardWorker(worker); return resultText(`discarded · ${worker.role} · ${worker.workerId.slice(-8)}`, { workerId: worker.workerId, discarded: true });
   }
 
   function reconcileActiveRuns(launchInputs: { projectCwd: string; parentSessionId: string }, parentSessionFile: string): void {
+    if (ensureCurrentRuntimeAuthority(parentSessionFile) !== "current") return;
     for (const { worker, run } of activeRunsForParent(getRegistry(), parentSessionFile)) {
       const runtime = run.runtime as RunRuntime;
       if (!runtime || runtime.version !== 2) { if (worker.recoveryError) deliverRecovery(worker, run, worker.recoveryError); continue; }
       if (run.terminalIntent) {
-        if (!run.claimKind) void beginTerminalRecovery(worker.workerId, run.runId).catch((error) => { if (!(error instanceof WorkerLifecycleOwnerBusyError)) { const current = getWorker(getRegistry(), worker.workerId); if (!current?.recoveryError) recordRecovery(worker.workerId, run.runId, error); } });
+        void beginTerminalRecovery(worker.workerId, run.runId).catch((error) => { if (!(error instanceof WorkerLifecycleOwnerBusyError)) { const current = getWorker(getRegistry(), worker.workerId); if (!current?.recoveryError) recordRecovery(worker.workerId, run.runId, error); } });
         continue;
       }
       if (run.claimKind) { if (worker.recoveryError) deliverRecovery(worker, run, worker.recoveryError); continue; }
@@ -974,7 +1035,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     api.registerCommand("worker:list", { description: "List retained workers; optional status and role filters", handler: async (args, context) => { const [status, role] = args.trim().split(/\s+/).filter(Boolean); const result = await control({ action: "list", ...(status ? { status: status as any } : {}), ...(role ? { role: role as any } : {}) }, context); context.ui.notify(compactWorkerList((result as any).details), "info"); } });
     api.registerCommand("worker:show", { description: "Show an active/latest or exact retained worker run", handler: async (args, context) => { const [workerId, runId] = args.trim().split(/\s+/); if (!workerId) return context.ui.notify("Usage: /worker:show <workerId> [runId]", "info"); const worker = ownedWorker(workerId, requireParentSession(context)); const exact = runId ?? worker.activeRunId ?? worker.latestRunId; if (!exact) return context.ui.notify(`Worker ${workerId} has no runs.`, "info"); const result = await control({ action: "get", workerId, runId: exact }, context); context.ui.notify(formatExactRun((result as any).details), "info"); } });
     api.registerCommand("worker:logs", { description: "Open logs for an active/latest or exact retained worker run", handler: async (args, context) => { const [workerId, possibleRun, ...viewer] = args.trim().split(/\s+/).filter(Boolean); if (!workerId) return context.ui.notify("Usage: /worker:logs <workerId> [runId] [viewer options]", "info"); const worker = ownedWorker(workerId, requireParentSession(context)); const hasRun = possibleRun?.startsWith("run_"); const runId = (hasRun ? possibleRun : undefined) ?? worker.activeRunId ?? worker.latestRunId; const run = runId ? getWorkerRun(getRegistry(), workerId, runId) : undefined; if (!run?.jobId) return context.ui.notify("No retained run logs.", "info"); await handleAsyncShellViewerCommand(context, [run.jobId, ...(hasRun ? viewer : [possibleRun, ...viewer].filter(Boolean))].join(" ")); } });
-    api.registerCommand("worker:cancel", { description: "Cancel active work while preserving retained state", handler: async (args, context) => { const workerId = args.trim(); if (!workerId) return context.ui.notify("Usage: /worker:cancel <workerId>", "info"); const result = await cancelWorker(ownedWorker(workerId, requireParentSession(context))); context.ui.notify(result === "cancelled" ? `Cancelled ${workerId}.` : "Worker is not active.", "info"); } });
+    api.registerCommand("worker:cancel", { description: "Cancel active work while preserving retained state", handler: async (args, context) => { const workerId = args.trim(); if (!workerId) return context.ui.notify("Usage: /worker:cancel <workerId>", "info"); const result = await cancelWorker(ownedWorker(workerId, requireParentSession(context))); context.ui.notify(result === "cancelled" ? `Cancelled ${workerId}.` : result === "accepted_pending" ? `Cancellation accepted for ${workerId}; the current runtime will finish it.` : result === "superseded" ? `Cancellation for ${workerId} was superseded by a terminal result.` : "Worker is not active.", "info"); } });
     api.registerCommand("worker:discard", { description: "Permanently discard one idle worker; requires --confirm", handler: async (args, context) => { const [workerId, confirm, ...extra] = args.trim().split(/\s+/).filter(Boolean); if (!workerId || confirm !== "--confirm" || extra.length) return context.ui.notify("Usage: /worker:discard <workerId> --confirm", "info"); await discardWorker(ownedWorker(workerId, requireParentSession(context))); context.ui.notify(`Discarded ${workerId}.`, "info"); } });
   }
 

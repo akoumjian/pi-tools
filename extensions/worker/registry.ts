@@ -11,6 +11,8 @@ export type WorkerRole = "work" | "review" | "integration";
 export type WorkerStatus = "idle" | "queued" | "running";
 export type WorkerRunStatus = "queued" | "running" | "settled";
 export type WorkerTerminalIntent = "cancellation" | "failure";
+export type ParentRuntimeIdentity = { runtimeId: string; pid: number; processStartToken: string };
+export type ParentRuntimeMember = ParentRuntimeIdentity & { generation: number; retired: boolean };
 export type WorkerOutcomeSource = "worker" | "system";
 export type WorkerOutcome =
   | "completed"
@@ -214,6 +216,17 @@ CREATE TABLE IF NOT EXISTS parent_runtimes (
   runtime_id TEXT NOT NULL,
   updated_at TEXT NOT NULL
 ) STRICT;
+CREATE TABLE IF NOT EXISTS parent_runtime_members (
+  parent_session_file TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  runtime_id TEXT NOT NULL,
+  owner_pid INTEGER,
+  owner_start_token TEXT,
+  registered_at TEXT NOT NULL,
+  retired_at TEXT,
+  PRIMARY KEY (parent_session_file, generation)
+) STRICT;
+CREATE INDEX IF NOT EXISTS parent_runtime_members_latest ON parent_runtime_members(parent_session_file, runtime_id, generation DESC);
 CREATE TABLE IF NOT EXISTS prepared_sets (
   prepared_id TEXT PRIMARY KEY,
   parent_session_file TEXT NOT NULL,
@@ -292,6 +305,10 @@ function migrateWorkerRegistry(database: SQLiteDatabaseSync, fromVersion: number
     3: () => {
       addColumnIfMissing(database, "runs", "terminal_intent", "TEXT");
       addColumnIfMissing(database, "runs", "terminal_error", "TEXT");
+      // A v3 cancellation claim represented an accepted parent cancellation even
+      // though v3 had no owner-independent intent column. Never migrate that
+      // interrupted operation back into a launchable queued run.
+      database.exec("UPDATE runs SET terminal_intent='cancellation',terminal_error=NULL WHERE status IN ('queued','running') AND claim_kind='cancellation' AND terminal_intent IS NULL");
     }
   };
   for (let version = fromVersion; version < WORKER_REGISTRY_SCHEMA_VERSION; version += 1) {
@@ -311,15 +328,60 @@ export function workerRegistryDataVersion(registry: WorkerRegistry): number {
   return Number(row.data_version);
 }
 
-export function registerParentRuntime(registry: WorkerRegistry, parentSessionFile: string, runtimeId: string, now: string): number {
+export function registerParentRuntime(registry: WorkerRegistry, parentSessionFile: string, runtimeId: string, now: string, owner?: Omit<ParentRuntimeIdentity, "runtimeId">): number {
+  return transaction(registry, () => registerParentRuntimeInTransaction(registry, parentSessionFile, { runtimeId, ...(owner ?? {}) }, now));
+}
+
+function registerParentRuntimeInTransaction(registry: WorkerRegistry, parentSessionFile: string, identity: { runtimeId: string; pid?: number; processStartToken?: string }, now: string): number {
+  const current = registry.database.prepare("SELECT generation FROM parent_runtimes WHERE parent_session_file = ?").get(parentSessionFile) as { generation: number } | undefined;
+  const generation = (current?.generation ?? 0) + 1;
+  registry.database.prepare(`INSERT INTO parent_runtimes(parent_session_file,generation,runtime_id,updated_at)
+    VALUES(?,?,?,?) ON CONFLICT(parent_session_file) DO UPDATE SET generation=excluded.generation,runtime_id=excluded.runtime_id,updated_at=excluded.updated_at`)
+    .run(parentSessionFile, generation, identity.runtimeId, now);
+  registry.database.prepare(`INSERT INTO parent_runtime_members(parent_session_file,generation,runtime_id,owner_pid,owner_start_token,registered_at,retired_at)
+    VALUES(?,?,?,?,?,?,NULL)`).run(parentSessionFile, generation, identity.runtimeId, nullable(identity.pid), nullable(identity.processStartToken), now);
+  return generation;
+}
+
+export function currentParentRuntime(registry: WorkerRegistry, parentSessionFile: string): { generation: number; runtimeId: string } | undefined {
+  return registry.database.prepare("SELECT generation,runtime_id AS runtimeId FROM parent_runtimes WHERE parent_session_file=?")
+    .get(parentSessionFile) as { generation: number; runtimeId: string } | undefined;
+}
+
+export function latestParentRuntimeMembers(registry: WorkerRegistry, parentSessionFile: string, afterGeneration: number, throughGeneration: number): ParentRuntimeMember[] {
+  const rows = registry.database.prepare(`SELECT m.generation,m.runtime_id,m.owner_pid,m.owner_start_token,m.retired_at
+    FROM parent_runtime_members m
+    WHERE m.parent_session_file=? AND m.generation>? AND m.generation<=?
+      AND m.generation=(SELECT MAX(n.generation) FROM parent_runtime_members n WHERE n.parent_session_file=m.parent_session_file AND n.runtime_id=m.runtime_id)
+    ORDER BY m.generation DESC`).all(parentSessionFile, afterGeneration, throughGeneration) as Array<{ generation: number; runtime_id: string; owner_pid: number | null; owner_start_token: string | null; retired_at: string | null }>;
+  return rows.map((row) => ({ generation: row.generation, runtimeId: row.runtime_id, pid: row.owner_pid ?? 0, processStartToken: row.owner_start_token ?? "", retired: row.retired_at !== null }));
+}
+
+export function promoteParentRuntime(registry: WorkerRegistry, input: { parentSessionFile: string; expectedGeneration: number; expectedRuntimeId: string; identity: ParentRuntimeIdentity; now: string }): number | undefined {
   return transaction(registry, () => {
-    const current = registry.database.prepare("SELECT generation FROM parent_runtimes WHERE parent_session_file = ?").get(parentSessionFile) as { generation: number } | undefined;
-    const generation = (current?.generation ?? 0) + 1;
-    registry.database.prepare(`INSERT INTO parent_runtimes(parent_session_file,generation,runtime_id,updated_at)
-      VALUES(?,?,?,?) ON CONFLICT(parent_session_file) DO UPDATE SET generation=excluded.generation,runtime_id=excluded.runtime_id,updated_at=excluded.updated_at`)
-      .run(parentSessionFile, generation, runtimeId, now);
-    return generation;
+    const member = registry.database.prepare(`SELECT retired_at FROM parent_runtime_members
+      WHERE parent_session_file=? AND runtime_id=? ORDER BY generation DESC LIMIT 1`).get(input.parentSessionFile, input.identity.runtimeId) as { retired_at: string | null } | undefined;
+    if (!member || member.retired_at !== null) return undefined;
+    const next = input.expectedGeneration + 1;
+    const updated = registry.database.prepare(`UPDATE parent_runtimes SET generation=?,runtime_id=?,updated_at=?
+      WHERE parent_session_file=? AND generation=? AND runtime_id=?`).run(next, input.identity.runtimeId, input.now, input.parentSessionFile, input.expectedGeneration, input.expectedRuntimeId);
+    if (Number(updated.changes) !== 1) return undefined;
+    registry.database.prepare(`INSERT INTO parent_runtime_members(parent_session_file,generation,runtime_id,owner_pid,owner_start_token,registered_at,retired_at)
+      VALUES(?,?,?,?,?,?,NULL)`).run(input.parentSessionFile, next, input.identity.runtimeId, input.identity.pid, input.identity.processStartToken, input.now);
+    return next;
   });
+}
+
+export function retireParentRuntime(registry: WorkerRegistry, parentSessionFile: string, runtimeId: string, now: string): void {
+  transaction(registry, () => {
+    registry.database.prepare("UPDATE parent_runtime_members SET retired_at=COALESCE(retired_at,?) WHERE parent_session_file=? AND runtime_id=?")
+      .run(now, parentSessionFile, runtimeId);
+  });
+}
+
+export function parentRuntimeGenerationMatches(registry: WorkerRegistry, parentSessionFile: string, runtimeGeneration: number): boolean {
+  const row = registry.database.prepare("SELECT generation FROM parent_runtimes WHERE parent_session_file=?").get(parentSessionFile) as { generation: number } | undefined;
+  return row?.generation === runtimeGeneration;
 }
 
 export function createWorkerAndRun(registry: WorkerRegistry, worker: Omit<WorkerRegistryRecord, "version">, run: WorkerRunRecord): void {
@@ -646,14 +708,11 @@ export function registerParentRuntimeAndRecoverClaims(
   parentSessionFile: string,
   runtimeId: string,
   now: string,
-  claimIsLive: (claim: WorkerLifecycleClaimRecoveryCandidate) => boolean
+  claimIsLive: (claim: WorkerLifecycleClaimRecoveryCandidate) => boolean,
+  owner?: Omit<ParentRuntimeIdentity, "runtimeId">
 ): number {
   return transaction(registry, () => {
-    const current = registry.database.prepare("SELECT generation FROM parent_runtimes WHERE parent_session_file=?").get(parentSessionFile) as { generation: number } | undefined;
-    const generation = (current?.generation ?? 0) + 1;
-    registry.database.prepare(`INSERT INTO parent_runtimes(parent_session_file,generation,runtime_id,updated_at)
-      VALUES(?,?,?,?) ON CONFLICT(parent_session_file) DO UPDATE SET generation=excluded.generation,runtime_id=excluded.runtime_id,updated_at=excluded.updated_at`)
-      .run(parentSessionFile, generation, runtimeId, now);
+    const generation = registerParentRuntimeInTransaction(registry, parentSessionFile, { runtimeId, ...(owner ?? {}) }, now);
     recoverInterruptedClaimsInTransaction(registry, parentSessionFile, generation, now, (claim) => {
       try { return claimIsLive(claim); } catch { return true; }
     });
@@ -685,7 +744,10 @@ function recoverInterruptedClaimsInTransaction(
       const candidate: WorkerLifecycleClaimRecoveryCandidate = { workerId: item.worker_id, runId: item.active_run_id, claimKind: item.claim_kind, claimNonce: item.claim_nonce, runtime: parseJson<Record<string, unknown>>(item.runtime_json) };
       if (claimIsLive(candidate)) continue;
     }
-    registry.database.prepare("UPDATE runs SET claim_kind=NULL,claim_nonce=NULL WHERE run_id=? AND worker_id=? AND claim_kind=? AND claim_nonce IS ?")
+    registry.database.prepare(`UPDATE runs SET claim_kind=NULL,claim_nonce=NULL,
+      terminal_intent=CASE WHEN claim_kind='cancellation' THEN COALESCE(terminal_intent,'cancellation') ELSE terminal_intent END,
+      terminal_error=CASE WHEN claim_kind='cancellation' AND terminal_intent IS NULL THEN NULL ELSE terminal_error END
+      WHERE run_id=? AND worker_id=? AND claim_kind=? AND claim_nonce IS ?`)
       .run(item.active_run_id, item.worker_id, item.claim_kind, item.claim_nonce);
     if (item.claim_kind === "cancellation") registry.database.prepare("UPDATE workers SET recovery_error=?,version=version+1,updated_at=? WHERE worker_id=?")
       .run("Interrupted cancellation claim is ready for exact containment recovery.", now, item.worker_id);
@@ -715,9 +777,12 @@ export function createWorkerRunBatch(registry: WorkerRegistry, input: {
   items: WorkerBatchCreateItem[];
   reviewLeases?: WorkerReviewLeaseClaim[];
   consumedPrepared?: Array<{ preparedId: string; parentSessionFile: string }>;
+  authority?: { parentSessionFile: string; runtimeGeneration: number };
   now: string;
 }): void {
   transaction(registry, () => {
+    if (input.authority && !parentRuntimeGenerationMatches(registry, input.authority.parentSessionFile, input.authority.runtimeGeneration))
+      throw new Error("Parent runtime was superseded; reload this session to regain worker lifecycle authority.");
     for (const lease of input.reviewLeases ?? []) {
       const result = registry.database.prepare(`UPDATE workers SET reviewed_by_worker_id=?,version=version+1,updated_at=?
         WHERE worker_id=? AND status='idle' AND (reviewed_by_worker_id IS NULL OR reviewed_by_worker_id=?) AND latest_run_id=? AND role IN ('work','integration')`)
@@ -757,9 +822,8 @@ export function releaseWorkerRunClaim(registry: WorkerRegistry, workerId: string
     .run(workerId, runId, kind, nonce).changes) === 1);
 }
 
-export function requestWorkerCancellation(registry: WorkerRegistry, workerId: string, runId: string, now: string, runtimeGeneration?: number): boolean {
+export function requestWorkerCancellation(registry: WorkerRegistry, workerId: string, runId: string, now: string): boolean {
   return transaction(registry, () => {
-    if (runtimeGeneration !== undefined && !workerRuntimeGenerationMatches(registry, workerId, runtimeGeneration)) return false;
     const result = registry.database.prepare(`UPDATE runs SET terminal_intent=CASE WHEN terminal_intent='failure' THEN terminal_intent ELSE 'cancellation' END,
       terminal_error=CASE WHEN terminal_intent='failure' THEN terminal_error ELSE NULL END
       WHERE worker_id=? AND run_id=? AND status IN ('queued','running')`).run(workerId, runId);
