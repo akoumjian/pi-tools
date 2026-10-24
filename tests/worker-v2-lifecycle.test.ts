@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync,
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { SessionManager, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { registerWorkerExtension } from "../extensions/worker/index.js";
@@ -77,6 +78,25 @@ async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolea
     async close() { releaseContainer(); for (const instance of instances) { try { await instance.event("session_shutdown"); } catch {} } rmSync(root, { recursive: true, force: true }); }
   };
 }
+const lifecycleOwnerFixture = fileURLToPath(new URL("./fixtures/worker-lifecycle-claim-owner.js", import.meta.url));
+
+async function spawnLifecycleClaimOwner(f: Fixture, item: { workerId: string; runId: string }, claimKind: "launch" | "settlement", mode: "hold" | "retire" = "hold") {
+  const parent = realpathSync(f.session.getSessionFile()!);
+  const child = spawn(process.execPath, [lifecycleOwnerFixture, f.runtimeRoot, parent, item.workerId, item.runId, claimKind, mode], { stdio: ["ignore", "ignore", "pipe", "ipc"] });
+  const claimed = await new Promise<any>((resolve, reject) => {
+    let stderr = ""; child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+    const timer = setTimeout(() => reject(new Error(`lifecycle owner did not claim: ${stderr}`)), 4_000);
+    child.once("error", reject); child.once("exit", (code, signal) => { if (mode !== "retire") reject(new Error(`lifecycle owner exited before claim (${code}/${signal}): ${stderr}`)); });
+    child.on("message", (message: any) => { if (message?.event === "claimed") { clearTimeout(timer); resolve(message); } });
+  });
+  return { child, claimed };
+}
+
+async function stopLifecycleClaimOwner(child: ReturnType<typeof spawn>, signal: NodeJS.Signals = "SIGKILL"): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  child.kill(signal); await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+}
+
 function job(jobId: string, status: JobMeta["status"], exitCode = status === "exited" ? 0 : undefined): JobMeta { return { jobId, command: "worker", cwd: "/tmp", status, durationMs: 1, exitCode, signal: null, notifyOnExit: false, completionNotified: true, logDir: "/tmp", stdoutLog: `/tmp/${jobId}.out`, stderrLog: `/tmp/${jobId}.err`, outputBytes: { stdout: 0, stderr: 0 } } as JobMeta; }
 function receipt(result: any) { return result.details.runs[0] as { workerId: string; runId: string; role: string }; }
 async function waitFor(check: () => boolean, timeout = 3_000) { const end = Date.now() + timeout; while (!check()) { if (Date.now() > end) throw new Error("condition timed out"); await new Promise((resolve) => setTimeout(resolve, 10)); } }
@@ -303,6 +323,67 @@ test("first cancellation behind a dead newest owner promotes, reclaims, and fini
     db = f.registry(); assert.equal(getWorkerRun(db, started.workerId, started.runId)!.outcome, "cancelled"); assert.equal(currentParentRuntime(db, parent)!.runtimeId !== "dead-newer-runtime", true); db.close();
     assert.equal(f.launches.length, 0);
   } finally { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await f.close(); }
+});
+
+test("K1: elected runtime automatically reclaims a crashed newer process launch claim and launches once", async () => {
+  const f = await fixture(); let owner: Awaited<ReturnType<typeof spawnLifecycleClaimOwner>> | undefined; try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "K1 crashed launch owner" }] }));
+    owner = await spawnLifecycleClaimOwner(f, started, "launch");
+    await stopLifecycleClaimOwner(owner.child);
+    await waitFor(() => f.launches.length === 1, 4_000);
+    const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; const parent = realpathSync(f.session.getSessionFile()!); assert.equal(run.status, "running"); assert.equal(run.claimKind, undefined); assert.ok(currentParentRuntime(db, parent)!.generation > owner.claimed.generation); db.close();
+    assert.equal(f.created.length, 1); assert.equal(f.launches.length, 1);
+    await f.call("worker_control", { action: "cancel", workerId: started.workerId });
+  } finally { if (owner) await stopLifecycleClaimOwner(owner.child); await f.close(); }
+});
+
+test("K1b: elected runtime automatically reclaims a cleanly unregistered launch claim and launches once", async () => {
+  const f = await fixture(); let owner: Awaited<ReturnType<typeof spawnLifecycleClaimOwner>> | undefined; try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "K1b retired launch owner" }] }));
+    owner = await spawnLifecycleClaimOwner(f, started, "launch", "retire");
+    if (owner.child.exitCode === null && owner.child.signalCode === null) await new Promise<void>((resolve) => owner!.child.once("exit", () => resolve()));
+    await waitFor(() => f.launches.length === 1, 4_000);
+    const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; db.close(); assert.equal(run.status, "running"); assert.equal(run.claimKind, undefined);
+    assert.equal(f.created.length, 1); assert.equal(f.launches.length, 1);
+    await f.call("worker_control", { action: "cancel", workerId: started.workerId });
+  } finally { if (owner) await stopLifecycleClaimOwner(owner.child); await f.close(); }
+});
+
+test("K3: elected runtime reclaims a crashed settlement claim and preserves accepted completion", async () => {
+  const f = await fixture(); let owner: Awaited<ReturnType<typeof spawnLifecycleClaimOwner>> | undefined; try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "K3 accepted settlement" }] })); await f.event("turn_end");
+    owner = await spawnLifecycleClaimOwner(f, started, "settlement");
+    const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: "accepted K3" }); launch.resolve(job(launch.record.jobId, "exited", 0));
+    await stopLifecycleClaimOwner(owner.child);
+    await waitFor(() => { const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId); db.close(); return run?.outcome === "completed"; }, 4_000);
+    const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; db.close(); assert.equal(run.summary, "accepted K3"); assert.equal(run.outcomeSource, "worker");
+    assert.equal(f.removed.filter((id) => id === started.runId).length, 1); assert.equal(f.messages.filter((message) => message.details?.runId === started.runId && message.details?.outcome === "completed").length, 1);
+  } finally { if (owner) await stopLifecycleClaimOwner(owner.child); await f.close(); }
+});
+
+test("K3c: cancel after settlement-owner death settles accepted completion instead of cancelling", async () => {
+  const f = await fixture(); let owner: Awaited<ReturnType<typeof spawnLifecycleClaimOwner>> | undefined; try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "K3c accepted result wins" }] })); await f.event("turn_end");
+    owner = await spawnLifecycleClaimOwner(f, started, "settlement");
+    const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: "accepted K3c" }); launch.resolve(job(launch.record.jobId, "exited", 0));
+    await stopLifecycleClaimOwner(owner.child);
+    const cancelled = await f.call("worker_control", { action: "cancel", workerId: started.workerId }); assert.ok(["superseded", "not_active"].includes((cancelled.details as any).cancellation));
+    const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; db.close(); assert.equal(run.outcome, "completed"); assert.equal(run.summary, "accepted K3c"); assert.equal(run.terminalIntent, undefined);
+    assert.equal(f.removed.filter((id) => id === started.runId).length, 1); assert.equal(f.messages.filter((message) => message.details?.runId === started.runId && message.details?.outcome === "completed").length, 1);
+  } finally { if (owner) await stopLifecycleClaimOwner(owner.child); await f.close(); }
+});
+
+test("K4: current newer registration automatically reclaims an older owner after its later death", async () => {
+  const f = await fixture(); let owner: Awaited<ReturnType<typeof spawnLifecycleClaimOwner>> | undefined; try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "K4 older owner death" }] }));
+    owner = await spawnLifecycleClaimOwner(f, started, "launch");
+    await f.reload();
+    let db = f.registry(); assert.equal(getWorkerRun(db, started.workerId, started.runId)!.claimNonce, owner.claimed.claimNonce, "new registration preserves the live older owner"); db.close();
+    await stopLifecycleClaimOwner(owner.child);
+    await waitFor(() => f.launches.length === 1, 4_000);
+    db = f.registry(); assert.equal(getWorkerRun(db, started.workerId, started.runId)!.status, "running"); db.close(); assert.equal(f.created.length, 1); assert.equal(f.launches.length, 1);
+    const current = await f.reload(); await current.call("worker_control", { action: "cancel", workerId: started.workerId });
+  } finally { if (owner) await stopLifecycleClaimOwner(owner.child); await f.close(); }
 });
 
 test("foreign-process claim survives while live and is recovered after exact owner death", async () => {

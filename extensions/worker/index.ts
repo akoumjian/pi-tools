@@ -17,10 +17,10 @@ import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
 import { WorkerControlParamsV2, WorkerMergeApplyParams, WorkerMergeTestParams, WorkerRunParamsV2, type WorkerControlInputV2, type WorkerRunInputV2 } from "./contract.js";
 import { applyPreparedWorkerMerges, consumePreparedMergeSet, defaultPreparedMergeRoot, prepareWorkerMerges, readPreparedMergeSet, restoreConsumedPreparedMergeSet } from "./merge.js";
 import {
-  abandonWorkerDiscard, activeRunsForParent, claimPreparedSetApply, clearWorkerRecoveryError, claimWorkerDiscard, claimWorkerDelivery, claimWorkerRun, claimWorkerTerminalIntent,
+  abandonWorkerDiscard, activeRunsForParent, claimPreparedSetApply, claimWorkerAcceptedSettlement, clearWorkerRecoveryError, claimWorkerDiscard, claimWorkerDelivery, claimWorkerRun, claimWorkerTerminalIntent,
   countWorkers, createWorkerRunBatch, finalizeClaimedWorkerRun, finalizeWorkerDiscard, finalizeWorkerRunLaunch, findWorkerRunById, finishPreparedSetApply,
   getWorker, getWorkerRun, listWorkerRuns, listWorkers, markWorkerDeliveryDelivered, openWorkerRegistry, pendingWorkerDeliveries,
-  currentParentRuntime, latestParentRuntimeMembers, promoteParentRuntime, readPreparedSetRecord, recordWorkerSettlementRecovery, reconcileWorkerDeliveries, registerParentRuntimeAndRecoverClaims, releasePreparedSetApply, releaseWorkerDeliveryClaim, releaseWorkerRunClaim, requestWorkerCancellation, requestWorkerFailure, retireParentRuntime, setClaimedWorkerTerminalIntent, setWorkerRecoveryError, storePreparedSet,
+  currentParentRuntime, latestParentRuntimeMembers, promoteParentRuntime, readPreparedSetRecord, recordWorkerSettlementRecovery, reconcileWorkerDeliveries, registerParentRuntimeAndRecoverClaims, releasePreparedSetApply, releaseWorkerDeliveryClaim, releaseWorkerRunClaim, recoverProvablyDeadWorkerRunClaim, requestWorkerCancellation, requestWorkerFailure, retireParentRuntime, setClaimedWorkerTerminalIntent, setWorkerRecoveryError, storePreparedSet,
   subscribeWorkerRegistryChanges, updateClaimedWorkerRunRuntime, updatePreparedSetStatus, updateWorkerRuntimeMetadata, workerRegistryDataVersion,
   type ParentRuntimeIdentity, type ParentRuntimeMember, type WorkerBatchCreateItem, type WorkerLifecycleClaimRecoveryCandidate, type WorkerRegistry, type WorkerRegistryRecord, type WorkerRepositoryResult, type WorkerRole, type WorkerRunRecord, type WorkerTerminalIntent
 } from "./registry.js";
@@ -129,6 +129,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   const starting = new Map<string, { runId: string; completion: Promise<void> }>();
   const terminalRecoveries = new Map<string, Promise<"cancelled" | "failed" | "not_active">>();
   const deliveredRecovery = new Set<string>();
+  const lifecycleClaimProbeAt = new Map<string, number>();
   const getRegistry = () => registry ??= openWorkerRegistry(runtimeRoot);
   const operationSnapshots = new Map<string, WorkerOperationSnapshot>();
   const clearOperationSnapshot = (toolCallId: string): void => { if (toolCallId) operationSnapshots.delete(toolCallId); };
@@ -666,14 +667,36 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         const file = lifecycleAdmissionPath(runtime); const admission = readLifecycleAdmission(file);
         if (admission && admission.workerId === workerId && admission.runId === runId && admission.claimKind === run.claimKind && admission.claimNonce === run.claimNonce) {
           const state = lifecycleAdmissionLiveness(admission);
-          if (state === "dead") { endLifecycleAdmission(file, admission.claimNonce); releaseWorkerRunClaim(getRegistry(), workerId, runId, run.claimKind, run.claimNonce); return; }
+          if (state === "dead") { endLifecycleAdmission(file, admission.claimNonce); recoverDeadLifecycleClaim(workerId, run, true); return; }
         } else if (lifecycleClaimNonceLiveness(run.claimNonce) === "dead") {
-          releaseWorkerRunClaim(getRegistry(), workerId, runId, run.claimKind, run.claimNonce); return;
+          recoverDeadLifecycleClaim(workerId, run, true); return;
         }
       }
       await delay(Math.min(25, Math.max(1, deadline - Date.now())));
     }
     throw new WorkerLifecycleOwnerBusyError(`Worker ${workerId}/${runId} still has a live lifecycle operation; terminal intent remains pending.`);
+  }
+
+  function recoverDeadLifecycleClaim(workerId: string, run: WorkerRunRecord, forceProbe = false): boolean {
+    if (!run.claimKind || !run.claimNonce) return false;
+    const observedAt = Date.now(); const nextProbe = lifecycleClaimProbeAt.get(run.claimNonce) ?? 0;
+    if (!forceProbe && observedAt < nextProbe) return false;
+    lifecycleClaimProbeAt.set(run.claimNonce, observedAt + Math.max(ownerProbeIntervalMs, 250));
+    const candidate: WorkerLifecycleClaimRecoveryCandidate = { workerId, runId: run.runId, claimKind: run.claimKind, claimNonce: run.claimNonce, runtime: run.runtime ?? {} };
+    if (lifecycleClaimIsLive(candidate)) return false;
+    const recovered = recoverProvablyDeadWorkerRunClaim(getRegistry(), { workerId, runId: run.runId, claimKind: run.claimKind, claimNonce: run.claimNonce, runtimeGeneration, now: now().toISOString() });
+    if (recovered) { lifecycleClaimProbeAt.delete(run.claimNonce); if (run.claimKind === "launch") pending.delete(run.runId); }
+    return recovered;
+  }
+
+  function validAcceptedResultEvidence(worker: WorkerRegistryRecord, run: WorkerRunRecord): boolean {
+    if (run.status !== "running") return false;
+    const runtime = run.runtime as RunRuntime; if (!runtime?.settledFile || !runtime.resultFile || !existsSync(runtime.settledFile) || !existsSync(runtime.resultFile)) return false;
+    try {
+      const settled = readWorkerHostSettlement(runtime.settledFile); const accepted = readWorkerRuntimeResult(runtime.resultFile);
+      return settled.workerId === worker.workerId && settled.runId === run.runId && settled.sessionId === worker.sessionId && path.resolve(settled.resultFile) === path.resolve(runtime.resultFile)
+        && accepted.workerId === worker.workerId && accepted.runId === run.runId;
+    } catch { return false; }
   }
 
   function persistClaimedRuntime(runtime: RunRuntime, workerId: string, runId: string, claimKind: LifecycleClaimKind, claimNonce: string): void {
@@ -704,7 +727,11 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   function assertRunClaim(workerId: string, runId: string, kind: "launch" | "settlement" | "cancellation", nonce: string): void { const run = getWorkerRun(getRegistry(), workerId, runId); if (run?.claimKind !== kind || run.claimNonce !== nonce) throw new Error(`Worker ${workerId}/${runId} ${kind} authority was revoked.`); }
 
   async function settleCompletedRun(workerId: string, runId: string, job: Pick<JobMeta, "status" | "exitCode" | "error">): Promise<void> {
-    const nonce = lifecycleClaimNonce(); if (!claimWorkerRun(getRegistry(), workerId, runId, "settlement", nonce, ["running"], runtimeGeneration)) return;
+    const worker = getWorker(getRegistry(), workerId); const before = worker && getWorkerRun(getRegistry(), workerId, runId); if (!worker || !before) return;
+    const accepted = job.status === "exited" && job.exitCode === 0 && validAcceptedResultEvidence(worker, before);
+    const nonce = lifecycleClaimNonce();
+    const claimed = accepted ? claimWorkerAcceptedSettlement(getRegistry(), workerId, runId, nonce, runtimeGeneration) : claimWorkerRun(getRegistry(), workerId, runId, "settlement", nonce, ["running"], runtimeGeneration);
+    if (!claimed) return;
     const runtime = getWorkerRun(getRegistry(), workerId, runId)!.runtime as RunRuntime; let operationAdmission: string | undefined; let releaseClaim = false;
     try { operationAdmission = beginLifecycleAdmission(runtime, workerId, runId, "settlement", nonce); releaseClaim = await settleClaimedRun(workerId, runId, job, nonce); }
     catch (error) { releaseClaim = true; recordRecovery(workerId, runId, error); }
@@ -790,9 +817,19 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     worker = getWorker(getRegistry(), workerId); run = getWorkerRun(getRegistry(), workerId, runId);
     if (run?.status === "settled") return run.outcome === "cancelled" ? "cancelled" : run.outcome === "failed" ? "failed" : "not_active";
     if (!worker || worker.activeRunId !== runId || !run || !run.terminalIntent) return "not_active";
+    if (validAcceptedResultEvidence(worker, run)) {
+      await settleCompletedRun(workerId, runId, { status: "exited", exitCode: 0 });
+      return "not_active";
+    }
     const terminalIntent = run.terminalIntent; const claimKind = terminalIntent === "cancellation" ? "cancellation" : "settlement"; const nonce = lifecycleClaimNonce();
     if (!claimWorkerTerminalIntent(getRegistry(), { workerId, runId, terminalIntent, claimKind, claimNonce: nonce, now: now().toISOString(), runtimeGeneration })) return "not_active";
     pending.delete(runId);
+    const claimedWorker = getWorker(getRegistry(), workerId); const claimedRun = getWorkerRun(getRegistry(), workerId, runId);
+    if (claimedWorker && claimedRun && validAcceptedResultEvidence(claimedWorker, claimedRun)) {
+      releaseWorkerRunClaim(getRegistry(), workerId, runId, claimKind, nonce);
+      await settleCompletedRun(workerId, runId, { status: "exited", exitCode: 0 });
+      return "not_active";
+    }
     if (terminalIntent === "failure") {
       await failClaimedRun(workerId, runId, "settlement", nonce, new Error(run.terminalError ?? "Worker run failed before accepting a result."));
       const after = getWorkerRun(getRegistry(), workerId, runId);
@@ -806,6 +843,12 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       await reconcileTerminatedPersistedAsyncShellJobsForOwner(path.join(workerPaths(roots, workerId).stateDir, "async-shell"), { kind: "worker-run", workerId, runId }, 250);
       const survivors = await waitForWorkerShellRecords(workerId, runId);
       if (survivors.length) throw new WorkerContainmentError(`Worker-owned process records remain active after container removal: ${survivors.map((job) => job.jobId).join(", ")}.`);
+      const beforeFinalizationWorker = getWorker(getRegistry(), workerId); const beforeFinalizationRun = getWorkerRun(getRegistry(), workerId, runId);
+      if (beforeFinalizationWorker && beforeFinalizationRun && validAcceptedResultEvidence(beforeFinalizationWorker, beforeFinalizationRun)) {
+        releaseWorkerRunClaim(getRegistry(), workerId, runId, "cancellation", nonce);
+        await settleCompletedRun(workerId, runId, { status: "exited", exitCode: 0 });
+        return "not_active";
+      }
       finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind: "cancellation", claimNonce: nonce, outcome: "cancelled", outcomeSource: "system", summary: "Worker run was cancelled by its parent.", sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile) : undefined, settledAt: now().toISOString() });
       active.delete(workerId); deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration); return "cancelled";
     } catch (error) {
@@ -817,7 +860,8 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   async function cancelWorker(worker: WorkerRegistryRecord): Promise<"cancelled" | "accepted_pending" | "superseded" | "not_active"> {
     if (!worker.activeRunId) return "not_active"; const runId = worker.activeRunId;
     const recoveringRun = getWorkerRun(getRegistry(), worker.workerId, runId); const recoveringRuntime = recoveringRun?.runtime as RunRuntime | undefined;
-    if (worker.recoveryError && recoveringRun?.status === "running" && !recoveringRun.terminalIntent && recoveringRuntime && existsSync(recoveringRuntime.settledFile) && existsSync(recoveringRuntime.resultFile)) {
+    if (recoveringRun && !recoveringRun.terminalIntent && validAcceptedResultEvidence(worker, recoveringRun)) {
+      if (ensureCurrentRuntimeAuthority(worker.parentSessionFile) === "current" && recoveringRun.claimKind) recoverDeadLifecycleClaim(worker.workerId, recoveringRun, true);
       await settleCompletedRun(worker.workerId, runId, { status: "exited", exitCode: 0 });
       const current = getWorker(getRegistry(), worker.workerId); if (!current?.activeRunId) return "superseded";
       throw new Error(`Worker ${worker.workerId}/${runId} has an accepted result whose settlement still requires recovery; cancellation will not discard it.`);
@@ -979,14 +1023,25 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
 
   function reconcileActiveRuns(launchInputs: { projectCwd: string; parentSessionId: string }, parentSessionFile: string): void {
     if (ensureCurrentRuntimeAuthority(parentSessionFile) !== "current") return;
-    for (const { worker, run } of activeRunsForParent(getRegistry(), parentSessionFile)) {
-      const runtime = run.runtime as RunRuntime;
+    const observedClaims = new Set<string>();
+    for (const activeRun of activeRunsForParent(getRegistry(), parentSessionFile)) {
+      let worker = activeRun.worker; let run = activeRun.run; const runtime = run.runtime as RunRuntime;
       if (!runtime || runtime.version !== 2) { if (worker.recoveryError) deliverRecovery(worker, run, worker.recoveryError); continue; }
+      if (run.claimNonce) observedClaims.add(run.claimNonce);
+      if (run.status === "running" && validAcceptedResultEvidence(worker, run)) {
+        if (run.claimKind && !recoverDeadLifecycleClaim(worker.workerId, run)) continue;
+        void settleCompletedRun(worker.workerId, run.runId, { status: "exited", exitCode: 0 }).catch((error) => recordRecovery(worker.workerId, run.runId, error));
+        continue;
+      }
       if (run.terminalIntent) {
         void beginTerminalRecovery(worker.workerId, run.runId).catch((error) => { if (!(error instanceof WorkerLifecycleOwnerBusyError)) { const current = getWorker(getRegistry(), worker.workerId); if (!current?.recoveryError) recordRecovery(worker.workerId, run.runId, error); } });
         continue;
       }
-      if (run.claimKind) { if (worker.recoveryError) deliverRecovery(worker, run, worker.recoveryError); continue; }
+      if (run.claimKind) {
+        if (!recoverDeadLifecycleClaim(worker.workerId, run)) { if (worker.recoveryError) deliverRecovery(worker, run, worker.recoveryError); continue; }
+        worker = getWorker(getRegistry(), worker.workerId) ?? worker; run = getWorkerRun(getRegistry(), worker.workerId, run.runId) ?? run;
+        if (run.claimKind) continue;
+      }
       if (worker.recoveryError) {
         if (run.status === "running" && existsSync(runtime.settledFile) && existsSync(runtime.resultFile)) clearWorkerRecoveryError(getRegistry(), worker.workerId, run.runId, now().toISOString());
         else if (run.status === "queued") clearWorkerRecoveryError(getRegistry(), worker.workerId, run.runId, now().toISOString());
@@ -1029,6 +1084,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       catch (error) { requestWorkerFailure(getRegistry(), worker.workerId, run.runId, sanitizeError(error), now().toISOString(), runtimeGeneration); continue; }
       if (claimWorkerRun(getRegistry(), worker.workerId, run.runId, "settlement", nonce, ["running"], runtimeGeneration)) void failClaimedRun(worker.workerId, run.runId, "settlement", nonce, new Error("Worker supervisor exited without a verified result settlement.")).catch((error) => recordRecovery(worker.workerId, run.runId, error));
     }
+    for (const nonce of lifecycleClaimProbeAt.keys()) if (!observedClaims.has(nonce)) lifecycleClaimProbeAt.delete(nonce);
   }
 
   function registerCommands(): void {

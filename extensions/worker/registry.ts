@@ -822,6 +822,33 @@ export function releaseWorkerRunClaim(registry: WorkerRegistry, workerId: string
     .run(workerId, runId, kind, nonce).changes) === 1);
 }
 
+/** Releases one exact claim only after the caller has proved its owner dead. */
+export function recoverProvablyDeadWorkerRunClaim(registry: WorkerRegistry, input: {
+  workerId: string; runId: string; claimKind: "launch" | "settlement" | "cancellation"; claimNonce: string; runtimeGeneration: number; now: string;
+}): boolean {
+  return transaction(registry, () => {
+    if (!workerRuntimeGenerationMatches(registry, input.workerId, input.runtimeGeneration)) return false;
+    const result = registry.database.prepare(`UPDATE runs SET claim_kind=NULL,claim_nonce=NULL,
+      terminal_intent=CASE WHEN claim_kind='cancellation' THEN COALESCE(terminal_intent,'cancellation') ELSE terminal_intent END,
+      terminal_error=CASE WHEN claim_kind='cancellation' AND terminal_intent IS NULL THEN NULL ELSE terminal_error END
+      WHERE worker_id=? AND run_id=? AND status IN ('queued','running') AND claim_kind=? AND claim_nonce=?`)
+      .run(input.workerId, input.runId, input.claimKind, input.claimNonce);
+    if (Number(result.changes) !== 1) return false;
+    if (input.claimKind === "cancellation") registry.database.prepare("UPDATE workers SET recovery_error=?,version=version+1,updated_at=? WHERE worker_id=? AND active_run_id=?")
+      .run("Interrupted cancellation claim is ready for exact containment recovery.", input.now, input.workerId, input.runId);
+    return true;
+  });
+}
+
+/** Claims a verified accepted result even if a later terminal request is pending. */
+export function claimWorkerAcceptedSettlement(registry: WorkerRegistry, workerId: string, runId: string, nonce: string, runtimeGeneration: number): boolean {
+  return transaction(registry, () => {
+    if (!workerRuntimeGenerationMatches(registry, workerId, runtimeGeneration)) return false;
+    return Number(registry.database.prepare("UPDATE runs SET claim_kind='settlement',claim_nonce=? WHERE worker_id=? AND run_id=? AND status='running' AND claim_kind IS NULL")
+      .run(nonce, workerId, runId).changes) === 1;
+  });
+}
+
 export function requestWorkerCancellation(registry: WorkerRegistry, workerId: string, runId: string, now: string): boolean {
   return transaction(registry, () => {
     const result = registry.database.prepare(`UPDATE runs SET terminal_intent=CASE WHEN terminal_intent='failure' THEN terminal_intent ELSE 'cancellation' END,
