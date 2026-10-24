@@ -38,6 +38,10 @@ Repository paths must identify contained Git repositories. Artifact paths may id
 
 ## Review
 
+Only a latest idle work/integration run with worker-submitted outcome `completed` is review-ready. Worker-submitted `needs_input` and `blocked`, and system-settled `failed` and `cancelled`, are not review signals. Review launch chooses the first available configured review selection whose provider differs from the subject provider and fails before launch when no independent provider is available.
+
+The parent launches a review for every eligible completed result and treats its outcome as advisory evidence. On `request_changes`, the parent resumes the same subject worker with the findings and reviews its next completed run; the default parent-driven workflow stops after that one correction/re-review cycle unless the parent deliberately authorizes another. Review never accepts, applies, publishes, grounds, or closes tasks.
+
 A review receives the exact subject run/session metadata, repository/artifact entry points, and additional-input mapping in `/review/context.json`. `/review/subject` is a disposable writable view of the complete unchanged subject workspace; reviewer reports belong under `/workspace`. The reviewed worker is leased against resume while review runs. Review workers have no credentials, Beads mutation, fix implementation, push, target mutation, or acceptance authority.
 
 Container bootstrap, root-only launch-control setup, and OverlayFS setup retain root only for required setup. The worker cannot write the root launch-control directory. Every worker command is launched through audited `setpriv` UID/GID and cleared-group dropping to the host owner, so worker repositories, results, and discardable workspace files remain host-owned. Supported rootful Docker environments use a local-driver OverlayFS view with one Docker-managed scratch volume containing sibling upper/work directories. Unsupported/rootless environments fail preflight. Writes to the subject view are deleted after settlement; reviewer session/workspace/reports remain retained.

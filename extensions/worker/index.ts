@@ -209,7 +209,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     description: "Start durable work, review, or integration workers, or resume previous workers. The `runs` list can launch or resume up to eight workers in one call. Each new worker receives its role-specific inputs, private workspace, retained session, and allowed Beads tasks; resumed workers preserve their exact role, workspace, session, and model selection. Runs execute asynchronously and deliver structured results when they settle.",
     promptSnippet: "Start work, review, or integration workers, or resume previous workers.",
     promptGuidelines: [
-      "Use `start` with role `work` for substantial self-contained assignments or substantial independent work that benefits from parallel execution; handle quick, tightly sequential, or parent-context-heavy work directly. Follow every completed work or integration run with a `review` start before relying on its output. Use an `integration` start after `worker_merge_test` reports conflicts when delegating resolution is preferable to resolving them yourself. Use `resume` for answers, corrections, or follow-up on the same worker, and start a replacement only after intentionally abandoning the previous worker. Batch only independent runs.",
+      "Use `start` with role `work` for substantial self-contained assignments or substantial independent work that benefits from parallel execution; handle quick, tightly sequential, or parent-context-heavy work directly. Treat only work/integration outcome `completed` as ready for review, and start an independent `review` before relying on it; the worker system selects a different provider or fails before launch. On `request_changes`, resume the subject with the findings and review its next completed run, with at most one correction/re-review cycle by default. Use an `integration` start after `worker_merge_test` reports conflicts when delegating resolution is preferable to resolving them yourself. Use `resume` for answers, corrections, or follow-up on the same worker, and start a replacement only after intentionally abandoning the previous worker. Batch only independent runs.",
       inputJsonSchemaGuideline("worker_run", WorkerRunParamsV2), outputJsonSchemaGuideline("worker_run", RetainedToolOutputSchemas.worker_run),
       "The parent remains sole authority for grounding, semantic acceptance, merge testing, validation, application, publication, Beads closure, and discard.",
       "worker_run constraints: Only result content is provider-visible; details remain internal."
@@ -346,10 +346,13 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
           const binding = latest?.binding; const paths = workerPaths(roots, worker.workerId); provisionWorkerPaths(paths);
           const role = worker.role; const inputs = validateAdditionalInputs({ values: request.additionalInputs, existing: runtimeInputs(worker), role, workspaceRoot: paths.workspaceRoot, runtimeRoot });
           let reviewOverlayPlan: ReviewOverlayPlan | undefined; let contextFile: string | undefined; let reviewedRunId: string | undefined; let preparedId: string | undefined; let operationRepositories: Array<Record<string, unknown>> | undefined; const pendingWorkSessionId = !worker.sessionId && role === "work" ? randomUUID() : undefined; const reservedRunId = role === "review" ? createWorkerRunId(now(), random()) : undefined;
+          let modelSelection = worker.modelSelection!;
           const mounts = inputMounts(inputs);
           if (role === "review") {
             if (!binding || !("reviewedRunId" in binding)) throw new Error(`Review worker ${worker.workerId} lost its reviewed-run binding.`);
             const subject = reviewSubject(binding.reviewedRunId, parentSessionFile, worker.workerId); reviewedRunId = binding.reviewedRunId;
+            if (!modelSelection) throw new Error(`Review worker ${worker.workerId} has no model provider provenance.`);
+            modelSelection = resolveModel(role, modelSelection, context, reviewedRunProvider(subject.run));
             contextFile = writeReviewContext(paths, request.workerId, reservedRunId!, subject.worker, subject.run, inputs);
             reviewOverlayPlan = { workerId: worker.workerId, runId: reservedRunId!, subjectWorkspace: subject.worker.workspaceRoot, reviewerWorkspace: paths.workspaceRoot, contextFile, reviewedSessionFile: subject.worker.sessionFile!, additionalInputs: inputs.map((item) => ({ source: item.source, target: item.target })) };
           } else if (role === "integration") {
@@ -359,11 +362,10 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
           }
           const retained = retainedWorkerRuntime(worker);
           if (pendingWorkSessionId) retained.cacheLineage = prepareWorkerCacheLineage({ stateRoot: roots.stateRoot, workerStateDir: paths.stateDir, parentSessionFile, parentSessionId: context.sessionManager.getSessionId(), route: parseWorkerModelSelection(worker.modelSelection!), now: now() });
-          const plan = finishPlanSafely({ request, role, workerId: worker.workerId, ...(reservedRunId ? { runId: reservedRunId } : {}), paths, taskIds: unique([...worker.taskIds, ...(request.additionalTaskIds ?? [])]), modelSelection: worker.modelSelection!, binding, workerRuntime: { version: 2, inputs, ...retained }, newWorker: false, expectedVersion: worker.version, reviewOverlayPlan, contextFile, reviewedRunId, preparedId, operationRepositories, pendingWorkSessionId, mounts, parentSessionFile, context });
+          const plan = finishPlanSafely({ request, role, workerId: worker.workerId, ...(reservedRunId ? { runId: reservedRunId } : {}), paths, taskIds: unique([...worker.taskIds, ...(request.additionalTaskIds ?? [])]), modelSelection, binding, workerRuntime: { version: 2, inputs, ...retained }, newWorker: false, expectedVersion: worker.version, reviewOverlayPlan, contextFile, reviewedRunId, preparedId, operationRepositories, pendingWorkSessionId, mounts, parentSessionFile, context });
           plans.push(plan); continue;
         }
         const role = request.role;
-        const modelSelection = resolveModel(role, role === "work" ? request.modelSelection : undefined, context);
         const workerId = createWorkerId(now(), random()); const paths = workerPaths(roots, workerId); const reservedRunId = role === "review" ? createWorkerRunId(now(), random()) : undefined;
         const taskIds = role === "review" ? [] : unique(request.taskIds);
         let subject: ReturnType<typeof reviewSubject> | undefined;
@@ -372,8 +374,13 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         let integrationSet: ReturnType<typeof readPreparedMergeSet> | undefined;
         let inputs: RetainedInput[] = [];
         if (role === "work") repositoryBaselines = (request.repositoryBaselines ?? []).map((item) => { const repo = canonicalRepository(item.path); return { path: repo, resolvedCommit: trustedGit(repo, ["rev-parse", `${item.revision ?? "HEAD"}^{commit}`]).trim() }; });
-        else if (role === "review") { subject = reviewSubject(request.reviewedRunId, parentSessionFile); inputs = validateAdditionalInputs({ values: request.additionalInputs, role, workspaceRoot: paths.workspaceRoot, runtimeRoot }); }
+        else if (role === "review") {
+          subject = reviewSubject(request.reviewedRunId, parentSessionFile);
+          inputs = validateAdditionalInputs({ values: request.additionalInputs, role, workspaceRoot: paths.workspaceRoot, runtimeRoot });
+        }
         else { integrationSet = trustedPreparedSet(getRegistry(), parentSessionFile, request.preparedId); inputs = validateAdditionalInputs({ values: request.additionalInputs, role, workspaceRoot: paths.workspaceRoot, runtimeRoot }); }
+        const excludedProvider = subject ? reviewedRunProvider(subject.run) : undefined;
+        const modelSelection = resolveModel(role, role === "work" ? request.modelSelection : undefined, context, excludedProvider);
         provisionWorkerPaths(paths);
         try { if (role === "work") cacheLineage = prepareWorkerCacheLineage({ stateRoot: roots.stateRoot, workerStateDir: paths.stateDir, parentSessionFile, parentSessionId: context.sessionManager.getSessionId(), route: parseWorkerModelSelection(modelSelection), now: now() }); }
         catch (error) { rmSync(paths.stateDir, { recursive: true, force: true }); throw error; }
@@ -733,8 +740,24 @@ function verifyRetainedSession(worker: WorkerRegistryRecord): void { if (worker.
 function runtimeInputs(worker: WorkerRegistryRecord): RetainedInput[] { const value = worker.runtime?.inputs; return Array.isArray(value) ? value as RetainedInput[] : []; }
 function retainedWorkerRuntime(worker: WorkerRegistryRecord): Partial<WorkerRuntime> { const baselines = worker.runtime?.repositoryBaselines; const cacheLineage = worker.runtime?.cacheLineage; return { ...(Array.isArray(baselines) ? { repositoryBaselines: baselines as any } : {}), ...(cacheLineage && typeof cacheLineage === "object" ? { cacheLineage: cacheLineage as WorkerCacheLineageRecord } : {}) }; }
 function parseWorkerModelSelection(value: string): { provider: string; model: string; thinkingLevel: string } { const slash = value.indexOf("/"); const colon = value.lastIndexOf(":"); if (slash < 1 || colon <= slash + 1) throw new Error(`Invalid worker model selection: ${value}.`); return { provider: value.slice(0, slash), model: value.slice(slash + 1, colon), thinkingLevel: value.slice(colon + 1) }; }
+function reviewedRunProvider(run: WorkerRunRecord): string { if (!run.modelSelection) throw new Error(`Reviewed run ${run.runId} has no model provider provenance.`); return parseWorkerModelSelection(run.modelSelection).provider; }
 function roleInstructionsFor(role: WorkerRole): string { return workerRoleInstructions(role).text; }
-function resolveModel(role: WorkerRole, explicit: string | undefined, context: ExtensionContext): string { const errors: string[] = []; for (const requested of preferredWorkerModel(role, explicit)) { try { const parsed = parseModelThinkingPair(requested); const resolved = resolveExtensionModel({ registry: context.modelRegistry, requested, fallbackThinkingLevel: parsed.thinkingLevel, label: `${role} worker`, noModelMessage: `No configured ${role} model is available.` }); assertChildAgentRouteAllowed(resolved.model, resolved.thinkingLevel, `${role} worker`); if (`${resolved.model.provider}/${resolved.model.id}:${resolved.thinkingLevel}` !== requested) throw new Error(`Selection ${requested} could not be honored exactly.`); return requested; } catch (error) { errors.push(sanitizeError(error)); } } throw new Error(`No configured ${role} model selection is available before launch. ${errors.join(" ")}`); }
+function resolveModel(role: WorkerRole, explicit: string | undefined, context: ExtensionContext, excludedProvider?: string): string {
+  const errors: string[] = [];
+  for (const requested of preferredWorkerModel(role, explicit)) {
+    try {
+      const parsed = parseModelThinkingPair(requested);
+      const resolved = resolveExtensionModel({ registry: context.modelRegistry, requested, fallbackThinkingLevel: parsed.thinkingLevel, label: `${role} worker`, noModelMessage: `No configured ${role} model is available.` });
+      assertChildAgentRouteAllowed(resolved.model, resolved.thinkingLevel, `${role} worker`);
+      if (excludedProvider !== undefined && resolved.model.provider === excludedProvider) throw new Error(`Selection ${requested} is not independent from the subject provider ${excludedProvider}.`);
+      if (`${resolved.model.provider}/${resolved.model.id}:${resolved.thinkingLevel}` !== requested) throw new Error(`Selection ${requested} could not be honored exactly.`);
+      return requested;
+    } catch (error) { errors.push(sanitizeError(error)); }
+  }
+  const requirement = excludedProvider === undefined ? "" : ` independent from subject provider ${excludedProvider}`;
+  throw new Error(`No configured ${role} model selection${requirement} is available before launch. ${errors.join(" ")}`);
+}
+
 function requireParentSession(context: ExtensionContext): string { const file = context.sessionManager.getSessionFile(); if (!file) throw new Error("Managed workers require a persisted parent session."); return realpathOrResolve(file); }
 function realpathOrResolve(value: string): string { try { return realpathSync(value); } catch { return path.resolve(value); } }
 function countLines(file: string): number { try { const text = readFileSync(file, "utf8"); return text === "" ? 0 : text.split("\n").length - (text.endsWith("\n") ? 1 : 0); } catch { return 0; } }

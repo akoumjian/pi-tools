@@ -18,7 +18,7 @@ const model = (provider: string, id: string) => ({ id, name: id, provider, api: 
 type Launch = { record: any; runtime: any; resolve(job: JobMeta): void; handle: ManagedAsyncJobHandle };
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
-async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolean; removeThrowsOnce?: boolean; removeAlwaysThrows?: boolean; deferContainer?: boolean } = {}) {
+async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolean; removeThrowsOnce?: boolean; removeAlwaysThrows?: boolean; deferContainer?: boolean; models?: Model<Api>[]; authenticatedProviders?: string[] } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "pi-worker-v2-lifecycle-"));
   const runtimeRoot = path.join(root, "runtime"); const workersRoot = path.join(runtimeRoot, "workers"); mkdirSync(workersRoot, { recursive: true });
   const session = SessionManager.create(root, path.join(root, "parent-session"), { id: `parent-${Date.now()}` }); writeFileSync(session.getSessionFile()!, `${JSON.stringify(session.getHeader())}\n`, { mode: 0o600 });
@@ -26,7 +26,7 @@ async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolea
   const launches: Launch[] = []; const created: string[] = []; const removed: string[] = []; const overlays: ReviewOverlayRecord[] = []; const cleaned: ReviewOverlayRecord[] = [];
   let releaseContainer = () => {}; const containerGate = options.deferContainer ? new Promise<void>((resolve) => { releaseContainer = resolve; }) : undefined; let removeFailures = 0; let counter = 0; const random = () => `${(++counter).toString(16).padStart(8, "0")}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`;
   const api = { registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand(name: string, command: any) { commands.set(name, command); }, registerMessageRenderer(name: string, renderer: Function) { renderers.set(name, renderer); }, on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, sendMessage(message: any) { messages.push(message); } } as unknown as ExtensionAPI;
-  const context = { cwd: root, hasUI: false, mode: "rpc", sessionManager: session, modelRegistry: { hasConfiguredAuth: () => true, getAll: () => [model("openai-codex", "gpt-5.6-sol"), model("anthropic", "claude-opus-5-5")] }, thinkingLevel: "xhigh", isIdle: () => true, hasPendingMessages: () => false, ui: { notify(message: string) { notifications.push(message); } } } as unknown as ExtensionContext;
+  const context = { cwd: root, hasUI: false, mode: "rpc", sessionManager: session, modelRegistry: { hasConfiguredAuth: (candidate: Model<Api>) => options.authenticatedProviders?.includes(candidate.provider) ?? true, getAll: () => options.models ?? [model("openai-codex", "gpt-5.6-sol"), model("anthropic", "claude-opus-5-5")] }, thinkingLevel: "xhigh", isIdle: () => true, hasPendingMessages: () => false, ui: { notify(message: string) { notifications.push(message); } } } as unknown as ExtensionContext;
   registerWorkerExtension(api, {
     runtimeRoot, roots: { stateRoot: workersRoot, workspaceRoot: workersRoot }, codeRoot: root, preparedRoot: path.join(runtimeRoot, "prepared"), targetRoot: root, dockerPath: "/fake/docker", random, now: () => new Date(`2026-01-01T00:00:${String(counter).padStart(2, "0")}.000Z`),
     waitForHostIdentity: async () => {},
@@ -206,6 +206,49 @@ test("failed deferred review overlay setup system-settles and releases the subje
   } finally { await f.close(); }
 });
 
+test("only completed work and integration outcomes are review-ready", async () => {
+  const f = await fixture(); try {
+    const blocked = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "subject" }] }));
+    await f.event("turn_end"); await complete(f, blocked, { outcome: "blocked", summary: "External prerequisite." });
+    await assert.rejects(f.call("worker_run", { runs: [{ action: "start", role: "review", reviewedRunId: blocked.runId }] }), /not eligible/);
+  } finally { await f.close(); }
+});
+
+test("review selection is provider-independent and fails closed without an alternative provider", async () => {
+  const f = await fixture(); try {
+    const anthropicSubject = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "subject", modelSelection: "anthropic/claude-opus-5-5:xhigh" }] }));
+    await f.event("turn_end"); await complete(f, anthropicSubject);
+    const openaiReview = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "review", reviewedRunId: anthropicSubject.runId }] }));
+    let db = f.registry(); assert.equal(getWorker(db, openaiReview.workerId)!.modelSelection, "openai-codex/gpt-5.6-sol:xhigh"); db.close();
+    await f.event("turn_end"); await f.call("worker_control", { action: "cancel", workerId: openaiReview.workerId });
+  } finally { await f.close(); }
+
+  const onlyOpenAi = await fixture({ models: [model("openai-codex", "gpt-5.6-sol")] }); try {
+    const subject = receipt(await onlyOpenAi.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "subject" }] }));
+    await onlyOpenAi.event("turn_end"); await complete(onlyOpenAi, subject);
+    await assert.rejects(onlyOpenAi.call("worker_run", { runs: [{ action: "start", role: "review", reviewedRunId: subject.runId }] }), /independent from subject provider openai-codex/);
+  } finally { await onlyOpenAi.close(); }
+
+  const missingProvenance = await fixture(); try {
+    const subject = receipt(await missingProvenance.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "subject" }] }));
+    await missingProvenance.event("turn_end"); await complete(missingProvenance, subject);
+    const db = missingProvenance.registry(); db.database.prepare("UPDATE runs SET model_selection=NULL WHERE run_id=?").run(subject.runId); db.close();
+    await assert.rejects(missingProvenance.call("worker_run", { runs: [{ action: "start", role: "review", reviewedRunId: subject.runId }] }), /no model provider provenance/);
+  } finally { await missingProvenance.close(); }
+});
+
+test("review creation refuses an unauthenticated independent provider without residue", async () => {
+  const f = await fixture({ authenticatedProviders: ["openai-codex"] }); try {
+    const subject = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "subject" }] }));
+    await f.event("turn_end"); await complete(f, subject);
+    const before = readdirSync(f.workersRoot).sort();
+    await assert.rejects(f.call("worker_run", { runs: [{ action: "start", role: "review", reviewedRunId: subject.runId }] }), /No configured review model selection independent from subject provider openai-codex.*no configured auth/i);
+    const db = f.registry(); const rows = listWorkers(db, { parentSessionFile: realpathSync(f.session.getSessionFile()!) });
+    assert.equal(rows.total, 1); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, undefined); db.close();
+    assert.deepEqual(readdirSync(f.workersRoot).sort(), before);
+  } finally { await f.close(); }
+});
+
 test("review starts fresh, mounts exact subject session range, cancellation releases lease, and resume recreates it", async () => {
   const f = await fixture(); try {
     const subject = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "subject" }] })); await f.event("turn_end"); await complete(f, subject);
@@ -219,6 +262,20 @@ test("review starts fresh, mounts exact subject session range, cancellation rele
     await f.call("worker_control", { action: "cancel", workerId: review.workerId }); db = f.registry(); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, undefined); db.close();
     const resumed = receipt(await f.call("worker_run", { runs: [{ action: "resume", workerId: review.workerId, instructions: "continue" }] })); await f.event("turn_end"); db = f.registry(); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, review.workerId); const resumedRuntime = getWorkerRun(db, review.workerId, resumed.runId)!.runtime as any; assert.notEqual(resumedRuntime.overlay.mergedVolume, runtime.overlay.mergedVolume); assert.equal((getWorker(db, review.workerId)!.runtime?.inputs as any[]).length, 1); db.close();
     await f.call("worker_control", { action: "cancel", workerId: review.workerId }); await f.call("worker_control", { action: "discard", workerId: review.workerId }); db = f.registry(); assert.equal(getWorker(db, review.workerId), undefined); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, undefined); db.close();
+  } finally { await f.close(); }
+});
+
+
+test("review resume rejects retained same-provider provenance without creating a run or lease", async () => {
+  const f = await fixture(); try {
+    const subject = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "subject" }] })); await f.event("turn_end"); await complete(f, subject);
+    const review = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "review", reviewedRunId: subject.runId }] }));
+    await f.call("worker_control", { action: "cancel", workerId: review.workerId });
+    let db = f.registry(); db.database.prepare("UPDATE workers SET model_selection=? WHERE worker_id=?").run("openai-codex/gpt-5.6-sol:xhigh", review.workerId); db.database.prepare("UPDATE runs SET model_selection=? WHERE worker_id=?").run("openai-codex/gpt-5.6-sol:xhigh", review.workerId);
+    const runCount = Number((db.database.prepare("SELECT COUNT(*) AS count FROM runs WHERE worker_id=?").get(review.workerId) as any).count); const runDirectory = path.join(f.workersRoot, review.workerId, "runs"); const before = readdirSync(runDirectory).sort(); db.close();
+    await assert.rejects(f.call("worker_run", { runs: [{ action: "resume", workerId: review.workerId, instructions: "continue" }] }), /not independent from the subject provider openai-codex/);
+    db = f.registry(); assert.equal(Number((db.database.prepare("SELECT COUNT(*) AS count FROM runs WHERE worker_id=?").get(review.workerId) as any).count), runCount); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, undefined); db.close();
+    assert.deepEqual(readdirSync(runDirectory).sort(), before);
   } finally { await f.close(); }
 });
 
@@ -251,7 +308,7 @@ test("review needs_input retains its exact subject lease and the same reviewer c
   } finally { await f.close(); }
 });
 
-test("integration starts in a fresh session, receives full conflict context, and resume preserves repositories and prior inputs", async () => {
+test("integration starts fresh, resumes with retained context, and exposes its completed run for independent review", async () => {
   const f = await fixture(); try {
     const target = path.join(f.root, "targets", "repo"); const candidate = path.join(f.root, "candidate"); mkdirSync(path.dirname(target), { recursive: true });
     gitInit(target); writeFileSync(path.join(target, "shared.txt"), "base\n"); git(target, "add", "."); git(target, "commit", "-m", "base");
@@ -270,7 +327,9 @@ test("integration starts in a fresh session, receives full conflict context, and
     const extra = path.join(f.root, "extra.txt"); writeFileSync(extra, "extra\n"); const resumed = receipt(await f.call("worker_run", { runs: [{ action: "resume", workerId: started.workerId, instructions: "continue", additionalInputs: [extra] }] }));
     db = f.registry(); worker = getWorker(db, resumed.workerId)!; run = getWorkerRun(db, resumed.workerId, resumed.runId)!; runtime = run.runtime as any; const updated = JSON.parse(readFileSync(runtime.contextFile, "utf8"));
     assert.equal(updated.additionalInputs.length, 2); assert.equal(existsSync(movedRepo), true); assert.equal(runtime.container.mounts.some((mount: any) => mount.target === "/integration/context.json"), true); assert.equal((worker.runtime?.inputs as any[]).length, 2); db.close();
-    await f.call("worker_control", { action: "cancel", workerId: resumed.workerId }); await f.call("worker_control", { action: "discard", workerId: resumed.workerId }); db = f.registry(); assert.equal(getWorker(db, resumed.workerId), undefined); const retainedPrepared = db.database.prepare("SELECT prepared_id FROM prepared_sets WHERE prepared_id=?").get(prepared.preparedId); assert.equal(retainedPrepared, undefined); db.close();
+    await f.event("turn_end"); await complete(f, resumed);
+    const review = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "review", reviewedRunId: resumed.runId }] })); db = f.registry(); assert.equal(getWorker(db, review.workerId)!.modelSelection, "anthropic/claude-opus-5-5:xhigh"); assert.deepEqual(getWorkerRun(db, review.workerId, review.runId)!.binding, { reviewedWorkerId: resumed.workerId, reviewedRunId: resumed.runId }); db.close();
+    await f.call("worker_control", { action: "cancel", workerId: review.workerId }); await f.call("worker_control", { action: "discard", workerId: review.workerId }); await f.call("worker_control", { action: "discard", workerId: resumed.workerId }); db = f.registry(); assert.equal(getWorker(db, resumed.workerId), undefined); const retainedPrepared = db.database.prepare("SELECT prepared_id FROM prepared_sets WHERE prepared_id=?").get(prepared.preparedId); assert.equal(retainedPrepared, undefined); db.close();
   } finally { await f.close(); }
 });
 

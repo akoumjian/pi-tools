@@ -28,14 +28,16 @@ Resume the same worker for corrections and follow-up. Start a replacement only a
 
 ### 3. Review
 
-Start a review worker for every completed work or integration run.
+Treat an accepted `worker_result_submit` outcome `completed` from a work or integration worker as its ready-for-review signal. Worker-submitted `needs_input` and `blocked`, and system-settled `failed` and `cancelled`, are not review-eligible.
 
-- `approve`: treat the review as evidence; the parent still decides acceptance.
-- `request_changes`: resume the original worker with the findings, then review the new completed run.
+Start a review worker for every eligible completed result. The worker system selects a configured reviewer from a different provider than the subject and fails before launch when no independent provider is available.
+
+- `approve`: treat the review as advisory evidence; the parent still decides acceptance.
+- `request_changes`: resume the original subject worker with the findings, then independently review its new completed run. Treat this as one bounded correction and re-review cycle by default; any further cycle requires a deliberate parent decision.
 - `needs_input`: answer and resume the same reviewer.
 - `blocked`: resolve or defer the review prerequisite.
 
-Use review instructions only for emphasis, questions, acceptance criteria, or follow-up. A focused review must still report material issues outside the requested focus.
+Use review instructions only for emphasis, questions, acceptance criteria, or follow-up. A focused review must still report material issues outside the requested focus. Review never accepts work, mutates authoritative repositories, applies merges, publishes, or closes tasks.
 
 ### 4. Integrate Repository Results
 

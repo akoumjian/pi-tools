@@ -25,7 +25,7 @@ export const StartWork = Type.Object({
 }, { additionalProperties: false });
 export const StartReview = Type.Object({
   action: Type.Literal("start", { description: "Start a new worker in the specified role." }),
-  role: Type.Literal("review", { description: "Independently review the latest completed run of a work or integration worker." }),
+  role: Type.Literal("review", { description: "Independently review the latest completed run of a work or integration worker using a different configured provider; launch fails if no independent provider is available." }),
   reviewedRunId: Type.String({ minLength: 1, maxLength: 128, pattern: "^run_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$", description: "Run to review. It must be the latest completed run of a work or integration worker. The review worker automatically receives its complete workspace, repository and artifact entry points, candidate inventories, and session." }),
   instructions: Type.Optional(Type.String({ minLength: 1, maxLength: 12 * 1024, description: "Optional review guidance. Omit for a general review. Use to emphasize risks, ask questions, supply acceptance criteria, or guide a follow-up review. The reviewer still reports material issues outside the requested focus." })),
   additionalInputs: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), { maxItems: 16, uniqueItems: true, description: "Additional files or directories outside the reviewed workspace to mount read-only for the reviewer. Use for prior review reports, datasets, specifications, reference trees, or other relevant context." })),
