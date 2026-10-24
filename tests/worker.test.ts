@@ -107,6 +107,34 @@ test("parent tool labels and approved copy remain exact and schemas carry field 
   const schemaText = JSON.stringify(WorkerRunParams); for (const phrase of ["Continue a previous worker", "One or more Beads task IDs", "Additional files or directories", "When to deliver the asynchronous result"]) assert.match(schemaText, new RegExp(phrase));
 });
 
+test("worker package-generation mismatch registers no launchable tools", () => {
+  const tools: ToolDefinition[] = [];
+  assert.throws(
+    () => registerWorkerExtension({ registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, on() {}, sendMessage() {} } as unknown as ExtensionAPI, {
+      assertPackageGeneration() { throw new Error("Fully quit and restart Pi; /reload cannot safely replace cached transitive modules."); }
+    }),
+    /Fully quit and restart Pi/
+  );
+  assert.deepEqual(tools, []);
+});
+
+test("worker tools fail before lifecycle effects when package generation changes", async () => {
+  const tools: ToolDefinition[] = [];
+  let checks = 0;
+  registerWorkerExtension({ registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, on() {}, sendMessage() {} } as unknown as ExtensionAPI, {
+    assertPackageGeneration() {
+      checks += 1;
+      if (checks > 1) throw new Error("Fully quit and restart Pi; /reload cannot safely replace cached transitive modules.");
+    }
+  });
+  const run = tools.find((tool) => tool.name === "worker_run")!;
+  await assert.rejects(
+    () => run.execute!("generation-call", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "Do work." }] }, new AbortController().signal, undefined, undefined as never),
+    /Fully quit and restart Pi/
+  );
+  assert.equal(checks, 2, "registration and execution each check the package generation");
+});
+
 test("strict control and beads schemas reject unrelated fields and approved bounds", async () => {
   assert.equal(Check(WorkerControlParams, { action: "cancel", workerId: "worker_20260101000000_aaaaaaaa", limit: 1 }), false);
   assert.equal(Check(WorkerControlParams, { action: "list", runId: "run_20260101000000_aaaaaaaa" }), false);

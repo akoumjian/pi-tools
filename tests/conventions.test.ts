@@ -155,6 +155,17 @@ test("pi-tools packages plain worker role instructions and one parent skill", ()
   assert.equal(existsSync(path.join(packageRoot, "skills", "managed-worker-integration")), false);
 });
 
+test("package upgrade guidance requires a full process restart", () => {
+  const readme = readText("README.md");
+  const workerDoc = readText("docs/extensions/worker.md");
+  const notificationDoc = readText("docs/extensions/completion-notifications.md");
+  assert.match(readme, /Fully restart Pi after installing or updating the package/);
+  assert.match(workerDoc, /Every worker operation rechecks the on-disk fingerprint/);
+  assert.match(workerDoc, /`\/reload` remains supported for same-generation worker delivery/);
+  assert.match(notificationDoc, /Fully quit and restart Pi after package installation or update/);
+  assert.doesNotMatch(notificationDoc, /must `\/reload` or restart after installation or update/);
+});
+
 test("pi-tools package files whitelist excludes tests and local runtime artifacts", () => {
   const manifest = packageJson();
   assert.deepEqual(manifest.files, [

@@ -1,9 +1,11 @@
 import { readFileSync } from "node:fs";
 import type { ConfigPath } from "../_shared/config.js";
 import { formatConfigPath, readPiToolsJsonConfigSource } from "../_shared/config.js";
+import { readPiToolsPackageGeneration } from "../_shared/package-generation.js";
 import { assertSubagentRouteSpecAllowed } from "../_shared/model-spec.js";
 import type { WorkerRole } from "./registry.js";
 
+export const PI_TOOLS_RUNTIME_GENERATION = readPiToolsPackageGeneration(import.meta.url).fingerprint;
 export const WORKER_CONFIG_FILE = "worker-settings.json";
 export type WorkerModelPreferences = Record<WorkerRole, string[]>;
 export type WorkerSettings = {

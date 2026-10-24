@@ -7,6 +7,8 @@ import { defineTool, type AgentToolResult, type ExtensionAPI, type ExtensionCont
 import { resolveExtensionModel, assertChildAgentRouteAllowed, parseModelThinkingPair } from "../_shared/model-spec.js";
 import { throwIfAborted } from "../_shared/cancellation.js";
 import { asyncJobProcessStartToken, createAsyncJobId, isAsyncJobProcessIdentityAlive, signalAsyncJobProcessIdentity } from "../_shared/async-job.js";
+import * as asyncJobPackage from "../_shared/async-job.js";
+import { assertPiToolsPackageGeneration } from "../_shared/package-generation.js";
 import { handleAsyncShellViewerCommand, reconcileTerminatedPersistedAsyncShellJobsForOwner, unsettledPersistedAsyncShellJobsForOwner, type JobMeta, type ManagedAsyncJobHandle } from "../async-shell/index.js";
 import { createWorkerContainerAsync, planWorkerContainer, resolveDockerPath, settleWorkerContainerAsync, type WorkerContainerReference } from "../_shared/worker-container.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
@@ -26,6 +28,7 @@ import {
 import { readWorkerRuntimeResult } from "./runtime.js";
 import { cleanupReviewOverlayAsync, createReviewOverlayAsync, type ReviewOverlayRecord } from "./review-workspace.js";
 import { preferredWorkerModel } from "./settings.js";
+import * as workerSettingsPackage from "./settings.js";
 import { createWorkerId, createWorkerRunId, defaultWorkerRoots, provisionWorkerPaths, workerPaths, type WorkerPaths, type WorkerRoots } from "./identity.js";
 import { createWorkerSession, forkWorkerSession, verifyWorkerSession } from "./session.js";
 import { launchWorkerHost, readWorkerHostProcess, readWorkerHostSettlement, type WorkerLaunchRecord } from "./runner.js";
@@ -81,11 +84,19 @@ export type WorkerExtensionDependencies = {
   launch?: (api: ExtensionAPI, context: ExtensionContext, input: { record: WorkerLaunchRecord; runtime: RunRuntime }) => ManagedAsyncJobHandle;
   createOverlay?: (input: Parameters<typeof createReviewOverlayAsync>[0]) => ReviewOverlayRecord | Promise<ReviewOverlayRecord>; cleanupOverlay?: (dockerPath: string, overlay: ReviewOverlayRecord) => void | Promise<void>;
   waitForHostIdentity?: (runtime: RunRuntime, workerId: string, runId: string) => Promise<void>;
+  assertPackageGeneration?: () => void;
 };
 
 export default function workerExtension(api: ExtensionAPI): void { registerWorkerExtension(api); }
 
 export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExtensionDependencies = {}): void {
+  const assertCurrentPackageGeneration = overrides.assertPackageGeneration ?? (() => {
+    assertPiToolsPackageGeneration(import.meta.url, [
+      { name: "async-job", marker: asyncJobPackage.PI_TOOLS_RUNTIME_GENERATION },
+      { name: "worker settings", marker: workerSettingsPackage.PI_TOOLS_RUNTIME_GENERATION }
+    ]);
+  });
+  assertCurrentPackageGeneration();
   const roots = overrides.roots ?? defaultWorkerRoots();
   const runtimeRoot = overrides.runtimeRoot ?? path.dirname(roots.stateRoot);
   const now = overrides.now ?? (() => new Date());
@@ -222,6 +233,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     },
     execute: async (toolCallId: string, params: WorkerRunInputV2, signal: AbortSignal, onUpdate: any, context: ExtensionContext): Promise<AgentToolResult<any>> => {
       clearOperationSnapshot(toolCallId);
+      assertCurrentPackageGeneration();
       throwIfAborted(signal);
       const parentSessionFile = requireParentSession(context);
       const planned = preflightBatch(params, context, parentSessionFile);
@@ -272,6 +284,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     renderCall: (args: unknown, theme: any) => compactCall(theme, workerControlCallLabel(args)),
     renderResult: (result: AgentToolResult<any>, _options: unknown, theme: any) => compactResult(theme, result, "worker control"),
     execute: async (_callId: string, params: WorkerControlInputV2, signal: AbortSignal, _update: any, context: ExtensionContext): Promise<AgentToolResult<any>> => {
+      assertCurrentPackageGeneration();
       throwIfAborted(signal); return control(params, context);
     }
   });
@@ -285,6 +298,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     parameters: WorkerMergeTestParams, executionMode: "sequential",
     renderCall: (args, theme, context) => compactCall(theme, "testing merge", mergeCallOperationHint(args, renderArgumentsComplete(context))), renderResult: (result, _options, theme) => compactResult(theme, result as any, "merge test", mergeResultOperationHint(safeResultDetails(result))),
     async execute(_id, params, signal, _update, context) {
+      assertCurrentPackageGeneration();
       throwIfAborted(signal); const parent = requireParentSession(context);
       const resolved = params.repositories.map((request) => ({ ...request, candidateRef: request.candidateRef ?? "HEAD" }));
       const set = prepareWorkerMerges(parent, resolved, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, sourceForCandidate: managedCandidateWarnings(parent) });
@@ -306,6 +320,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     },
     async execute(toolCallId, params, signal, _update, context) {
       clearOperationSnapshot(toolCallId);
+      assertCurrentPackageGeneration();
       throwIfAborted(signal); const parent = requireParentSession(context); const trustedSet = trustedPreparedSet(getRegistry(), parent, params.preparedId); if (!["ready", "partial", "failed"].includes(trustedSet.status)) throw new Error(`Prepared set ${params.preparedId} is not ready.`);
       const operation = mergeOperation(trustedSet.repositories);
       const nonce = claimNonce(); if (!claimPreparedSetApply(getRegistry(), params.preparedId, parent, nonce, now().toISOString())) throw new Error(`Prepared set ${params.preparedId} is already being applied or changed state.`);
