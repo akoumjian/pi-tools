@@ -44,6 +44,24 @@ function assertViewerHalfWriteChildLiveness(target: WorkerSessionViewTarget, par
   const script = `import { appendFileSync } from "node:fs"; import { createWorkerSessionViewerComponent, loadWorkerSessionViewSnapshot, loadWorkerSessionViewSnapshotAsync } from ${JSON.stringify(moduleUrl)}; const target = JSON.parse(process.argv[1]); const initial = loadWorkerSessionViewSnapshot(target); appendFileSync(target.sessionFile, process.argv[2]); await new Promise((resolve, reject) => { const component = createWorkerSessionViewerComponent({ tui: { terminal: { rows: 30 }, requestRender() {} }, getTheme: () => ({}), initialSnapshot: initial, loadSnapshot: async (request) => { try { const value = await loadWorkerSessionViewSnapshotAsync(target, request); if (!value.incompleteTrailingEntry) throw new Error("missing partial notice"); resolve(); return value; } catch (error) { reject(error); throw error; } }, done() {} }); component.handleInput("r"); });`;
   execFileSync(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(target), partial], { timeout: 5_000, stdio: "pipe" });
 }
+function assertRunningIndexIsolationChild(target: WorkerSessionViewTarget, mode: "settlement" | "sync" | "concurrent"): void {
+  const moduleUrl = new URL("../extensions/worker/view.js", import.meta.url).href;
+  const script = `import { appendFileSync } from "node:fs"; import { countSessionLines, loadWorkerSessionViewSnapshot, loadWorkerSessionViewSnapshotAsync } from ${JSON.stringify(moduleUrl)}; const target = JSON.parse(process.argv[1]); const mode = process.argv[2]; const final = JSON.stringify({ type: "message", id: "final", parentId: "seed-349", timestamp: "now", message: { role: "user", content: "FINAL ANSWER" } }) + "\\n"; let triggered = false; let end; let syncValue; let second; let heartbeats = 0; const timer = setInterval(() => { heartbeats += 1; }, 1); const dependencies = { afterChunkRead() { if (triggered) return; triggered = true; appendFileSync(target.sessionFile, final); if (mode === "settlement") end = countSessionLines(target.sessionFile); if (mode === "sync") syncValue = loadWorkerSessionViewSnapshot(target); if (mode === "concurrent") second = loadWorkerSessionViewSnapshotAsync(target); } }; const first = await loadWorkerSessionViewSnapshotAsync(target, { mode: "tail" }, dependencies); if (!triggered || first.totalVisibleEntries !== 350 || first.blocks.some((block) => block.text === "FINAL ANSWER")) throw new Error("small snapshot was not isolated"); if (mode === "settlement") { const settled = await loadWorkerSessionViewSnapshotAsync({ ...target, runStatus: "settled", workerStatus: "idle", outcome: "completed", sessionEndLine: end }); if (settled.totalVisibleEntries !== 351 || !settled.blocks.some((block) => block.text === "FINAL ANSWER")) throw new Error("settled snapshot lost final entry"); } if (mode === "sync" && (syncValue?.totalVisibleEntries !== 351 || !syncValue.blocks.some((block) => block.text === "FINAL ANSWER"))) throw new Error("sync overlap was not exact"); if (mode === "concurrent") { const larger = await second; if (larger.totalVisibleEntries !== 351 || !larger.blocks.some((block) => block.text === "FINAL ANSWER")) throw new Error("larger async snapshot was not exact"); } clearInterval(timer); if (heartbeats < 1) throw new Error("async index did not yield");`;
+  execFileSync(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(target), mode], { timeout: 8_000, stdio: "pipe" });
+}
+
+function assertViewerSettlementIndexIsolationChild(target: WorkerSessionViewTarget): void {
+  const moduleUrl = new URL("../extensions/worker/view.js", import.meta.url).href;
+  const script = `import { appendFileSync } from "node:fs"; import { countSessionLines, createWorkerSessionViewerComponent, loadWorkerSessionViewSnapshot, loadWorkerSessionViewSnapshotAsync } from ${JSON.stringify(moduleUrl)}; let target = JSON.parse(process.argv[1]); const make = (id, parentId, content) => JSON.stringify({ type: "message", id, parentId, timestamp: "now", message: { role: "user", content } }) + "\\n"; const initial = loadWorkerSessionViewSnapshot(target); let growth = ""; for (let index = 0; index < 350; index += 1) growth += make("growth-" + index, index === 0 ? "base" : "growth-" + (index - 1), "GROWTH-" + index + "-" + "x".repeat(7000)); appendFileSync(target.sessionFile, growth); let triggered = false; let pending; let heartbeats = 0; const timer = setInterval(() => { heartbeats += 1; }, 1); const dependencies = { afterChunkRead() { if (triggered) return; triggered = true; appendFileSync(target.sessionFile, make("final", "growth-349", "FINAL ANSWER")); const end = countSessionLines(target.sessionFile); target = { ...target, runStatus: "settled", workerStatus: "idle", outcome: "completed", sessionEndLine: end }; } }; const theme = { fg: (_color, text) => text, bold: (text) => text }; const component = createWorkerSessionViewerComponent({ tui: { terminal: { rows: 30 }, requestRender() {} }, getTheme: () => theme, initialSnapshot: initial, loadSnapshot: (request) => pending = loadWorkerSessionViewSnapshotAsync(target, request, dependencies), done() {} }); component.handleInput("r"); await new Promise((resolve) => setImmediate(resolve)); await pending; await new Promise((resolve) => setImmediate(resolve)); const firstFrame = component.render(100).join("\\n"); if (firstFrame.includes("Loading transcript page")) throw new Error("first refresh stayed loading"); component.handleInput("r"); await new Promise((resolve) => setImmediate(resolve)); await pending; await new Promise((resolve) => setImmediate(resolve)); const secondFrame = component.render(100).join("\\n"); if (!secondFrame.includes("FINAL ANSWER") || secondFrame.includes("Loading transcript page")) throw new Error("second refresh did not show settled final entry"); const reopened = loadWorkerSessionViewSnapshot(target); if (!reopened.blocks.some((block) => block.text === "FINAL ANSWER")) throw new Error("reopen lost final entry"); clearInterval(timer); if (heartbeats < 1) throw new Error("viewer refresh did not yield"); component.handleInput("q");`;
+  execFileSync(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(target)], { timeout: 8_000, stdio: "pipe" });
+}
+
+function assertAlternatingOversizedReadBound(target: WorkerSessionViewTarget, maximumBytes: number): void {
+  const moduleUrl = new URL("../extensions/worker/view.js", import.meta.url).href;
+  const script = `import fs from "node:fs"; import { syncBuiltinESMExports } from "node:module"; const original = fs.readSync; let bytes = 0; fs.readSync = function(...args) { const count = original.apply(this, args); bytes += count; return count; }; syncBuiltinESMExports(); const view = await import(${JSON.stringify(moduleUrl)}); const target = JSON.parse(process.argv[1]); let page = view.loadWorkerSessionViewSnapshot(target); bytes = 0; let blocks = page.blocks.length; while (page.hasPreviousPage) { page = view.loadWorkerSessionViewSnapshot(target, {}, { mode: "before", line: page.pageStartLine, ...(page.hasPreviousBlocksInEntry ? { block: page.pageStartBlock } : {}) }); blocks += page.blocks.length; } if (blocks !== 8) throw new Error("alternating traversal lost displayable entries: " + blocks); if (bytes > Number(process.argv[2])) throw new Error("alternating traversal reread " + bytes + " bytes");`;
+  execFileSync(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(target), String(maximumBytes)], { timeout: 8_000, stdio: "pipe" });
+}
+
 const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as Theme;
 
 test("worker conversation view preserves the opening assignment and renders compaction chronologically without raw JSONL", () => {
@@ -222,6 +240,27 @@ test("byte-bounded latest pages retain exact backward continuation when the open
     const forward = collect("forward"); const backward = collect("backward");
     assert.deepEqual(backward.sequence, forward.sequence); assert.equal(forward.sequence.length, 304); assert.equal(forward.sequence[0], "OPENING-BYTE-RAN");
     for (const page of [...forward.pages, ...backward.pages]) assert.equal(page.previousVisibleEntries + page.totalActiveEntries + page.nextVisibleEntries, page.totalVisibleEntries);
+  } finally { f.close(); }
+});
+
+test("async running snapshots stay isolated from settlement, sync, and concurrent index growth", () => {
+  for (const mode of ["settlement", "sync", "concurrent"] as const) {
+    const f = fixture();
+    try {
+      const entries = Array.from({ length: 350 }, (_, index) => line(message(`seed-${index}`, index === 0 ? null : `seed-${index - 1}`, `SEED-${index}-${"x".repeat(7000)}`)));
+      writeFileSync(f.sessionFile, line(header(f.target)) + entries.join(""));
+      const running = { ...f.target, runStatus: "running" as const, workerStatus: "running" as const, outcome: undefined, sessionStartLine: 2, sessionEndLine: undefined };
+      assertRunningIndexIsolationChild(running, mode);
+    } finally { f.close(); }
+  }
+});
+
+test("viewer refresh settles during final-write indexing and a second refresh shows the answer", () => {
+  const f = fixture();
+  try {
+    writeFileSync(f.sessionFile, line(header(f.target)) + line(message("base", null, "BASE")));
+    const running = { ...f.target, runStatus: "running" as const, workerStatus: "running" as const, outcome: undefined, sessionStartLine: 2, sessionEndLine: undefined };
+    assertViewerSettlementIndexIsolationChild(running);
   } finally { f.close(); }
 });
 
@@ -513,6 +552,22 @@ test("byte-bounded cursor pages make monotonic progress across adjacent multi-Mi
   }
 });
 
+test("alternating oversized backward traversal uses cached offsets within a linear read bound", () => {
+  const f = fixture();
+  try {
+    const entries = [line(message("opening", null, "OPENING"))];
+    let parent = "opening";
+    for (let index = 0; index < 6; index += 1) {
+      entries.push(line(message(`small-${index}`, parent, `SMALL-${index}-${"s".repeat(1024 * 1024)}`))); parent = `small-${index}`;
+      entries.push(line(message(`huge-${index}`, parent, `HUGE-${index}-${"h".repeat(9 * 1024 * 1024)}`))); parent = `huge-${index}`;
+    }
+    entries.push(line(message("last", parent, "LAST")));
+    writeFileSync(f.sessionFile, line(header(f.target)) + entries.join(""));
+    const target = { ...f.target, sessionStartLine: 2, sessionEndLine: entries.length + 1 };
+    assertAlternatingOversizedReadBound(target, 96 * 1024 * 1024);
+  } finally { f.close(); }
+});
+
 test("earlier and later counts exclude non-rendering custom entries at run edges", () => {
   const f = fixture();
   try {
@@ -542,6 +597,24 @@ test("paging skips windows containing only nondisplayed entries", () => {
     assert.deepEqual(forward.blocks.map((block) => block.text), ["DISPLAY-END"]); assert.equal(forward.previousVisibleEntries, 1); assert.equal(forward.nextVisibleEntries, 0);
     const backward = loadWorkerSessionViewSnapshot(target, {}, { mode: "before", line: entries.length + 1 });
     assert.deepEqual(backward.blocks.map((block) => block.text), ["DISPLAY-START"]); assert.equal(backward.previousVisibleEntries, 0); assert.equal(backward.nextVisibleEntries, 1);
+  } finally { f.close(); }
+});
+
+test("oversized skip notices remain exact after visibility and line-index thinning", async () => {
+  const f = fixture();
+  try {
+    const hidden = Array.from({ length: 70_100 }, (_, index) => line({ type: "custom", id: `hidden-${index}`, parentId: index === 0 ? "start" : `hidden-${index - 1}`, timestamp: "now", data: "hidden" })).join("");
+    const entries = line(message("start", null, "DISPLAY-START")) + hidden
+      + line(message("huge-1", "hidden-70099", `HUGE-1-${"x".repeat(9 * 1024 * 1024)}`))
+      + line(message("huge-2", "huge-1", `HUGE-2-${"x".repeat(9 * 1024 * 1024)}`))
+      + line(message("end", "huge-2", "DISPLAY-END"));
+    writeFileSync(f.sessionFile, line(header(f.target)) + entries);
+    const endLine = 70_105;
+    const target = { ...f.target, sessionStartLine: 2, sessionEndLine: endLine };
+    for (const value of [loadWorkerSessionViewSnapshot(target, {}, { mode: "before", line: endLine }), await loadWorkerSessionViewSnapshotAsync(target, { mode: "before", line: endLine })]) {
+      assert.deepEqual(value.blocks.map((block) => block.text), ["DISPLAY-START"]); assert.equal(value.skippedOversizedEntries, 2);
+      assert.equal(value.previousVisibleEntries, 0); assert.equal(value.nextVisibleEntries, 1);
+    }
   } finally { f.close(); }
 });
 

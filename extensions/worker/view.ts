@@ -43,7 +43,7 @@ type WorkerSessionHeader = {
   parentSession?: string;
 };
 
-type SessionLineCheckpoint = { lineNumber: number; offset: number; pinned?: boolean };
+type SessionLineCheckpoint = { lineNumber: number; offset: number; pinned?: boolean; oversizedStartOffset?: number };
 type SessionLineIndex = {
   dev: number;
   ino: number;
@@ -59,10 +59,11 @@ type SessionLineIndex = {
   checkpoints: SessionLineCheckpoint[];
 };
 
-type RenderableCheckpoint = { line: number; count: number };
-type RunVisibility = { openingLine?: number; openingRenderable: boolean; keptLine: number; hiddenEntries: number; compactionCount: number; incompleteTrailingEntry: boolean; renderedEntries: number; renderableCheckpoints: RenderableCheckpoint[]; incompleteLine?: number };
+type RenderableCheckpoint = { line: number; count: number; oversizedEntries: number; oversizedEntriesExact: boolean };
+type RunVisibility = { openingLine?: number; openingRenderable: boolean; keptLine: number; hiddenEntries: number; compactionCount: number; incompleteTrailingEntry: boolean; renderedEntries: number; oversizedEntries: number; renderableCheckpoints: RenderableCheckpoint[]; incompleteLine?: number };
 type RunVisibilityState = RunVisibility & {
   generation: number;
+  snapshotSize: number;
   analyzedEndLine: number;
   validEntries: number;
   entryIds: Map<string, { line: number; ordinal: number }>;
@@ -192,9 +193,9 @@ export function loadWorkerSessionViewSnapshot(
   return snapshotFromPage(target, readTrustedSessionPage(target, request, dependencies), request);
 }
 
-export async function loadWorkerSessionViewSnapshotAsync(target: WorkerSessionViewTarget, request: WorkerSessionPageRequest = { mode: "tail" }): Promise<WorkerSessionViewSnapshot> {
+export async function loadWorkerSessionViewSnapshotAsync(target: WorkerSessionViewTarget, request: WorkerSessionPageRequest = { mode: "tail" }, dependencies: WorkerSessionReadDependencies = {}): Promise<WorkerSessionViewSnapshot> {
   validateRunRange(target);
-  return snapshotFromPage(target, await readTrustedSessionPageAsync(target, request), request);
+  return snapshotFromPage(target, await readTrustedSessionPageAsync(target, request, dependencies), request);
 }
 
 function snapshotFromPage(target: WorkerSessionViewTarget, selected: ReadSessionPage, request: WorkerSessionPageRequest): WorkerSessionViewSnapshot {
@@ -477,10 +478,10 @@ function readTrustedSessionPage(target: WorkerSessionViewTarget, request: Worker
   throw new Error("Worker session changed while reading; refresh the view.");
 }
 
-async function readTrustedSessionPageAsync(target: WorkerSessionViewTarget, request: WorkerSessionPageRequest): Promise<ReadSessionPage> {
+async function readTrustedSessionPageAsync(target: WorkerSessionViewTarget, request: WorkerSessionPageRequest, dependencies: WorkerSessionReadDependencies): Promise<ReadSessionPage> {
   const file = trustedSessionPath(target);
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    try { return await readStableSessionPageAsync(file, target, request); }
+    try { return await readStableSessionPageAsync(file, target, request, dependencies); }
     catch (error) {
       if (attempt === 0 && error instanceof SessionChangedDuringReadError) { await yieldToEventLoop(); continue; }
       if (error instanceof SessionChangedDuringReadError) throw new Error("Worker session changed while reading; refresh the view.");
@@ -539,18 +540,19 @@ function readStableSessionPage(file: string, target: WorkerSessionViewTarget, re
   } finally { closeSync(fd); }
 }
 
-async function readStableSessionPageAsync(file: string, target: WorkerSessionViewTarget, request: WorkerSessionPageRequest): Promise<ReadSessionPage> {
+async function readStableSessionPageAsync(file: string, target: WorkerSessionViewTarget, request: WorkerSessionPageRequest, dependencies: WorkerSessionReadDependencies): Promise<ReadSessionPage> {
   const { fd, opened } = openSessionSnapshot(file);
   try {
     const headerLine = readHeaderLine(fd, opened.size);
     if (target.sessionStartLine === undefined) return emptyQueuedPage(headerLine);
-    const index = reusableSessionLineIndex(fd, file, opened, opened.size);
+    const index = cloneSessionLineIndex(reusableSessionLineIndex(fd, file, opened, opened.size));
+    retainSessionLineIndexByCas(file, index);
     while (index.size < opened.size && (target.sessionEndLine === undefined || sessionLineCount(index) < target.sessionEndLine)) {
-      extendSessionLineIndex(fd, file, index, opened.size, {}, 1);
-      retainSessionLineIndex(file, index);
+      extendSessionLineIndex(fd, file, index, opened.size, dependencies, 1);
+      retainSessionLineIndexByCas(file, index);
       await yieldToEventLoop();
     }
-    retainSessionLineIndex(file, index);
+    retainSessionLineIndexByCas(file, index);
     const indexedLines = sessionLineCount(index);
     if (target.sessionEndLine !== undefined && indexedLines < target.sessionEndLine) throw new Error("Worker session does not contain the retained run end line.");
     const runStartLine = Math.max(2, target.sessionStartLine);
@@ -558,6 +560,7 @@ async function readStableSessionPageAsync(file: string, target: WorkerSessionVie
     const visibility = await analyzeRunVisibilityCooperatively(fd, file, opened.size, index, runStartLine, runEndLine, target.sessionEndLine);
     await yieldToEventLoop();
     const selected = selectVisiblePage(fd, opened.size, index, headerLine, request, runStartLine, runEndLine, visibility);
+    dependencies.afterReadAttempt?.(file, 0);
     validateSessionSnapshot(fd, file, opened);
     return selected;
   } finally { closeSync(fd); }
@@ -706,7 +709,7 @@ function firstRenderableLineInRange(fd: number, snapshotSize: number, index: Ses
   }
   let line: number | undefined;
   scanRunEntries(fd, snapshotSize, index, scanStart, scanEnd, (entry, entryLine) => { if (line === undefined && isRenderableSessionEntry(entry)) line = entryLine; });
-  return { line, skippedOversizedEntries: oversizedLineCount(index, startLine, (line ?? startLine) - 1) };
+  return { line, skippedOversizedEntries: oversizedLineCount(fd, snapshotSize, index, visibility, startLine, (line ?? startLine) - 1) };
 }
 
 function lastRenderableLineInRange(fd: number, snapshotSize: number, index: SessionLineIndex, startLine: number, endLine: number, visibility: RunVisibility): RenderableLineSearch {
@@ -723,14 +726,23 @@ function lastRenderableLineInRange(fd: number, snapshotSize: number, index: Sess
   }
   let line: number | undefined;
   scanRunEntries(fd, snapshotSize, index, scanStart, endLine, (entry, entryLine) => { if (isRenderableSessionEntry(entry)) line = entryLine; });
-  return { line, skippedOversizedEntries: oversizedLineCount(index, (line ?? startLine - 1) + 1, endLine) };
+  return { line, skippedOversizedEntries: oversizedLineCount(fd, snapshotSize, index, visibility, (line ?? startLine - 1) + 1, endLine) };
 }
 
-function oversizedLineCount(index: SessionLineIndex, startLine: number, endLine: number): number {
+function oversizedLineCount(fd: number, snapshotSize: number, index: SessionLineIndex, visibility: RunVisibility, startLine: number, endLine: number): number {
   if (endLine < startLine) return 0;
-  let count = 0;
-  for (const checkpoint of index.checkpoints) if (checkpoint.pinned && checkpoint.lineNumber > startLine && checkpoint.lineNumber <= endLine + 1) count += 1;
-  return count;
+  return Math.max(0, oversizedCountThrough(fd, snapshotSize, index, visibility, endLine) - oversizedCountThrough(fd, snapshotSize, index, visibility, startLine - 1));
+}
+
+function oversizedCountThrough(fd: number, snapshotSize: number, index: SessionLineIndex, visibility: RunVisibility, line: number): number {
+  if (visibility.incompleteLine !== undefined) line = Math.min(line, visibility.incompleteLine - 1);
+  let checkpoint = visibility.renderableCheckpoints[0]!;
+  for (const candidate of visibility.renderableCheckpoints) {
+    if (candidate.line > line) break;
+    if (candidate.oversizedEntriesExact) checkpoint = candidate;
+  }
+  if (line <= checkpoint.line) return checkpoint.oversizedEntries;
+  return checkpoint.oversizedEntries + scanRunEntries(fd, snapshotSize, index, checkpoint.line + 1, line, () => {}).skippedOversizedEntries;
 }
 
 function nextVisibleRenderableLine(fd: number, snapshotSize: number, index: SessionLineIndex, startLine: number, runEndLine: number, visibility: RunVisibility): RenderableLineSearch {
@@ -785,17 +797,32 @@ function byteBoundedTailStart(index: SessionLineIndex, desiredStart: number, des
   return Math.max(desiredStart, result);
 }
 
-function visibilityStateKey(file: string, index: SessionLineIndex, runStartLine: number, fixedEndLine: number | undefined): string {
-  return `${file}\0${index.dev}:${index.ino}:${index.generation}:${runStartLine}:${fixedEndLine ?? "running"}`;
+function visibilityStatePrefix(file: string, index: SessionLineIndex, runStartLine: number): string {
+  return `${file}\0${index.dev}:${index.ino}:${index.generation}:${runStartLine}:`;
 }
 
-function visibilityState(file: string, index: SessionLineIndex, runStartLine: number, fixedEndLine: number | undefined): { key: string; state: RunVisibilityState } {
-  const key = visibilityStateKey(file, index, runStartLine, fixedEndLine);
+function visibilityStateKey(file: string, index: SessionLineIndex, runStartLine: number, runEndLine: number, snapshotSize: number, fixedEndLine: number | undefined): string {
+  const boundary = fixedEndLine === undefined ? `running:${runEndLine}:${snapshotSize}` : `settled:${fixedEndLine}`;
+  return `${visibilityStatePrefix(file, index, runStartLine)}${boundary}`;
+}
+
+function reusableVisibilityState(file: string, index: SessionLineIndex, runStartLine: number, runEndLine: number, snapshotSize: number): RunVisibilityState | undefined {
+  const prefix = `${visibilityStatePrefix(file, index, runStartLine)}running:`;
+  let best: RunVisibilityState | undefined;
+  for (const [candidateKey, candidate] of runVisibilityStates) {
+    if (!candidateKey.startsWith(prefix) || candidate.analyzedEndLine > runEndLine || candidate.snapshotSize > snapshotSize) continue;
+    if (!best || candidate.analyzedEndLine > best.analyzedEndLine || candidate.analyzedEndLine === best.analyzedEndLine && candidate.snapshotSize > best.snapshotSize) best = candidate;
+  }
+  return best;
+}
+
+function visibilityState(file: string, index: SessionLineIndex, runStartLine: number, runEndLine: number, snapshotSize: number, fixedEndLine: number | undefined): { key: string; state: RunVisibilityState } {
+  const key = visibilityStateKey(file, index, runStartLine, runEndLine, snapshotSize, fixedEndLine);
   let state: RunVisibilityState | undefined = runVisibilityStates.get(key);
   if (!state) {
-    const running = fixedEndLine === undefined ? undefined : runVisibilityStates.get(visibilityStateKey(file, index, runStartLine, undefined));
-    if (running && running.analyzedEndLine <= fixedEndLine!) state = cloneVisibilityState(running);
-    else state = { generation: index.generation, analyzedEndLine: runStartLine - 1, validEntries: 0, entryIds: new Map(), openingRenderable: false, keptLine: runStartLine, hiddenEntries: 0, compactionCount: 0, incompleteTrailingEntry: false, renderedEntries: 0, renderableCheckpoints: [{ line: runStartLine - 1, count: 0 }] };
+    const reusable = reusableVisibilityState(file, index, runStartLine, fixedEndLine ?? runEndLine, snapshotSize);
+    if (reusable) { state = cloneVisibilityState(reusable); state.snapshotSize = snapshotSize; }
+    else state = { generation: index.generation, snapshotSize, analyzedEndLine: runStartLine - 1, validEntries: 0, entryIds: new Map(), openingRenderable: false, keptLine: runStartLine, hiddenEntries: 0, compactionCount: 0, incompleteTrailingEntry: false, renderedEntries: 0, oversizedEntries: 0, renderableCheckpoints: [{ line: runStartLine - 1, count: 0, oversizedEntries: 0, oversizedEntriesExact: true }] };
     runVisibilityStates.set(key, state);
   }
   touchVisibilityState(key, state);
@@ -816,7 +843,7 @@ function touchVisibilityState(key: string, state: RunVisibilityState): void {
 }
 
 function visibilityResult(state: RunVisibilityState): RunVisibility {
-  return { openingLine: state.openingLine, openingRenderable: state.openingRenderable, keptLine: state.keptLine, hiddenEntries: state.hiddenEntries, compactionCount: state.compactionCount, incompleteTrailingEntry: state.incompleteTrailingEntry, renderedEntries: state.renderedEntries, renderableCheckpoints: state.renderableCheckpoints, ...(state.incompleteLine === undefined ? {} : { incompleteLine: state.incompleteLine }) };
+  return { openingLine: state.openingLine, openingRenderable: state.openingRenderable, keptLine: state.keptLine, hiddenEntries: state.hiddenEntries, compactionCount: state.compactionCount, incompleteTrailingEntry: state.incompleteTrailingEntry, renderedEntries: state.renderedEntries, oversizedEntries: state.oversizedEntries, renderableCheckpoints: state.renderableCheckpoints, ...(state.incompleteLine === undefined ? {} : { incompleteLine: state.incompleteLine }) };
 }
 
 function visibilityAnalysisComplete(state: RunVisibilityState, runEndLine: number, snapshotSize: number): boolean {
@@ -826,12 +853,14 @@ function visibilityAnalysisComplete(state: RunVisibilityState, runEndLine: numbe
 
 function analyzeRunVisibility(fd: number, file: string, snapshotSize: number, index: SessionLineIndex, runStartLine: number, runEndLine: number, fixedEndLine?: number): RunVisibility {
   for (;;) {
-    const { key, state } = visibilityState(file, index, runStartLine, fixedEndLine);
+    const { key, state } = visibilityState(file, index, runStartLine, runEndLine, snapshotSize, fixedEndLine);
     if (visibilityAnalysisComplete(state, runEndLine, snapshotSize)) return visibilityResult(state);
     const next = cloneVisibilityState(state);
+    next.snapshotSize = snapshotSize;
     next.incompleteTrailingEntry = false; delete next.incompleteLine; delete next.incompleteSnapshotSize;
     if (next.analyzedEndLine < runEndLine) {
-      const scan = scanRunEntries(fd, snapshotSize, index, Math.max(runStartLine, next.analyzedEndLine + 1), runEndLine, (entry, line) => updateVisibilityState(next, entry, line), (line) => recordVisibilityCheckpoint(next, line));
+      const scan = scanRunEntries(fd, snapshotSize, index, Math.max(runStartLine, next.analyzedEndLine + 1), runEndLine, (entry, line) => { updateVisibilityState(next, entry, line); if (isRenderableSessionEntry(entry)) recordVisibilityCheckpoint(next, line, false); }, (line, skippedOversizedEntries) => { next.oversizedEntries += skippedOversizedEntries; recordVisibilityCheckpoint(next, line, true); });
+      if (scan.snapshotExhausted) throw new SessionChangedDuringReadError();
       next.analyzedEndLine = Math.max(next.analyzedEndLine, scan.lastCompleteLine);
       if (scan.incompleteLine !== undefined) { next.incompleteTrailingEntry = true; next.incompleteLine = scan.incompleteLine; next.incompleteSnapshotSize = snapshotSize; }
     }
@@ -845,17 +874,19 @@ function analyzeRunVisibility(fd: number, file: string, snapshotSize: number, in
 
 async function analyzeRunVisibilityCooperatively(fd: number, file: string, snapshotSize: number, index: SessionLineIndex, runStartLine: number, runEndLine: number, fixedEndLine?: number): Promise<RunVisibility> {
   for (;;) {
-    const { key, state } = visibilityState(file, index, runStartLine, fixedEndLine);
+    const { key, state } = visibilityState(file, index, runStartLine, runEndLine, snapshotSize, fixedEndLine);
     if (visibilityAnalysisComplete(state, runEndLine, snapshotSize)) return visibilityResult(state);
     let flight = runVisibilityFlights.get(key);
     if (!flight) {
       const base = state;
       const next = cloneVisibilityState(base);
+      next.snapshotSize = snapshotSize;
       next.incompleteTrailingEntry = false; delete next.incompleteLine; delete next.incompleteSnapshotSize;
       const promise = (async () => {
         let incompleteTrailingEntry = false;
         if (next.analyzedEndLine < runEndLine) {
-          const scan = await scanRunEntriesCooperatively(fd, snapshotSize, index, Math.max(runStartLine, next.analyzedEndLine + 1), runEndLine, (entry, line) => updateVisibilityState(next, entry, line), (line) => recordVisibilityCheckpoint(next, line));
+          const scan = await scanRunEntriesCooperatively(fd, snapshotSize, index, Math.max(runStartLine, next.analyzedEndLine + 1), runEndLine, (entry, line) => { updateVisibilityState(next, entry, line); if (isRenderableSessionEntry(entry)) recordVisibilityCheckpoint(next, line, false); }, (line, skippedOversizedEntries) => { next.oversizedEntries += skippedOversizedEntries; recordVisibilityCheckpoint(next, line, true); });
+          if (scan.snapshotExhausted) throw new SessionChangedDuringReadError();
           next.analyzedEndLine = Math.max(next.analyzedEndLine, scan.lastCompleteLine);
           if (scan.incompleteLine !== undefined) { incompleteTrailingEntry = true; next.incompleteTrailingEntry = true; next.incompleteLine = scan.incompleteLine; next.incompleteSnapshotSize = snapshotSize; }
         }
@@ -869,7 +900,7 @@ async function analyzeRunVisibilityCooperatively(fd: number, file: string, snaps
     }
     const result = await flight.promise;
     if (result.incompleteTrailingEntry && result.snapshotSize === snapshotSize) {
-      const current = visibilityState(file, index, runStartLine, fixedEndLine).state;
+      const current = visibilityState(file, index, runStartLine, runEndLine, snapshotSize, fixedEndLine).state;
       return visibilityResult(current);
     }
   }
@@ -900,9 +931,9 @@ function isRenderableSessionEntry(entry: WorkerSessionEntry): boolean {
   return entry.oversized !== true && renderableBlockCount(entry) > 0;
 }
 
-function recordVisibilityCheckpoint(state: RunVisibilityState, line: number): void {
+function recordVisibilityCheckpoint(state: RunVisibilityState, line: number, oversizedEntriesExact = true): void {
   if (line < state.renderableCheckpoints[0]!.line) return;
-  const checkpoint = { line, count: state.renderedEntries };
+  const checkpoint = { line, count: state.renderedEntries, oversizedEntries: state.oversizedEntries, oversizedEntriesExact };
   if (state.renderableCheckpoints.at(-1)?.line === line) state.renderableCheckpoints[state.renderableCheckpoints.length - 1] = checkpoint;
   else state.renderableCheckpoints.push(checkpoint);
   while (state.renderableCheckpoints.length > MAX_VISIBILITY_CHECKPOINTS) {
@@ -955,35 +986,41 @@ async function findEntryLineCooperatively(fd: number, snapshotSize: number, inde
   return found;
 }
 
-type RunEntryScanResult = { lastCompleteLine: number; incompleteLine?: number };
+type RunEntryScanResult = { lastCompleteLine: number; skippedOversizedEntries: number; incompleteLine?: number; snapshotExhausted?: true };
 
-async function scanRunEntriesCooperatively(fd: number, snapshotSize: number, index: SessionLineIndex, startLine: number, endLine: number, visit: (entry: WorkerSessionEntry, line: number) => void, pageComplete?: (line: number) => void): Promise<RunEntryScanResult> {
+async function scanRunEntriesCooperatively(fd: number, snapshotSize: number, index: SessionLineIndex, startLine: number, endLine: number, visit: (entry: WorkerSessionEntry, line: number) => void, pageComplete?: (line: number, skippedOversizedEntries: number) => void): Promise<RunEntryScanResult> {
   let line = startLine;
   let lastCompleteLine = startLine - 1;
+  let skippedOversizedEntries = 0;
   while (line <= endLine) {
     const page = readPageLines(fd, snapshotSize, index, line, Math.min(endLine, line + MAX_SESSION_PAGE_LINES - 1), false);
+    skippedOversizedEntries += page.skippedOversizedEntries;
     for (const entry of parsedRunPageEntries(page)) visit(entry, entry.lineNumber);
     lastCompleteLine = page.incompleteTrailingEntry ? page.pageEndLine - 1 : page.pageEndLine;
-    if (lastCompleteLine >= line) pageComplete?.(lastCompleteLine);
-    if (page.incompleteTrailingEntry) { await yieldToEventLoop(); return { lastCompleteLine, incompleteLine: page.pageEndLine }; }
-    line = Math.max(line + 1, page.pageEndLine + 1);
+    if (lastCompleteLine >= line) pageComplete?.(lastCompleteLine, page.skippedOversizedEntries);
+    if (page.incompleteTrailingEntry) { await yieldToEventLoop(); return { lastCompleteLine, skippedOversizedEntries, incompleteLine: page.pageEndLine }; }
+    if (page.pageEndLine < line) { await yieldToEventLoop(); return { lastCompleteLine, skippedOversizedEntries, snapshotExhausted: true }; }
+    line = page.pageEndLine + 1;
     await yieldToEventLoop();
   }
-  return { lastCompleteLine };
+  return { lastCompleteLine, skippedOversizedEntries };
 }
 
-function scanRunEntries(fd: number, snapshotSize: number, index: SessionLineIndex, startLine: number, endLine: number, visit: (entry: WorkerSessionEntry, line: number) => void, pageComplete?: (line: number) => void): RunEntryScanResult {
+function scanRunEntries(fd: number, snapshotSize: number, index: SessionLineIndex, startLine: number, endLine: number, visit: (entry: WorkerSessionEntry, line: number) => void, pageComplete?: (line: number, skippedOversizedEntries: number) => void): RunEntryScanResult {
   let line = startLine;
   let lastCompleteLine = startLine - 1;
+  let skippedOversizedEntries = 0;
   while (line <= endLine) {
     const page = readPageLines(fd, snapshotSize, index, line, Math.min(endLine, line + MAX_SESSION_PAGE_LINES - 1), false);
+    skippedOversizedEntries += page.skippedOversizedEntries;
     for (const entry of parsedRunPageEntries(page)) visit(entry, entry.lineNumber);
     lastCompleteLine = page.incompleteTrailingEntry ? page.pageEndLine - 1 : page.pageEndLine;
-    if (lastCompleteLine >= line) pageComplete?.(lastCompleteLine);
-    if (page.incompleteTrailingEntry) return { lastCompleteLine, incompleteLine: page.pageEndLine };
-    line = Math.max(line + 1, page.pageEndLine + 1);
+    if (lastCompleteLine >= line) pageComplete?.(lastCompleteLine, page.skippedOversizedEntries);
+    if (page.incompleteTrailingEntry) return { lastCompleteLine, skippedOversizedEntries, incompleteLine: page.pageEndLine };
+    if (page.pageEndLine < line) return { lastCompleteLine, skippedOversizedEntries, snapshotExhausted: true };
+    line = page.pageEndLine + 1;
   }
-  return { lastCompleteLine };
+  return { lastCompleteLine, skippedOversizedEntries };
 }
 
 function parsedRunPageEntries(page: ReadPageLines): WorkerSessionEntry[] {
@@ -1057,7 +1094,7 @@ function extendSessionLineIndex(fd: number, file: string, index: SessionLineInde
       const nextLine = index.newlineCount + 1;
       if ((nextLine - 1) % index.stride === 0 || oversized) {
         const previous = index.checkpoints.at(-1);
-        const checkpoint = { lineNumber: nextLine, offset: absoluteNewline + 1, ...(oversized ? { pinned: true } : {}) };
+        const checkpoint = { lineNumber: nextLine, offset: absoluteNewline + 1, ...(oversized ? { pinned: true, oversizedStartOffset: index.lineStartOffset } : {}) };
         if (previous?.lineNumber === nextLine) index.checkpoints[index.checkpoints.length - 1] = { ...previous, ...checkpoint, pinned: previous.pinned || checkpoint.pinned };
         else index.checkpoints.push(checkpoint);
       }
@@ -1076,9 +1113,23 @@ function extendSessionLineIndex(fd: number, file: string, index: SessionLineInde
   index.fingerprint = sessionPrefixFingerprint(fd, position);
   while (index.checkpoints.length > MAX_LINE_INDEX_CHECKPOINTS) {
     const last = index.checkpoints.length - 1;
-    index.checkpoints = index.checkpoints.filter((_value, position) => position === 0 || position === last || position % 2 === 0);
+    const preferred = index.checkpoints.filter((value, position) => position === 0 || position === last || value.oversizedStartOffset !== undefined || position % 2 === 0);
+    index.checkpoints = preferred.length < index.checkpoints.length && preferred.length <= MAX_LINE_INDEX_CHECKPOINTS
+      ? preferred : index.checkpoints.filter((_value, position) => position === 0 || position === last || position % 2 === 0);
     index.stride *= 2;
   }
+}
+
+function cloneSessionLineIndex(index: SessionLineIndex): SessionLineIndex {
+  return { ...index, checkpoints: index.checkpoints.map((checkpoint) => ({ ...checkpoint })) };
+}
+
+function retainSessionLineIndexByCas(file: string, index: SessionLineIndex): void {
+  const current = sessionLineIndexes.get(file);
+  if (current && (current.generation > index.generation
+    || current.generation === index.generation && current.size >= index.size
+    || current.generation < index.generation && current.dev === index.dev && current.ino === index.ino && current.size > index.size)) return;
+  retainSessionLineIndex(file, cloneSessionLineIndex(index));
 }
 
 function retainSessionLineIndex(file: string, index: SessionLineIndex): void {
@@ -1120,6 +1171,9 @@ function readPageLines(fd: number, snapshotSize: number, index: SessionLineIndex
   if (desiredEnd < desiredStart) return { lines: [], oversizedEntryPrefixes: [], pageStartLine: desiredStart, pageEndLine: desiredEnd, skippedOversizedEntries: 0, incompleteTrailingEntry: false, droppedLeadingEntries: 0, decodedBytes: 0 };
   const checkpoint = nearestCheckpoint(index, desiredStart);
   const buffer = Buffer.allocUnsafe(Math.min(SESSION_READ_CHUNK, Math.max(1, snapshotSize - checkpoint.offset)));
+  const oversizedSpans = index.checkpoints.filter((value) => value.oversizedStartOffset !== undefined && value.offset <= snapshotSize);
+  let oversizedSpanIndex = oversizedSpans.findIndex((value) => value.offset > checkpoint.offset);
+  if (oversizedSpanIndex < 0) oversizedSpanIndex = oversizedSpans.length;
   const lines: Array<{ lineNumber: number; text: string; bytes: number }> = [];
   const oversizedEntryPrefixes: Array<{ lineNumber: number; text: string }> = [];
   let totalBytes = 0;
@@ -1163,7 +1217,19 @@ function readPageLines(fd: number, snapshotSize: number, index: SessionLineIndex
   };
 
   scan: while (position < snapshotSize && lineNumber <= desiredEnd) {
-    const count = readSync(fd, buffer, 0, Math.min(buffer.length, snapshotSize - position), position);
+    while (oversizedSpanIndex < oversizedSpans.length && oversizedSpans[oversizedSpanIndex]!.offset <= position) oversizedSpanIndex += 1;
+    const span = oversizedSpans[oversizedSpanIndex];
+    if (span?.oversizedStartOffset === position && span.lineNumber === lineNumber + 1) {
+      if (lineNumber >= desiredStart) {
+        pageEndLine = lineNumber;
+        skippedOversizedEntries += 1;
+        oversizedEntryPrefixes.push({ lineNumber, text: readOversizedEntryPrefix(fd, { startOffset: position, endOffset: span.offset - 1 }, snapshotSize) });
+      }
+      position = span.offset; lineNumber += 1; lineStartOffset = position; parts = []; partBytes = 0; oversized = false; oversizedSpanIndex += 1;
+      continue;
+    }
+    const beforePinnedSpan = span?.oversizedStartOffset !== undefined && span.oversizedStartOffset > position ? span.oversizedStartOffset - position : buffer.length;
+    const count = readSync(fd, buffer, 0, Math.min(buffer.length, snapshotSize - position, beforePinnedSpan), position);
     if (count === 0) throw new SessionChangedDuringReadError();
     let cursor = 0;
     while (cursor < count) {
