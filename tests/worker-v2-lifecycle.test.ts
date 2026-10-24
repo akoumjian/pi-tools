@@ -221,6 +221,60 @@ test("a new parent runtime adopts exact settlement after the launching runtime s
   }
 });
 
+test("truncated and non-regular sessions become bounded settlement evidence", async () => {
+  for (const damage of ["truncated", "non-regular"] as const) {
+    const f = await fixture();
+    try {
+      const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: `settle with ${damage} session` }] }));
+      await f.event("turn_end");
+      const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: `${damage} retained result` });
+      const db = f.registry(); const sessionFile = getWorker(db, started.workerId)!.sessionFile!; db.close();
+      if (damage === "truncated") writeFileSync(sessionFile, "");
+      else { rmSync(sessionFile); mkdirSync(sessionFile); }
+      launch.resolve(job(launch.record.jobId, "exited", 0));
+      await waitFor(() => { const side = f.registry(); const run = getWorkerRun(side, started.workerId, started.runId); side.close(); return run?.status === "settled"; });
+      const after = f.registry(); const run = getWorkerRun(after, started.workerId, started.runId)!; after.close();
+      assert.equal(run.outcome, "completed"); assert.equal(run.outcomeSource, "worker"); assert.equal(run.sessionEndLine, undefined);
+      assert.match(run.errors.map((error) => error.message).join(" "), damage === "truncated" ? /truncated below retained line/i : /not a regular file/i);
+    } finally { await f.close(); }
+  }
+});
+
+test("missing session settlement is best-effort and repeated reconciliation never leaks an async rejection", async () => {
+  const f = await fixture();
+  const runtimes: Array<{ handlers: Map<string, Function[]> }> = [];
+  try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "settle after session damage" }] }));
+    await f.event("turn_end"); await f.event("session_shutdown");
+    const detached = writeCompletionEvidence(f, started, { outcome: "completed", summary: "retained despite missing session" });
+    const before = f.registry(); const sessionFile = getWorker(before, started.workerId)!.sessionFile!; before.close(); rmSync(sessionFile);
+
+    for (let restart = 0; restart < 3; restart += 1) {
+      const handlers = new Map<string, Function[]>(); const api = {
+        registerTool() {}, registerCommand() {}, registerMessageRenderer() {}, sendMessage() {},
+        on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }
+      } as unknown as ExtensionAPI;
+      registerWorkerExtension(api, {
+        runtimeRoot: f.runtimeRoot, roots: { stateRoot: f.workersRoot, workspaceRoot: f.workersRoot }, codeRoot: f.root,
+        preparedRoot: path.join(f.runtimeRoot, "prepared"), targetRoot: f.root, dockerPath: "/fake/docker",
+        createContainer: async () => { throw new Error("settled run must not relaunch"); }, removeContainer: async () => {},
+        createOverlay: async () => { throw new Error("settled run must not create an overlay"); }, cleanupOverlay: async () => {},
+        waitForHostIdentity: async () => {}, launch: () => { throw new Error("settled run must not relaunch"); }
+      });
+      runtimes.push({ handlers });
+      for (const handler of handlers.get("session_start") ?? []) assert.equal(handler({}, f.context), undefined);
+      await waitFor(() => { const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId); db.close(); return run?.status === "settled"; });
+    }
+    const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; db.close();
+    assert.equal(run.outcome, "completed"); assert.equal(run.outcomeSource, "worker"); assert.equal(run.sessionEndLine, undefined);
+    assert.match(run.errors.map((error) => error.message).join(" "), /session end line could not be recorded safely.*unavailable/i);
+    detached.resolve(job(detached.record.jobId, "exited", 0));
+  } finally {
+    for (const runtime of runtimes) for (const handler of runtime.handlers.get("session_shutdown") ?? []) await handler({}, f.context);
+    await f.close();
+  }
+});
+
 test("failed deferred review overlay setup system-settles and releases the subject lease", async () => {
   const f = await fixture({ overlayThrows: true }); try {
     const subject = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "subject" }] })); await f.event("turn_end"); await complete(f, subject);

@@ -7,4 +7,4 @@
 - Use `worker_beads_tasks` for meaningful updates on assigned tasks; the parent owns acceptance and closure.
 - Never push, publish, release, or alter parent grounding. Return through `worker_result_submit` with the repository and artifact entry points needed for review and retesting.
 
-Repository candidates must live outside the workspace `cache/`, `tmp/`, and known HOME tool-cache subtrees; prefer `repos/`, which inventory scans first.
+Repository candidates must live outside the workspace `cache/`, `tmp/`, and known HOME tool-cache subtrees; prefer `repos/`, which inventory always scans first. Treat inventory notices naming skipped broad artifact, runtime, or tool-cache subtrees as explicit discovery limitations, and report every intended repository directly.

@@ -27,7 +27,7 @@ import { readWorkerRuntimeResult } from "./runtime.js";
 import { cleanupReviewOverlayAsync, createReviewOverlayAsync, type ReviewOverlayRecord } from "./review-workspace.js";
 import { preferredWorkerModel } from "./settings.js";
 import { createWorkerId, createWorkerRunId, defaultWorkerRoots, provisionWorkerPaths, workerPaths, type WorkerPaths, type WorkerRoots } from "./identity.js";
-import { createWorkerSession, forkWorkerSession, verifyWorkerSession } from "./session.js";
+import { createWorkerSession, forkWorkerSession, readWorkerSessionHeader, verifyWorkerSession } from "./session.js";
 import { launchWorkerHost, readWorkerHostProcess, readWorkerHostSettlement, type WorkerLaunchRecord } from "./runner.js";
 import { renderWorkerRuntimePrompt } from "./prompts.js";
 import { contextInputs, inputMounts, validateAdditionalInputs, type RetainedInput } from "./inputs.js";
@@ -157,7 +157,9 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       deliveredRecovery.clear();
       observedDataVersion = workerRegistryDataVersion(getRegistry());
       deliverPendingCompletions(api, getRegistry(), exactParent, runtimeGeneration);
-      void Promise.resolve().then(() => reconcileActiveRuns(context, exactParent));
+      void Promise.resolve().then(() => reconcileActiveRuns(context, exactParent)).catch((error) => {
+        try { context.ui.notify(`Worker reconciliation could not complete: ${sanitizeError(error)}`, "error"); } catch {}
+      });
       if (deliveryTimer) clearInterval(deliveryTimer);
       deliveryTimer = setInterval(() => {
         try {
@@ -523,7 +525,8 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       if (runtime.overlay) await cleanupOverlay(docker(), runtime.overlay);
       const inventory = inventoryWorkerRepositories({ workspaceRoot: worker.workspaceRoot, workerId, runId, reported, before: runtime.repositoryBefore });
       errors.push(...inventory.errors.map((message) => ({ scope: "repositories" as const, message: sanitizeError(message) })));
-      finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind: "settlement", claimNonce: nonce, outcome, outcomeSource, summary: summary.slice(0, 2048), ...(question ? { question } : {}), repositories: inventory.repositories, artifacts, errors, sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile) : undefined, settledAt: now().toISOString() });
+      const sessionEndLine = bestEffortSessionEndLine(worker.sessionFile, errors, run.sessionStartLine);
+      finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind: "settlement", claimNonce: nonce, outcome, outcomeSource, summary: summary.slice(0, 2048), ...(question ? { question } : {}), repositories: inventory.repositories, artifacts, errors, sessionEndLine, settledAt: now().toISOString() });
       if (currentContext?.sessionManager.getSessionFile() && realpathOrResolve(currentContext.sessionManager.getSessionFile()!) === worker.parentSessionFile) deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration);
     } catch (error) {
       const message = sanitizeError(error);
@@ -532,11 +535,13 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       try { if (existsSync(runtime.resultFile)) accepted = readWorkerRuntimeResult(runtime.resultFile); } catch {}
       if (attempts >= 3) {
         const retained = accepted ? ` Accepted result ${accepted.result.outcome} remains retained at ${runtime.resultFile}.` : ` Settlement evidence remains retained beneath ${runtime.runDir}.`;
+        const fallbackErrors: Array<{ scope: "run" | "repositories" | "artifacts"; message: string }> = [{ scope: "run", message: `${message}${retained}` }];
+        const sessionEndLine = bestEffortSessionEndLine(worker.sessionFile, fallbackErrors, accepted ? run.sessionStartLine : run.sessionStartLine === undefined ? undefined : run.sessionStartLine - 1);
         finalizeClaimedWorkerRun(getRegistry(), {
           parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind: "settlement", claimNonce: nonce,
           outcome: "failed", outcomeSource: "system", summary: `Worker result settlement failed after ${attempts} deterministic attempts.`,
-          artifacts: accepted?.result.artifacts ?? [], errors: [{ scope: "run", message: `${message}${retained}` }],
-          sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile) : undefined, settledAt: now().toISOString()
+          artifacts: accepted?.result.artifacts ?? [], errors: fallbackErrors,
+          sessionEndLine, settledAt: now().toISOString()
         });
         if (currentContext?.sessionManager.getSessionFile() && realpathOrResolve(currentContext.sessionManager.getSessionFile()!) === worker.parentSessionFile) deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration);
       } else {
@@ -550,7 +555,9 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   async function failClaimedRun(workerId: string, runId: string, claimKind: "launch" | "settlement", claimNonce: string, error: unknown): Promise<void> {
     const worker = getWorker(getRegistry(), workerId); const run = worker && getWorkerRun(getRegistry(), workerId, runId); if (!worker || !run || run.claimKind !== claimKind || run.claimNonce !== claimNonce) return; const runtime = run.runtime as RunRuntime;
     try { await removeContainer(docker(), runtime.container); if (runtime.overlay) await cleanupOverlay(docker(), runtime.overlay);
-      finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind, claimNonce, outcome: "failed", outcomeSource: "system", summary: "Worker run failed before accepting a result.", errors: [{ scope: "run", message: sanitizeError(error) }], sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile) : undefined, settledAt: now().toISOString() });
+      const errors: Array<{ scope: "run" | "repositories" | "artifacts"; message: string }> = [{ scope: "run", message: sanitizeError(error) }];
+      const sessionEndLine = bestEffortSessionEndLine(worker.sessionFile, errors, run.sessionStartLine === undefined ? undefined : run.sessionStartLine - 1);
+      finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind, claimNonce, outcome: "failed", outcomeSource: "system", summary: "Worker run failed before accepting a result.", errors, sessionEndLine, settledAt: now().toISOString() });
     } catch (cleanupError) { recordRecovery(workerId, runId, cleanupError); }
   }
 
@@ -578,7 +585,9 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       await reconcileTerminatedPersistedAsyncShellJobsForOwner(path.join(workerPaths(roots, worker.workerId).stateDir, "async-shell"), { kind: "worker-run", workerId: worker.workerId, runId }, 250);
       const survivors = await waitForWorkerShellRecords(worker.workerId, runId);
       if (survivors.length) throw new Error(`Worker-owned process records remain active after container removal: ${survivors.map((job) => job.jobId).join(", ")}.`);
-      finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId: worker.workerId, runId, claimKind: "cancellation", claimNonce: nonce, outcome: "cancelled", outcomeSource: "system", summary: "Worker run was cancelled by its parent.", sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile) : undefined, settledAt: now().toISOString() });
+      const errors: Array<{ scope: "run" | "repositories" | "artifacts"; message: string }> = [];
+      const sessionEndLine = bestEffortSessionEndLine(worker.sessionFile, errors, run.sessionStartLine === undefined ? undefined : run.sessionStartLine - 1);
+      finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId: worker.workerId, runId, claimKind: "cancellation", claimNonce: nonce, outcome: "cancelled", outcomeSource: "system", summary: "Worker run was cancelled by its parent.", ...(errors.length ? { errors } : {}), sessionEndLine, settledAt: now().toISOString() });
       active.delete(worker.workerId); deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration); return "cancelled";
     } catch (error) { recordRecovery(worker.workerId, runId, error); throw new Error(`Worker ${worker.workerId}/${runId} cancellation requires recovery: ${sanitizeError(error)}`); }
   }
@@ -675,7 +684,12 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         continue;
       }
       if (active.get(worker.workerId)?.runId === run.runId) continue;
-      if (existsSync(runtime.settledFile) && existsSync(runtime.resultFile)) { void settleCompletedRun(worker.workerId, run.runId, { status: "exited", exitCode: 0 }); continue; }
+      if (existsSync(runtime.settledFile) && existsSync(runtime.resultFile)) {
+        void settleCompletedRun(worker.workerId, run.runId, { status: "exited", exitCode: 0 }).catch((error) => {
+          try { recordRecovery(worker.workerId, run.runId, error); } catch {}
+        });
+        continue;
+      }
       if (existsSync(runtime.processFile)) { try { const process = readWorkerHostProcess(runtime.processFile); if (process.workerId === worker.workerId && process.runId === run.runId && process.nonce === runtime.processNonce && isAsyncJobProcessIdentityAlive(process)) continue; } catch {} }
       const nonce = claimNonce(); if (claimWorkerRun(getRegistry(), worker.workerId, run.runId, "settlement", nonce, ["running"])) void failClaimedRun(worker.workerId, run.runId, "settlement", nonce, new Error("Worker supervisor exited without a verified result settlement."));
     }
@@ -748,7 +762,14 @@ function writeIntegrationContext(paths: WorkerPaths, set: ReturnType<typeof read
 }
 function writeReadonlyJson(file: string, value: unknown): void { if (existsSync(file)) chmodSync(file, 0o600); writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 }); chmodSync(file, 0o400); }
 function sessionIdentity(paths: WorkerPaths): { sessionId: string; sessionFile: string } { const files = existsSync(paths.sessionDir) ? readdirSync(paths.sessionDir).filter((name) => name.endsWith(".jsonl")) : []; if (files.length !== 1) throw new Error(`Expected one fresh worker session in ${paths.sessionDir}.`); const sessionFile = realpathSync(path.join(paths.sessionDir, files[0]!)); const first = JSON.parse(readFileSync(sessionFile, "utf8").split("\n")[0]!); return { sessionId: first.id, sessionFile }; }
-function verifyRetainedSession(worker: WorkerRegistryRecord): void { if (worker.role === "work") verifyWorkerSession({ sessionFile: worker.sessionFile!, sessionId: worker.sessionId!, workspaceRoot: worker.workspaceRoot, parentSessionFile: worker.parentSessionFile }); else { const first = JSON.parse(readFileSync(worker.sessionFile!, "utf8").split("\n")[0]!); if (first.id !== worker.sessionId || realpathOrResolve(first.cwd) !== realpathOrResolve(worker.workspaceRoot) || first.parentSession) throw new Error(`Worker ${worker.workerId} retained independent session is invalid.`); } }
+function verifyRetainedSession(worker: WorkerRegistryRecord): void {
+  if (worker.role === "work") {
+    verifyWorkerSession({ sessionFile: worker.sessionFile!, sessionId: worker.sessionId!, workspaceRoot: worker.workspaceRoot, parentSessionFile: worker.parentSessionFile });
+    return;
+  }
+  const { header } = readWorkerSessionHeader(worker.sessionFile!);
+  if (header.id !== worker.sessionId || realpathOrResolve(header.cwd) !== realpathOrResolve(worker.workspaceRoot) || header.parentSession) throw new Error(`Worker ${worker.workerId} retained independent session is invalid.`);
+}
 function runtimeInputs(worker: WorkerRegistryRecord): RetainedInput[] { const value = worker.runtime?.inputs; return Array.isArray(value) ? value as RetainedInput[] : []; }
 function retainedWorkerRuntime(worker: WorkerRegistryRecord): Partial<WorkerRuntime> { const baselines = worker.runtime?.repositoryBaselines; const cacheLineage = worker.runtime?.cacheLineage; return { ...(Array.isArray(baselines) ? { repositoryBaselines: baselines as any } : {}), ...(cacheLineage && typeof cacheLineage === "object" ? { cacheLineage: cacheLineage as WorkerCacheLineageRecord } : {}) }; }
 function parseWorkerModelSelection(value: string): { provider: string; model: string; thinkingLevel: string } { const slash = value.indexOf("/"); const colon = value.lastIndexOf(":"); if (slash < 1 || colon <= slash + 1) throw new Error(`Invalid worker model selection: ${value}.`); return { provider: value.slice(0, slash), model: value.slice(slash + 1, colon), thinkingLevel: value.slice(colon + 1) }; }
@@ -756,6 +777,18 @@ function roleInstructionsFor(role: WorkerRole): string { return workerRoleInstru
 function resolveModel(role: WorkerRole, explicit: string | undefined, context: ExtensionContext): string { const errors: string[] = []; for (const requested of preferredWorkerModel(role, explicit)) { try { const parsed = parseModelThinkingPair(requested); const resolved = resolveExtensionModel({ registry: context.modelRegistry, requested, fallbackThinkingLevel: parsed.thinkingLevel, label: `${role} worker`, noModelMessage: `No configured ${role} model is available.` }); assertChildAgentRouteAllowed(resolved.model, resolved.thinkingLevel, `${role} worker`); if (`${resolved.model.provider}/${resolved.model.id}:${resolved.thinkingLevel}` !== requested) throw new Error(`Selection ${requested} could not be honored exactly.`); return requested; } catch (error) { errors.push(sanitizeError(error)); } } throw new Error(`No configured ${role} model selection is available before launch. ${errors.join(" ")}`); }
 function requireParentSession(context: ExtensionContext): string { const file = context.sessionManager.getSessionFile(); if (!file) throw new Error("Managed workers require a persisted parent session."); return realpathOrResolve(file); }
 function realpathOrResolve(value: string): string { try { return realpathSync(value); } catch { return path.resolve(value); } }
+function bestEffortSessionEndLine(file: string | undefined, errors: Array<{ scope: "run" | "repositories" | "artifacts"; message: string }>, minimum?: number): number | undefined {
+  if (!file) return undefined;
+  try {
+    const count = countLines(file);
+    if (minimum !== undefined && count < minimum) throw new Error(`Worker session was truncated below retained line ${minimum}.`);
+    return count;
+  } catch (error) {
+    errors.push({ scope: "run", message: `Worker session end line could not be recorded safely: ${sanitizeError(error)}`.slice(0, 768) });
+    return undefined;
+  }
+}
+
 function countLines(file: string): number { return countSessionLines(file); }
 function validateRunRequestBounds(request: WorkerRunInputV2["runs"][number]): void {
   if (Buffer.byteLength(request.instructions ?? "") > 12 * 1024) throw new Error("instructions must be at most 12 KiB UTF-8.");

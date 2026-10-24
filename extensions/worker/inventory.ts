@@ -130,13 +130,17 @@ export function discoverWorkerRepositories(
       const directory = path.join(current.directory, entry.name);
       const relative = displayRelative(root, directory);
       if (current.depth === 0 && RUNTIME_OWNED_SCAN_ROOTS.has(entry.name)) continue;
-      if (isKnownToolCache(relative) && !hasGitMarker(directory)) continue;
+      if (isKnownToolCache(relative, directory) && !hasGitMarker(directory)) {
+        markIncomplete(diagnostics, `Repository scan intentionally skipped tool-cache subtree ${safeInventoryText(relative)}.`);
+        continue;
+      }
       if (current.depth >= limits.maxDepth) {
         markIncomplete(diagnostics, `Repository scan skipped subtree ${safeInventoryText(relative)} below depth ${limits.maxDepth}.`);
         continue;
       }
       if (queue.length >= limits.maxDirectories) {
-        markIncomplete(diagnostics, `Repository scan skipped subtree ${safeInventoryText(relative)} after scheduling ${limits.maxDirectories} directories.`);
+        const broad = relative.split("/")[0] ?? relative;
+        markIncomplete(diagnostics, `Repository scan skipped broad subtree ${safeInventoryText(broad)} after scheduling ${limits.maxDirectories} directories.`);
         continue;
       }
       const next = { directory, depth: current.depth + 1 };
@@ -211,9 +215,11 @@ function boundedDirectoryEntries(directory: string, relative: string, diagnostic
   return entries;
 }
 
-function directoryPriority(depth: number, name: string): number { return depth === 0 && name === "repos" ? -1 : 0; }
-function isKnownToolCache(relative: string): boolean {
-  return relative === ".cache" || relative === ".cargo/registry" || relative === ".cargo/git" || relative === ".rustup/downloads" || relative === ".rustup/tmp" || relative === ".rustup/toolchains" || relative === ".gradle/caches" || relative === ".gradle/wrapper" || relative === ".m2/repository" || relative === "go/pkg" || relative === ".local/share" || relative.split("/").some((part) => part === ".venv" || part === "venv");
+function directoryPriority(depth: number, name: string): number { return depth === 0 && name === "repos" ? -2 : depth === 0 && name === "artifacts" ? 2 : 0; }
+function isKnownToolCache(relative: string, directory: string): boolean {
+  if (relative === ".cache" || relative === ".cargo/registry" || relative === ".cargo/git" || relative === ".rustup/downloads" || relative === ".rustup/tmp" || relative === ".rustup/toolchains" || relative === ".gradle/caches" || relative === ".gradle/wrapper" || relative === ".m2/repository" || relative === "go/pkg" || relative === ".local/share/pnpm/store" || relative === ".local/share/uv" || relative === ".local/share/bun") return true;
+  const name = path.basename(relative);
+  return (name === ".venv" || name === "venv") && existsSync(path.join(directory, "pyvenv.cfg"));
 }
 function hasGitMarker(directory: string): boolean { try { return lstatSync(path.join(directory, ".git")).isDirectory() || lstatSync(path.join(directory, ".git")).isFile(); } catch { return false; } }
 

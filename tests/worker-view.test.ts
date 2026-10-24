@@ -25,12 +25,12 @@ function header(target: WorkerSessionViewTarget, overrides: Record<string, unkno
 function message(id: string, parentId: string | null, content: string, extra: Record<string, unknown> = {}) { return { type: "message", id, parentId, timestamp: "2026-01-01T00:00:01.000Z", message: { role: "user", content, ...extra } }; }
 function line(value: unknown): string { return `${JSON.stringify(value)}\n`; }
 function snapshot(target: WorkerSessionViewTarget, blocks: WorkerSessionViewSnapshot["blocks"], overrides: Partial<WorkerSessionViewSnapshot> = {}): WorkerSessionViewSnapshot {
-  return { target, blocks, totalActiveEntries: blocks.length, malformedEntries: 0, skippedOversizedEntries: 0, incompleteTrailingEntry: false, runStartLine: target.sessionStartLine ?? 1, runEndLine: target.sessionEndLine ?? target.sessionStartLine ?? 0, pageStartLine: target.sessionStartLine ?? 1, pageEndLine: target.sessionEndLine ?? target.sessionStartLine ?? 0, hasPreviousPage: false, hasNextPage: false, refreshedAt: "now", ...overrides };
+  return { target, blocks, totalActiveEntries: blocks.length, malformedEntries: 0, skippedOversizedEntries: 0, incompleteTrailingEntry: false, hiddenCompactedEntries: 0, compactionCount: 0, runStartLine: target.sessionStartLine ?? 1, runEndLine: target.sessionEndLine ?? target.sessionStartLine ?? 0, pageStartLine: target.sessionStartLine ?? 1, pageEndLine: target.sessionEndLine ?? target.sessionStartLine ?? 0, hasPreviousPage: false, hasNextPage: false, refreshedAt: "now", ...overrides };
 }
 async function tick() { await new Promise<void>((resolve) => setImmediate(resolve)); }
 const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as Theme;
 
-test("worker conversation view renders the exact active compacted run branch without raw JSONL", () => {
+test("worker conversation view preserves the opening assignment and renders compaction chronologically without raw JSONL", () => {
   const f = fixture();
   try {
     const user = { type: "message", id: "u1", parentId: "outside-range", timestamp: "2026-01-01T00:00:01.000Z", message: { role: "user", content: "old question" } };
@@ -41,8 +41,8 @@ test("worker conversation view renders the exact active compacted run branch wit
     writeFileSync(f.sessionFile, line(header(f.target)) + line(user) + line(kept) + line(compaction) + "{bad json}\n" + line(assistant) + line(result));
     const value = loadWorkerSessionViewSnapshot({ ...f.target, sessionStartLine: 2, sessionEndLine: 7 });
     assert.equal(value.malformedEntries, 1);
-    assert.deepEqual(value.blocks.map((block) => block.kind), ["compaction", "user", "thinking", "tool", "assistant", "toolResult"]);
-    assert.equal(value.blocks.some((block) => block.text.includes("old question")), false);
+    assert.deepEqual(value.blocks.map((block) => block.kind), ["user", "user", "compaction", "thinking", "tool", "assistant", "toolResult"]);
+    assert.equal(value.blocks.some((block) => block.text.includes("old question")), true);
     const rendered = buildWorkerSessionViewerFrame(theme, { snapshot: value, topLine: 0, pinnedToEnd: false }, 100, 40).lines.join("\n");
     assert.match(rendered, /Earlier work summary|Tool call · search_many/); assert.doesNotMatch(rendered, /"type":"message"/);
   } finally { f.close(); }
@@ -74,6 +74,44 @@ test("large run ranges page to the opening prompt instead of refusing or cutting
     assert.equal(first.hasPreviousPage, false); assert.match(first.blocks[0]?.text ?? "", /OPENING PROMPT/);
     const next = loadWorkerSessionViewSnapshot(target, {}, { mode: "after", line: first.pageEndLine });
     assert.ok(next.pageStartLine > first.pageEndLine); assert.equal(next.blocks[0]?.label, "User");
+  } finally { f.close(); }
+});
+
+
+test("622-entry compacted run has one global visible order in forward and backward navigation", () => {
+  const f = fixture();
+  try {
+    const entries: string[] = [];
+    for (let index = 0; index < 622; index += 1) {
+      if (index === 234) entries.push(line({ type: "compaction", id: `m-${index}`, parentId: `m-${index - 1}`, timestamp: "2026-01-01T00:04:00.000Z", summary: "real-range compaction", firstKeptEntryId: "m-229", tokensBefore: 100_000 }));
+      else entries.push(line(message(`m-${index}`, index === 0 ? null : `m-${index - 1}`, index === 0 ? "OPENING ASSIGNMENT" : `entry-${index}`)));
+    }
+    writeFileSync(f.sessionFile, line(header(f.target)) + entries.join(""));
+    const target = { ...f.target, sessionStartLine: 2, sessionEndLine: 623 };
+    const traverse = (direction: "forward" | "backward") => {
+      const pages: WorkerSessionViewSnapshot[] = [];
+      let page = loadWorkerSessionViewSnapshot(target, {}, direction === "forward" ? { mode: "first" } : { mode: "tail" });
+      while (true) {
+        pages.push(page);
+        if (direction === "forward") {
+          if (!page.hasNextPage) break;
+          page = loadWorkerSessionViewSnapshot(target, {}, { mode: "after", line: page.pageEndLine });
+        } else {
+          if (!page.hasPreviousPage) break;
+          page = loadWorkerSessionViewSnapshot(target, {}, { mode: "before", line: page.pageStartLine });
+        }
+      }
+      if (direction === "backward") pages.reverse();
+      return { texts: pages.flatMap((value) => value.blocks.map((block) => block.text)), pages };
+    };
+    const forward = traverse("forward"); const backward = traverse("backward");
+    assert.deepEqual(backward.texts, forward.texts);
+    assert.equal(forward.texts[0], "OPENING ASSIGNMENT");
+    assert.ok(forward.texts.includes("entry-229")); assert.ok(forward.texts.includes("real-range compaction"));
+    assert.equal(forward.texts.includes("entry-228"), false);
+    assert.equal(forward.pages[0]!.hiddenCompactedEntries, 228);
+    const frame = buildWorkerSessionViewerFrame(theme, { snapshot: forward.pages[0]!, topLine: 0, pinnedToEnd: false }, 120, 40).lines.join("\n");
+    assert.match(frame, /228 earlier run entries are superseded by 1 compaction/);
   } finally { f.close(); }
 });
 
@@ -163,6 +201,29 @@ test("transcript pages keep every bounded block reachable and refresh theme-deri
     const component = createWorkerSessionViewerComponent({ tui: { terminal: { rows: 30 }, requestRender() { renders += 1; } } as never, getTheme: () => dynamicTheme, initialSnapshot: tailPage, loadSnapshot: (next) => { request = next; return firstPage; }, done() {} });
     assert.match(component.render(80).join("\n"), /A:TAIL/); prefix = "B:"; component.invalidate(); assert.match(component.render(80).join("\n"), /B:TAIL/);
     component.handleInput!("g"); assert.equal(request, undefined, "page scan is deferred out of the key handler"); await tick(); assert.deepEqual(request, { mode: "first" }); assert.ok(renders >= 2); assert.match(component.render(80).join("\n"), /OPEN/);
+  } finally { f.close(); }
+});
+
+
+test("line index invalidates an in-place growing rewrite and checkpoints oversized lines", () => {
+  const f = fixture();
+  try {
+    const initial = line(header(f.target)) + line(message("old-1", null, "old one")) + line(message("old-2", "old-1", "old two")) + line(message("old-3", "old-2", "old three"));
+    writeFileSync(f.sessionFile, initial);
+    assert.equal(countSessionLines(f.sessionFile), 4);
+    const rewritten = line(header(f.target)) + Array.from({ length: 6 }, (_, index) => line(message(`new-${index}`, index === 0 ? null : `new-${index - 1}`, `new ${index}`))).join("");
+    writeFileSync(f.sessionFile, rewritten);
+    assert.equal(countSessionLines(f.sessionFile), 7);
+
+    const huge = `${line(header(f.target))}${JSON.stringify(message("huge", null, "x"))}`;
+    writeFileSync(f.sessionFile, huge);
+    const fd = openSync(f.sessionFile, "r+");
+    try { ftruncateSync(fd, 9 * 1024 * 1024); writeSync(fd, Buffer.from(`\n${line(message("after", "huge", "after oversized"))}`), undefined, undefined, 9 * 1024 * 1024); }
+    finally { closeSync(fd); }
+    const lineCount = countSessionLines(f.sessionFile);
+    const target = { ...f.target, sessionStartLine: lineCount, sessionEndLine: lineCount };
+    assert.deepEqual(loadWorkerSessionViewSnapshot(target).blocks.map((block) => block.text), ["after oversized"]);
+    assert.deepEqual(loadWorkerSessionViewSnapshot(target).blocks.map((block) => block.text), ["after oversized"]);
   } finally { f.close(); }
 });
 

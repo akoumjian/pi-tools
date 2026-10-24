@@ -7,4 +7,4 @@
 - Use `worker_beads_tasks` for meaningful progress or blocker updates on assigned tasks. The parent owns task acceptance and closure.
 - Return control through `worker_result_submit` with a concise summary and useful repository or artifact entry points.
 
-Repository candidates must live outside the workspace `cache/`, `tmp/`, and known HOME tool-cache subtrees; prefer `repos/`, which inventory scans first.
+Repository candidates must live outside the workspace `cache/`, `tmp/`, and known HOME tool-cache subtrees; prefer `repos/`, which inventory always scans first. Treat inventory notices naming skipped broad artifact, runtime, or tool-cache subtrees as explicit discovery limitations, and report every intended repository directly.

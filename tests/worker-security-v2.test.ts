@@ -121,7 +121,7 @@ test("inventory bounds its traversal queue while preserving an already scheduled
     const wide = path.join(workspace, "wide"); mkdirSync(wide); for (let index = 0; index < 12; index += 1) mkdirSync(path.join(wide, `child-${String(index).padStart(2, "0")}`));
     const inventory = inventoryWorkerRepositories({ workspaceRoot: workspace, workerId: "worker_queue", runId: "run_queue", reported: ["repo"], before }, { scanLimits: { maxDirectories: 3, maxDirectoryEntries: 32, maxDepth: 4 } });
     assert.equal(inventory.repositories.find((item) => item.path === "repo")?.eligible, true);
-    assert.match(inventory.errors.join(" "), /wide\/child-.*after scheduling 3 directories/);
+    assert.match(inventory.errors.join(" "), /broad subtree wide after scheduling 3 directories/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -156,7 +156,7 @@ test("inventory matches symlink aliases by physical identity and sanitizes hosti
 });
 
 
-test("inventory protects repos priority from artifact breadth and suppresses known HOME tool-cache noise", () => {
+test("inventory protects repos priority and names broad artifact and HOME tool-cache limits", () => {
   const root = mkdtempSync(path.join(tmpdir(), "worker-inventory-priority-"));
   try {
     const workspace = path.join(root, "workspace"); mkdirSync(workspace, { recursive: true });
@@ -168,7 +168,8 @@ test("inventory protects repos priority from artifact breadth and suppresses kno
     mkdirSync(path.join(workspace, "scratch", ".venv", "lib", "python", "site-packages", "pkg"), { recursive: true });
     const inventory = inventoryWorkerRepositories({ workspaceRoot: workspace, workerId: "worker_priority", runId: "run_priority", reported: [relative], before }, { scanLimits: { maxDirectories: 8, maxDirectoryEntries: 128, maxDepth: 3 } });
     assert.equal(inventory.repositories.find((item) => item.path === relative.split(path.sep).join("/"))?.eligible, true);
-    assert.doesNotMatch(inventory.errors.join(" "), /\.cargo|\.venv/);
-    assert.match(inventory.errors.join(" "), /artifacts\/wide-.*after scheduling 8 directories/);
+    assert.match(inventory.errors.join(" "), /tool-cache subtree \.cargo\/registry/);
+    assert.match(inventory.errors.join(" "), /broad subtree artifacts/);
+    assert.match(inventory.errors.join(" "), /broad subtree artifacts after scheduling 8 directories/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

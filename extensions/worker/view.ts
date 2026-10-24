@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync, type Stats } from "node:fs";
 import path from "node:path";
 import { stripVTControlCharacters } from "node:util";
@@ -12,7 +13,11 @@ const INITIAL_LINE_INDEX_STRIDE = 128;
 const MAX_LINE_INDEX_CHECKPOINTS = 65_536;
 const MAX_LINE_INDEX_FILES = 16;
 const MAX_BLOCK_TEXT = 16 * 1024;
-const MAX_BLOCK_RENDER_LINES = 400;
+const MAX_DEFAULT_BLOCK_RENDER_LINES = 60;
+const MAX_THINKING_BLOCK_RENDER_LINES = 40;
+const MAX_TOOL_BLOCK_RENDER_LINES = 24;
+const SESSION_INDEX_FINGERPRINT_BYTES = 4096;
+const MAX_VISIBILITY_CACHE_ENTRIES = 32;
 const BIDI_CONTROLS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
 
 type WorkerSessionEntry = {
@@ -33,17 +38,22 @@ type WorkerSessionHeader = {
   parentSession?: string;
 };
 
-type SessionLineCheckpoint = { lineNumber: number; offset: number };
+type SessionLineCheckpoint = { lineNumber: number; offset: number; pinned?: boolean };
 type SessionLineIndex = {
   dev: number;
   ino: number;
   size: number;
   mtimeMs: number;
+  ctimeMs: number;
   newlineCount: number;
   lastByte?: number;
   stride: number;
+  lineStartOffset: number;
+  fingerprint: string;
   checkpoints: SessionLineCheckpoint[];
 };
+
+type RunVisibility = { openingLine?: number; keptLine: number; hiddenEntries: number; compactionCount: number };
 
 type ReadSessionPage = {
   headerLine: string;
@@ -56,9 +66,12 @@ type ReadSessionPage = {
   hasNextPage: boolean;
   skippedOversizedEntries: number;
   incompleteTrailingEntry: boolean;
+  hiddenCompactedEntries: number;
+  compactionCount: number;
 };
 
 const sessionLineIndexes = new Map<string, SessionLineIndex>();
+const runVisibilityCache = new Map<string, RunVisibility>();
 
 export type WorkerSessionViewTarget = {
   workerId: string;
@@ -97,6 +110,8 @@ export type WorkerSessionViewSnapshot = {
   malformedEntries: number;
   skippedOversizedEntries: number;
   incompleteTrailingEntry: boolean;
+  hiddenCompactedEntries: number;
+  compactionCount: number;
   runStartLine: number;
   runEndLine: number;
   pageStartLine: number;
@@ -129,7 +144,7 @@ type WorkerSessionViewerComponentOptions = {
   tui: TUI;
   getTheme: () => Theme;
   initialSnapshot: WorkerSessionViewSnapshot;
-  loadSnapshot: (request: WorkerSessionPageRequest) => WorkerSessionViewSnapshot;
+  loadSnapshot: (request: WorkerSessionPageRequest) => WorkerSessionViewSnapshot | Promise<WorkerSessionViewSnapshot>;
   done: (result: void) => void;
 };
 
@@ -143,14 +158,16 @@ export function loadWorkerSessionViewSnapshot(
   const header = parseSessionHeader(selected.headerLine);
   validateSessionHeader(header, target);
   const { entries, malformedEntries } = parseSessionEntries(selected.lines);
-  const active = activeSessionEntries(entries);
+  const ordered = orderedSessionEntries(entries);
   return {
     target,
-    blocks: active.flatMap(renderableBlocks),
-    totalActiveEntries: active.length,
+    blocks: ordered.flatMap(renderableBlocks),
+    totalActiveEntries: ordered.length,
     malformedEntries,
     skippedOversizedEntries: selected.skippedOversizedEntries,
     incompleteTrailingEntry: selected.incompleteTrailingEntry,
+    hiddenCompactedEntries: selected.hiddenCompactedEntries,
+    compactionCount: selected.compactionCount,
     runStartLine: selected.runStartLine,
     runEndLine: selected.runEndLine,
     pageStartLine: selected.pageStartLine,
@@ -161,20 +178,59 @@ export function loadWorkerSessionViewSnapshot(
   };
 }
 
+export async function loadWorkerSessionViewSnapshotAsync(target: WorkerSessionViewTarget, request: WorkerSessionPageRequest = { mode: "tail" }): Promise<WorkerSessionViewSnapshot> {
+  validateRunRange(target);
+  await warmSessionLineIndexCooperatively(target);
+  await yieldToEventLoop();
+  return loadWorkerSessionViewSnapshot(target, {}, request);
+}
+
+async function warmSessionLineIndexCooperatively(target: WorkerSessionViewTarget): Promise<void> {
+  if (target.sessionStartLine === undefined) return;
+  const file = trustedSessionPath(target);
+  let leaf;
+  try { leaf = lstatSync(file); } catch { throw new Error("Worker session file is unavailable."); }
+  if (!leaf.isFile() || leaf.isSymbolicLink()) throw new Error("Worker session path is not a regular file.");
+  let fd: number;
+  try { fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
+  catch { throw new Error("Worker session file could not be opened safely."); }
+  try {
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || opened.dev !== leaf.dev || opened.ino !== leaf.ino) throw new SessionChangedDuringReadError();
+    const index = reusableSessionLineIndex(fd, file, opened, opened.size);
+    while (index.size < opened.size) {
+      extendSessionLineIndex(fd, file, index, opened.size, {}, 1);
+      retainSessionLineIndex(file, index);
+      await yieldToEventLoop();
+    }
+    const availableLines = sessionLineCount(index);
+    if (target.sessionEndLine !== undefined && availableLines < target.sessionEndLine) throw new Error("Worker session does not contain the retained run end line.");
+    const runStartLine = Math.max(2, target.sessionStartLine);
+    const runEndLine = Math.max(runStartLine - 1, target.sessionEndLine ?? availableLines);
+    await analyzeRunVisibilityCooperatively(fd, file, opened.size, index, runStartLine, runEndLine);
+    const after = fstatSync(fd);
+    let current;
+    try { current = lstatSync(file); } catch { throw new SessionChangedDuringReadError(); }
+    if (!current.isFile() || current.dev !== opened.dev || current.ino !== opened.ino || after.dev !== opened.dev || after.ino !== opened.ino || after.size < opened.size) throw new SessionChangedDuringReadError();
+  } finally { closeSync(fd); }
+}
+
+function yieldToEventLoop(): Promise<void> { return new Promise((resolve) => setImmediate(resolve)); }
+
 export async function openWorkerSessionViewer(context: ExtensionCommandContext, target: WorkerSessionViewTarget, loadTarget: () => WorkerSessionViewTarget = () => target): Promise<void> {
   if (!context.hasUI || context.mode !== "tui") {
     context.ui.notify("/worker:view requires interactive Pi TUI mode.", "warning");
     return;
   }
   let initialSnapshot: WorkerSessionViewSnapshot;
-  try { initialSnapshot = loadWorkerSessionViewSnapshot(target); }
+  try { initialSnapshot = await loadWorkerSessionViewSnapshotAsync(target); }
   catch (error) { context.ui.notify(safeErrorMessage(error), "error"); return; }
   try {
     await context.ui.custom<void>((tui, _theme, _keybindings, done) => createWorkerSessionViewerComponent({
       tui,
       getTheme: () => context.ui.theme,
       initialSnapshot,
-      loadSnapshot: (request) => loadWorkerSessionViewSnapshot(loadTarget(), {}, request),
+      loadSnapshot: (request) => loadWorkerSessionViewSnapshotAsync(loadTarget(), request),
       done
     }));
   } catch (error) { context.ui.notify(safeErrorMessage(error), "error"); }
@@ -203,14 +259,16 @@ export function createWorkerSessionViewerComponent(options: WorkerSessionViewerC
     state.error = undefined;
     options.tui.requestRender();
     setImmediate(() => {
-      try {
-        state.snapshot = options.loadSnapshot(request);
+      Promise.resolve().then(() => options.loadSnapshot(request)).then((snapshot) => {
+        state.snapshot = snapshot;
         state.wrappedBodyCache = undefined;
         state.error = undefined;
         state.pinnedToEnd = placement === "end";
         state.topLine = 0;
-      } catch (error) { state.error = safeErrorMessage(error); }
-      finally { state.loading = false; options.tui.requestRender(); }
+      }, (error) => { state.error = safeErrorMessage(error); }).finally(() => {
+        state.loading = false;
+        options.tui.requestRender();
+      });
     });
   };
   return {
@@ -266,6 +324,7 @@ export function buildWorkerSessionViewerFrame(theme: Theme, state: WorkerSession
     body.truncatedBlocks > 0 ? `${body.truncatedBlocks} long block${body.truncatedBlocks === 1 ? " was" : "s were"} explicitly truncated within this page.` : undefined,
     state.snapshot.skippedOversizedEntries > 0 ? `${state.snapshot.skippedOversizedEntries} session entr${state.snapshot.skippedOversizedEntries === 1 ? "y exceeds" : "ies exceed"} the ${MAX_SESSION_PAGE_BYTES}-byte per-entry display bound and ${state.snapshot.skippedOversizedEntries === 1 ? "was" : "were"} skipped.` : undefined,
     state.snapshot.malformedEntries > 0 ? `${state.snapshot.malformedEntries} malformed session entr${state.snapshot.malformedEntries === 1 ? "y was" : "ies were"} skipped.` : undefined,
+    state.snapshot.hiddenCompactedEntries > 0 ? `${state.snapshot.hiddenCompactedEntries} earlier run entr${state.snapshot.hiddenCompactedEntries === 1 ? "y is" : "ies are"} superseded by ${state.snapshot.compactionCount} compaction${state.snapshot.compactionCount === 1 ? "" : "s"}; the opening assignment remains on the first page.` : undefined,
     state.snapshot.incompleteTrailingEntry ? "The final unterminated session entry was still being written and was skipped." : undefined,
     state.loading ? "Loading transcript page…" : undefined,
     state.error
@@ -279,7 +338,7 @@ export function buildWorkerSessionViewerFrame(theme: Theme, state: WorkerSession
     theme.fg("dim", `model: ${sanitizeViewText(target.modelSelection ?? "unavailable")}`),
     theme.fg("dim", `run lines: ${state.snapshot.runStartLine}..${target.sessionEndLine ?? "current"} · page: ${state.snapshot.pageStartLine}..${state.snapshot.pageEndLine}`),
     theme.fg("muted", `manual snapshot · refreshed=${sanitizeViewText(state.snapshot.refreshedAt)}`),
-    theme.fg("dim", "↑↓ or j/k scroll • J/K block • PgUp/PgDn page/continue • [/] page • g/G first/latest"),
+    theme.fg("dim", "↑↓ or j/k scroll • J/K block • PgUp/PgDn continue • [/] page • g/Home first • G/End latest"),
     theme.fg("dim", "r refreshes latest read-only snapshot • Esc/Ctrl+C/q closes"),
     ...warnings.map((warning) => theme.fg("warning", sanitizeViewText(warning))),
     border
@@ -290,7 +349,7 @@ export function buildWorkerSessionViewerFrame(theme: Theme, state: WorkerSession
   const visible = body.lines.slice(topLine, topLine + pageSize);
   const first = body.lines.length === 0 ? 0 : topLine + 1;
   const last = Math.min(body.lines.length, topLine + visible.length);
-  const footer = [border, theme.fg("muted", `lines ${first}-${last} of ${body.lines.length} · page blocks ${state.snapshot.blocks.length} · active entries ${state.snapshot.totalActiveEntries}`)];
+  const footer = [border, theme.fg("muted", `lines ${first}-${last} of ${body.lines.length} · page blocks ${state.snapshot.blocks.length} · visible entries ${state.snapshot.totalActiveEntries}`)];
   return { lines: [...header, ...visible, ...footer].map((line) => truncateToWidth(line, safeWidth, "", false)), topLine, pageSize, maxTopLine };
 }
 
@@ -338,12 +397,7 @@ function validateRunRange(target: WorkerSessionViewTarget): void {
 }
 
 function readTrustedSessionPage(target: WorkerSessionViewTarget, request: WorkerSessionPageRequest, dependencies: WorkerSessionReadDependencies): ReadSessionPage {
-  const sessionRoot = realpathSync(target.sessionRoot);
-  const requested = path.resolve(target.sessionFile);
-  const canonicalParent = realpathSync(path.dirname(requested));
-  if (!sameOrWithin(sessionRoot, canonicalParent)) throw new Error("Worker session file is outside its retained session directory.");
-  const exact = path.join(canonicalParent, path.basename(requested));
-  if (!strictlyWithin(sessionRoot, exact)) throw new Error("Worker session file is outside its retained session directory.");
+  const exact = trustedSessionPath(target);
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try { return readStableSessionPage(exact, target, request, dependencies, attempt); }
     catch (error) {
@@ -353,6 +407,16 @@ function readTrustedSessionPage(target: WorkerSessionViewTarget, request: Worker
     }
   }
   throw new Error("Worker session changed while reading; refresh the view.");
+}
+
+function trustedSessionPath(target: WorkerSessionViewTarget): string {
+  const sessionRoot = realpathSync(target.sessionRoot);
+  const requested = path.resolve(target.sessionFile);
+  const canonicalParent = realpathSync(path.dirname(requested));
+  if (!sameOrWithin(sessionRoot, canonicalParent)) throw new Error("Worker session file is outside its retained session directory.");
+  const exact = path.join(canonicalParent, path.basename(requested));
+  if (!strictlyWithin(sessionRoot, exact)) throw new Error("Worker session file is outside its retained session directory.");
+  return exact;
 }
 
 class SessionChangedDuringReadError extends Error {}
@@ -374,17 +438,18 @@ function readStableSessionPage(file: string, target: WorkerSessionViewTarget, re
     if (!opened.isFile()) throw new Error("Worker session path is not a regular file.");
     if (opened.dev !== leaf.dev || opened.ino !== leaf.ino) throw new SessionChangedDuringReadError();
     const headerLine = readHeaderLine(fd, opened.size);
-    if (target.sessionStartLine === undefined) return { headerLine, lines: [], runStartLine: 1, runEndLine: 0, pageStartLine: 1, pageEndLine: 0, hasPreviousPage: false, hasNextPage: false, skippedOversizedEntries: 0, incompleteTrailingEntry: false };
+    if (target.sessionStartLine === undefined) return { headerLine, lines: [], runStartLine: 1, runEndLine: 0, pageStartLine: 1, pageEndLine: 0, hasPreviousPage: false, hasNextPage: false, skippedOversizedEntries: 0, incompleteTrailingEntry: false, hiddenCompactedEntries: 0, compactionCount: 0 };
     const index = ensureSessionLineIndex(fd, file, opened, opened.size, dependencies);
     const availableLines = sessionLineCount(index);
     if (target.sessionEndLine !== undefined && availableLines < target.sessionEndLine) throw new Error("Worker session does not contain the retained run end line.");
     const runStartLine = Math.max(2, target.sessionStartLine);
     const runEndLine = Math.max(runStartLine - 1, target.sessionEndLine ?? availableLines);
-    const bounds = pageBounds(request, runStartLine, runEndLine);
-    const page = readPageLines(fd, opened.size, index, bounds.startLine, bounds.endLine, request.mode === "tail" || request.mode === "before");
+    const visibility = analyzeRunVisibility(fd, file, opened.size, index, runStartLine, runEndLine);
+    const bounds = visiblePageBounds(request, runStartLine, runEndLine, visibility);
+    const page = readVisiblePage(fd, opened.size, index, bounds, request.mode === "tail" || request.mode === "before");
     dependencies.afterReadAttempt?.(file, attempt);
     const after = fstatSync(fd);
-    if (!after.isFile() || after.dev !== opened.dev || after.ino !== opened.ino || after.size < opened.size || after.size === opened.size && after.mtimeMs !== opened.mtimeMs) throw new SessionChangedDuringReadError();
+    if (!after.isFile() || after.dev !== opened.dev || after.ino !== opened.ino || after.size < opened.size || after.size === opened.size && (after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs)) throw new SessionChangedDuringReadError();
     let currentLeaf;
     try { currentLeaf = lstatSync(file); } catch { throw new SessionChangedDuringReadError(); }
     if (!currentLeaf.isFile() || currentLeaf.dev !== opened.dev || currentLeaf.ino !== opened.ino) throw new SessionChangedDuringReadError();
@@ -393,54 +458,253 @@ function readStableSessionPage(file: string, target: WorkerSessionViewTarget, re
       ...page,
       runStartLine,
       runEndLine,
-      hasPreviousPage: page.pageStartLine > runStartLine,
-      hasNextPage: page.pageEndLine < runEndLine
+      hasPreviousPage: visibleCountLessThan(page.pageStartLine, runEndLine, visibility) > 0,
+      hasNextPage: visibleCountLessThanOrEqual(page.pageEndLine, runEndLine, visibility) < visibleLineCount(runEndLine, visibility),
+      hiddenCompactedEntries: visibility.hiddenEntries,
+      compactionCount: visibility.compactionCount
     };
   } finally { closeSync(fd); }
 }
 
-function pageBounds(request: WorkerSessionPageRequest, runStartLine: number, runEndLine: number): { startLine: number; endLine: number } {
-  if (runEndLine < runStartLine) return { startLine: runStartLine, endLine: runStartLine - 1 };
-  if (request.mode === "first") return { startLine: runStartLine, endLine: Math.min(runEndLine, runStartLine + MAX_SESSION_PAGE_LINES - 1) };
-  if (request.mode === "after") { const startLine = Math.max(runStartLine, request.line + 1); return { startLine, endLine: Math.min(runEndLine, startLine + MAX_SESSION_PAGE_LINES - 1) }; }
-  const endLine = request.mode === "before" ? Math.min(runEndLine, request.line - 1) : runEndLine;
-  return { startLine: Math.max(runStartLine, endLine - MAX_SESSION_PAGE_LINES + 1), endLine };
+type VisiblePageBounds = { startLine: number; endLine: number; openingLine?: number };
+
+function visiblePageBounds(request: WorkerSessionPageRequest, runStartLine: number, runEndLine: number, visibility: RunVisibility): VisiblePageBounds {
+  const count = visibleLineCount(runEndLine, visibility);
+  if (count === 0) return { startLine: runStartLine, endLine: runStartLine - 1 };
+  let firstOrdinal: number;
+  let lastOrdinal: number;
+  if (request.mode === "first") { firstOrdinal = 0; lastOrdinal = Math.min(count - 1, MAX_SESSION_PAGE_LINES - 1); }
+  else if (request.mode === "after") { firstOrdinal = visibleCountLessThanOrEqual(request.line, runEndLine, visibility); lastOrdinal = Math.min(count - 1, firstOrdinal + MAX_SESSION_PAGE_LINES - 1); }
+  else {
+    lastOrdinal = request.mode === "before" ? visibleCountLessThan(request.line, runEndLine, visibility) - 1 : count - 1;
+    firstOrdinal = Math.max(0, lastOrdinal - MAX_SESSION_PAGE_LINES + 1);
+  }
+  if (firstOrdinal < 0 || firstOrdinal >= count || lastOrdinal < firstOrdinal) return { startLine: runStartLine, endLine: runStartLine - 1 };
+  const firstLine = visibleLineAt(firstOrdinal, visibility);
+  const lastLine = visibleLineAt(lastOrdinal, visibility);
+  const openingIsSeparate = visibility.openingLine !== undefined && visibility.openingLine < visibility.keptLine && firstOrdinal === 0;
+  return { startLine: openingIsSeparate && lastOrdinal > 0 ? visibility.keptLine : firstLine, endLine: lastLine, ...(openingIsSeparate ? { openingLine: visibility.openingLine } : {}) };
+}
+
+function visibleLineCount(runEndLine: number, visibility: RunVisibility): number {
+  const preservedOpening = visibility.openingLine !== undefined && visibility.openingLine < visibility.keptLine ? 1 : 0;
+  return preservedOpening + Math.max(0, runEndLine - visibility.keptLine + 1);
+}
+function visibleLineAt(ordinal: number, visibility: RunVisibility): number {
+  const preservedOpening = visibility.openingLine !== undefined && visibility.openingLine < visibility.keptLine;
+  if (preservedOpening && ordinal === 0) return visibility.openingLine!;
+  return visibility.keptLine + ordinal - (preservedOpening ? 1 : 0);
+}
+function visibleCountLessThan(line: number, runEndLine: number, visibility: RunVisibility): number {
+  const opening = visibility.openingLine !== undefined && visibility.openingLine < visibility.keptLine && visibility.openingLine < line ? 1 : 0;
+  const range = Math.max(0, Math.min(runEndLine - visibility.keptLine + 1, line - visibility.keptLine));
+  return opening + range;
+}
+function visibleCountLessThanOrEqual(line: number, runEndLine: number, visibility: RunVisibility): number {
+  return visibleCountLessThan(line + 1, runEndLine, visibility);
+}
+
+function readVisiblePage(fd: number, snapshotSize: number, index: SessionLineIndex, bounds: VisiblePageBounds, keepTail: boolean): Omit<ReadSessionPage, "headerLine" | "runStartLine" | "runEndLine" | "hasPreviousPage" | "hasNextPage" | "hiddenCompactedEntries" | "compactionCount"> {
+  const main = readPageLines(fd, snapshotSize, index, bounds.startLine, bounds.endLine, keepTail);
+  if (bounds.openingLine === undefined || bounds.openingLine >= bounds.startLine) return main;
+  const opening = readPageLines(fd, snapshotSize, index, bounds.openingLine, bounds.openingLine, false);
+  return {
+    lines: [...opening.lines, ...main.lines],
+    pageStartLine: opening.pageStartLine,
+    pageEndLine: main.pageEndLine >= main.pageStartLine ? main.pageEndLine : opening.pageEndLine,
+    skippedOversizedEntries: opening.skippedOversizedEntries + main.skippedOversizedEntries,
+    incompleteTrailingEntry: opening.incompleteTrailingEntry || main.incompleteTrailingEntry
+  };
+}
+
+function visibilityCacheKey(file: string, snapshotSize: number, index: SessionLineIndex, runStartLine: number, runEndLine: number): string {
+  return `${file}\0${index.dev}:${index.ino}:${snapshotSize}:${index.mtimeMs}:${index.ctimeMs}:${index.fingerprint}:${runStartLine}:${runEndLine}`;
+}
+
+function analyzeRunVisibility(fd: number, file: string, snapshotSize: number, index: SessionLineIndex, runStartLine: number, runEndLine: number): RunVisibility {
+  const cacheKey = visibilityCacheKey(file, snapshotSize, index, runStartLine, runEndLine);
+  const cached = runVisibilityCache.get(cacheKey);
+  if (cached) return cached;
+  let firstEntryLine: number | undefined;
+  let openingUserLine: number | undefined;
+  let compactionCount = 0;
+  let lastCompaction: { line: number; firstKeptEntryId?: string } | undefined;
+  scanRunEntries(fd, snapshotSize, index, runStartLine, runEndLine, (entry, line) => {
+    firstEntryLine ??= line;
+    if (openingUserLine === undefined && entry.type === "message" && record(entry.message)?.role === "user") openingUserLine = line;
+    if (entry.type === "compaction") {
+      compactionCount += 1;
+      lastCompaction = { line, ...(typeof entry.firstKeptEntryId === "string" ? { firstKeptEntryId: entry.firstKeptEntryId } : {}) };
+    }
+  });
+  const openingLine = openingUserLine ?? firstEntryLine;
+  let keptLine = lastCompaction?.line ?? runStartLine;
+  let hiddenEntries = 0;
+  if (lastCompaction) {
+    let validBeforeKept = 0;
+    scanRunEntries(fd, snapshotSize, index, runStartLine, lastCompaction.line, (entry, line) => {
+      if (lastCompaction!.firstKeptEntryId && entry.id === lastCompaction!.firstKeptEntryId) {
+        keptLine = line;
+        hiddenEntries = validBeforeKept;
+      }
+      if (line !== openingLine) validBeforeKept += 1;
+    });
+    if (!lastCompaction.firstKeptEntryId || keptLine === lastCompaction.line) hiddenEntries = validBeforeKept - (lastCompaction.line === openingLine ? 0 : 1);
+  }
+  const value = { openingLine, keptLine, hiddenEntries, compactionCount };
+  retainRunVisibility(cacheKey, value);
+  return value;
+}
+
+async function analyzeRunVisibilityCooperatively(fd: number, file: string, snapshotSize: number, index: SessionLineIndex, runStartLine: number, runEndLine: number): Promise<RunVisibility> {
+  const cacheKey = visibilityCacheKey(file, snapshotSize, index, runStartLine, runEndLine);
+  const cached = runVisibilityCache.get(cacheKey);
+  if (cached) return cached;
+  let firstEntryLine: number | undefined;
+  let openingUserLine: number | undefined;
+  let compactionCount = 0;
+  let lastCompaction: { line: number; firstKeptEntryId?: string } | undefined;
+  await scanRunEntriesCooperatively(fd, snapshotSize, index, runStartLine, runEndLine, (entry, line) => {
+    firstEntryLine ??= line;
+    if (openingUserLine === undefined && entry.type === "message" && record(entry.message)?.role === "user") openingUserLine = line;
+    if (entry.type === "compaction") {
+      compactionCount += 1;
+      lastCompaction = { line, ...(typeof entry.firstKeptEntryId === "string" ? { firstKeptEntryId: entry.firstKeptEntryId } : {}) };
+    }
+  });
+  const openingLine = openingUserLine ?? firstEntryLine;
+  let keptLine = lastCompaction?.line ?? runStartLine;
+  let hiddenEntries = 0;
+  if (lastCompaction) {
+    let validBeforeKept = 0;
+    await scanRunEntriesCooperatively(fd, snapshotSize, index, runStartLine, lastCompaction.line, (entry, line) => {
+      if (lastCompaction!.firstKeptEntryId && entry.id === lastCompaction!.firstKeptEntryId) { keptLine = line; hiddenEntries = validBeforeKept; }
+      if (line !== openingLine) validBeforeKept += 1;
+    });
+    if (!lastCompaction.firstKeptEntryId || keptLine === lastCompaction.line) hiddenEntries = validBeforeKept - (lastCompaction.line === openingLine ? 0 : 1);
+  }
+  const value = { openingLine, keptLine, hiddenEntries, compactionCount };
+  retainRunVisibility(cacheKey, value);
+  return value;
+}
+
+async function scanRunEntriesCooperatively(fd: number, snapshotSize: number, index: SessionLineIndex, startLine: number, endLine: number, visit: (entry: WorkerSessionEntry, line: number) => void): Promise<void> {
+  let line = startLine;
+  while (line <= endLine) {
+    const page = readPageLines(fd, snapshotSize, index, line, Math.min(endLine, line + MAX_SESSION_PAGE_LINES - 1), false);
+    for (const item of page.lines) {
+      let value: unknown;
+      try { value = JSON.parse(item.text); } catch { continue; }
+      if (isSessionEntry(value)) visit({ ...value, lineNumber: item.lineNumber }, item.lineNumber);
+    }
+    line = Math.max(line + 1, page.pageEndLine + 1);
+    await yieldToEventLoop();
+  }
+}
+
+function retainRunVisibility(cacheKey: string, value: RunVisibility): void {
+  runVisibilityCache.delete(cacheKey);
+  runVisibilityCache.set(cacheKey, value);
+  while (runVisibilityCache.size > MAX_VISIBILITY_CACHE_ENTRIES) runVisibilityCache.delete(runVisibilityCache.keys().next().value!);
+}
+
+function scanRunEntries(fd: number, snapshotSize: number, index: SessionLineIndex, startLine: number, endLine: number, visit: (entry: WorkerSessionEntry, line: number) => void): void {
+  let line = startLine;
+  while (line <= endLine) {
+    const page = readPageLines(fd, snapshotSize, index, line, Math.min(endLine, line + MAX_SESSION_PAGE_LINES - 1), false);
+    for (const item of page.lines) {
+      let value: unknown;
+      try { value = JSON.parse(item.text); } catch { continue; }
+      if (isSessionEntry(value)) visit({ ...value, lineNumber: item.lineNumber }, item.lineNumber);
+    }
+    const next = Math.max(line + 1, page.pageEndLine + 1);
+    line = next;
+  }
 }
 
 function ensureSessionLineIndex(fd: number, file: string, opened: Stats, snapshotSize: number, dependencies: WorkerSessionReadDependencies = {}): SessionLineIndex {
+  const index = reusableSessionLineIndex(fd, file, opened, snapshotSize);
+  extendSessionLineIndex(fd, file, index, snapshotSize, dependencies);
+  retainSessionLineIndex(file, index);
+  return index;
+}
+
+function reusableSessionLineIndex(fd: number, file: string, opened: Stats, snapshotSize: number): SessionLineIndex {
   let index = sessionLineIndexes.get(file);
-  if (!index || index.dev !== opened.dev || index.ino !== opened.ino || index.size > snapshotSize || index.size === snapshotSize && index.mtimeMs !== opened.mtimeMs) {
-    index = { dev: opened.dev, ino: opened.ino, size: 0, mtimeMs: opened.mtimeMs, newlineCount: 0, stride: INITIAL_LINE_INDEX_STRIDE, checkpoints: [{ lineNumber: 1, offset: 0 }] };
+  const identityChanged = !index || index.dev !== opened.dev || index.ino !== opened.ino;
+  const sizeInvalid = Boolean(index && index.size > snapshotSize);
+  const sameSizeMetadataChanged = Boolean(index && index.size === snapshotSize && (index.mtimeMs !== opened.mtimeMs || index.ctimeMs !== opened.ctimeMs));
+  const prefixChanged = Boolean(index && index.size <= snapshotSize && index.fingerprint !== sessionPrefixFingerprint(fd, index.size));
+  if (identityChanged || sizeInvalid || sameSizeMetadataChanged || prefixChanged) {
+    index = {
+      dev: opened.dev, ino: opened.ino, size: 0, mtimeMs: opened.mtimeMs, ctimeMs: opened.ctimeMs,
+      newlineCount: 0, stride: INITIAL_LINE_INDEX_STRIDE, lineStartOffset: 0,
+      fingerprint: sessionPrefixFingerprint(fd, 0), checkpoints: [{ lineNumber: 1, offset: 0, pinned: true }]
+    };
   }
+  return index!;
+}
+
+function extendSessionLineIndex(fd: number, file: string, index: SessionLineIndex, snapshotSize: number, dependencies: WorkerSessionReadDependencies = {}, chunks = Number.POSITIVE_INFINITY): void {
   const buffer = Buffer.allocUnsafe(SESSION_READ_CHUNK);
   let position = index.size;
-  while (position < snapshotSize) {
+  let chunksRead = 0;
+  while (position < snapshotSize && chunksRead < chunks) {
     const count = readSync(fd, buffer, 0, Math.min(buffer.length, snapshotSize - position), position);
     if (count === 0) throw new SessionChangedDuringReadError();
     let cursor = 0;
     while (cursor < count) {
       const newline = buffer.indexOf(0x0a, cursor);
       if (newline < 0 || newline >= count) break;
+      const absoluteNewline = position + newline;
+      const oversized = absoluteNewline - index.lineStartOffset > MAX_SESSION_PAGE_BYTES;
       index.newlineCount += 1;
       const nextLine = index.newlineCount + 1;
-      if ((nextLine - 1) % index.stride === 0) index.checkpoints.push({ lineNumber: nextLine, offset: position + newline + 1 });
+      if ((nextLine - 1) % index.stride === 0 || oversized) {
+        const previous = index.checkpoints.at(-1);
+        const checkpoint = { lineNumber: nextLine, offset: absoluteNewline + 1, ...(oversized ? { pinned: true } : {}) };
+        if (previous?.lineNumber === nextLine) index.checkpoints[index.checkpoints.length - 1] = { ...previous, ...checkpoint, pinned: previous.pinned || checkpoint.pinned };
+        else index.checkpoints.push(checkpoint);
+      }
+      index.lineStartOffset = absoluteNewline + 1;
       cursor = newline + 1;
     }
     index.lastByte = buffer[count - 1];
     position += count;
+    chunksRead += 1;
+    index.size = position;
     dependencies.afterChunkRead?.(file, position);
   }
-  index.size = snapshotSize;
-  index.mtimeMs = opened.mtimeMs;
+  index.size = position;
+  index.mtimeMs = fstatSync(fd).mtimeMs;
+  index.ctimeMs = fstatSync(fd).ctimeMs;
+  index.fingerprint = sessionPrefixFingerprint(fd, position);
   while (index.checkpoints.length > MAX_LINE_INDEX_CHECKPOINTS) {
-    index.checkpoints = index.checkpoints.filter((_value, position) => position % 2 === 0);
+    index.checkpoints = index.checkpoints.filter((value, position) => value.pinned || position % 2 === 0);
     index.stride *= 2;
   }
+}
+
+function retainSessionLineIndex(file: string, index: SessionLineIndex): void {
   sessionLineIndexes.delete(file);
   sessionLineIndexes.set(file, index);
   while (sessionLineIndexes.size > MAX_LINE_INDEX_FILES) sessionLineIndexes.delete(sessionLineIndexes.keys().next().value!);
-  return index;
 }
+
+function sessionPrefixFingerprint(fd: number, size: number): string {
+  const hash = createHash("sha256").update(String(size));
+  for (const offset of uniqueNumbers([0, Math.max(0, size - SESSION_INDEX_FINGERPRINT_BYTES)])) {
+    const length = Math.min(SESSION_INDEX_FINGERPRINT_BYTES, Math.max(0, size - offset));
+    if (length === 0) continue;
+    const buffer = Buffer.allocUnsafe(length);
+    const count = readSync(fd, buffer, 0, length, offset);
+    if (count !== length) throw new SessionChangedDuringReadError();
+    hash.update(buffer.subarray(0, count));
+  }
+  return hash.digest("hex");
+}
+
+function uniqueNumbers(values: number[]): number[] { return [...new Set(values)]; }
 
 function sessionLineCount(index: SessionLineIndex): number { return index.size === 0 ? 0 : index.newlineCount + (index.lastByte === 0x0a ? 0 : 1); }
 
@@ -456,7 +720,7 @@ function readHeaderLine(fd: number, snapshotSize: number): string {
   return decodeUtf8(buffer.subarray(0, newline));
 }
 
-function readPageLines(fd: number, snapshotSize: number, index: SessionLineIndex, desiredStart: number, desiredEnd: number, keepTail: boolean): Omit<ReadSessionPage, "headerLine" | "runStartLine" | "runEndLine" | "hasPreviousPage" | "hasNextPage"> {
+function readPageLines(fd: number, snapshotSize: number, index: SessionLineIndex, desiredStart: number, desiredEnd: number, keepTail: boolean): Omit<ReadSessionPage, "headerLine" | "runStartLine" | "runEndLine" | "hasPreviousPage" | "hasNextPage" | "hiddenCompactedEntries" | "compactionCount"> {
   if (desiredEnd < desiredStart) return { lines: [], pageStartLine: desiredStart, pageEndLine: desiredEnd, skippedOversizedEntries: 0, incompleteTrailingEntry: false };
   const checkpoint = nearestCheckpoint(index, desiredStart);
   const buffer = Buffer.allocUnsafe(Math.min(SESSION_READ_CHUNK, Math.max(1, snapshotSize - checkpoint.offset)));
@@ -564,29 +828,22 @@ function validateSessionHeader(header: WorkerSessionHeader, target: WorkerSessio
   } else if (header.parentSession !== undefined) throw new Error("Worker session unexpectedly inherits a parent conversation.");
 }
 
-function activeSessionEntries(entries: WorkerSessionEntry[]): WorkerSessionEntry[] {
+function orderedSessionEntries(entries: WorkerSessionEntry[]): WorkerSessionEntry[] {
   const byId = new Map<string, WorkerSessionEntry>();
-  for (const entry of entries) { if (byId.has(entry.id)) throw new Error("Worker run session page contains duplicate entry ids."); byId.set(entry.id, entry); }
-  const leaf = entries.at(-1);
-  if (!leaf) return [];
-  const branch: WorkerSessionEntry[] = [];
-  const seen = new Set<string>();
-  let current: WorkerSessionEntry | undefined = leaf;
-  while (current) {
-    if (seen.has(current.id)) throw new Error("Worker run session branch contains a cycle.");
-    seen.add(current.id); branch.push(current);
-    if (current.parentId === null) break;
-    current = byId.get(current.parentId);
-    if (!current) break;
+  for (const entry of entries) {
+    if (byId.has(entry.id)) throw new Error("Worker run session page contains duplicate entry ids.");
+    byId.set(entry.id, entry);
   }
-  branch.reverse();
-  let compactionIndex = -1;
-  for (let index = branch.length - 1; index >= 0; index -= 1) if (branch[index]?.type === "compaction") { compactionIndex = index; break; }
-  if (compactionIndex < 0) return branch;
-  const compaction = branch[compactionIndex]!;
-  const firstKeptEntryId = typeof compaction.firstKeptEntryId === "string" ? compaction.firstKeptEntryId : undefined;
-  const keptIndex = firstKeptEntryId ? branch.findIndex((entry) => entry.id === firstKeptEntryId) : -1;
-  return [compaction, ...(keptIndex >= 0 && keptIndex < compactionIndex ? branch.slice(keptIndex, compactionIndex) : []), ...branch.slice(compactionIndex + 1)];
+  for (const entry of entries) {
+    const seen = new Set<string>();
+    let current: WorkerSessionEntry | undefined = entry;
+    while (current) {
+      if (seen.has(current.id)) throw new Error("Worker run session branch contains a cycle.");
+      seen.add(current.id);
+      current = current.parentId === null ? undefined : byId.get(current.parentId);
+    }
+  }
+  return entries;
 }
 
 function renderableBlocks(entry: WorkerSessionEntry): WorkerSessionViewBlock[] {
@@ -652,13 +909,16 @@ function renderBlock(theme: Theme, block: WorkerSessionViewBlock, width: number)
   const labelColor: ThemeColor = block.kind === "user" ? "accent" : block.kind === "tool" ? "toolTitle" : block.kind === "toolResult" ? "success" : block.kind === "error" ? "error" : block.kind === "thinking" ? "muted" : block.kind === "compaction" ? "warning" : block.kind === "status" ? "dim" : "text";
   const label = `${theme.fg(labelColor, theme.bold(sanitizeViewText(block.label).slice(0, 256)))} ${theme.fg("dim", sanitizeViewText(block.timestamp).slice(0, 128))}`;
   const textWidth = Math.max(1, width - 2);
-  const textTruncated = block.text.length > MAX_BLOCK_TEXT;
-  const text = boundBlockText(block.text);
+  const lineLimit = block.kind === "tool" || block.kind === "toolResult" || block.kind === "error" || block.kind === "custom"
+    ? MAX_TOOL_BLOCK_RENDER_LINES : block.kind === "thinking" ? MAX_THINKING_BLOCK_RENDER_LINES : MAX_DEFAULT_BLOCK_RENDER_LINES;
+  const characterLimit = Math.min(MAX_BLOCK_TEXT, Math.max(512, textWidth * lineLimit));
+  const textTruncated = block.text.length > characterLimit;
+  const text = boundBlockText(block.text, characterLimit);
   const content: string[] = [];
   let displayTruncated = false;
   for (const rawLine of text.split("\n")) {
     for (const wrapped of wrapTextWithAnsi(sanitizeViewText(rawLine), textWidth)) {
-      if (content.length >= MAX_BLOCK_RENDER_LINES) { displayTruncated = true; break; }
+      if (content.length >= lineLimit) { displayTruncated = true; break; }
       content.push(`  ${wrapped}`);
     }
     if (displayTruncated) break;
@@ -678,7 +938,7 @@ function partText(part: unknown): string {
   if (value.type === "toolCall") return `[tool call · ${textField(value.name, "unknown")}] ${boundedJson(value.arguments ?? value.input ?? {})}`;
   return `[${typeof value.type === "string" ? sanitizeViewText(value.type) : "unsupported content"}]`;
 }
-function boundBlockText(value: string): string { return value.length <= MAX_BLOCK_TEXT ? value : `${value.slice(0, MAX_BLOCK_TEXT)}\n[… block text truncated …]`; }
+function boundBlockText(value: string, limit = MAX_BLOCK_TEXT): string { return value.length <= limit ? value : `${value.slice(0, limit)}\n[… block text truncated …]`; }
 function boundedJson(value: unknown): string { try { return boundBlockText(JSON.stringify(value)); } catch { return "[unserializable content]"; } }
 function textField(value: unknown, fallback: string): string { return typeof value === "string" ? value : fallback; }
 function numberField(value: unknown): string { return typeof value === "number" && Number.isFinite(value) ? String(value) : "unknown"; }
