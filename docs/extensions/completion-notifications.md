@@ -85,4 +85,4 @@ Lookup follows the standard pi-tools chain: `PI_TOOLS_CONFIG_DIR`, per-machine c
 - Unsupported transports and delivery errors are no-ops recorded in `/notify status`.
 - Notifications do not retry through a second transport.
 - There are no timers, persistent notification queues, provider calls, session entries, sidecars, or notification logs.
-- Existing Pi sessions must `/reload` or restart after installation or update.
+- Existing Pi sessions must fully restart Pi after installation or package update (`/reload` is sufficient only for same-version configuration/context changes).

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -19,6 +19,8 @@ import asyncShellExtension, {
   cancelPersistedAsyncShellJobsForOwner,
   createAsyncShellViewerComponent,
   loadAsyncShellViewerSnapshot,
+  listEligibleAsyncShellPrune,
+  migrateAsyncShellRuntimeHolder,
   parseAsyncShellPruneArgs,
   parseAsyncShellViewerArgs,
   previewAsyncShellPrune,
@@ -201,9 +203,15 @@ test("async-shell pruning is exact, previewed, terminal-only, and separate from 
     await writeJobMeta(dir, undelivered, { status: "failed", notifyOnExit: true, completionNotified: false });
     await writeJobMeta(dir, workerOwned, { status: "cancelled", owner: { kind: "worker-run", workerId: "worker_20261024180000_prune01", runId: "run_20261024180000_prune01" } });
 
-    assert.deepEqual(parseAsyncShellPruneArgs(`${eligible} ${eligible}`), { help: false, confirm: false, jobIds: [eligible] });
+    assert.deepEqual(parseAsyncShellPruneArgs(`${eligible} ${eligible}`), { help: false, confirm: false, listEligible: false, offset: 0, limit: 100, jobIds: [eligible] });
     assert.match(buildAsyncShellPruneUsage(), /no wildcard/i);
     assert.throws(() => parseAsyncShellPruneArgs("*"), /Invalid async shell job id/);
+    const eligibility = listEligibleAsyncShellPrune({ cwd: dir }, 0, 2);
+    assert.deepEqual(eligibility.entries.map((entry) => entry.jobId), [eligible]);
+    assert.equal(eligibility.scanned, 2);
+    assert.equal(eligibility.nextOffset, 2);
+    assert.throws(() => parseAsyncShellPruneArgs("--eligible --confirm"), /read-only/);
+    assert.throws(() => parseAsyncShellPruneArgs("--offset 1"), /require --eligible/);
     const preview = previewAsyncShellPrune({ cwd: dir }, [eligible]);
     assert.equal(preview[0]?.jobId, eligible);
     assert.ok(existsSync(preview[0]!.logDir), "preview is read-only");
@@ -212,6 +220,22 @@ test("async-shell pruning is exact, previewed, terminal-only, and separate from 
     const deleted = pruneAsyncShellJobs({ cwd: dir }, [eligible]);
     assert.equal(deleted.length, 1);
     assert.equal(existsSync(preview[0]!.logDir), false);
+  });
+});
+
+test("async-shell pruning accepts a symlinked registry ancestor while retaining realpath containment", async () => {
+  await withTempDir(async (dir) => {
+    const realParent = path.join(dir, "real-parent");
+    const linkedParent = path.join(dir, "linked-parent");
+    await mkdir(realParent, { recursive: true });
+    await symlink(realParent, linkedParent, "dir");
+    const project = path.join(linkedParent, "project");
+    await mkdir(project, { recursive: true });
+    const jobId = "job_20261024180000_symlinkroot";
+    await writeJobMeta(project, jobId, { status: "exited", notifyOnExit: false, completionNotified: true });
+    const preview = previewAsyncShellPrune({ cwd: project }, [jobId]);
+    assert.equal(preview[0]?.logDir, path.join(project, ".pi", "async-shell", "jobs", jobId));
+    assert.equal(pruneAsyncShellJobs({ cwd: project }, [jobId]).length, 1);
   });
 });
 
@@ -355,6 +379,41 @@ test("async-shell activity survives a fresh module reload and old completion cle
   });
 });
 
+test("concurrent child session runtime cannot deactivate or receive parent completions", async () => {
+  await withTempDir(async (dir) => {
+    const parentApi = createFakeApi();
+    const childApi = createFakeApi();
+    asyncShellExtension(parentApi);
+    asyncShellExtension(childApi);
+    const parentContext = {
+      ...createContext(dir),
+      sessionManager: { getSessionId: () => "parent-runtime-session", getEntries: () => [] }
+    } as unknown as ExtensionContext;
+    const childContext = {
+      ...createContext(dir),
+      sessionManager: { getSessionId: () => "child-runtime-session", getSessionFile: () => undefined, getEntries: () => [] }
+    } as unknown as ExtensionContext;
+    await parentApi.emit("session_start", { reason: "startup" }, parentContext);
+    await childApi.emit("session_start", { reason: "startup" }, childContext);
+
+    const handle = startManagedAsyncJob(parentApi, parentContext, {
+      command: "parent completion after child bind",
+      cwd: dir,
+      executable: process.execPath,
+      args: ["-e", "setTimeout(() => {}, 80)"],
+      notifyOnExit: true
+    });
+    await waitWithRefTimeout(handle.completion);
+    await delay(200);
+    assert.equal(parentApi.sentMessages.length, 1);
+    assert.equal(childApi.sentMessages.length, 0);
+    const delivered = parentApi.sentMessages[0]!.message as { details?: { originSessionId?: string } };
+    assert.equal(delivered.details?.originSessionId, "parent-runtime-session");
+    await childApi.emit("session_shutdown", { reason: "quit" }, childContext);
+    await parentApi.emit("session_shutdown", { reason: "quit" }, parentContext);
+  });
+});
+
 test("ordinary async-shell completion rebinds to the fresh extension runtime after reload", async () => {
   await withTempDir(async (dir) => {
     const originalApi = createFakeApi();
@@ -391,6 +450,49 @@ test("ordinary async-shell completion rebinds to the fresh extension runtime aft
     const delivered = freshApi.sentMessages[0]!.message as { customType?: string; details?: { originSessionId?: string } };
     assert.equal(delivered.customType, "async-shell");
     assert.equal(delivered.details?.originSessionId, sessionId);
+    await freshApi.emit("session_shutdown", { reason: "quit" }, freshContext);
+  });
+});
+
+test("reload never replays an accepted async-shell batch absent from the session ledger", async () => {
+  await withTempDir(async (dir) => {
+    const originalApi = createFakeApi();
+    asyncShellExtension(originalApi);
+    const sessionId = "reload-ambiguous-delivery-session";
+    const originalContext = {
+      ...createContext(dir),
+      sessionManager: { getSessionId: () => sessionId, getEntries: () => [] }
+    } as unknown as ExtensionContext;
+    await originalApi.emit("session_start", { reason: "startup" }, originalContext);
+    const handle = startManagedAsyncJob(originalApi, originalContext, {
+      command: "ambiguous reload delivery probe",
+      cwd: dir,
+      executable: process.execPath,
+      args: ["-e", "setTimeout(() => {}, 80)"],
+      notifyOnExit: true
+    });
+    const completed = await waitWithRefTimeout(handle.completion);
+    await delay(200);
+    assert.equal(originalApi.sentMessages.length, 1);
+    const acceptedMessage = originalApi.sentMessages[0]!.message;
+    await originalApi.emit("session_shutdown", { reason: "reload" }, originalContext);
+
+    const freshModule = await import(`../extensions/async-shell/index.js?ambiguous-delivery-reload=${Date.now()}`);
+    const freshApi = createFakeApi();
+    freshModule.default(freshApi);
+    const freshContext = {
+      ...createContext(dir),
+      sessionManager: { getSessionId: () => sessionId, getEntries: () => [] }
+    } as unknown as ExtensionContext;
+    await freshApi.emit("session_start", { reason: "reload" }, freshContext);
+    await delay(150);
+    await freshApi.emit("agent_end", {}, freshContext);
+    assert.equal(freshApi.sentMessages.length, 0, "an accepted but unreceipted batch remains claimed instead of replaying");
+    let persisted = JSON.parse(await readFile(path.join(completed.logDir, "meta.json"), "utf8")) as { completionNotified: boolean };
+    assert.equal(persisted.completionNotified, false);
+    await freshApi.emit("message_end", { message: { ...(acceptedMessage as Record<string, unknown>), role: "custom" } }, freshContext);
+    persisted = JSON.parse(await readFile(path.join(completed.logDir, "meta.json"), "utf8")) as { completionNotified: boolean };
+    assert.equal(persisted.completionNotified, true, "a later exact receipt still acknowledges the retained batch");
     await freshApi.emit("session_shutdown", { reason: "quit" }, freshContext);
   });
 });
@@ -438,15 +540,22 @@ test("reload acknowledges an accepted async-shell delivery already present in th
   });
 });
 
+test("async-shell upgrades the version-one process-global holder in place", () => {
+  const holder = { version: 1, jobs: new Map(), activityListeners: new Set() };
+  const migrated = migrateAsyncShellRuntimeHolder(holder);
+  assert.equal(migrated, holder);
+  assert.equal(migrated.version, 2);
+  assert.ok(migrated.pendingCompletionNotifications instanceof Map);
+  assert.ok(migrated.completionDeliveryBatches instanceof Map);
+  assert.ok(migrated.scheduledCompletionJobIds instanceof Set);
+  assert.ok(migrated.completionRuntimes instanceof Map);
+});
+
 test("async-shell rejects an incompatible process-global runtime holder", () => {
-  const moduleUrl = new URL("../extensions/async-shell/index.js", import.meta.url).href;
-  const script = [
-    `Reflect.set(globalThis, Symbol.for("@akoumjian/pi-tools/async-shell-runtime"), { version: 99, jobs: new Map(), activityListeners: new Set() });`,
-    `await import(${JSON.stringify(moduleUrl)});`
-  ].join("\n");
-  const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8" });
-  assert.notEqual(result.status, 0);
-  assert.match(`${result.stdout}${result.stderr}`, /Incompatible async-shell runtime holder/);
+  assert.throws(
+    () => migrateAsyncShellRuntimeHolder({ version: 99, jobs: new Map(), activityListeners: new Set() }),
+    /Incompatible async-shell runtime holder/
+  );
 });
 
 test("async-shell activity listener failures do not block another live listener", async () => {
