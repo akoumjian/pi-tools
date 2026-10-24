@@ -28,7 +28,7 @@ Resume the same worker for corrections and follow-up. Start a replacement only a
 
 ### 3. Review
 
-Treat `worker_result_submit` outcome `completed` from a work or integration worker as its ready-for-review signal. Outcomes `needs_input`, `blocked`, `failed`, and `cancelled` are not review-eligible.
+Treat an accepted `worker_result_submit` outcome `completed` from a work or integration worker as its ready-for-review signal. Worker-submitted `needs_input` and `blocked`, and system-settled `failed` and `cancelled`, are not review-eligible.
 
 Start a review worker for every eligible completed result. The worker system selects a configured reviewer from a different provider than the subject and fails before launch when no independent provider is available.
 

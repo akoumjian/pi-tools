@@ -38,9 +38,9 @@ Repository paths must identify contained Git repositories. Artifact paths may id
 
 ## Review
 
-Only a latest idle work/integration run with outcome `completed` is review-ready; `needs_input`, `blocked`, `failed`, and `cancelled` are not review signals. Review launch chooses the first available configured review selection whose provider differs from the subject provider and fails before launch when no independent provider is available.
+Only a latest idle work/integration run with worker-submitted outcome `completed` is review-ready. Worker-submitted `needs_input` and `blocked`, and system-settled `failed` and `cancelled`, are not review signals. Review launch chooses the first available configured review selection whose provider differs from the subject provider and fails before launch when no independent provider is available.
 
-The parent launches a review for every eligible completed result and treats its outcome as advisory evidence. On `request_changes`, the parent resumes the same subject worker with the findings and reviews its next completed run; the default automatic loop stops after that one correction/re-review cycle unless the parent deliberately authorizes another. Review never accepts, applies, publishes, grounds, or closes tasks.
+The parent launches a review for every eligible completed result and treats its outcome as advisory evidence. On `request_changes`, the parent resumes the same subject worker with the findings and reviews its next completed run; the default parent-driven workflow stops after that one correction/re-review cycle unless the parent deliberately authorizes another. Review never accepts, applies, publishes, grounds, or closes tasks.
 
 A review receives the exact subject run/session metadata, repository/artifact entry points, and additional-input mapping in `/review/context.json`. `/review/subject` is a disposable writable view of the complete unchanged subject workspace; reviewer reports belong under `/workspace`. The reviewed worker is leased against resume while review runs. Review workers have no credentials, Beads mutation, fix implementation, push, target mutation, or acceptance authority.
 
