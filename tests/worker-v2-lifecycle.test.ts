@@ -78,6 +78,30 @@ test("worker_run returns complete provider-visible identities and defers Docker 
 });
 
 
+test("worker:view handler enforces parent and worker/run ownership without mutation or delivery", async () => {
+  const f = await fixture(); try {
+    const first = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-first"], instructions: "first" }] }));
+    const second = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-second"], instructions: "second" }] }));
+    await f.event("turn_end");
+    const command = f.commands.get("worker:view")!;
+    const beforeMessages = f.messages.length;
+    const before = (() => { const db = f.registry(); const rows = db.database.prepare("SELECT worker_id,status,active_run_id,latest_run_id,version FROM workers ORDER BY worker_id").all(); db.close(); return JSON.stringify(rows); })();
+
+    await command.handler(`${first.workerId} ${second.runId}`, f.context);
+    assert.match(f.notifications.at(-1) ?? "", /no matching retained run/i);
+    await command.handler(first.workerId, f.context);
+    assert.match(f.notifications.at(-1) ?? "", /requires interactive Pi TUI mode/);
+
+    const foreignSession = path.join(f.root, "foreign-parent.jsonl"); writeFileSync(foreignSession, "\n");
+    const foreign = { ...f.context, sessionManager: { getSessionFile: () => foreignSession, getSessionId: () => "foreign" } } as unknown as ExtensionContext;
+    await command.handler(first.workerId, foreign);
+    assert.match(f.notifications.at(-1) ?? "", /Unknown worker.*parent session/);
+    assert.equal(f.messages.length, beforeMessages, "view must not emit or acknowledge delivery messages");
+    const after = (() => { const db = f.registry(); const rows = db.database.prepare("SELECT worker_id,status,active_run_id,latest_run_id,version FROM workers ORDER BY worker_id").all(); db.close(); return JSON.stringify(rows); })();
+    assert.equal(after, before, "view must not mutate worker lifecycle state");
+  } finally { await f.close(); }
+});
+
 test("turn_end returns without awaiting deferred container readiness", async () => {
   const f = await fixture({ deferContainer: true }); try {
     const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "async launch" }] }));

@@ -8,6 +8,8 @@ import { canonicalPathWithin, canonicalRepository, createTrustedGitOperation, tr
 const MAX_REPOSITORIES = 128;
 const MAX_DISCOVERY_DIRECTORIES = 4096;
 const MAX_DIRECTORY_ENTRIES = 8192;
+const MAX_DISCOVERY_DEPTH = 8;
+const RUNTIME_OWNED_SCAN_ROOTS = new Set(["cache", "tmp"]);
 const MAX_INVENTORY_GIT_OUTPUT = 1024 * 1024;
 const MAX_REMOTE_OUTPUT = 64 * 1024;
 const BIDI_CONTROLS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
@@ -15,8 +17,10 @@ const BIDI_CONTROL = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
 
 export type RepositorySnapshot = { path: string; commit: string; dirty: boolean };
 export type DiscoveredWorkerRepository = { absolute: string; relative: string; identity?: string; issues?: string[] };
-export type InventoryDependencies = { afterHeadRead?: (repository: string, commit: string, tree: string) => void };
+export type InventoryScanLimits = { maxRepositories: number; maxDirectories: number; maxDirectoryEntries: number; maxDepth: number };
+export type InventoryDependencies = { afterHeadRead?: (repository: string, commit: string, tree: string) => void; scanLimits?: Partial<InventoryScanLimits> };
 type ScanDiagnostics = { complete: boolean; limitations: string[] };
+const DEFAULT_SCAN_LIMITS: InventoryScanLimits = { maxRepositories: MAX_REPOSITORIES, maxDirectories: MAX_DISCOVERY_DIRECTORIES, maxDirectoryEntries: MAX_DIRECTORY_ENTRIES, maxDepth: MAX_DISCOVERY_DEPTH };
 type RepositoryHead = { commit: string; tree: string };
 
 export function snapshotWorkerRepositories(workspaceRoot: string): RepositorySnapshot[] {
@@ -43,11 +47,10 @@ export function inventoryWorkerRepositories(input: {
   }
   const before = new Map((input.before ?? []).map((item) => [item.path, item]));
   const diagnostics: ScanDiagnostics = { complete: true, limitations: [] };
-  const discovered = discoverWorkerRepositories(root, operation, diagnostics);
+  const discovered = discoverWorkerRepositories(root, operation, diagnostics, scanLimits(dependencies.scanLimits));
   if (!diagnostics.complete) errors.push(...diagnostics.limitations.map(safeInventoryText));
   const repositories = discovered.map(({ absolute, relative, identity, issues: discoveryIssues }): WorkerRepositoryResult => {
     const issues: string[] = [...(discoveryIssues ?? [])];
-    if (!diagnostics.complete) issues.push("Independent repository scan was incomplete.");
     if (hasTerminalControls(relative)) issues.push("Repository path contains terminal-control characters.");
     let commit = ""; let dirty = true; let source: string | undefined;
     try {
@@ -74,14 +77,19 @@ export function inventoryWorkerRepositories(input: {
     const candidateId = `candidate_${createHash("sha256").update(`${input.workerId}\0${input.runId}\0${relative}\0${commit}`).digest("hex").slice(0, 24)}`;
     if (!wasReported && changed) issues.push("Changed repository was not reported by worker_result_submit.");
     if (wasReported && !changed) issues.push("Reported repository did not change during this run.");
-    return { candidateId, path: relative, commit: commit || "unknown", ...(source ? { source } : {}), reported: wasReported, changed, dirty, eligible: wasReported && changed && !dirty && Boolean(commit) && diagnostics.complete && !hasTerminalControls(relative), ...(issues.length ? { issues: unique(issues) } : {}) };
+    return { candidateId, path: safeInventoryText(relative), commit: commit || "unknown", ...(source ? { source } : {}), reported: wasReported, changed, dirty, eligible: wasReported && changed && !dirty && Boolean(commit) && !hasTerminalControls(relative), ...(issues.length ? { issues: unique(issues) } : {}) };
   });
   const discoveredIdentities = new Set(discovered.flatMap((item) => item.identity === undefined ? [] : [item.identity]));
   for (const [identity, relative] of reported) if (!discoveredIdentities.has(identity)) errors.push(`Reported repository was not found by independent workspace scan: ${safeInventoryText(relative)}.`);
   return { repositories, errors: unique(errors).slice(0, 128) };
 }
 
-export function discoverWorkerRepositories(workspaceRoot: string, operation: TrustedGitOperation = createTrustedGitOperation(), diagnostics: ScanDiagnostics = { complete: true, limitations: [] }): DiscoveredWorkerRepository[] {
+export function discoverWorkerRepositories(
+  workspaceRoot: string,
+  operation: TrustedGitOperation = createTrustedGitOperation(),
+  diagnostics: ScanDiagnostics = { complete: true, limitations: [] },
+  limits: InventoryScanLimits = DEFAULT_SCAN_LIMITS
+): DiscoveredWorkerRepository[] {
   const root = realpathSync(workspaceRoot);
   if (!statSync(root).isDirectory() || lstatSync(root).isSymbolicLink()) return [];
   const found: DiscoveredWorkerRepository[] = [];
@@ -89,11 +97,9 @@ export function discoverWorkerRepositories(workspaceRoot: string, operation: Tru
   const queue: Array<{ directory: string; depth: number }> = [{ directory: root, depth: 0 }];
   let cursor = 0;
   while (cursor < queue.length) {
-    if (cursor >= MAX_DISCOVERY_DIRECTORIES) { markIncomplete(diagnostics, `Repository scan stopped after ${MAX_DISCOVERY_DIRECTORIES} directories.`); break; }
-    if (found.length >= MAX_REPOSITORIES) { markIncomplete(diagnostics, `Repository scan stopped after ${MAX_REPOSITORIES} repositories.`); break; }
     const current = queue[cursor++]!;
-    if (current.depth > 8) { markIncomplete(diagnostics, "Repository scan skipped directories below depth 8."); continue; }
-    const entries = boundedDirectoryEntries(current.directory, diagnostics);
+    const currentRelative = displayRelative(root, current.directory);
+    const entries = boundedDirectoryEntries(current.directory, currentRelative, diagnostics, limits.maxDirectoryEntries);
     if (entries === undefined) continue;
     if (current.depth > 0 && entries.some((entry) => entry.name === ".git" && !entry.isSymbolicLink())) {
       const relative = path.relative(root, current.directory).split(path.sep).join("/");
@@ -113,11 +119,26 @@ export function discoverWorkerRepositories(workspaceRoot: string, operation: Tru
       } catch (error) {
         found.push({ absolute: current.directory, relative, issues: [`Repository path validation failed: ${safeInventoryText(error instanceof Error ? error.message : String(error)).slice(0, 448)}`] });
       }
+      if (found.length >= limits.maxRepositories && cursor < queue.length) {
+        markIncomplete(diagnostics, `Repository scan stopped at ${safeInventoryText(currentRelative)} after ${limits.maxRepositories} repositories.`);
+        break;
+      }
       continue;
     }
     for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
       if (!entry.isDirectory() || entry.isSymbolicLink() || entry.name === ".git" || entry.name === ".pi" || entry.name === "node_modules") continue;
-      queue.push({ directory: path.join(current.directory, entry.name), depth: current.depth + 1 });
+      const directory = path.join(current.directory, entry.name);
+      const relative = displayRelative(root, directory);
+      if (current.depth === 0 && RUNTIME_OWNED_SCAN_ROOTS.has(entry.name)) continue;
+      if (current.depth >= limits.maxDepth) {
+        markIncomplete(diagnostics, `Repository scan skipped subtree ${safeInventoryText(relative)} below depth ${limits.maxDepth}.`);
+        continue;
+      }
+      if (queue.length >= limits.maxDirectories) {
+        markIncomplete(diagnostics, `Repository scan skipped subtree ${safeInventoryText(relative)} after scheduling ${limits.maxDirectories} directories.`);
+        continue;
+      }
+      queue.push({ directory, depth: current.depth + 1 });
     }
   }
   return found.sort((a, b) => a.relative.localeCompare(b.relative));
@@ -171,21 +192,28 @@ function repositorySource(repository: string, operation: TrustedGitOperation): s
   } catch { return undefined; }
 }
 
-function boundedDirectoryEntries(directory: string, diagnostics: ScanDiagnostics): Dirent[] | undefined {
+function boundedDirectoryEntries(directory: string, relative: string, diagnostics: ScanDiagnostics, maxEntries: number): Dirent[] | undefined {
   let dir;
   try { dir = opendirSync(directory); }
-  catch (error) { markIncomplete(diagnostics, `Repository scan could not read one directory: ${safeInventoryText(error instanceof Error ? error.message : String(error)).slice(0, 256)}`); return undefined; }
+  catch { markIncomplete(diagnostics, `Repository scan could not read directory ${safeInventoryText(relative)}.`); return undefined; }
   const entries: Dirent[] = [];
   try {
     while (true) {
       const entry = dir.readSync();
       if (!entry) break;
-      if (entries.length >= MAX_DIRECTORY_ENTRIES) { markIncomplete(diagnostics, `Repository scan stopped reading a directory after ${MAX_DIRECTORY_ENTRIES} entries.`); break; }
+      if (entries.length >= maxEntries) { markIncomplete(diagnostics, `Repository scan stopped reading directory ${safeInventoryText(relative)} after ${maxEntries} entries.`); break; }
       entries.push(entry);
     }
   } finally { dir.closeSync(); }
   return entries;
 }
+
+function scanLimits(overrides: Partial<InventoryScanLimits> | undefined): InventoryScanLimits {
+  const values = { ...DEFAULT_SCAN_LIMITS, ...overrides };
+  for (const [name, value] of Object.entries(values)) if (!Number.isSafeInteger(value) || value < 1) throw new Error(`Invalid repository scan limit ${name}.`);
+  return values;
+}
+function displayRelative(root: string, value: string): string { const relative = path.relative(root, value).split(path.sep).join("/"); return relative || "."; }
 
 function pathIdentity(value: string): string {
   const exact = realpathSync(value);

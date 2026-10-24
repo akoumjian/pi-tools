@@ -32,7 +32,7 @@ import { launchWorkerHost, readWorkerHostProcess, readWorkerHostSettlement, type
 import { renderWorkerRuntimePrompt } from "./prompts.js";
 import { contextInputs, inputMounts, validateAdditionalInputs, type RetainedInput } from "./inputs.js";
 import { inspectInterruptedGitState, inventoryWorkerRepositories, snapshotWorkerRepositories, type RepositorySnapshot } from "./inventory.js";
-import { openWorkerSessionViewer } from "./view.js";
+import { openWorkerSessionViewer, sanitizeViewText, type WorkerSessionViewTarget } from "./view.js";
 import { canonicalPathWithin, canonicalRepository, trustedGit } from "./trusted-git.js";
 import { prepareWorkerCacheLineage, registerParentCacheLineageCapture, type WorkerCacheLineageRecord } from "./cache-lineage.js";
 
@@ -687,17 +687,26 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     api.registerCommand("worker:view", { description: "Open a bounded read-only conversation view for an active/latest or exact worker run", handler: async (args, context) => {
       const values = args.trim().split(/\s+/).filter(Boolean); const [workerId, runId, ...extra] = values;
       if (!workerId || extra.length || (runId !== undefined && !runId.startsWith("run_"))) return context.ui.notify("Usage: /worker:view <workerId> [runId]", "info");
-      const worker = ownedWorker(workerId, requireParentSession(context)); const exact = runId ?? worker.activeRunId ?? worker.latestRunId;
-      if (!exact) return context.ui.notify(`Worker ${workerId} has no runs.`, "info");
-      const run = getWorkerRun(getRegistry(), workerId, exact); if (!run) return context.ui.notify(`Worker ${workerId} has no retained run ${exact}.`, "warning");
-      if (!worker.sessionId || !worker.sessionFile) return context.ui.notify(`Worker ${workerId} has no retained Pi session.`, "warning");
-      await openWorkerSessionViewer(context, { workerId, role: worker.role, workerStatus: worker.status, runId: run.runId, runStatus: run.status, ...(run.outcome ? { outcome: run.outcome } : {}), ...(run.modelSelection ?? worker.modelSelection ? { modelSelection: run.modelSelection ?? worker.modelSelection } : {}), sessionId: worker.sessionId, sessionFile: worker.sessionFile, workspaceRoot: worker.workspaceRoot, parentSessionFile: worker.parentSessionFile, ...(run.sessionStartLine === undefined ? {} : { sessionStartLine: run.sessionStartLine }), ...(run.sessionEndLine === undefined ? {} : { sessionEndLine: run.sessionEndLine }) });
+      try {
+        const parent = requireParentSession(context);
+        const target = workerViewTarget(workerId, runId, parent);
+        await openWorkerSessionViewer(context, target, () => workerViewTarget(workerId, target.runId, parent));
+      } catch (error) { context.ui.notify(sanitizeViewText(error instanceof Error ? error.message : String(error)), "error"); }
     } });
     api.registerCommand("worker:logs", { description: "Open logs for an active/latest or exact retained worker run", handler: async (args, context) => { const [workerId, possibleRun, ...viewer] = args.trim().split(/\s+/).filter(Boolean); if (!workerId) return context.ui.notify("Usage: /worker:logs <workerId> [runId] [viewer options]", "info"); const worker = ownedWorker(workerId, requireParentSession(context)); const hasRun = possibleRun?.startsWith("run_"); const runId = (hasRun ? possibleRun : undefined) ?? worker.activeRunId ?? worker.latestRunId; const run = runId ? getWorkerRun(getRegistry(), workerId, runId) : undefined; if (!run?.jobId) return context.ui.notify("No retained run logs.", "info"); await handleAsyncShellViewerCommand(context, [run.jobId, ...(hasRun ? viewer : [possibleRun, ...viewer].filter(Boolean))].join(" ")); } });
     api.registerCommand("worker:cancel", { description: "Cancel active work while preserving retained state", handler: async (args, context) => { const workerId = args.trim(); if (!workerId) return context.ui.notify("Usage: /worker:cancel <workerId>", "info"); const result = await cancelWorker(ownedWorker(workerId, requireParentSession(context))); context.ui.notify(result === "cancelled" ? `Cancelled ${workerId}.` : "Worker is not active.", "info"); } });
     api.registerCommand("worker:discard", { description: "Permanently discard one idle worker; requires --confirm", handler: async (args, context) => { const [workerId, confirm, ...extra] = args.trim().split(/\s+/).filter(Boolean); if (!workerId || confirm !== "--confirm" || extra.length) return context.ui.notify("Usage: /worker:discard <workerId> --confirm", "info"); await discardWorker(ownedWorker(workerId, requireParentSession(context))); context.ui.notify(`Discarded ${workerId}.`, "info"); } });
   }
 
+  function workerViewTarget(workerId: string, requestedRunId: string | undefined, parent: string): WorkerSessionViewTarget {
+    const worker = ownedWorker(workerId, parent);
+    const runId = requestedRunId ?? worker.activeRunId ?? worker.latestRunId;
+    if (!runId) throw new Error("Worker has no retained runs.");
+    const run = getWorkerRun(getRegistry(), worker.workerId, runId);
+    if (!run) throw new Error("Worker has no matching retained run.");
+    if (!worker.sessionId || !worker.sessionFile) throw new Error("Worker has no retained Pi session.");
+    return { workerId: worker.workerId, role: worker.role, workerStatus: worker.status, runId: run.runId, runStatus: run.status, ...(run.outcome ? { outcome: run.outcome } : {}), ...(run.modelSelection ?? worker.modelSelection ? { modelSelection: run.modelSelection ?? worker.modelSelection } : {}), sessionId: worker.sessionId, sessionFile: worker.sessionFile, workspaceRoot: worker.workspaceRoot, parentSessionFile: worker.parentSessionFile, ...(run.sessionStartLine === undefined ? {} : { sessionStartLine: run.sessionStartLine }), ...(run.sessionEndLine === undefined ? {} : { sessionEndLine: run.sessionEndLine }) };
+  }
   function ownedWorker(workerId: string, parent: string): WorkerRegistryRecord { const worker = getWorker(getRegistry(), workerId); if (!worker || worker.parentSessionFile !== parent) throw new Error(`Unknown worker ${workerId} for this parent session.`); return worker; }
   function reviewSubject(runId: string, parent: string, reviewerWorkerId?: string) {
     const found = findWorkerRunById(getRegistry(), runId); if (!found || found.worker.parentSessionFile !== parent) throw new Error(`Unknown reviewed run ${runId}.`);
