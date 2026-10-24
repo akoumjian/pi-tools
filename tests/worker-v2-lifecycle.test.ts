@@ -18,7 +18,7 @@ const model = (provider: string, id: string) => ({ id, name: id, provider, api: 
 type Launch = { record: any; runtime: any; resolve(job: JobMeta): void; handle: ManagedAsyncJobHandle };
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
-async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolean; removeThrowsOnce?: boolean; removeAlwaysThrows?: boolean; deferContainer?: boolean } = {}) {
+async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolean; removeThrowsOnce?: boolean; removeAlwaysThrows?: boolean; deferContainer?: boolean; models?: Model<Api>[] } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "pi-worker-v2-lifecycle-"));
   const runtimeRoot = path.join(root, "runtime"); const workersRoot = path.join(runtimeRoot, "workers"); mkdirSync(workersRoot, { recursive: true });
   const session = SessionManager.create(root, path.join(root, "parent-session"), { id: `parent-${Date.now()}` }); writeFileSync(session.getSessionFile()!, `${JSON.stringify(session.getHeader())}\n`, { mode: 0o600 });
@@ -26,7 +26,7 @@ async function fixture(options: { launchThrows?: boolean; overlayThrows?: boolea
   const launches: Launch[] = []; const created: string[] = []; const removed: string[] = []; const overlays: ReviewOverlayRecord[] = []; const cleaned: ReviewOverlayRecord[] = [];
   let releaseContainer = () => {}; const containerGate = options.deferContainer ? new Promise<void>((resolve) => { releaseContainer = resolve; }) : undefined; let removeFailures = 0; let counter = 0; const random = () => `${(++counter).toString(16).padStart(8, "0")}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`;
   const api = { registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand(name: string, command: any) { commands.set(name, command); }, registerMessageRenderer(name: string, renderer: Function) { renderers.set(name, renderer); }, on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, sendMessage(message: any) { messages.push(message); } } as unknown as ExtensionAPI;
-  const context = { cwd: root, hasUI: false, mode: "rpc", sessionManager: session, modelRegistry: { hasConfiguredAuth: () => true, getAll: () => [model("openai-codex", "gpt-5.6-sol"), model("anthropic", "claude-opus-5-5")] }, thinkingLevel: "xhigh", isIdle: () => true, hasPendingMessages: () => false, ui: { notify(message: string) { notifications.push(message); } } } as unknown as ExtensionContext;
+  const context = { cwd: root, hasUI: false, mode: "rpc", sessionManager: session, modelRegistry: { hasConfiguredAuth: () => true, getAll: () => options.models ?? [model("openai-codex", "gpt-5.6-sol"), model("anthropic", "claude-opus-5-5")] }, thinkingLevel: "xhigh", isIdle: () => true, hasPendingMessages: () => false, ui: { notify(message: string) { notifications.push(message); } } } as unknown as ExtensionContext;
   registerWorkerExtension(api, {
     runtimeRoot, roots: { stateRoot: workersRoot, workspaceRoot: workersRoot }, codeRoot: root, preparedRoot: path.join(runtimeRoot, "prepared"), targetRoot: root, dockerPath: "/fake/docker", random, now: () => new Date(`2026-01-01T00:00:${String(counter).padStart(2, "0")}.000Z`),
     waitForHostIdentity: async () => {},
@@ -204,6 +204,37 @@ test("failed deferred review overlay setup system-settles and releases the subje
     assert.equal(f.overlays.length, 0); await f.event("turn_end");
     const db = f.registry(); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, undefined); assert.equal(getWorkerRun(db, review.workerId, review.runId)!.outcome, "failed"); db.close();
   } finally { await f.close(); }
+});
+
+test("only completed work and integration outcomes are review-ready", async () => {
+  const f = await fixture(); try {
+    const blocked = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "subject" }] }));
+    await f.event("turn_end"); await complete(f, blocked, { outcome: "blocked", summary: "External prerequisite." });
+    await assert.rejects(f.call("worker_run", { runs: [{ action: "start", role: "review", reviewedRunId: blocked.runId }] }), /not eligible/);
+  } finally { await f.close(); }
+});
+
+test("review selection is provider-independent and fails closed without an alternative provider", async () => {
+  const f = await fixture(); try {
+    const anthropicSubject = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "subject", modelSelection: "anthropic/claude-opus-5-5:xhigh" }] }));
+    await f.event("turn_end"); await complete(f, anthropicSubject);
+    const openaiReview = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "review", reviewedRunId: anthropicSubject.runId }] }));
+    let db = f.registry(); assert.equal(getWorker(db, openaiReview.workerId)!.modelSelection, "openai-codex/gpt-5.6-sol:xhigh"); db.close();
+    await f.event("turn_end"); await f.call("worker_control", { action: "cancel", workerId: openaiReview.workerId });
+  } finally { await f.close(); }
+
+  const onlyOpenAi = await fixture({ models: [model("openai-codex", "gpt-5.6-sol")] }); try {
+    const subject = receipt(await onlyOpenAi.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "subject" }] }));
+    await onlyOpenAi.event("turn_end"); await complete(onlyOpenAi, subject);
+    await assert.rejects(onlyOpenAi.call("worker_run", { runs: [{ action: "start", role: "review", reviewedRunId: subject.runId }] }), /independent from subject provider openai-codex/);
+  } finally { await onlyOpenAi.close(); }
+
+  const missingProvenance = await fixture(); try {
+    const subject = receipt(await missingProvenance.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "subject" }] }));
+    await missingProvenance.event("turn_end"); await complete(missingProvenance, subject);
+    const db = missingProvenance.registry(); db.database.prepare("UPDATE runs SET model_selection=NULL WHERE run_id=?").run(subject.runId); db.close();
+    await assert.rejects(missingProvenance.call("worker_run", { runs: [{ action: "start", role: "review", reviewedRunId: subject.runId }] }), /no model provider provenance/);
+  } finally { await missingProvenance.close(); }
 });
 
 test("review starts fresh, mounts exact subject session range, cancellation releases lease, and resume recreates it", async () => {
