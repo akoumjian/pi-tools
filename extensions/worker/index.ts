@@ -761,7 +761,12 @@ function writeIntegrationContext(paths: WorkerPaths, set: ReturnType<typeof read
   writeReadonlyJson(file, value); return file;
 }
 function writeReadonlyJson(file: string, value: unknown): void { if (existsSync(file)) chmodSync(file, 0o600); writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 }); chmodSync(file, 0o400); }
-function sessionIdentity(paths: WorkerPaths): { sessionId: string; sessionFile: string } { const files = existsSync(paths.sessionDir) ? readdirSync(paths.sessionDir).filter((name) => name.endsWith(".jsonl")) : []; if (files.length !== 1) throw new Error(`Expected one fresh worker session in ${paths.sessionDir}.`); const sessionFile = realpathSync(path.join(paths.sessionDir, files[0]!)); const first = JSON.parse(readFileSync(sessionFile, "utf8").split("\n")[0]!); return { sessionId: first.id, sessionFile }; }
+function sessionIdentity(paths: WorkerPaths): { sessionId: string; sessionFile: string } {
+  const files = existsSync(paths.sessionDir) ? readdirSync(paths.sessionDir).filter((name) => name.endsWith(".jsonl")) : [];
+  if (files.length !== 1) throw new Error(`Expected one fresh worker session in ${paths.sessionDir}.`);
+  const { sessionFile, header } = readWorkerSessionHeader(path.join(paths.sessionDir, files[0]!));
+  return { sessionId: header.id, sessionFile };
+}
 function verifyRetainedSession(worker: WorkerRegistryRecord): void {
   if (worker.role === "work") {
     verifyWorkerSession({ sessionFile: worker.sessionFile!, sessionId: worker.sessionId!, workspaceRoot: worker.workspaceRoot, parentSessionFile: worker.parentSessionFile });

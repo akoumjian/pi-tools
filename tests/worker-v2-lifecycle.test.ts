@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, ftruncateSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -157,6 +157,22 @@ test("cancelling an initial queued work run defers its exact fork until a resume
     const resumed = receipt(await f.call("worker_run", { runs: [{ action: "resume", workerId: started.workerId, instructions: "continue" }] }));
     assert.equal(resumed.workerId, started.workerId); await f.event("turn_end"); db = f.registry(); worker = getWorker(db, resumed.workerId)!; const header = JSON.parse(readFileSync(worker.sessionFile!, "utf8").split("\n")[0]!); assert.equal(realpathSync(header.parentSession), realpathSync(f.session.getSessionFile()!)); db.close();
     await f.call("worker_control", { action: "cancel", workerId: resumed.workerId }); db = f.registry(); assert.equal(getWorkerRun(db, resumed.workerId, resumed.runId)!.outcome, "cancelled"); db.close();
+  } finally { await f.close(); }
+});
+
+test("work resume uses bounded session identity for a sparse session beyond 512 MiB", async () => {
+  const f = await fixture();
+  try {
+    const first = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "create retained session" }] }));
+    await f.event("turn_end"); await complete(f, first);
+    const before = f.registry(); const sessionFile = getWorker(before, first.workerId)!.sessionFile!; before.close();
+    const fd = openSync(sessionFile, "r+"); try { ftruncateSync(fd, 600 * 1024 * 1024); } finally { closeSync(fd); }
+    const rssBefore = process.memoryUsage().rss; const started = performance.now();
+    const resumed = receipt(await f.call("worker_run", { runs: [{ action: "resume", workerId: first.workerId, instructions: "resume a very large retained session" }] }));
+    const elapsed = performance.now() - started; const rssGrowth = process.memoryUsage().rss - rssBefore;
+    assert.equal(resumed.workerId, first.workerId); assert.ok(elapsed < 5_000, `large resume took ${elapsed}ms`); assert.ok(rssGrowth < 128 * 1024 * 1024, `large resume grew RSS by ${rssGrowth} bytes`);
+    await f.event("turn_end"); assert.equal(f.launches.some((launch) => launch.record.runId === resumed.runId), true);
+    await f.call("worker_control", { action: "cancel", workerId: resumed.workerId });
   } finally { await f.close(); }
 });
 

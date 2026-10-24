@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { SessionManager, type ExtensionCommandContext, type Theme } from "@earendil-works/pi-coding-agent";
-import { buildWorkerSessionViewerFrame, countSessionLines, createWorkerSessionViewerComponent, loadWorkerSessionViewSnapshot, openWorkerSessionViewer, sanitizeViewText, type WorkerSessionPageRequest, type WorkerSessionViewSnapshot, type WorkerSessionViewTarget, type WorkerSessionViewerState } from "../extensions/worker/view.js";
+import { buildWorkerSessionViewerFrame, countSessionLines, createWorkerSessionViewerComponent, loadWorkerSessionViewSnapshot, loadWorkerSessionViewSnapshotAsync, openWorkerSessionViewer, sanitizeViewText, type WorkerSessionPageRequest, type WorkerSessionViewSnapshot, type WorkerSessionViewTarget, type WorkerSessionViewerState } from "../extensions/worker/view.js";
 import { forkWorkerSession } from "../extensions/worker/session.js";
 
 function fixture(options: { root?: string; splitRoots?: boolean } = {}) {
@@ -25,7 +25,7 @@ function header(target: WorkerSessionViewTarget, overrides: Record<string, unkno
 function message(id: string, parentId: string | null, content: string, extra: Record<string, unknown> = {}) { return { type: "message", id, parentId, timestamp: "2026-01-01T00:00:01.000Z", message: { role: "user", content, ...extra } }; }
 function line(value: unknown): string { return `${JSON.stringify(value)}\n`; }
 function snapshot(target: WorkerSessionViewTarget, blocks: WorkerSessionViewSnapshot["blocks"], overrides: Partial<WorkerSessionViewSnapshot> = {}): WorkerSessionViewSnapshot {
-  return { target, blocks, totalActiveEntries: blocks.length, malformedEntries: 0, skippedOversizedEntries: 0, incompleteTrailingEntry: false, hiddenCompactedEntries: 0, compactionCount: 0, runStartLine: target.sessionStartLine ?? 1, runEndLine: target.sessionEndLine ?? target.sessionStartLine ?? 0, pageStartLine: target.sessionStartLine ?? 1, pageEndLine: target.sessionEndLine ?? target.sessionStartLine ?? 0, hasPreviousPage: false, hasNextPage: false, refreshedAt: "now", ...overrides };
+  return { target, blocks, totalActiveEntries: blocks.length, malformedEntries: 0, skippedOversizedEntries: 0, incompleteTrailingEntry: false, hiddenCompactedEntries: 0, compactionCount: 0, previousVisibleEntries: 0, nextVisibleEntries: 0, totalVisibleEntries: blocks.length, runStartLine: target.sessionStartLine ?? 1, runEndLine: target.sessionEndLine ?? target.sessionStartLine ?? 0, pageStartLine: target.sessionStartLine ?? 1, pageEndLine: target.sessionEndLine ?? target.sessionStartLine ?? 0, hasPreviousPage: false, hasNextPage: false, refreshedAt: "now", ...overrides };
 }
 async function tick() { await new Promise<void>((resolve) => setImmediate(resolve)); }
 const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as Theme;
@@ -109,9 +109,75 @@ test("622-entry compacted run has one global visible order in forward and backwa
     assert.equal(forward.texts[0], "OPENING ASSIGNMENT");
     assert.ok(forward.texts.includes("entry-229")); assert.ok(forward.texts.includes("real-range compaction"));
     assert.equal(forward.texts.includes("entry-228"), false);
-    assert.equal(forward.pages[0]!.hiddenCompactedEntries, 228);
+    assert.equal(forward.pages[0]!.hiddenCompactedEntries, 228); assert.equal(forward.pages[0]!.totalVisibleEntries, 394); assert.equal(forward.pages[0]!.compactionCount, 1);
     const frame = buildWorkerSessionViewerFrame(theme, { snapshot: forward.pages[0]!, topLine: 0, pinnedToEnd: false }, 120, 40).lines.join("\n");
     assert.match(frame, /228 earlier run entries are superseded by 1 compaction/);
+  } finally { f.close(); }
+});
+
+test("compaction boundaries before the run preserve all 15, 20, and 42 in-run entries in both directions", () => {
+  for (const preCompactionEntries of [15, 20, 42]) {
+    const f = fixture();
+    try {
+      const inherited = message("parent-kept", null, "inherited retained boundary");
+      const run: string[] = [line(message("opening", "parent-kept", `OPEN-${preCompactionEntries}`))];
+      for (let index = 0; index < preCompactionEntries; index += 1) run.push(line(message(`before-${index}`, index === 0 ? "opening" : `before-${index - 1}`, `before-${index}`)));
+      run.push(line({ type: "compaction", id: "compaction", parentId: `before-${preCompactionEntries - 1}`, timestamp: "2026-01-01T00:04:00.000Z", summary: `summary-${preCompactionEntries}`, firstKeptEntryId: "parent-kept", tokensBefore: 100_000 }));
+      for (let index = 0; index < 10; index += 1) run.push(line(message(`after-${index}`, index === 0 ? "compaction" : `after-${index - 1}`, `after-${index}`)));
+      writeFileSync(f.sessionFile, line(header(f.target)) + line(inherited) + run.join(""));
+      const target = { ...f.target, sessionStartLine: 3, sessionEndLine: 3 + run.length - 1 };
+      const forward: WorkerSessionViewSnapshot[] = []; let page = loadWorkerSessionViewSnapshot(target, {}, { mode: "first" });
+      while (true) { forward.push(page); if (!page.hasNextPage) break; page = loadWorkerSessionViewSnapshot(target, {}, { mode: "after", line: page.pageEndLine }); }
+      const backward: WorkerSessionViewSnapshot[] = []; page = loadWorkerSessionViewSnapshot(target, {}, { mode: "tail" });
+      while (true) { backward.push(page); if (!page.hasPreviousPage) break; page = loadWorkerSessionViewSnapshot(target, {}, { mode: "before", line: page.pageStartLine }); }
+      backward.reverse();
+      const texts = (pages: WorkerSessionViewSnapshot[]) => pages.flatMap((value) => value.blocks.map((block) => block.text));
+      assert.deepEqual(texts(backward), texts(forward));
+      assert.equal(forward[0]!.hiddenCompactedEntries, 0); assert.equal(forward[0]!.totalVisibleEntries, run.length);
+      assert.equal(texts(forward)[0], `OPEN-${preCompactionEntries}`); assert.ok(texts(forward).includes("before-0"));
+    } finally { f.close(); }
+  }
+});
+
+test("byte-bounded latest pages retain exact backward continuation when the opening is separate", () => {
+  const f = fixture();
+  try {
+    const entries: string[] = [line(message("opening", null, "OPENING-BYTE-RANGE")), line(message("hidden", "opening", "hidden")), line(message("kept", "hidden", "KEPT-BYTE-RANGE")), line({ type: "compaction", id: "compact", parentId: "kept", timestamp: "now", summary: "BYTE-COMPACTION", firstKeptEntryId: "kept", tokensBefore: 10 })];
+    for (let index = 0; index < 301; index += 1) entries.push(line(message(`large-${index}`, index === 0 ? "compact" : `large-${index - 1}`, `LARGE-${String(index).padStart(3, "0")}-${"x".repeat(40 * 1024)}`)));
+    writeFileSync(f.sessionFile, line(header(f.target)) + entries.join(""));
+    const target = { ...f.target, sessionStartLine: 2, sessionEndLine: entries.length + 1 };
+    const collect = (direction: "forward" | "backward") => {
+      const pages: WorkerSessionViewSnapshot[] = []; let page = loadWorkerSessionViewSnapshot(target, {}, direction === "forward" ? { mode: "first" } : { mode: "tail" });
+      while (true) { pages.push(page); if (direction === "forward") { if (!page.hasNextPage) break; page = loadWorkerSessionViewSnapshot(target, {}, { mode: "after", line: page.pageEndLine }); } else { if (!page.hasPreviousPage) break; page = loadWorkerSessionViewSnapshot(target, {}, { mode: "before", line: page.pageStartLine }); } }
+      if (direction === "backward") pages.reverse();
+      return { pages, sequence: pages.flatMap((value) => value.blocks.map((block) => block.text.slice(0, 16))) };
+    };
+    const tail = loadWorkerSessionViewSnapshot(target);
+    assert.equal(tail.hasPreviousPage, true); assert.ok(tail.previousVisibleEntries > 0); assert.equal(tail.totalVisibleEntries, 304);
+    assert.equal(tail.previousVisibleEntries + tail.totalActiveEntries + tail.nextVisibleEntries, tail.totalVisibleEntries);
+    const forward = collect("forward"); const backward = collect("backward");
+    assert.deepEqual(backward.sequence, forward.sequence); assert.equal(forward.sequence.length, 304); assert.equal(forward.sequence[0], "OPENING-BYTE-RAN");
+    for (const page of [...forward.pages, ...backward.pages]) assert.equal(page.previousVisibleEntries + page.totalActiveEntries + page.nextVisibleEntries, page.totalVisibleEntries);
+  } finally { f.close(); }
+});
+
+test("async running refreshes reuse visibility and scan only an appended suffix", async () => {
+  const f = fixture();
+  try {
+    const entries = Array.from({ length: 1_400 }, (_, index) => line(message(`m-${index}`, index === 0 ? null : `m-${index - 1}`, `entry-${index}-${"x".repeat(12_000)}`)));
+    writeFileSync(f.sessionFile, line(header(f.target)) + entries.join(""));
+    const target = { ...f.target, runStatus: "running" as const, workerStatus: "running" as const, outcome: undefined, sessionStartLine: 2, sessionEndLine: undefined };
+    let ticks = 0; const timer = setInterval(() => { ticks += 1; }, 1);
+    const first = await loadWorkerSessionViewSnapshotAsync(target);
+    clearInterval(timer); assert.ok(ticks > 0, "cold scan must yield to the event loop"); assert.equal(first.totalVisibleEntries, 1_400);
+    writeFileSync(f.sessionFile, line(message("m-1400", "m-1399", "APPENDED-SUFFIX")), { flag: "a" });
+    const started = performance.now(); const refreshed = await loadWorkerSessionViewSnapshotAsync(target); const elapsed = performance.now() - started;
+    assert.match(refreshed.blocks.at(-1)?.text ?? "", /APPENDED-SUFFIX/); assert.equal(refreshed.totalVisibleEntries, 1_401); assert.ok(elapsed < 1_000, `incremental refresh took ${elapsed}ms`);
+    const settled = { ...target, runStatus: "settled" as const, workerStatus: "idle" as const, outcome: "completed", sessionEndLine: 1_402 };
+    await loadWorkerSessionViewSnapshotAsync(settled);
+    for (let index = 0; index < 200; index += 1) writeFileSync(f.sessionFile, line(message(`later-${index}`, index === 0 ? "m-1400" : `later-${index - 1}`, `later run ${index}-${"y".repeat(10_000)}`)), { flag: "a" });
+    const settledStarted = performance.now(); const settledRefresh = await loadWorkerSessionViewSnapshotAsync(settled); const settledElapsed = performance.now() - settledStarted;
+    assert.equal(settledRefresh.totalVisibleEntries, 1_401); assert.ok(settledElapsed < 1_000, `settled refresh after later appends took ${settledElapsed}ms`);
   } finally { f.close(); }
 });
 
@@ -204,6 +270,17 @@ test("transcript pages keep every bounded block reachable and refresh theme-deri
   } finally { f.close(); }
 });
 
+
+test("adversarial page wrapping has a fixed aggregate budget while keeping every block reachable", () => {
+  const f = fixture();
+  try {
+    const blocks = Array.from({ length: 1_536 }, (_, index) => ({ kind: index % 3 === 0 ? "tool" as const : index % 3 === 1 ? "thinking" as const : "assistant" as const, label: `ADVERSARIAL-${index}`, timestamp: "now", text: `${"z".repeat(7_000)}\n${"y".repeat(5_000)}\n${"x".repeat(5_000)}` }));
+    const state: WorkerSessionViewerState = { snapshot: snapshot(f.target, blocks), topLine: 0, pinnedToEnd: false };
+    const started = performance.now(); buildWorkerSessionViewerFrame(theme, state, 240, 40); const elapsed = performance.now() - started;
+    const cache = state.wrappedBodyCache!;
+    assert.equal(cache.blockStarts.length, 1_536); assert.ok(cache.lines.length < 20_000); assert.ok(elapsed < 2_000, `bounded wrap took ${elapsed}ms`);
+  } finally { f.close(); }
+});
 
 test("line index invalidates an in-place growing rewrite and checkpoints oversized lines", () => {
   const f = fixture();

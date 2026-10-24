@@ -36,7 +36,7 @@ export function createWorkerSession(input: { workspaceRoot: string; sessionDir: 
   if (!sessionFile) throw new Error("Pi did not allocate the fresh worker session.");
   if (!existsSync(sessionFile)) writeFileSync(sessionFile, `${JSON.stringify(manager.getHeader())}\n`, { mode: 0o600 });
   const exact = realpathSync(sessionFile);
-  const entries = parseSessionEntries(readSmallSession(exact));
+  const { entries } = readWorkerSessionHeader(exact, { includeEntries: true });
   const header = entries.find((entry): entry is SessionHeader => entry.type === "session");
   if (!header || header.id !== input.sessionId || path.resolve(header.cwd) !== workspaceRoot || header.parentSession) {
     throw new Error(`Fresh worker session identity mismatch: ${exact}.`);
@@ -54,7 +54,7 @@ export function forkWorkerSession(input: ForkWorkerSessionInput): WorkerSessionI
   const sessionFile = manager.getSessionFile();
   if (!sessionFile) throw new Error("Pi did not persist the forked worker session.");
 
-  return verifyWorkerSession({ sessionFile, sessionId: input.sessionId, workspaceRoot, parentSessionFile });
+  return verifyWorkerSession({ sessionFile, sessionId: input.sessionId, workspaceRoot, parentSessionFile }, { includeEntries: true });
 }
 
 export function verifyWorkerSession(input: {
@@ -62,8 +62,8 @@ export function verifyWorkerSession(input: {
   sessionId: string;
   workspaceRoot: string;
   parentSessionFile: string;
-}): WorkerSessionIdentity {
-  const { sessionFile, header, entries } = readWorkerSessionHeader(input.sessionFile);
+}, options: { includeEntries?: boolean } = {}): WorkerSessionIdentity {
+  const { sessionFile, header, entries } = readWorkerSessionHeader(input.sessionFile, options);
   const workspaceRoot = realpathSync(input.workspaceRoot);
   const parentSessionFile = realpathSync(input.parentSessionFile);
   if (header.id !== input.sessionId) throw new Error(`Worker session id mismatch: expected ${input.sessionId}, found ${header.id}.`);
@@ -74,7 +74,7 @@ export function verifyWorkerSession(input: {
   return { sessionId: header.id, sessionFile, sessionDir: path.dirname(sessionFile), workspaceRoot, parentSessionFile, entries };
 }
 
-export function readWorkerSessionHeader(file: string): { sessionFile: string; header: SessionHeader; entries: FileEntry[] } {
+export function readWorkerSessionHeader(file: string, options: { includeEntries?: boolean } = {}): { sessionFile: string; header: SessionHeader; entries: FileEntry[] } {
   const requested = path.resolve(file);
   let leaf;
   try { leaf = lstatSync(requested); } catch { throw new Error(`Worker session file is unavailable: ${requested}`); }
@@ -89,7 +89,7 @@ export function readWorkerSessionHeader(file: string): { sessionFile: string; he
     let value: unknown;
     try { value = JSON.parse(first); } catch { throw new Error(`Worker session header is malformed: ${requested}`); }
     if (!isSessionHeader(value)) throw new Error(`Worker session has no valid header: ${requested}`);
-    const entries = opened.size <= MAX_RETURNED_SESSION_BYTES ? parseSessionEntries(readSnapshot(fd, opened.size)) : [value];
+    const entries = options.includeEntries && opened.size <= MAX_RETURNED_SESSION_BYTES ? parseSessionEntries(readSnapshot(fd, opened.size)) : [value];
     const after = fstatSync(fd);
     const current = lstatSync(requested);
     if (!current.isFile() || current.dev !== opened.dev || current.ino !== opened.ino || after.dev !== opened.dev || after.ino !== opened.ino || after.size < opened.size) throw new Error(`Worker session changed during verification: ${requested}`);
@@ -115,11 +115,6 @@ function readSnapshot(fd: number, size: number): string {
     offset += count;
   }
   return decodeUtf8(buffer);
-}
-
-function readSmallSession(file: string): string {
-  const { entries } = readWorkerSessionHeader(file);
-  return entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n";
 }
 
 function decodeUtf8(value: Buffer): string {
