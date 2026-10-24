@@ -742,7 +742,7 @@ function defaultToolPolicyError(report: DefaultToolPolicyReport): string {
     "Native tools strict replacement failed.",
     ...details,
     "Expected stock bash/read/write/edit to be inactive. Replacement tools are required only for stock capabilities that were active in this profile: bash -> shell_*, read -> read_many/search_many, write -> write_many, edit -> edit_many.",
-    "Run /native:status and /profile:doctor, then /reload after fixing package registration or extension filters."
+    "Run /native:status and /profile:doctor, then fully restart Pi after fixing package registration or extension filters."
   ].join(" ");
 }
 
@@ -758,7 +758,7 @@ export function buildNativeToolsStatusText(api: Pick<ExtensionAPI, "getActiveToo
     "",
     report.ok
       ? "Replacement policy is satisfied. Use the active shell_*/read_many/search_many/write_many/edit_many replacements instead of stock single-file tools."
-      : "Fix package registration or package filters, then run /reload. The native-tools extension expects @akoumjian/pi-tools async-shell and batch tools to load together for any enabled stock capabilities."
+      : "Fix package registration or package filters, then fully restart Pi. The native-tools extension expects @akoumjian/pi-tools async-shell and batch tools to load together for any enabled stock capabilities."
   ].join("\n");
 }
 

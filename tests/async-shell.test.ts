@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { existsSync, mkdirSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -25,6 +25,8 @@ import asyncShellExtension, {
   parseAsyncShellViewerArgs,
   previewAsyncShellPrune,
   pruneAsyncShellJobs,
+  recoverAsyncShellPruneLeftovers,
+  refreshAsyncShellRetentionSnapshot,
   sanitizeAsyncShellViewerText,
   renderAsyncShellActivityStatus,
   startManagedAsyncJob,
@@ -203,15 +205,18 @@ test("async-shell pruning is exact, previewed, terminal-only, and separate from 
     await writeJobMeta(dir, undelivered, { status: "failed", notifyOnExit: true, completionNotified: false });
     await writeJobMeta(dir, workerOwned, { status: "cancelled", owner: { kind: "worker-run", workerId: "worker_20261024180000_prune01", runId: "run_20261024180000_prune01" } });
 
-    assert.deepEqual(parseAsyncShellPruneArgs(`${eligible} ${eligible}`), { help: false, confirm: false, listEligible: false, offset: 0, limit: 100, jobIds: [eligible] });
+    assert.deepEqual(parseAsyncShellPruneArgs(`${eligible} ${eligible}`), { help: false, confirm: false, recover: false, inventory: undefined, after: undefined, limit: 100, targets: [eligible] });
     assert.match(buildAsyncShellPruneUsage(), /no wildcard/i);
-    assert.throws(() => parseAsyncShellPruneArgs("*"), /Invalid async shell job id/);
-    const eligibility = listEligibleAsyncShellPrune({ cwd: dir }, 0, 2);
+    assert.throws(() => parseAsyncShellPruneArgs("*"), /Invalid async-shell job or leftover target/);
+    const eligibility = await listEligibleAsyncShellPrune({ cwd: dir }, undefined, 2);
     assert.deepEqual(eligibility.entries.map((entry) => entry.jobId), [eligible]);
-    assert.equal(eligibility.scanned, 2);
-    assert.equal(eligibility.nextOffset, 2);
+    assert.equal(eligibility.snapshot.totals.eligible.count, 1);
+    assert.equal(eligibility.snapshot.totals.ineligible.count, 2);
     assert.throws(() => parseAsyncShellPruneArgs("--eligible --confirm"), /read-only/);
-    assert.throws(() => parseAsyncShellPruneArgs("--offset 1"), /require --eligible/);
+    assert.throws(() => parseAsyncShellPruneArgs("--offset 1"), /deletion-stable --after/);
+    const maximumTargets = Array.from({ length: 250 }, (_value, index) => `job_20261024_cap${String(index).padStart(3, "0")}`);
+    assert.equal(parseAsyncShellPruneArgs(maximumTargets.join(" ")).targets.length, 250);
+    assert.throws(() => parseAsyncShellPruneArgs([...maximumTargets, "job_20261024_cap250"].join(" ")), /at most 250/);
     const preview = previewAsyncShellPrune({ cwd: dir }, [eligible]);
     assert.equal(preview[0]?.jobId, eligible);
     assert.ok(existsSync(preview[0]!.logDir), "preview is read-only");
@@ -220,6 +225,111 @@ test("async-shell pruning is exact, previewed, terminal-only, and separate from 
     const deleted = pruneAsyncShellJobs({ cwd: dir }, [eligible]);
     assert.equal(deleted.length, 1);
     assert.equal(existsSync(preview[0]!.logDir), false);
+  });
+});
+
+
+test("retention inventory uses deletion-stable cursors and reports bounded class totals", async () => {
+  await withTempDir(async (dir) => {
+    const ids = [
+      "job_20261024180000_cursor001",
+      "job_20261024180000_cursor002",
+      "job_20261024180000_cursor003"
+    ];
+    for (const id of ids) await writeJobMeta(dir, id, { status: "exited", notifyOnExit: false, completionNotified: true });
+    const first = await listEligibleAsyncShellPrune({ cwd: dir }, undefined, 1);
+    assert.deepEqual(first.entries.map((entry) => entry.name), [ids[0]]);
+    assert.equal(first.nextAfter, ids[0]);
+    pruneAsyncShellJobs({ cwd: dir }, [ids[0]!]);
+    const second = await listEligibleAsyncShellPrune({ cwd: dir }, first.nextAfter, 1);
+    assert.deepEqual(second.entries.map((entry) => entry.name), [ids[1]], "deleting the first page must not skip the next key");
+    assert.equal(second.snapshot.totals.eligible.count, 2);
+    assert.equal(parseAsyncShellPruneArgs("--eligible --after job_20261024180000_cursor001 --limit 1").after, ids[0]);
+  });
+});
+
+test("pending and prune leftovers are visible, exactly deletable, and prune recovery is atomic", async () => {
+  await withTempDir(async (dir) => {
+    const root = path.join(dir, ".pi", "async-shell", "jobs");
+    const pendingJob = "job_20261024180000_pending01";
+    const pruneJob = "job_20261024180000_recover01";
+    const orphanJob = "job_20261024180000_orphan001";
+    const pending = `.pending-${pendingJob}-123e4567-e89b-42d3-a456-426614174000`;
+    const prune = `.prune-${pruneJob}-123e4567-e89b-42d3-a456-426614174001`;
+    const interruptedDelete = `.prune-${orphanJob}-123e4567-e89b-42d3-a456-426614174002`;
+    await mkdir(path.join(root, pending), { recursive: true });
+    await writeFile(path.join(root, pending, "stdout.log"), "pending data");
+    const pendingLogDir = path.join(root, pendingJob);
+    await writeFile(path.join(root, pending, "meta.json"), `${JSON.stringify({
+      jobId: pendingJob,
+      command: "interrupted publication",
+      cwd: dir,
+      shell: "/bin/zsh",
+      status: "running",
+      pid: 2_147_483_647,
+      startedAt: new Date().toISOString(),
+      notifyOnExit: true,
+      completionNotified: false,
+      logDir: pendingLogDir,
+      stdoutLog: path.join(pendingLogDir, "stdout.log"),
+      stderrLog: path.join(pendingLogDir, "stderr.log"),
+      outputBytes: { stdout: 0, stderr: 0 }
+    })}\n`);
+    await writeJobMeta(dir, pruneJob, { status: "exited", notifyOnExit: false, completionNotified: true });
+    await rename(path.join(root, pruneJob), path.join(root, prune));
+    await mkdir(path.join(root, interruptedDelete), { recursive: true });
+    await writeFile(path.join(root, interruptedDelete, "partial"), "trash");
+
+    const leftovers = await listEligibleAsyncShellPrune({ cwd: dir }, undefined, 100, "leftovers");
+    assert.deepEqual(leftovers.entries.map((entry) => entry.name), [pending, interruptedDelete, prune].sort());
+    assert.equal(leftovers.snapshot.totals.leftovers.count, 3);
+    assert.ok(leftovers.snapshot.totals.leftovers.bytes >= Buffer.byteLength("pending datatrash"));
+    assert.match(await buildAsyncShellStatusText(createContext(dir)), /Leftovers: 1 pending .*2 prune/);
+
+    const recoveryPreview = previewAsyncShellPrune({ cwd: dir }, [prune]);
+    assert.equal(recoveryPreview[0]?.recoveryEligible, true);
+    recoverAsyncShellPruneLeftovers({ cwd: dir }, [prune]);
+    assert.equal(existsSync(path.join(root, prune)), false);
+    assert.equal(existsSync(path.join(root, pruneJob)), true);
+    assert.equal(previewAsyncShellPrune({ cwd: dir }, [interruptedDelete])[0]?.recoveryEligible, false);
+    assert.equal(pruneAsyncShellJobs({ cwd: dir }, [pending, interruptedDelete]).length, 2);
+    assert.equal((await readdir(root)).some((name) => name.startsWith(".pending-") || name.startsWith(".prune-")), false);
+  });
+});
+
+test("retention scanning yields the event loop and publishes progress for large registries", async () => {
+  await withTempDir(async (dir) => {
+    const root = path.join(dir, ".pi", "async-shell", "jobs");
+    await mkdir(root, { recursive: true });
+    const total = 2_000;
+    for (let offset = 0; offset < total; offset += 100) {
+      await Promise.all(Array.from({ length: Math.min(100, total - offset) }, (_value, index) =>
+        mkdir(path.join(root, `unknown-${String(offset + index).padStart(5, "0")}`))));
+    }
+    const api = createFakeApi();
+    asyncShellExtension(api);
+    const notifications: string[] = [];
+    const commandContext = {
+      ...createContext(dir),
+      mode: "tui",
+      hasUI: true,
+      ui: { notify(message: string): void { notifications.push(message); } }
+    } as unknown as ExtensionCommandContext;
+    const commandStartedAt = Date.now();
+    await required(api.commands.get("async:status"), "async:status command").handler("", commandContext);
+    assert.ok(Date.now() - commandStartedAt < 500, "status returns progress without waiting for the full large scan");
+    assert.match(notifications.join("\n"), /scan (started|in progress)/i);
+
+    let timerFired = false;
+    let progressEvents = 0;
+    const timer = setTimeout(() => { timerFired = true; }, 0);
+    const snapshot = await refreshAsyncShellRetentionSnapshot({ cwd: dir }, () => { progressEvents += 1; });
+    clearTimeout(timer);
+    assert.equal(snapshot.totals.directories, total);
+    assert.equal(snapshot.totals.unknownLeftovers.count, total);
+    assert.equal(parseAsyncShellPruneArgs("--leftovers --after unknown-00099 --limit 100").after, "unknown-00099");
+    assert.equal(timerFired, true, "the registry scan must not monopolize the event loop");
+    assert.ok(progressEvents > 1, "large scans expose chunk progress");
   });
 });
 
@@ -549,6 +659,7 @@ test("async-shell upgrades the version-one process-global holder in place", () =
   assert.ok(migrated.completionDeliveryBatches instanceof Map);
   assert.ok(migrated.scheduledCompletionJobIds instanceof Set);
   assert.ok(migrated.completionRuntimes instanceof Map);
+  assert.ok(migrated.retentionSnapshots instanceof Map);
 });
 
 test("async-shell rejects an incompatible process-global runtime holder", () => {
@@ -628,7 +739,7 @@ test("async-shell-status reports job root and recent jobs", async () => {
     assert.ok(api.commands.has("async:status"));
     assert.ok(api.commands.has("async:prune"));
     assert.equal(api.commands.has("async-shell-status"), false, "deprecated kebab alias removed");
-    const text = buildAsyncShellStatusText(createContext(dir));
+    const text = await buildAsyncShellStatusText(createContext(dir));
     assert.match(text, /Async shell status/);
     assert.match(text, /Job root:/);
     assert.match(text, /Recent jobs: 0/);
@@ -1098,6 +1209,72 @@ test("shell_start batches deferred completions by the requested delivery mode an
     }
     const steerAfter = JSON.parse(await readFile(path.join(steerDetails!.logDir!, "meta.json"), "utf8")) as { completionNotified: boolean };
     assert.equal(steerAfter.completionNotified, true);
+  });
+});
+
+
+test("Escape-style agent interruption preserves a queued completion without replaying its accepted send", async () => {
+  await withTempDir(async (dir) => {
+    const api = createFakeApi();
+    asyncShellExtension(api);
+    const shellStart = required(api.registeredTools.find((tool) => tool.name === "shell_start"), "shell_start tool");
+    assert.ok(shellStart.execute);
+    let idle = false;
+    const context = createContext(dir, () => idle);
+    await api.emit("session_start", { type: "session_start" }, context);
+    const controller = new AbortController();
+    const escape = setTimeout(() => controller.abort(), 100);
+    const startResult = await shellStart.execute(
+      "tool-call-id",
+      { commands: [{ command: "sleep 7", cwd: dir, job_name: "escape-pending", completionDelivery: "followUp" }] } as never,
+      controller.signal,
+      undefined,
+      context
+    ).finally(() => clearTimeout(escape));
+    const jobId = (startResult.details as { jobs: Array<{ jobId: string }> }).jobs[0]!.jobId;
+    idle = true;
+    await api.emit("agent_end", { type: "agent_end", messages: [] }, context);
+    for (let attempt = 0; attempt < 400 && api.sentMessages.length === 0; attempt += 1) await delay(25);
+    assert.equal(api.sentMessages.length, 1, "the completion survives the interrupted agent turn");
+    await api.emit("agent_end", { type: "agent_end", messages: [] }, context);
+    await delay(50);
+    assert.equal(api.sentMessages.length, 1, "an accepted ambiguous send remains claimed");
+    const status = await buildAsyncShellStatusText(context);
+    assert.match(status, /1 claimed in 1 unreceipted batch/);
+    assert.match(status, new RegExp(jobId));
+  });
+});
+
+test("failed compaction follow-up send stays queued and retries only on a later lifecycle flush", async () => {
+  await withTempDir(async (dir) => {
+    const api = createFakeApi();
+    let attempts = 0;
+    api.sendMessage = (message: unknown, options: unknown): void => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("injected compaction follow-up rejection");
+      api.sentMessages.push({ message, options });
+    };
+    asyncShellExtension(api);
+    const shellStart = required(api.registeredTools.find((tool) => tool.name === "shell_start"), "shell_start tool");
+    assert.ok(shellStart.execute);
+    const context = createContext(dir, true);
+    await api.emit("session_start", { type: "session_start" }, context);
+    await shellStart.execute(
+      "tool-call-id",
+      { commands: [{ command: "sleep 7", cwd: dir, job_name: "compaction-follow-up", completionDelivery: "followUp" }] } as never,
+      new AbortController().signal,
+      undefined,
+      context
+    );
+    for (let attempt = 0; attempt < 160 && attempts === 0; attempt += 1) await delay(25);
+    assert.equal(attempts, 1);
+    assert.equal(api.sentMessages.length, 0, "a rejected send is not accepted or lost");
+    assert.match(await buildAsyncShellStatusText(context), /0 claimed in 0 unreceipted batches; 1 unsent/);
+    await api.emit("turn_end", { type: "turn_end", turnIndex: 0, timestamp: Date.now(), message: {}, toolResults: [] }, context);
+    assert.equal(attempts, 2);
+    assert.equal(api.sentMessages.length, 1);
+    await api.emit("turn_end", { type: "turn_end", turnIndex: 1, timestamp: Date.now(), message: {}, toolResults: [] }, context);
+    assert.equal(attempts, 2, "the accepted retry remains claimed without ambiguous replay");
   });
 });
 
@@ -1793,6 +1970,65 @@ test("managed spawn metadata failure retains and settles the spawned process", a
       try { process.kill(pid, 0); await delay(10); } catch { alive = false; }
     }
     assert.equal(alive, false);
+  });
+});
+
+
+test("persistent startup metadata failure settles once and leaves a classified exact pending artifact", async () => {
+  await withTempDir(async (dir) => {
+    const api = createFakeApi();
+    asyncShellExtension(api);
+    const jobId = "job_20260910193000_metacollide";
+    const jobsDirectory = path.join(dir, ".pi", "async-shell", "jobs");
+    const logDirectory = path.join(jobsDirectory, jobId);
+    const handle = startManagedAsyncJob(api, createContext(dir), {
+      jobId,
+      command: "persistent metadata collision",
+      cwd: dir,
+      executable: process.execPath,
+      args: ["-e", "setInterval(()=>{},1000)"],
+      notifyOnExit: false,
+      persistSpawnedMetadata: () => mkdirSync(path.join(logDirectory, "collision"), { recursive: true })
+    });
+    const completion = await waitWithRefTimeout(handle.completion);
+    assert.equal(completion.status, "failed");
+    assert.match(completion.error ?? "", /persist spawned async job metadata/i);
+    const endedAt = completion.endedAt;
+    const pid = handle.snapshot().pid;
+    if (pid !== undefined) {
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        try { process.kill(pid, 0); await delay(10); } catch { break; }
+      }
+    }
+    assert.equal(handle.snapshot().endedAt, endedAt, "close/error races cannot settle the job twice");
+    const leftovers = await listEligibleAsyncShellPrune({ cwd: dir }, undefined, 100, "leftovers");
+    const pending = required(leftovers.entries.find((entry) => entry.kind === "pending"), "classified pending metadata artifact");
+    assert.equal(previewAsyncShellPrune({ cwd: dir }, [pending.name])[0]?.kind, "pending");
+    assert.equal(pruneAsyncShellJobs({ cwd: dir }, [pending.name]).length, 1);
+  });
+});
+
+test("terminal metadata write failure cannot escape the child lifecycle or strand waiters", async () => {
+  await withTempDir(async (dir) => {
+    const api = createFakeApi();
+    asyncShellExtension(api);
+    const handle = startManagedAsyncJob(api, createContext(dir), {
+      jobId: "job_20260910193000_terminalmeta",
+      command: "terminal metadata failure",
+      cwd: dir,
+      executable: process.execPath,
+      args: ["-e", "setTimeout(()=>process.exit(0),300)"],
+      notifyOnExit: false
+    });
+    const metaPath = path.join(handle.snapshot().logDir, "meta.json");
+    await rm(metaPath);
+    await mkdir(metaPath);
+    const completion = await waitWithRefTimeout(handle.completion);
+    assert.equal(completion.status, "failed");
+    assert.match(completion.error ?? "", /terminal metadata persistence failed/i);
+    const endedAt = completion.endedAt;
+    await delay(50);
+    assert.equal(handle.snapshot().endedAt, endedAt, "terminal persistence failure settles exactly once");
   });
 });
 

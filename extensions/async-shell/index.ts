@@ -27,6 +27,14 @@ import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/
 import { workerResultAdmissionPath } from "../_shared/worker-contract.js";
 import { readStrictWorkerJobMeta, workerJobIsSettled } from "../_shared/worker-job-settlement.js";
 import { writeAtomicJson } from "../_shared/atomic-json.js";
+import {
+  isCanonicalAsyncShellJobId,
+  parseAsyncShellLeftoverName,
+  scanAsyncShellRetention,
+  type AsyncShellRetentionEntry,
+  type AsyncShellRetentionProgress,
+  type AsyncShellRetentionSnapshot
+} from "./retention.js";
 
 export type JobStatus = "running" | "exited" | "failed" | "cancelled" | "unknown";
 export type AsyncShellJobOwner = {
@@ -207,28 +215,41 @@ export type AsyncShellViewerArgs = {
   follow: boolean;
 };
 
+export type AsyncShellPruneInventory = "eligible" | "ineligible" | "leftovers";
+
 export type AsyncShellPruneArgs = {
   help: boolean;
   confirm: boolean;
-  listEligible: boolean;
-  offset: number;
+  recover: boolean;
+  inventory?: AsyncShellPruneInventory;
+  after?: string;
   limit: number;
-  jobIds: string[];
+  targets: string[];
 };
 
 export type AsyncShellPruneEntry = {
+  target: string;
+  kind: "job" | "pending" | "prune";
   jobId: string;
-  status: JobStatus;
+  status?: JobStatus;
   bytes: number;
   logDir: string;
+  recoveryEligible: boolean;
 };
 
 export type AsyncShellPrunePage = {
-  entries: AsyncShellPruneEntry[];
-  offset: number;
-  scanned: number;
-  total: number;
-  nextOffset?: number;
+  inventory: AsyncShellPruneInventory;
+  entries: AsyncShellRetentionEntry[];
+  after?: string;
+  nextAfter?: string;
+  snapshot: AsyncShellRetentionSnapshot;
+};
+
+type AsyncShellRetentionState = {
+  snapshot?: AsyncShellRetentionSnapshot;
+  scan?: Promise<AsyncShellRetentionSnapshot>;
+  progress?: AsyncShellRetentionProgress;
+  progressListeners?: Set<(progress: AsyncShellRetentionProgress) => void>;
 };
 
 export type AsyncShellViewerStreamSnapshot = {
@@ -354,6 +375,7 @@ type AsyncShellRuntimeHolder = {
   completionDeliveryBatches: Map<string, CompletionDeliveryBatch>;
   scheduledCompletionJobIds: Set<string>;
   completionRuntimes: Map<string, CompletionDeliveryRuntime>;
+  retentionSnapshots: Map<string, AsyncShellRetentionState>;
   nextCompletionGeneration: number;
 };
 
@@ -369,19 +391,21 @@ export function migrateAsyncShellRuntimeHolder(existingValue: unknown): AsyncShe
     throw new Error(`Incompatible async-shell runtime holder for version ${ASYNC_SHELL_RUNTIME_HOLDER_VERSION}.`);
   }
   // Version 1 contained only jobs and activity listeners. Upgrade that object
-  // in place so an installed-package update followed by /reload does not lose
-  // live jobs or fail module evaluation. Version 2 fields are also initialized
+  // in place so a compatible prior holder survives an uncached same-version
+  // development reload. Version 2 fields are also initialized
   // defensively for the short-lived pre-release holder shape.
   existing.pendingCompletionNotifications ??= new Map<string, JobRuntime>();
   existing.completionDeliveryBatches ??= new Map<string, CompletionDeliveryBatch>();
   existing.scheduledCompletionJobIds ??= new Set<string>();
   existing.completionRuntimes ??= new Map<string, CompletionDeliveryRuntime>();
+  existing.retentionSnapshots ??= new Map<string, AsyncShellRetentionState>();
   existing.nextCompletionGeneration ??= 0;
   if (
     !(existing.pendingCompletionNotifications instanceof Map) ||
     !(existing.completionDeliveryBatches instanceof Map) ||
     !(existing.scheduledCompletionJobIds instanceof Set) ||
     !(existing.completionRuntimes instanceof Map) ||
+    !(existing.retentionSnapshots instanceof Map) ||
     typeof existing.nextCompletionGeneration !== "number"
   ) {
     throw new Error(`Incompatible async-shell runtime holder for version ${ASYNC_SHELL_RUNTIME_HOLDER_VERSION}.`);
@@ -401,6 +425,7 @@ function asyncShellRuntimeHolder(): AsyncShellRuntimeHolder {
     completionDeliveryBatches: new Map<string, CompletionDeliveryBatch>(),
     scheduledCompletionJobIds: new Set<string>(),
     completionRuntimes: new Map<string, CompletionDeliveryRuntime>(),
+    retentionSnapshots: new Map<string, AsyncShellRetentionState>(),
     nextCompletionGeneration: 0
   };
   Reflect.set(globalThis, ASYNC_SHELL_RUNTIME_HOLDER_KEY, created);
@@ -413,6 +438,7 @@ const asyncShellActivityListeners = asyncShellRuntime.activityListeners;
 const pendingCompletionNotifications = asyncShellRuntime.pendingCompletionNotifications;
 const completionDeliveryBatches = asyncShellRuntime.completionDeliveryBatches;
 const scheduledCompletionJobIds = asyncShellRuntime.scheduledCompletionJobIds;
+const retentionSnapshots = asyncShellRuntime.retentionSnapshots;
 
 function subscribeAsyncShellActivity(listener: AsyncShellActivityListener): () => void {
   asyncShellActivityListeners.add(listener);
@@ -482,7 +508,7 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     {
       description: "Show async-shell job storage and recent job diagnostics",
       handler: async (_args, context) => {
-        context.ui.notify(buildAsyncShellStatusText(context), "info");
+        context.ui.notify(buildLatestAsyncShellStatusText(context), "info");
       }
     },
     []
@@ -492,9 +518,9 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     api,
     "async:prune",
     {
-      description: "Preview or explicitly prune exact terminal ordinary async-shell jobs",
+      description: "Inspect retention inventory or preview, prune, and recover exact async-shell storage targets",
       handler: async (args, context) => {
-        handleAsyncShellPruneCommand(context, args);
+        await handleAsyncShellPruneCommand(context, args);
       }
     },
     []
@@ -589,7 +615,7 @@ export default function asyncShellExtension(api: ExtensionAPI): void {
     async execute(_toolCallId, params: StatusInput, signal, _onUpdate, context): Promise<AgentToolResult<JobSummaryDetails | JobListDetails>> {
       throwIfAborted(signal);
       if (params.jobId === undefined) {
-        const jobsList = listJobs(context, params.limit ?? 20);
+        const jobsList = await listJobs(context, params.limit ?? 20);
         return {
           content: [{ type: "text", text: formatJobList(jobsList) }],
           details: { jobs: jobsList }
@@ -806,8 +832,14 @@ function startJob(
 
   child.on("error", (error) => {
     if (failedBeforeSpawn) {
-      runtime.error = error.message;
-      try { writeMeta(runtime); } catch {}
+      runtime.error = runtime.error ? `${runtime.error}; ${error.message}` : error.message;
+      try {
+        writeMeta(runtime);
+      } catch (cause) {
+        const persistenceError = `Terminal metadata persistence failed: ${cause instanceof Error ? cause.message : String(cause)}`;
+        runtime.error = `${runtime.error}; ${persistenceError}`;
+      }
+      try { notifyAsyncShellActivity(); } catch {}
       return;
     }
     finalizeJob(api, runtime, "failed", undefined, undefined, error.message);
@@ -822,10 +854,12 @@ function startJob(
   } catch (cause) {
     runtime.startupError = `Unable to persist spawned async job metadata: ${cause instanceof Error ? cause.message : String(cause)}`;
     runtime.notifyOnExit = false;
+    if (failedBeforeSpawn) runtime.error = runtime.error ? `${runtime.error}; ${runtime.startupError}` : runtime.startupError;
     if (!failedBeforeSpawn) {
       try {
         signalAsyncJobExecution(runtime.pid, runtime.processToken, "SIGKILL");
       } catch {}
+      finalizeJob(api, runtime, "failed", null, null, runtime.startupError);
     }
   }
   notifyAsyncShellActivity();
@@ -1075,9 +1109,7 @@ function finalizeJob(
   signal: NodeJS.Signals | null | undefined,
   error?: string
 ): void {
-  if (isTerminal(job.status)) {
-    return;
-  }
+  if (isTerminal(job.status)) return;
 
   const endedAtMs = Date.now();
   job.status = status;
@@ -1086,14 +1118,27 @@ function finalizeJob(
   job.exitCode = exitCode;
   job.signal = signal;
   job.error = error;
-  job.outputBytes = asyncJobOutputBytes(job.stdoutLog, job.stderrLog);
-  writeMeta(job);
-  notifyAsyncShellActivity();
 
-  for (const resolve of job.waiters.splice(0)) {
-    resolve();
+  try {
+    job.outputBytes = asyncJobOutputBytes(job.stdoutLog, job.stderrLog);
+    writeMeta(job);
+  } catch (cause) {
+    const persistenceError = `Terminal metadata persistence failed: ${cause instanceof Error ? cause.message : String(cause)}`;
+    job.status = "failed";
+    job.error = job.error ? `${job.error}; ${persistenceError}` : persistenceError;
+    // A transient first failure may still permit a truthful failed record. A
+    // persistent filesystem failure remains represented by the in-memory
+    // result; it must never prevent waiters or the interactive host settling.
+    try {
+      job.outputBytes = asyncJobOutputBytes(job.stdoutLog, job.stderrLog);
+      writeMeta(job);
+    } catch {}
   }
 
+  try { notifyAsyncShellActivity(); } catch {}
+  for (const resolve of job.waiters.splice(0)) {
+    try { resolve(); } catch {}
+  }
   scheduleCompletionNotification(api, job);
 }
 
@@ -1683,29 +1728,27 @@ function requireActiveJob(context: ExtensionContext, jobId: string): JobRuntime 
   return job;
 }
 
-function listJobs(context: ExtensionContext, limit: number): JobMeta[] {
-  const root = path.join(jobsRoot(context.cwd), "jobs");
-  const diskJobs = existsSync(root)
-    ? readdirSync(root, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && isValidAsyncJobId(entry.name))
-      .map((entry) => readMetaFile(path.join(root, entry.name, "meta.json"), root, entry.name))
-      .filter((job): job is JobMeta => job !== undefined)
-    : [];
+async function listJobs(context: ExtensionContext, limit: number): Promise<JobMeta[]> {
+  return jobsFromRetentionSnapshot(context, await refreshAsyncShellRetentionSnapshot(context), limit);
+}
 
+function jobsFromRetentionSnapshot(context: ExtensionContext, snapshot: AsyncShellRetentionSnapshot, limit: number): JobMeta[] {
+  const diskJobs = snapshot.recentJobs.filter(isSnapshotJobMeta).map((job) => publicJob(job as JobMeta));
   const activeJobs = Array.from(jobs.values())
     .filter((job) => isJobInContext(context, job))
     .map(publicJob);
   const byId = new Map<string, JobMeta>();
-  for (const job of diskJobs) {
-    byId.set(job.jobId, job);
-  }
-  for (const job of activeJobs) {
-    byId.set(job.jobId, job);
-  }
-
+  for (const job of diskJobs) byId.set(job.jobId, job);
+  for (const job of activeJobs) byId.set(job.jobId, job);
   return Array.from(byId.values())
     .sort((left, right) => Date.parse(right.startedAt) - Date.parse(left.startedAt))
     .slice(0, clampInteger(limit, 1, 100));
+}
+
+function isSnapshotJobMeta(value: Record<string, unknown>): boolean {
+  return typeof value.jobId === "string" && typeof value.command === "string" && typeof value.cwd === "string" &&
+    typeof value.startedAt === "string" && typeof value.status === "string" && typeof value.logDir === "string" &&
+    typeof value.stdoutLog === "string" && typeof value.stderrLog === "string";
 }
 
 function activeJobForContext(context: Pick<ExtensionContext, "cwd">, jobId: string): JobRuntime | undefined {
@@ -1976,33 +2019,32 @@ function resolveCwd(context: ExtensionContext, requestedCwd: string | undefined)
 
 export function parseAsyncShellPruneArgs(rawArgs: string): AsyncShellPruneArgs {
   const tokens = rawArgs.trim() === "" ? [] : rawArgs.trim().split(/\s+/);
-  const jobIds: string[] = [];
+  const targets: string[] = [];
   let help = false;
   let confirm = false;
-  let listEligible = false;
-  let offset = 0;
+  let recover = false;
+  let inventory: AsyncShellPruneInventory | undefined;
+  let after: string | undefined;
   let limit = 100;
   let pagingRequested = false;
+  const selectInventory = (value: AsyncShellPruneInventory): void => {
+    if (inventory !== undefined && inventory !== value) throw new Error("Select exactly one inventory class: --eligible, --ineligible, or --leftovers.");
+    inventory = value;
+  };
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index]!;
-    if (token === "--help" || token === "-h") {
-      help = true;
-      continue;
-    }
-    if (token === "--confirm") {
-      confirm = true;
-      continue;
-    }
-    if (token === "--eligible") {
-      listEligible = true;
-      continue;
-    }
-    if (token === "--offset" || token.startsWith("--offset=")) {
+    if (token === "--help" || token === "-h") { help = true; continue; }
+    if (token === "--confirm") { confirm = true; continue; }
+    if (token === "--recover") { recover = true; continue; }
+    if (token === "--eligible") { selectInventory("eligible"); continue; }
+    if (token === "--ineligible") { selectInventory("ineligible"); continue; }
+    if (token === "--leftovers") { selectInventory("leftovers"); continue; }
+    if (token === "--offset" || token.startsWith("--offset=")) throw new Error("--offset is not supported because deletion can skip entries; use the deletion-stable --after cursor.");
+    if (token === "--after" || token.startsWith("--after=")) {
       pagingRequested = true;
-      const value = token === "--offset" ? tokens[++index] : token.slice("--offset=".length);
-      if (value === undefined || !/^\d+$/.test(value)) throw new Error("--offset must be a non-negative integer.");
-      offset = Number.parseInt(value, 10);
-      if (!Number.isSafeInteger(offset)) throw new Error("--offset must be a safe integer.");
+      const value = token === "--after" ? tokens[++index] : token.slice("--after=".length);
+      if (value === undefined || !isSafeAsyncShellRegistryName(value)) throw new Error("--after requires one exact safe registry directory name.");
+      after = value;
       continue;
     }
     if (token === "--limit" || token.startsWith("--limit=")) {
@@ -2014,90 +2056,192 @@ export function parseAsyncShellPruneArgs(rawArgs: string): AsyncShellPruneArgs {
       continue;
     }
     if (token.startsWith("-")) throw new Error(`${buildAsyncShellPruneUsage()}\n\nUnknown option: ${token}`);
-    assertValidAsyncJobId(token);
-    if (!jobIds.includes(token)) jobIds.push(token);
+    assertValidAsyncShellPruneTarget(token);
+    if (!targets.includes(token)) targets.push(token);
   }
-  if (jobIds.length > 100) throw new Error("Prune accepts at most 100 exact job ids.");
-  if (listEligible && (confirm || jobIds.length > 0)) throw new Error("--eligible is read-only and cannot be combined with exact job ids or --confirm.");
-  if (!listEligible && pagingRequested) throw new Error("--offset and --limit require --eligible.");
-  return { help, confirm, listEligible, offset, limit, jobIds };
+  if (targets.length > 250) throw new Error("Prune accepts at most 250 exact targets.");
+  if (inventory !== undefined && (confirm || recover || targets.length > 0)) throw new Error("Inventory discovery is read-only and cannot be combined with exact targets, --recover, or --confirm.");
+  if (inventory === undefined && pagingRequested) throw new Error("--after and --limit require --eligible, --ineligible, or --leftovers.");
+  if (recover && targets.some((target) => parseAsyncShellLeftoverName(target)?.kind !== "prune")) throw new Error("--recover accepts only exact .prune-* leftover targets.");
+  return { help, confirm, recover, inventory, after, limit, targets };
+}
+
+function isSafeAsyncShellRegistryName(name: string): boolean {
+  return name.length > 0 && Buffer.byteLength(name, "utf8") <= 255 && name !== "." && name !== ".." && !/[\/\\\0]/.test(name);
+}
+
+function assertValidAsyncShellPruneTarget(target: string): void {
+  if (isCanonicalAsyncShellJobId(target) || parseAsyncShellLeftoverName(target) !== undefined) return;
+  throw new Error(`Invalid async-shell job or leftover target: ${target}`);
 }
 
 export function buildAsyncShellPruneUsage(): string {
   return [
-    "Usage: /async:prune <job-id> [job-id ...] [--confirm]",
-    "       /async:prune --eligible [--offset N] [--limit 1..100]",
+    "Usage: /async:prune <exact-job-or-leftover> [...] [--confirm]",
+    "       /async:prune <exact-.prune-leftover> [...] --recover [--confirm]",
+    "       /async:prune --eligible|--ineligible|--leftovers [--after EXACT-NAME] [--limit 1..100]",
     "",
-    "Without --confirm, exact IDs receive a read-only preview. Confirmation revalidates the complete exact set before deletion.",
-    "--eligible is bounded read-only discovery: it scans one page of persisted directories and prints eligible exact IDs; it never deletes.",
-    "Only terminal ordinary jobs with completed delivery evidence are eligible; active, unknown, worker-owned, or undelivered jobs fail closed.",
+    "Without --confirm, up to 250 exact targets receive a read-only preview. Confirmation revalidates the complete exact set before deletion or recovery.",
+    "Inventory discovery is bounded and read-only. Its --after cursor is deletion-stable; it never deletes.",
+    "Eligible jobs are terminal ordinary jobs with completed delivery evidence. Active, unknown, worker-owned, process-live, or undelivered jobs fail closed.",
+    "Interrupted .pending-* and .prune-* directories are classified as leftovers and require exact preview/revalidation. Only exact .prune-* leftovers can be recovered.",
     "There is no wildcard, deletion selector, age selector, automatic pruning, or time-based deletion."
   ].join("\n");
 }
 
-function previewAsyncShellPruneEntry(root: string, realRoot: string, jobId: string): AsyncShellPruneEntry {
-  assertValidAsyncJobId(jobId);
-  const logDir = path.join(root, jobId);
-  if (!existsSync(logDir)) throw new Error(`Async shell job does not exist: ${jobId}`);
+function retentionState(context: Pick<ExtensionContext, "cwd">): { root: string; state: AsyncShellRetentionState } {
+  const root = path.join(jobsRoot(context.cwd), "jobs");
+  let state = retentionSnapshots.get(root);
+  if (!state) {
+    state = {};
+    retentionSnapshots.set(root, state);
+  }
+  return { root, state };
+}
+
+export async function refreshAsyncShellRetentionSnapshot(
+  context: Pick<ExtensionContext, "cwd">,
+  onProgress?: (progress: AsyncShellRetentionProgress) => void
+): Promise<AsyncShellRetentionSnapshot> {
+  const { root, state } = retentionState(context);
+  state.progressListeners ??= new Set();
+  if (onProgress !== undefined) state.progressListeners.add(onProgress);
+  if (state.scan === undefined) {
+    state.progress = { scanned: 0, total: 0 };
+    state.scan = scanAsyncShellRetention(root, (progress) => {
+      state.progress = progress;
+      for (const listener of state.progressListeners ?? []) {
+        try { listener(progress); } catch {}
+      }
+    }).then((snapshot) => {
+      state.snapshot = snapshot;
+      return snapshot;
+    }).finally(() => {
+      state.scan = undefined;
+      state.progress = undefined;
+      state.progressListeners?.clear();
+    });
+  }
+  try {
+    return await state.scan;
+  } finally {
+    if (onProgress !== undefined) state.progressListeners?.delete(onProgress);
+  }
+}
+
+export function latestAsyncShellRetentionSnapshot(context: Pick<ExtensionContext, "cwd">): AsyncShellRetentionSnapshot | undefined {
+  return retentionState(context).state.snapshot;
+}
+
+export async function listEligibleAsyncShellPrune(
+  context: Pick<ExtensionContext, "cwd">,
+  after?: string,
+  limit = 100,
+  inventory: AsyncShellPruneInventory = "eligible"
+): Promise<AsyncShellPrunePage> {
+  if (after !== undefined && !isSafeAsyncShellRegistryName(after)) throw new Error("Prune inventory cursor must be one exact safe registry directory name.");
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error("Prune inventory limit must be from 1 to 100.");
+  const snapshot = await refreshAsyncShellRetentionSnapshot(context);
+  return asyncShellPrunePageFromSnapshot(snapshot, after, limit, inventory);
+}
+
+function asyncShellPrunePageFromSnapshot(
+  snapshot: AsyncShellRetentionSnapshot,
+  after: string | undefined,
+  limit: number,
+  inventory: AsyncShellPruneInventory
+): AsyncShellPrunePage {
+  const matching = snapshot.entries.filter((entry) => inventory === "leftovers"
+    ? entry.kind === "pending" || entry.kind === "prune" || entry.kind === "unknown-leftover"
+    : entry.kind === inventory);
+  const afterIndex = after === undefined ? 0 : matching.findIndex((entry) => entry.name > after);
+  const start = after === undefined ? 0 : afterIndex < 0 ? matching.length : afterIndex;
+  const entries = matching.slice(start, start + limit);
+  const nextAfter = start + entries.length < matching.length ? entries.at(-1)?.name : undefined;
+  return { inventory, entries, snapshot, ...(after === undefined ? {} : { after }), ...(nextAfter === undefined ? {} : { nextAfter }) };
+}
+
+function beginAsyncShellRetentionRefresh(context: Pick<ExtensionContext, "cwd">): AsyncShellRetentionState {
+  const { state } = retentionState(context);
+  if (state.scan === undefined) void refreshAsyncShellRetentionSnapshot(context).catch(() => {});
+  return state;
+}
+
+function previewAsyncShellPruneEntry(root: string, realRoot: string, target: string): AsyncShellPruneEntry {
+  assertValidAsyncShellPruneTarget(target);
+  const logDir = path.join(root, target);
+  if (!existsSync(logDir)) throw new Error(`Async-shell prune target does not exist: ${target}`);
   const entryStat = lstatSync(logDir);
-  if (!entryStat.isDirectory() || entryStat.isSymbolicLink()) throw new Error(`Async shell job path is not an ordinary directory: ${jobId}`);
+  if (!entryStat.isDirectory() || entryStat.isSymbolicLink()) throw new Error(`Async-shell prune target is not an ordinary directory: ${target}`);
   const realLogDir = realpathSync(logDir);
-  if (path.dirname(realLogDir) !== realRoot || path.basename(realLogDir) !== jobId) throw new Error(`Async shell job path escapes its registry: ${jobId}`);
-  // Metadata records the lexical project path used when the job started. Keep
-  // that validation separate from realpath containment so macOS /var ->
-  // /private/var and other symlinked registry ancestors remain usable.
+  if (path.dirname(realLogDir) !== realRoot || path.basename(realLogDir) !== target) throw new Error(`Async-shell prune target escapes its registry: ${target}`);
+  const leftover = parseAsyncShellLeftoverName(target);
+  if (leftover?.kind === "pending") {
+    const maybeJob = readMetaFile(path.join(logDir, "meta.json"), root, leftover.jobId);
+    if (maybeJob !== undefined) assertPrunablePendingArtifact(maybeJob, leftover.jobId);
+    return { target, kind: "pending", jobId: leftover.jobId, bytes: directoryTreeBytes(logDir), logDir, recoveryEligible: false };
+  }
+  const jobId = leftover?.jobId ?? target;
   const job = readMetaFile(path.join(logDir, "meta.json"), root, jobId);
-  if (!job) throw new Error(`Async shell job metadata is missing or invalid: ${jobId}`);
-  if (realpathSync(job.logDir) !== realLogDir) throw new Error(`Async shell job metadata path escapes its registry: ${jobId}`);
+  if (!job && leftover?.kind === "prune") {
+    return { target, kind: "prune", jobId, bytes: directoryTreeBytes(logDir), logDir, recoveryEligible: false };
+  }
+  if (!job) throw new Error(`Async-shell job metadata is missing or invalid: ${target}`);
+  assertPrunableAsyncShellJob(job, jobId);
+  if (leftover === undefined) {
+    if (realpathSync(job.logDir) !== realLogDir) throw new Error(`Async-shell job metadata path escapes its registry: ${jobId}`);
+  }
+  return {
+    target,
+    kind: leftover?.kind ?? "job",
+    jobId,
+    status: job.status,
+    bytes: directoryTreeBytes(logDir),
+    logDir,
+    recoveryEligible: leftover?.kind === "prune" && !existsSync(path.join(root, jobId))
+  };
+}
+
+function assertPrunablePendingArtifact(job: JobMeta, jobId: string): void {
+  const live = jobs.get(jobId);
+  if (job.owner !== undefined) throw new Error(`Worker-owned async artifact must be removed through worker cleanup: ${jobId}`);
+  if (live !== undefined && (!isTerminal(live.status) || live.activeWaiters > 0)) throw new Error(`Async-shell job is still active: ${jobId}`);
+  if (live?.completionFollowUpQueued) throw new Error(`Async-shell job still has a queued completion follow-up: ${jobId}`);
+  if (isAsyncJobExecutionAlive(job.pid, job.processToken)) throw new Error(`Async-shell job process identity is still alive: ${jobId}`);
+}
+
+function assertPrunableAsyncShellJob(job: JobMeta, jobId: string): void {
   const live = jobs.get(jobId);
   if (job.owner !== undefined) throw new Error(`Worker-owned async job must be removed through worker cleanup: ${jobId}`);
-  if (!isTerminal(job.status) || job.status === "unknown") throw new Error(`Async shell job is not terminal: ${jobId} (${job.status})`);
-  if (live !== undefined && (!isTerminal(live.status) || live.activeWaiters > 0)) throw new Error(`Async shell job is still active: ${jobId}`);
-  if (job.notifyOnExit && !job.completionNotified) throw new Error(`Async shell job still has undelivered completion evidence: ${jobId}`);
-  if (live?.completionFollowUpQueued) throw new Error(`Async shell job still has a queued completion follow-up: ${jobId}`);
-  if (isAsyncJobExecutionAlive(job.pid, job.processToken)) throw new Error(`Async shell job process identity is still alive: ${jobId}`);
-  const outputBytes = asyncJobOutputBytes(job.stdoutLog, job.stderrLog);
-  const metaPath = path.join(logDir, "meta.json");
-  const metaBytes = existsSync(metaPath) ? statSync(metaPath).size : 0;
-  return { jobId, status: job.status, bytes: outputBytes.stdout + outputBytes.stderr + metaBytes, logDir };
+  if (!isTerminal(job.status) || job.status === "unknown") throw new Error(`Async-shell job is not terminal: ${jobId} (${job.status})`);
+  if (live !== undefined && (!isTerminal(live.status) || live.activeWaiters > 0)) throw new Error(`Async-shell job is still active: ${jobId}`);
+  if (job.notifyOnExit && !job.completionNotified) throw new Error(`Async-shell job still has undelivered completion evidence: ${jobId}`);
+  if (live?.completionFollowUpQueued) throw new Error(`Async-shell job still has a queued completion follow-up: ${jobId}`);
+  if (isAsyncJobExecutionAlive(job.pid, job.processToken)) throw new Error(`Async-shell job process identity is still alive: ${jobId}`);
 }
 
-export function previewAsyncShellPrune(context: Pick<ExtensionContext, "cwd">, jobIds: string[]): AsyncShellPruneEntry[] {
-  if (jobIds.length === 0) throw new Error(buildAsyncShellPruneUsage());
+function directoryTreeBytes(target: string): number {
+  const info = lstatSync(target);
+  if (info.isSymbolicLink()) return 0;
+  if (!info.isDirectory()) return info.isFile() ? info.size : 0;
+  return readdirSync(target, { withFileTypes: true }).reduce((total, entry) => total + directoryTreeBytes(path.join(target, entry.name)), 0);
+}
+
+export function previewAsyncShellPrune(context: Pick<ExtensionContext, "cwd">, targets: string[]): AsyncShellPruneEntry[] {
+  if (targets.length === 0) throw new Error(buildAsyncShellPruneUsage());
+  if (targets.length > 250) throw new Error("Prune accepts at most 250 exact targets.");
   const root = path.join(jobsRoot(context.cwd), "jobs");
   const realRoot = realpathSync(root);
-  return jobIds.map((jobId) => previewAsyncShellPruneEntry(root, realRoot, jobId));
+  return targets.map((target) => previewAsyncShellPruneEntry(root, realRoot, target));
 }
 
-export function listEligibleAsyncShellPrune(
-  context: Pick<ExtensionContext, "cwd">,
-  offset = 0,
-  limit = 100
-): AsyncShellPrunePage {
-  if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("Prune eligibility offset must be a non-negative safe integer.");
-  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error("Prune eligibility limit must be from 1 to 100.");
-  const root = path.join(jobsRoot(context.cwd), "jobs");
-  if (!existsSync(root)) return { entries: [], offset, scanned: 0, total: 0 };
-  const realRoot = realpathSync(root);
-  const names = readdirSync(root, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink() && isValidAsyncJobId(entry.name))
-    .map((entry) => entry.name)
-    .sort();
-  const selected = names.slice(offset, offset + limit);
-  const entries: AsyncShellPruneEntry[] = [];
-  for (const jobId of selected) {
-    try { entries.push(previewAsyncShellPruneEntry(root, realRoot, jobId)); } catch {}
-  }
-  const nextOffset = offset + selected.length < names.length ? offset + selected.length : undefined;
-  return { entries, offset, scanned: selected.length, total: names.length, ...(nextOffset === undefined ? {} : { nextOffset }) };
-}
-
-export function pruneAsyncShellJobs(context: Pick<ExtensionContext, "cwd">, jobIds: string[]): AsyncShellPruneEntry[] {
-  const entries = previewAsyncShellPrune(context, jobIds);
+export function pruneAsyncShellJobs(context: Pick<ExtensionContext, "cwd">, targets: string[]): AsyncShellPruneEntry[] {
+  const entries = previewAsyncShellPrune(context, targets);
   const renamed: Array<{ entry: AsyncShellPruneEntry; trash: string }> = [];
   try {
     for (const entry of entries) {
-      const trash = path.join(path.dirname(entry.logDir), `.prune-${entry.jobId}-${randomUUID()}`);
+      const trashKind = entry.kind === "pending" ? "pending" : "prune";
+      const trash = path.join(path.dirname(entry.logDir), `.${trashKind}-${entry.jobId}-${randomUUID()}`);
       renameSync(entry.logDir, trash);
       renamed.push({ entry, trash });
     }
@@ -2105,12 +2249,13 @@ export function pruneAsyncShellJobs(context: Pick<ExtensionContext, "cwd">, jobI
     for (const item of renamed.reverse()) {
       try { renameSync(item.trash, item.entry.logDir); } catch {}
     }
+    retentionSnapshots.delete(path.join(jobsRoot(context.cwd), "jobs"));
     throw error;
   }
   let removed = 0;
   try {
     for (const item of renamed) {
-      rmSync(item.trash, { recursive: true, force: true });
+      rmSync(item.trash, { recursive: true, force: false });
       removed += 1;
     }
   } catch (error) {
@@ -2118,10 +2263,37 @@ export function pruneAsyncShellJobs(context: Pick<ExtensionContext, "cwd">, jobI
       if (!existsSync(item.trash)) continue;
       try { renameSync(item.trash, item.entry.logDir); } catch {}
     }
-    for (const item of renamed.slice(0, removed)) forgetAsyncShellJob(item.entry.jobId);
+    for (const item of renamed.slice(0, removed)) if (item.entry.kind === "job") forgetAsyncShellJob(item.entry.jobId);
+    retentionSnapshots.delete(path.join(jobsRoot(context.cwd), "jobs"));
     throw error;
   }
-  for (const item of renamed) forgetAsyncShellJob(item.entry.jobId);
+  for (const item of renamed) if (item.entry.kind === "job") forgetAsyncShellJob(item.entry.jobId);
+  retentionSnapshots.delete(path.join(jobsRoot(context.cwd), "jobs"));
+  return entries;
+}
+
+export function recoverAsyncShellPruneLeftovers(context: Pick<ExtensionContext, "cwd">, targets: string[]): AsyncShellPruneEntry[] {
+  const entries = previewAsyncShellPrune(context, targets);
+  for (const entry of entries) {
+    if (entry.kind !== "prune" || !entry.recoveryEligible) throw new Error(`Async-shell leftover is not recoverable: ${entry.target}`);
+  }
+  const root = path.join(jobsRoot(context.cwd), "jobs");
+  const recovered: AsyncShellPruneEntry[] = [];
+  try {
+    for (const entry of entries) {
+      const destination = path.join(root, entry.jobId);
+      if (existsSync(destination)) throw new Error(`Cannot recover ${entry.target}; ${entry.jobId} already exists.`);
+      renameSync(entry.logDir, destination);
+      recovered.push(entry);
+    }
+  } catch (error) {
+    for (const entry of recovered.reverse()) {
+      try { renameSync(path.join(root, entry.jobId), entry.logDir); } catch {}
+    }
+    retentionSnapshots.delete(root);
+    throw error;
+  }
+  retentionSnapshots.delete(root);
   return entries;
 }
 
@@ -2136,7 +2308,7 @@ function forgetAsyncShellJob(jobId: string): void {
   notifyAsyncShellActivity();
 }
 
-export function handleAsyncShellPruneCommand(context: ExtensionCommandContext, rawArgs: string): void {
+export async function handleAsyncShellPruneCommand(context: ExtensionCommandContext, rawArgs: string): Promise<void> {
   let args: AsyncShellPruneArgs;
   try {
     args = parseAsyncShellPruneArgs(rawArgs);
@@ -2149,28 +2321,51 @@ export function handleAsyncShellPruneCommand(context: ExtensionCommandContext, r
     return;
   }
   try {
-    if (args.listEligible) {
-      const page = listEligibleAsyncShellPrune(context, args.offset, args.limit);
-      const bytes = page.entries.reduce((sum, entry) => sum + entry.bytes, 0);
-      const rangeEnd = page.scanned === 0 ? page.offset : page.offset + page.scanned - 1;
-      const ids = page.entries.map((entry) => entry.jobId);
+    if (args.inventory !== undefined) {
+      const state = beginAsyncShellRetentionRefresh(context);
+      if (state.snapshot === undefined) {
+        const progress = state.progress;
+        context.ui.notify(progress && progress.total > 0
+          ? `Async-shell inventory scan in progress: ${progress.scanned}/${progress.total} directories. Run the same command again for the latest completed snapshot.`
+          : "Async-shell inventory scan started asynchronously. Run the same command again for progress or the latest completed snapshot.", "info");
+        return;
+      }
+      const page = asyncShellPrunePageFromSnapshot(state.snapshot, args.after, args.limit, args.inventory);
+      const total = args.inventory === "eligible" ? page.snapshot.totals.eligible
+        : args.inventory === "ineligible" ? page.snapshot.totals.ineligible
+          : page.snapshot.totals.leftovers;
+      const pageBytes = page.entries.reduce((sum, entry) => sum + entry.bytes, 0);
+      const exactTargets = page.entries.map((entry) => entry.name);
+      const actionableTargets = page.entries
+        .filter((entry) => entry.kind === "eligible" || entry.kind === "pending" || entry.kind === "prune")
+        .map((entry) => entry.name);
       context.ui.notify([
-        `Eligible prune scan: ${page.entries.length} eligible in ${page.scanned} director${page.scanned === 1 ? "y" : "ies"} at offsets ${page.offset}-${rangeEnd}; ${formatBytes(bytes)} eligible data; ${page.total} stored directories.`,
-        ...page.entries.map((entry) => `${entry.jobId} · ${entry.status} · ${formatBytes(entry.bytes)}`),
-        ids.length > 0 ? `Preview these exact IDs: /async:prune ${ids.join(" ")}` : undefined,
-        page.nextOffset === undefined ? "End of stored directory list." : `Next page: /async:prune --eligible --offset ${page.nextOffset} --limit ${args.limit}`
+        `${capitalize(args.inventory)} inventory: ${total.count} total (${formatBytes(total.bytes)}); page ${page.entries.length} (${formatBytes(pageBytes)}). Registry: ${page.snapshot.totals.directories} directories, ${formatBytes(page.snapshot.totals.bytes)}.`,
+        `Snapshot ${page.snapshot.scannedAt}; ${state.progress && state.progress.total > 0 ? `refresh ${state.progress.scanned}/${state.progress.total}` : "refresh started"}.`,
+        `Eligible ${page.snapshot.totals.eligible.count} (${formatBytes(page.snapshot.totals.eligible.bytes)}); ineligible ${page.snapshot.totals.ineligible.count} (${formatBytes(page.snapshot.totals.ineligible.bytes)}); leftovers ${page.snapshot.totals.leftovers.count} (${formatBytes(page.snapshot.totals.leftovers.bytes)}: ${page.snapshot.totals.pending.count} pending, ${page.snapshot.totals.prune.count} prune, ${page.snapshot.totals.unknownLeftovers.count} unknown).`,
+        ...page.entries.map((entry) => `${entry.name} · ${entry.kind}${entry.status ? `/${entry.status}` : ""} · ${formatBytes(entry.bytes)} · ${entry.reason}`),
+        exactTargets.length > 0 ? `Exact IDs: ${exactTargets.join(" ")}` : "No exact IDs in this page.",
+        actionableTargets.length > 0 ? `Preview actionable exact targets: /async:prune ${actionableTargets.join(" ")}` : undefined,
+        page.nextAfter === undefined ? "End of inventory." : `Next page: /async:prune --${args.inventory} --after ${page.nextAfter} --limit ${args.limit}`
       ].filter((line): line is string => line !== undefined).join("\n"), "info");
       return;
     }
-    const entries = args.confirm ? pruneAsyncShellJobs(context, args.jobIds) : previewAsyncShellPrune(context, args.jobIds);
+    const entries = args.confirm
+      ? args.recover ? recoverAsyncShellPruneLeftovers(context, args.targets) : pruneAsyncShellJobs(context, args.targets)
+      : previewAsyncShellPrune(context, args.targets);
     const bytes = entries.reduce((sum, entry) => sum + entry.bytes, 0);
+    const action = args.recover ? args.confirm ? "Recovered" : "Recovery preview" : args.confirm ? "Pruned" : "Prune preview";
     context.ui.notify(
-      `${args.confirm ? "Pruned" : "Prune preview"}: ${entries.length} job${entries.length === 1 ? "" : "s"}, ${formatBytes(bytes)}\n${entries.map((entry) => `${entry.jobId} · ${entry.status} · ${formatBytes(entry.bytes)}`).join("\n")}${args.confirm ? "" : "\nRun the same exact command with --confirm to delete."}`,
+      `${action}: ${entries.length} target${entries.length === 1 ? "" : "s"}, ${formatBytes(bytes)}\n${entries.map((entry) => `${entry.target} · ${entry.kind}${entry.status ? `/${entry.status}` : ""} · ${formatBytes(entry.bytes)}`).join("\n")}${args.confirm ? "" : `\nRun the same exact command with --confirm to ${args.recover ? "recover" : "delete"}.`}`,
       args.confirm ? "info" : "warning"
     );
   } catch (error) {
     context.ui.notify(error instanceof Error ? error.message : String(error), "error");
   }
+}
+
+function capitalize(value: string): string {
+  return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
 export function parseAsyncShellViewerArgs(rawArgs: string): AsyncShellViewerArgs {
@@ -2288,7 +2483,7 @@ export async function handleAsyncShellViewerCommand(context: ExtensionCommandCon
 }
 
 async function pickAsyncShellViewerJob(context: ExtensionCommandContext): Promise<string | undefined> {
-  const recentJobs = listJobs(context, ASYNC_SHELL_VIEWER_MAX_JOBS);
+  const recentJobs = await listJobs(context, ASYNC_SHELL_VIEWER_MAX_JOBS);
   if (recentJobs.length === 0) {
     context.ui.notify(`No async-shell jobs found under ${jobsRoot(context.cwd)}.`, "warning");
     return undefined;
@@ -2622,26 +2817,79 @@ function statusColor(status: JobStatus): "success" | "error" | "warning" | "mute
   return "muted";
 }
 
-function countStoredAsyncShellJobDirectories(projectCwd: string): number {
-  const root = path.join(jobsRoot(projectCwd), "jobs");
-  if (!existsSync(root)) return 0;
-  return readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory() && isValidAsyncJobId(entry.name)).length;
+function formatAsyncShellDeliveryBacklog(
+  context: Pick<ExtensionContext, "cwd"> & Partial<Pick<ExtensionContext, "sessionManager">>
+): string {
+  let sessionId: string | undefined;
+  try { sessionId = context.sessionManager?.getSessionId(); } catch {}
+  if (!sessionId) return "Completion delivery backlog: unavailable without an exact session ID.";
+  const claimedIds = new Set<string>();
+  let batches = 0;
+  for (const batch of completionDeliveryBatches.values()) {
+    if (batch.originSessionId !== sessionId) continue;
+    const matching = Array.from(batch.jobIds).filter((jobId) => jobs.get(jobId)?.originProjectCwd === context.cwd);
+    if (matching.length === 0) continue;
+    batches += 1;
+    matching.forEach((jobId) => claimedIds.add(jobId));
+  }
+  const unsentIds = Array.from(pendingCompletionNotifications.values())
+    .filter((job) => job.originSessionId === sessionId && job.originProjectCwd === context.cwd && !job.completionFollowUpQueued)
+    .map((job) => job.jobId);
+  const exact = [...claimedIds, ...unsentIds].slice(0, 20);
+  return `Completion delivery backlog: ${claimedIds.size} claimed in ${batches} unreceipted batch${batches === 1 ? "" : "es"}; ${unsentIds.length} unsent.${exact.length > 0 ? ` Exact job IDs (up to 20): ${exact.join(" ")}` : ""}`;
 }
 
-export function buildAsyncShellStatusText(context: Pick<ExtensionContext, "cwd">): string {
+function buildLatestAsyncShellStatusText(context: Pick<ExtensionContext, "cwd"> & Partial<Pick<ExtensionContext, "sessionManager">>): string {
   const root = jobsRoot(context.cwd);
-  const recentJobs = listJobs(context as ExtensionContext, 20);
-  const storedJobCount = countStoredAsyncShellJobDirectories(context.cwd);
-  const running = recentJobs.filter((job) => job.status === "running").length;
-  const terminal = recentJobs.length - running;
+  const state = beginAsyncShellRetentionRefresh(context);
+  if (state.snapshot === undefined) {
+    const progress = state.progress;
+    return [
+      "Async shell status",
+      "",
+      `Job root: ${root}`,
+      `Job root state: ${describePathAccess(root)}`,
+      progress && progress.total > 0
+        ? `Storage scan in progress: ${progress.scanned}/${progress.total} directories. Run /async:status again for the latest completed snapshot.`
+        : "Storage scan started asynchronously. Run /async:status again for progress or the latest completed snapshot."
+    ].join("\n");
+  }
+  const totals = state.snapshot.totals;
+  const progress = state.progress;
   return [
     "Async shell status",
     "",
     `Job root: ${root}`,
     `Job root state: ${describePathAccess(root)}`,
-    `Stored job directories: ${storedJobCount}`,
+    `Latest storage snapshot: ${state.snapshot.scannedAt} (${formatDuration(state.snapshot.durationMs)} scan)`,
+    `Stored directories: ${totals.directories}, ${formatBytes(totals.bytes)}`,
+    `Eligible: ${totals.eligible.count}, ${formatBytes(totals.eligible.bytes)}; ineligible: ${totals.ineligible.count}, ${formatBytes(totals.ineligible.bytes)}; leftovers: ${totals.leftovers.count}, ${formatBytes(totals.leftovers.bytes)}`,
+    `Leftovers: ${totals.pending.count} pending (${formatBytes(totals.pending.bytes)}), ${totals.prune.count} prune (${formatBytes(totals.prune.bytes)}), ${totals.unknownLeftovers.count} unknown (${formatBytes(totals.unknownLeftovers.bytes)})`,
+    formatAsyncShellDeliveryBacklog(context),
+    progress && progress.total > 0 ? `Refresh in progress: ${progress.scanned}/${progress.total} directories.` : "Refresh started asynchronously."
+  ].join("\n");
+}
+
+export async function buildAsyncShellStatusText(context: Pick<ExtensionContext, "cwd"> & Partial<Pick<ExtensionContext, "sessionManager">>): Promise<string> {
+  const root = jobsRoot(context.cwd);
+  const snapshot = await refreshAsyncShellRetentionSnapshot(context);
+  const recentJobs = jobsFromRetentionSnapshot(context as ExtensionContext, snapshot, 20);
+  const running = recentJobs.filter((job) => job.status === "running").length;
+  const terminal = recentJobs.length - running;
+  const totals = snapshot.totals;
+  return [
+    "Async shell status",
+    "",
+    `Job root: ${root}`,
+    `Job root state: ${describePathAccess(root)}`,
+    `Storage snapshot: ${snapshot.scannedAt} (${formatDuration(snapshot.durationMs)} scan)`,
+    `Stored directories: ${totals.directories}, ${formatBytes(totals.bytes)}`,
+    `Eligible: ${totals.eligible.count}, ${formatBytes(totals.eligible.bytes)}; ineligible: ${totals.ineligible.count}, ${formatBytes(totals.ineligible.bytes)}; leftovers: ${totals.leftovers.count}, ${formatBytes(totals.leftovers.bytes)}`,
+    `Leftovers: ${totals.pending.count} pending (${formatBytes(totals.pending.bytes)}), ${totals.prune.count} prune (${formatBytes(totals.prune.bytes)}), ${totals.unknownLeftovers.count} unknown (${formatBytes(totals.unknownLeftovers.bytes)})`,
+    formatAsyncShellDeliveryBacklog(context),
     `Recent jobs: ${recentJobs.length} (${running} running, ${terminal} terminal or detached)`,
     running > 0 ? "Use /async:view for provider-free human viewing, shell_status without a jobId to list jobs, shell_read for model inspection, or shell_cancel to stop a running job. Do not poll; completion notices will be batched into history and resume the agent." : "No running jobs in the recent async-shell registry. Use /async:view to inspect historical output.",
+    totals.leftovers.count > 0 ? "Inspect bounded exact leftover IDs with /async:prune --leftovers. Recovery or deletion requires exact preview and confirmation." : undefined,
     recentJobs.some((job) => job.status === "unknown") ? "Some jobs were started by a previous Pi process and are no longer attached." : undefined
   ].filter((line): line is string => line !== undefined).join("\n");
 }
