@@ -210,7 +210,7 @@ export function validateChildToolAllowlist(
   throw new Error([
     `${label} configured tools are unavailable: ${missing.join(", ")}.`,
     `Config source: ${configSource}.`,
-    "Adjust extension settings, package filters, or loaded extensions, then run /reload."
+    "Adjust extension settings, package filters, or loaded extensions, then fully restart Pi."
   ].join(" "));
 }
 

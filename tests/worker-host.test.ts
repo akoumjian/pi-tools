@@ -9,6 +9,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { defaultWorkerExtensionPaths, launchWorkerHost, type WorkerLaunchRecord } from "../extensions/worker/runner.js";
 import { readWorkerRuntimeResult } from "../extensions/worker/runtime.js";
+import { previewAsyncShellPrune } from "../extensions/async-shell/index.js";
 import { forkWorkerSession } from "../extensions/worker/session.js";
 const WORKER_RECORD_VERSION = 1;
 type WorkerRecord = {
@@ -151,6 +152,11 @@ test("worker host completes an exact-fork fake-provider run while ignoring works
     const job = await launched.handle.completion.finally(() => clearInterval(keepAlive));
     assert.equal(job.status, "exited", await readFile(job.stderrLog, "utf8"));
     assert.equal(job.exitCode, 0);
+    const expectedManagedBy = { kind: "worker-host", workerId: record.workerId, runId: "run-test" };
+    assert.deepEqual(job.managedBy, expectedManagedBy, "launchWorkerHost must mark its actual async host job");
+    const persistedHostMeta = JSON.parse(await readFile(path.join(job.logDir, "meta.json"), "utf8")) as { managedBy?: unknown };
+    assert.deepEqual(persistedHostMeta.managedBy, expectedManagedBy);
+    assert.throws(() => previewAsyncShellPrune({ cwd: parentCwd }, [job.jobId]), /managed-worker evidence; ordinary prune refused/);
 
     const accepted = readWorkerRuntimeResult(resultFile);
     assert.equal(accepted.workerId, record.workerId);
