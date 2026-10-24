@@ -28,6 +28,22 @@ function snapshot(target: WorkerSessionViewTarget, blocks: WorkerSessionViewSnap
   return { target, blocks, totalActiveEntries: blocks.length, malformedEntries: 0, skippedOversizedEntries: 0, incompleteTrailingEntry: false, hiddenCompactedEntries: 0, compactionCount: 0, previousVisibleEntries: 0, nextVisibleEntries: 0, totalVisibleEntries: blocks.length, runStartLine: target.sessionStartLine ?? 1, runEndLine: target.sessionEndLine ?? target.sessionStartLine ?? 0, pageStartLine: target.sessionStartLine ?? 1, pageEndLine: target.sessionEndLine ?? target.sessionStartLine ?? 0, hasPreviousPage: false, hasNextPage: false, refreshedAt: "now", ...overrides };
 }
 async function tick() { await new Promise<void>((resolve) => setImmediate(resolve)); }
+async function watchdog<T>(promise: Promise<T>, milliseconds = 2_000): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`watchdog expired after ${milliseconds}ms`)), milliseconds);
+    void promise.then((value) => { clearTimeout(timer); resolve(value); }, (error) => { clearTimeout(timer); reject(error); });
+  });
+}
+function assertHalfWriteChildLiveness(target: WorkerSessionViewTarget): void {
+  const moduleUrl = new URL("../extensions/worker/view.js", import.meta.url).href;
+  const script = `import { loadWorkerSessionViewSnapshotAsync } from ${JSON.stringify(moduleUrl)}; const target = JSON.parse(process.argv[1]); const value = await loadWorkerSessionViewSnapshotAsync(target); if (!value.incompleteTrailingEntry) process.exit(2);`;
+  execFileSync(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(target)], { timeout: 5_000, stdio: "pipe" });
+}
+function assertViewerHalfWriteChildLiveness(target: WorkerSessionViewTarget, partial: string): void {
+  const moduleUrl = new URL("../extensions/worker/view.js", import.meta.url).href;
+  const script = `import { appendFileSync } from "node:fs"; import { createWorkerSessionViewerComponent, loadWorkerSessionViewSnapshot, loadWorkerSessionViewSnapshotAsync } from ${JSON.stringify(moduleUrl)}; const target = JSON.parse(process.argv[1]); const initial = loadWorkerSessionViewSnapshot(target); appendFileSync(target.sessionFile, process.argv[2]); await new Promise((resolve, reject) => { const component = createWorkerSessionViewerComponent({ tui: { terminal: { rows: 30 }, requestRender() {} }, getTheme: () => ({}), initialSnapshot: initial, loadSnapshot: async (request) => { try { const value = await loadWorkerSessionViewSnapshotAsync(target, request); if (!value.incompleteTrailingEntry) throw new Error("missing partial notice"); resolve(); return value; } catch (error) { reject(error); throw error; } }, done() {} }); component.handleInput("r"); });`;
+  execFileSync(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(target), partial], { timeout: 5_000, stdio: "pipe" });
+}
 const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as Theme;
 
 test("worker conversation view preserves the opening assignment and renders compaction chronologically without raw JSONL", () => {
@@ -231,6 +247,56 @@ test("async running refreshes reuse visibility and scan only an appended suffix"
   } finally { f.close(); }
 });
 
+test("running and settled half-written tails stay live and running refresh completes them", async () => {
+  const f = fixture();
+  try {
+    const complete = line(message("complete", null, "COMPLETE"));
+    const trailing = JSON.stringify(message("partial", "complete", "PARTIAL-COMPLETED"));
+    const split = trailing.length - 17;
+    writeFileSync(f.sessionFile, line(header(f.target)) + complete + trailing.slice(0, split));
+    const running = { ...f.target, runStatus: "running" as const, workerStatus: "running" as const, outcome: undefined, sessionStartLine: 2, sessionEndLine: undefined };
+    const settled = { ...running, runStatus: "settled" as const, workerStatus: "idle" as const, outcome: "failed", sessionEndLine: 3 };
+    assertHalfWriteChildLiveness(running); assertHalfWriteChildLiveness(settled);
+    let timerTicks = 0; const timer = setInterval(() => { timerTicks += 1; }, 1);
+    const first = await watchdog(loadWorkerSessionViewSnapshotAsync(running));
+    clearInterval(timer);
+    assert.ok(timerTicks > 0, "partial-tail analysis must yield to timers"); assert.equal(first.incompleteTrailingEntry, true); assert.deepEqual(first.blocks.map((block) => block.text), ["COMPLETE"]);
+    const repeatedStarted = performance.now(); const repeated = await watchdog(loadWorkerSessionViewSnapshotAsync(running));
+    assert.equal(repeated.incompleteTrailingEntry, true); assert.ok(performance.now() - repeatedStarted < 500, "unchanged partial tail should use its bounded marker");
+
+    const fixed = await watchdog(loadWorkerSessionViewSnapshotAsync(settled));
+    assert.equal(fixed.incompleteTrailingEntry, true); assert.deepEqual(fixed.blocks.map((block) => block.text), ["COMPLETE"]);
+
+    writeFileSync(f.sessionFile, `${trailing.slice(split)}\n`, { flag: "a" });
+    const completed = await watchdog(loadWorkerSessionViewSnapshotAsync(running));
+    assert.equal(completed.incompleteTrailingEntry, false); assert.equal(completed.blocks.some((block) => block.text === "PARTIAL-COMPLETED"), true);
+    const fixedAgain = await watchdog(loadWorkerSessionViewSnapshotAsync(settled));
+    assert.equal(fixedAgain.incompleteTrailingEntry, true, "settled snapshots retain the recorded half-write decision"); assert.deepEqual(fixedAgain.blocks.map((block) => block.text), ["COMPLETE"]);
+  } finally { f.close(); }
+});
+
+test("viewer refresh remains responsive while a session entry is half-written", async () => {
+  const f = fixture(); const guard = fixture();
+  try {
+    writeFileSync(f.sessionFile, line(header(f.target)) + line(message("complete", null, "COMPLETE")));
+    const target = { ...f.target, runStatus: "running" as const, workerStatus: "running" as const, outcome: undefined, sessionStartLine: 2, sessionEndLine: undefined };
+    const trailing = JSON.stringify(message("partial", "complete", "VIEWER-PARTIAL")); const split = trailing.length - 9;
+    writeFileSync(guard.sessionFile, line(header(guard.target)) + line(message("complete", null, "COMPLETE")));
+    assertViewerHalfWriteChildLiveness({ ...target, sessionFile: guard.sessionFile, sessionRoot: guard.sessionRoot, workspaceRoot: guard.target.workspaceRoot, parentSessionFile: guard.target.parentSessionFile }, trailing.slice(0, split));
+    const initial = loadWorkerSessionViewSnapshot(target);
+    writeFileSync(f.sessionFile, trailing.slice(0, split), { flag: "a" });
+    let pending: Promise<WorkerSessionViewSnapshot> | undefined; let renders = 0;
+    const component = createWorkerSessionViewerComponent({ tui: { terminal: { rows: 30 }, requestRender() { renders += 1; } } as never, getTheme: () => theme, initialSnapshot: initial,
+      loadSnapshot: (request) => pending = loadWorkerSessionViewSnapshotAsync(target, request), done() {} });
+    let heartbeats = 0; const heartbeat = setInterval(() => { heartbeats += 1; }, 1);
+    component.handleInput!("r"); await tick(); await watchdog(pending!); await tick(); clearInterval(heartbeat);
+    assert.ok(heartbeats > 0); assert.ok(renders >= 2); assert.match(component.render(100).join("\n"), /final unterminated session entry/);
+
+    writeFileSync(f.sessionFile, `${trailing.slice(split)}\n`, { flag: "a" }); pending = undefined; component.handleInput!("r"); await tick(); await watchdog(pending!); await tick();
+    assert.match(component.render(100).join("\n"), /VIEWER-PARTIAL/);
+  } finally { f.close(); guard.close(); }
+});
+
 test("running view accepts repeated append-only growth and incrementally indexes it", () => {
   const f = fixture();
   try {
@@ -381,6 +447,66 @@ test("production-shaped 310,000-block transcripts keep load and frames bounded",
     assert.ok(frameElapsed < 1_000, `2,048-block frame took ${frameElapsed}ms`);
     const second = loadWorkerSessionViewSnapshot(target, {}, { mode: "after", line: first.pageEndLine, block: first.pageEndBlock });
     assert.equal(second.blocks.length, 2_048); assert.equal(second.hasPreviousPage, true); assert.equal(second.hasNextPage, true); assert.equal(second.previousVisibleEntries + second.totalActiveEntries + second.nextVisibleEntries, second.totalVisibleEntries);
+  } finally { f.close(); }
+});
+
+test("byte-bounded cursor pages make monotonic progress across adjacent multi-MiB entries", () => {
+  const shapes = [[5, 5], [4, 5], [5, 5, 5], [3, 3, 3], [9, 1], [1, 9]];
+  for (const [shapeIndex, sizes] of shapes.entries()) {
+    const f = fixture();
+    try {
+      const entries = [line(message("opening", null, `OPENING-${shapeIndex}`))];
+      for (const [index, size] of sizes!.entries()) entries.push(line(message(`big-${index}`, index === 0 ? "opening" : `big-${index - 1}`, `BIG-${index}-${"x".repeat(size * 1024 * 1024)}`)));
+      entries.push(line(message("last", `big-${sizes!.length - 1}`, `LAST-${shapeIndex}`)));
+      writeFileSync(f.sessionFile, line(header(f.target)) + entries.join(""));
+      const target = { ...f.target, sessionStartLine: 2, sessionEndLine: entries.length + 1 };
+      const traverse = (direction: "forward" | "backward") => {
+        const pages: WorkerSessionViewSnapshot[] = []; const cursors = new Set<string>(); let previousCursor: [number, number] | undefined;
+        let page = loadWorkerSessionViewSnapshot(target, {}, direction === "forward" ? { mode: "first" } : { mode: "tail" });
+        for (let step = 0; step < 32; step += 1) {
+          assert.ok(page.blocks.length > 0, `${sizes} ${direction} produced an empty page`); assert.equal(page.previousVisibleEntries + page.totalActiveEntries + page.nextVisibleEntries, page.totalVisibleEntries); pages.push(page);
+          const cursorValue: [number, number] = direction === "forward" ? [page.pageEndLine, page.pageEndBlock ?? 0] : [page.pageStartLine, page.pageStartBlock ?? 0];
+          const cursor = `${cursorValue[0]}:${cursorValue[1]}`;
+          assert.equal(cursors.has(cursor), false, `${sizes} ${direction} repeated cursor ${cursor}`); cursors.add(cursor);
+          if (previousCursor) {
+            const comparison = cursorValue[0] === previousCursor[0] ? cursorValue[1] - previousCursor[1] : cursorValue[0] - previousCursor[0];
+            assert.ok(direction === "forward" ? comparison > 0 : comparison < 0, `${sizes} ${direction} cursor was not monotonic`);
+          }
+          previousCursor = cursorValue;
+          if (direction === "forward") {
+            if (!page.hasNextPage) break;
+            page = loadWorkerSessionViewSnapshot(target, {}, { mode: "after", line: page.pageEndLine, block: page.pageEndBlock });
+          } else {
+            if (!page.hasPreviousPage) break;
+            page = loadWorkerSessionViewSnapshot(target, {}, { mode: "before", line: page.pageStartLine, block: page.pageStartBlock });
+          }
+          if (step === 31) assert.fail(`${sizes} ${direction} traversal did not terminate`);
+        }
+        if (direction === "backward") pages.reverse();
+        return pages.flatMap((value) => value.blocks.map((block) => block.text));
+      };
+      const expected = [`OPENING-${shapeIndex}`, ...sizes!.flatMap((size, index) => size > 8 ? [] : [`BIG-${index}-`]), `LAST-${shapeIndex}`];
+      const normalize = (values: string[]) => values.map((value) => value.startsWith("BIG-") ? value.slice(0, 6) : value);
+      assert.deepEqual(normalize(traverse("forward")), expected); assert.deepEqual(normalize(traverse("backward")), expected);
+    } finally { f.close(); }
+  }
+});
+
+test("earlier and later counts exclude non-rendering custom entries at run edges", () => {
+  const f = fixture();
+  try {
+    const hiddenStart = { type: "custom", id: "hidden-start", parentId: null, timestamp: "now", data: "hidden" };
+    const shown = message("shown", "hidden-start", "ONLY-DISPLAYED");
+    const hiddenEnd = { type: "custom_message", id: "hidden-end", parentId: "shown", timestamp: "now", customType: "manual-provider-retry", display: false, content: "hidden" };
+    writeFileSync(f.sessionFile, line(header(f.target)) + line(hiddenStart) + line(shown) + line(hiddenEnd));
+    const target = { ...f.target, sessionStartLine: 2, sessionEndLine: 4 };
+    for (const request of [{ mode: "first" as const }, { mode: "tail" as const }]) {
+      const value = loadWorkerSessionViewSnapshot(target, {}, request);
+      assert.deepEqual(value.blocks.map((block) => block.text), ["ONLY-DISPLAYED"]); assert.equal(value.totalVisibleEntries, 1);
+      assert.equal(value.previousVisibleEntries, 0); assert.equal(value.nextVisibleEntries, 0); assert.equal(value.hasPreviousPage, false); assert.equal(value.hasNextPage, false);
+      const frame = buildWorkerSessionViewerFrame(theme, { snapshot: value, topLine: 0, pinnedToEnd: false }, 100, 30).lines.join("\n");
+      assert.doesNotMatch(frame, /earlier visible|later visible/);
+    }
   } finally { f.close(); }
 });
 
