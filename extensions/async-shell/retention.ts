@@ -1,5 +1,6 @@
-import type { Dirent } from "node:fs";
+import { existsSync, type Dirent } from "node:fs";
 import { lstat, readFile, readdir } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
 import { isAsyncJobExecutionAlive } from "../_shared/async-job.js";
 
@@ -44,6 +45,9 @@ const JOB_ID_PATTERN = /^job_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const LEFTOVER_PATTERN = /^\.(pending|prune)-(job_[A-Za-z0-9][A-Za-z0-9_-]{0,127})-([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
 const TERMINAL = new Set(["exited", "failed", "cancelled"]);
 const SCAN_BATCH_SIZE = 256;
+const DEFAULT_WORKER_RUNTIME_ROOT = path.join(homedir(), ".local", "share", "agent", "worker-runtime");
+const WORKER_HOST_COMMAND_PATTERN = /^Pi worker host (worker_[A-Za-z0-9][A-Za-z0-9_-]{0,127})\/(run_[A-Za-z0-9][A-Za-z0-9_-]{0,127})$/;
+const MANAGED_WORKER_EVIDENCE_REASON = "managed-worker evidence; use worker discard/cleanup";
 
 export function parseAsyncShellLeftoverName(name: string): { kind: "pending" | "prune"; jobId: string } | undefined {
   const match = LEFTOVER_PATTERN.exec(name);
@@ -55,9 +59,41 @@ export function isCanonicalAsyncShellJobId(name: string): boolean {
   return JOB_ID_PATTERN.test(name);
 }
 
+export function managedWorkerEvidenceReason(
+  job: Record<string, unknown>,
+  managedWorkerJobIds: ReadonlySet<string> = readManagedWorkerHostJobIds()
+): string | undefined {
+  if (typeof job.jobId === "string" && managedWorkerJobIds.has(job.jobId)) return MANAGED_WORKER_EVIDENCE_REASON;
+  if (isRecord(job.managedBy) && job.managedBy.kind === "worker-host" && typeof job.managedBy.workerId === "string" && typeof job.managedBy.runId === "string") {
+    return MANAGED_WORKER_EVIDENCE_REASON;
+  }
+  if (typeof job.command === "string" && WORKER_HOST_COMMAND_PATTERN.test(job.command)) return MANAGED_WORKER_EVIDENCE_REASON;
+  return undefined;
+}
+
+export function readManagedWorkerHostJobIds(runtimeRoot = DEFAULT_WORKER_RUNTIME_ROOT): Set<string> {
+  const ids = new Set<string>();
+  const databasePath = path.join(runtimeRoot, "registry.sqlite");
+  if (!existsSync(databasePath)) return ids;
+  const sqlite = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite") | undefined;
+  if (!sqlite) throw new Error("Managed-worker evidence protection requires node:sqlite while a worker registry exists.");
+  let database: import("node:sqlite").DatabaseSync | undefined;
+  try {
+    database = new sqlite.DatabaseSync(databasePath, { readOnly: true });
+    const rows = database.prepare("SELECT job_id FROM runs WHERE job_id IS NOT NULL").all() as Array<{ job_id?: unknown }>;
+    for (const row of rows) if (typeof row.job_id === "string" && JOB_ID_PATTERN.test(row.job_id)) ids.add(row.job_id);
+    return ids;
+  } catch (cause) {
+    throw new Error(`Managed-worker evidence registry is unavailable: ${cause instanceof Error ? cause.message : String(cause)}`);
+  } finally {
+    try { database?.close(); } catch {}
+  }
+}
+
 export async function scanAsyncShellRetention(
   root: string,
-  onProgress?: (progress: AsyncShellRetentionProgress) => void
+  onProgress?: (progress: AsyncShellRetentionProgress) => void,
+  managedWorkerJobIds = readManagedWorkerHostJobIds()
 ): Promise<AsyncShellRetentionSnapshot> {
   const startedAt = Date.now();
   let dirents: Dirent<string>[];
@@ -67,15 +103,12 @@ export async function scanAsyncShellRetention(
     if (isNodeError(error) && error.code === "ENOENT") return emptySnapshot(root, startedAt);
     throw error;
   }
-  const names = dirents
-    .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
-    .map((entry) => entry.name)
-    .sort();
+  const names = dirents.map((entry) => entry.name).sort();
   const entries: AsyncShellRetentionEntry[] = [];
   const recentJobs: Record<string, unknown>[] = [];
   for (let offset = 0; offset < names.length; offset += SCAN_BATCH_SIZE) {
     const chunk = names.slice(offset, offset + SCAN_BATCH_SIZE);
-    const classified = await Promise.all(chunk.map((name) => classifyEntry(root, name)));
+    const classified = await Promise.all(chunk.map((name) => classifyEntry(root, name, managedWorkerJobIds)));
     for (const item of classified) {
       entries.push(item.entry);
       if (item.job !== undefined) recentJobs.push(item.job);
@@ -95,7 +128,7 @@ export async function scanAsyncShellRetention(
   };
 }
 
-async function classifyEntry(root: string, name: string): Promise<{ entry: AsyncShellRetentionEntry; job?: Record<string, unknown> }> {
+async function classifyEntry(root: string, name: string, managedWorkerJobIds: ReadonlySet<string>): Promise<{ entry: AsyncShellRetentionEntry; job?: Record<string, unknown> }> {
   const entryPath = path.join(root, name);
   const summary = await pathTreeSummary(entryPath);
   const bytes = summary.bytes;
@@ -114,7 +147,7 @@ async function classifyEntry(root: string, name: string): Promise<{ entry: Async
   }
   const job = await readJobMeta(root, name);
   if (!job) return { entry: { name, kind: "ineligible", jobId: name, bytes, reason: "metadata missing or invalid" } };
-  const reason = ineligibleReason(job);
+  const reason = ineligibleReason(job, managedWorkerJobIds);
   return {
     entry: {
       name,
@@ -146,7 +179,9 @@ async function readJobMeta(root: string, jobId: string): Promise<Record<string, 
   }
 }
 
-function ineligibleReason(job: Record<string, unknown>): string | undefined {
+function ineligibleReason(job: Record<string, unknown>, managedWorkerJobIds: ReadonlySet<string>): string | undefined {
+  const managedReason = managedWorkerEvidenceReason(job, managedWorkerJobIds);
+  if (managedReason !== undefined) return managedReason;
   if (job.owner !== undefined) return "worker-owned";
   const status = typeof job.status === "string" ? job.status : "unknown";
   if (!TERMINAL.has(status)) return `non-terminal:${status}`;
@@ -173,6 +208,10 @@ async function pathTreeSummary(target: string): Promise<PathTreeSummary> {
   try { children = await readdir(target, { withFileTypes: true, encoding: "utf8" }); } catch (error) { return { bytes: 0, info, error: errorMessage(error) }; }
   const childSummaries = await Promise.all(children.map((child) => pathTreeSummary(path.join(target, child.name))));
   return { bytes: childSummaries.reduce((total, child) => total + child.bytes, 0), info };
+}
+
+export function summarizeAsyncShellRetentionEntries(entries: AsyncShellRetentionEntry[]): AsyncShellRetentionTotals {
+  return retentionTotals(entries);
 }
 
 function retentionTotals(entries: AsyncShellRetentionEntry[]): AsyncShellRetentionTotals {
@@ -204,6 +243,10 @@ function retentionTotals(entries: AsyncShellRetentionEntry[]): AsyncShellRetenti
 
 function emptySnapshot(root: string, startedAt: number): AsyncShellRetentionSnapshot {
   return { version: 1, root, scannedAt: new Date().toISOString(), durationMs: Date.now() - startedAt, entries: [], recentJobs: [], totals: retentionTotals([]) };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {

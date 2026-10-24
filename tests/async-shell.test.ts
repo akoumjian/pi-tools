@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import fs, { existsSync, mkdirSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -19,6 +21,7 @@ import asyncShellExtension, {
   cancelPersistedAsyncShellJobsForOwner,
   createAsyncShellViewerComponent,
   loadAsyncShellViewerSnapshot,
+  latestAsyncShellRetentionSnapshot,
   listEligibleAsyncShellPrune,
   migrateAsyncShellRuntimeHolder,
   parseAsyncShellPruneArgs,
@@ -32,6 +35,7 @@ import asyncShellExtension, {
   startManagedAsyncJob,
   type AsyncShellViewerSnapshot
 } from "../extensions/async-shell/index.js";
+import { managedWorkerEvidenceReason, readManagedWorkerHostJobIds, scanAsyncShellRetention } from "../extensions/async-shell/retention.js";
 
 type SentMessage = {
   message: unknown;
@@ -229,6 +233,93 @@ test("async-shell pruning is exact, previewed, terminal-only, and separate from 
 });
 
 
+
+test("ordinary retention protects new, legacy-command, and exact-registry managed-worker host evidence", async () => {
+  await withTempDir(async (dir) => {
+    const marked = "job_20261024180000_workerhost1";
+    const legacy = "job_20261024180000_workerhost2";
+    const registryId = "job_20261024180000_workerhost3";
+    await writeJobMeta(dir, marked, {
+      command: "host process changed wording",
+      status: "exited",
+      notifyOnExit: false,
+      processToken: "123e4567-e89b-42d3-a456-426614174301",
+      managedBy: { kind: "worker-host", workerId: "worker_20261024180000_host01", runId: "run_20261024180000_host01" }
+    });
+    await writeJobMeta(dir, legacy, {
+      command: "Pi worker host worker_20261024180000_host02/run_20261024180000_host02",
+      status: "failed",
+      notifyOnExit: false,
+      processToken: "123e4567-e89b-42d3-a456-426614174302"
+    });
+    await writeJobMeta(dir, registryId, { command: "legacy host with edited command", status: "cancelled", notifyOnExit: false, processToken: "123e4567-e89b-42d3-a456-426614174303" });
+
+    const inventory = await listEligibleAsyncShellPrune({ cwd: dir }, undefined, 100, "ineligible");
+    assert.deepEqual(inventory.entries.map((entry) => [entry.name, entry.reason]), [
+      [marked, "managed-worker evidence; use worker discard/cleanup"],
+      [legacy, "managed-worker evidence; use worker discard/cleanup"]
+    ]);
+    assert.throws(() => previewAsyncShellPrune({ cwd: dir }, [marked]), /managed-worker evidence; use worker discard\/cleanup/);
+    assert.throws(() => pruneAsyncShellJobs({ cwd: dir }, [legacy]), /managed-worker evidence; use worker discard\/cleanup/);
+
+    const runtimeRoot = path.join(dir, "worker-runtime");
+    await mkdir(runtimeRoot);
+    const database = new DatabaseSync(path.join(runtimeRoot, "registry.sqlite"));
+    database.exec("CREATE TABLE runs(job_id TEXT)");
+    database.prepare("INSERT INTO runs(job_id) VALUES(?)").run(registryId);
+    database.close();
+    const registryIds = readManagedWorkerHostJobIds(runtimeRoot);
+    assert.deepEqual([...registryIds], [registryId]);
+    assert.equal(managedWorkerEvidenceReason({ jobId: registryId, command: "edited" }, registryIds), "managed-worker evidence; use worker discard/cleanup");
+    const invalidRoot = path.join(dir, "invalid-worker-runtime");
+    await mkdir(invalidRoot);
+    const invalidDatabase = new DatabaseSync(path.join(invalidRoot, "registry.sqlite"));
+    invalidDatabase.exec("CREATE TABLE unrelated(value TEXT)");
+    invalidDatabase.close();
+    assert.throws(() => readManagedWorkerHostJobIds(invalidRoot), /evidence registry is unavailable/);
+    const directSnapshot = await scanAsyncShellRetention(path.join(dir, ".pi", "async-shell", "jobs"), undefined, registryIds);
+    assert.equal(directSnapshot.entries.find((entry) => entry.name === registryId)?.reason, "managed-worker evidence; use worker discard/cleanup");
+    assert.equal(existsSync(path.join(dir, ".pi", "async-shell", "jobs", marked)), true);
+  });
+});
+
+
+test("managed async host marker persists in canonical metadata", async () => {
+  await withTempDir(async (dir) => {
+    const api = createFakeApi();
+    asyncShellExtension(api);
+    const managedBy = { kind: "worker-host" as const, workerId: "worker_20261024180000_marked", runId: "run_20261024180000_marked" };
+    const handle = startManagedAsyncJob(api, createContext(dir), {
+      jobId: "job_20261024180000_markedhost",
+      command: `Pi worker host ${managedBy.workerId}/${managedBy.runId}`,
+      cwd: dir,
+      executable: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      notifyOnExit: false,
+      managedBy
+    });
+    await waitWithRefTimeout(handle.completion);
+    const persisted = JSON.parse(await readFile(path.join(handle.snapshot().logDir, "meta.json"), "utf8")) as { managedBy?: unknown };
+    assert.deepEqual(persisted.managedBy, managedBy);
+    assert.throws(() => previewAsyncShellPrune({ cwd: dir }, [handle.jobId]), /managed-worker evidence; use worker discard\/cleanup/);
+  });
+});
+
+test("retention totals count regular stray root files including pending-shaped names", async () => {
+  await withTempDir(async (dir) => {
+    const root = path.join(dir, ".pi", "async-shell", "jobs");
+    await mkdir(root, { recursive: true });
+    const pendingFile = ".pending-job_20261024180000_file0001-123e4567-e89b-42d3-a456-426614174099";
+    await writeFile(path.join(root, pendingFile), "pending-file");
+    await writeFile(path.join(root, "stray-root-file"), "stray");
+    const snapshot = await refreshAsyncShellRetentionSnapshot({ cwd: dir });
+    assert.equal(snapshot.totals.directories, 2);
+    assert.equal(snapshot.totals.unknownLeftovers.count, 2);
+    assert.equal(snapshot.totals.bytes, Buffer.byteLength("pending-filestray"));
+    assert.match(snapshot.entries.find((entry) => entry.name === pendingFile)?.reason ?? "", /not an ordinary directory/);
+  });
+});
+
 test("retention inventory uses deletion-stable cursors and reports bounded class totals", async () => {
   await withTempDir(async (dir) => {
     const ids = [
@@ -241,10 +332,47 @@ test("retention inventory uses deletion-stable cursors and reports bounded class
     assert.deepEqual(first.entries.map((entry) => entry.name), [ids[0]]);
     assert.equal(first.nextAfter, ids[0]);
     pruneAsyncShellJobs({ cwd: dir }, [ids[0]!]);
+    const latest = required(latestAsyncShellRetentionSnapshot({ cwd: dir }), "latest retention snapshot after confirm");
+    assert.equal(latest.totals.eligible.count, 2);
+    assert.deepEqual(latest.entries.filter((entry) => entry.kind === "eligible").map((entry) => entry.name), ids.slice(1));
     const second = await listEligibleAsyncShellPrune({ cwd: dir }, first.nextAfter, 1);
     assert.deepEqual(second.entries.map((entry) => entry.name), [ids[1]], "deleting the first page must not skip the next key");
     assert.equal(second.snapshot.totals.eligible.count, 2);
     assert.equal(parseAsyncShellPruneArgs("--eligible --after job_20261024180000_cursor001 --limit 1").after, ids[0]);
+  });
+});
+
+
+test("partial deletion failure leaves complete remaining evidence under recoverable prune names", async () => {
+  await withTempDir(async (dir) => {
+    const first = "job_20261024180000_partial01";
+    const second = "job_20261024180000_partial02";
+    await writeJobMeta(dir, first, { status: "exited", notifyOnExit: false, completionNotified: true });
+    await writeJobMeta(dir, second, { status: "exited", notifyOnExit: false, completionNotified: true });
+    const originalRmSync = fs.rmSync;
+    let removals = 0;
+    fs.rmSync = ((target: fs.PathLike, options?: fs.RmDirOptions) => {
+      if (path.basename(String(target)).startsWith(".prune-")) {
+        removals += 1;
+        if (removals === 2) throw new Error("injected second removal failure");
+      }
+      return originalRmSync(target, options as never);
+    }) as typeof fs.rmSync;
+    syncBuiltinESMExports();
+    try {
+      assert.throws(() => pruneAsyncShellJobs({ cwd: dir }, [first, second]), /retained classified recovery targets/);
+    } finally {
+      fs.rmSync = originalRmSync;
+      syncBuiltinESMExports();
+    }
+    const root = path.join(dir, ".pi", "async-shell", "jobs");
+    const names = await readdir(root);
+    assert.equal(names.includes(first), false);
+    assert.equal(names.includes(second), false, "a possibly partial directory is never restored as canonical");
+    const retained = required(names.find((name) => name.startsWith(`.prune-${second}-`)), "classified retained prune target");
+    assert.equal(previewAsyncShellPrune({ cwd: dir }, [retained])[0]?.recoveryEligible, true);
+    assert.equal(recoverAsyncShellPruneLeftovers({ cwd: dir }, [retained]).length, 1);
+    assert.equal(existsSync(path.join(root, second)), true);
   });
 });
 
@@ -319,6 +447,7 @@ test("retention scanning yields the event loop and publishes progress for large 
     await required(api.commands.get("async:status"), "async:status command").handler("", commandContext);
     assert.ok(Date.now() - commandStartedAt < 500, "status returns progress without waiting for the full large scan");
     assert.match(notifications.join("\n"), /scan (started|in progress)/i);
+    assert.match(notifications.join("\n"), /Completion delivery backlog:/);
 
     let timerFired = false;
     let progressEvents = 0;
@@ -994,6 +1123,41 @@ test("shell_status lists recent jobs when jobId is omitted", async () => {
     assert.equal(details.jobs[0].command, "printf listed");
     assert.equal(details.jobs[0].status, "exited");
     assert.match(JSON.stringify(result.content), /printf listed/);
+  });
+});
+
+
+test("shell_status returns immediately from the latest snapshot and refreshes in the background", async () => {
+  await withTempDir(async (dir) => {
+    const historical = "job_20261024180000_latest001";
+    await writeJobMeta(dir, historical, { command: "historical latest snapshot", startedAt: "2026-10-24T18:00:00.000Z" });
+    await refreshAsyncShellRetentionSnapshot({ cwd: dir });
+    const api = createFakeApi();
+    asyncShellExtension(api);
+    const shellStatus = required(api.registeredTools.find((tool) => tool.name === "shell_status"), "shell_status tool");
+    const startedAt = Date.now();
+    const result = await shellStatus.execute!("latest-list", { limit: 5 } as never, new AbortController().signal, undefined, createContext(dir));
+    assert.ok(Date.now() - startedAt < 500, "list must not await its background refresh");
+    assert.deepEqual((result.details as { jobs: Array<{ jobId: string }> }).jobs.map((job) => job.jobId), [historical]);
+  });
+});
+
+test("snapshot job lists preserve exact managed-worker owner filtering", async () => {
+  await withTempDir(async (dir) => {
+    const workerId = "worker_20261024180000_owner01";
+    const runId = "run_20261024180000_owner01";
+    const own = "job_20261024180000_owner001";
+    const other = "job_20261024180000_owner002";
+    await writeJobMeta(dir, own, { owner: { kind: "worker-run", workerId, runId }, command: "owned current run" });
+    await writeJobMeta(dir, other, { owner: { kind: "worker-run", workerId: "worker_other", runId: "run_other" }, command: "owned prior run" });
+    await refreshAsyncShellRetentionSnapshot({ cwd: dir });
+    await withEnv({ PI_WORKER_ID: workerId, PI_WORKER_RUN_ID: runId, PI_WORKER_ASYNC_JOB_ROOT: path.join(dir, ".pi", "async-shell") }, async () => {
+      const api = createFakeApi();
+      asyncShellExtension(api);
+      const shellStatus = required(api.registeredTools.find((tool) => tool.name === "shell_status"), "shell_status tool");
+      const result = await shellStatus.execute!("owner-list", { limit: 20 } as never, new AbortController().signal, undefined, createContext(dir));
+      assert.deepEqual((result.details as { jobs: Array<{ jobId: string }> }).jobs.map((job) => job.jobId), [own]);
+    });
   });
 });
 
@@ -2029,6 +2193,119 @@ test("terminal metadata write failure cannot escape the child lifecycle or stran
     const endedAt = completion.endedAt;
     await delay(50);
     assert.equal(handle.snapshot().endedAt, endedAt, "terminal persistence failure settles exactly once");
+  });
+});
+
+
+test("grace-period metadata failure never rejects the batch or strands a sibling completion", async () => {
+  await withTempDir(async (dir) => {
+    const api = createFakeApi();
+    asyncShellExtension(api);
+    const shellStart = required(api.registeredTools.find((tool) => tool.name === "shell_start"), "shell_start tool");
+    assert.ok(shellStart.execute);
+    const context = createContext(dir, true);
+    let started: Array<{ jobId: string; stdoutLog: string }> = [];
+    const controller = new AbortController();
+    const resultPromise = shellStart.execute(
+      "metadata-grace-batch",
+      { commands: [
+        { command: "sleep 0.4", cwd: dir, job_name: "blocked-meta" },
+        { command: "sleep 1.2", cwd: dir, job_name: "sibling" }
+      ] } as never,
+      controller.signal,
+      (update) => { started = (update.details as { jobs: Array<{ jobId: string; stdoutLog: string }> }).jobs; },
+      context
+    );
+    for (let attempt = 0; attempt < 100 && started.length === 0; attempt += 1) await delay(5);
+    assert.equal(started.length, 2);
+    const blockedMeta = path.join(path.dirname(started[0]!.stdoutLog), "meta.json");
+    await rm(blockedMeta);
+    await mkdir(blockedMeta);
+    await delay(650);
+    controller.abort();
+    const result = await resultPromise;
+    const details = result.details as { jobs: Array<{ status: string; error?: string }> };
+    assert.equal(details.jobs[0]?.status, "failed");
+    assert.match(details.jobs[0]?.error ?? "", /metadata persistence failed/i);
+    assert.match(String(result.content[0]?.type === "text" ? result.content[0].text : ""), /failed \(process exit 0\)/);
+    for (let attempt = 0; attempt < 160 && api.sentMessages.length === 0; attempt += 1) await delay(25);
+    assert.equal(api.sentMessages.length, 1, "the sibling clears its barrier and delivers once");
+    assert.match(JSON.stringify(api.sentMessages[0]?.message), /sibling/);
+    assert.doesNotMatch(JSON.stringify(api.sentMessages[0]?.message), /blocked-meta/);
+  });
+});
+
+test("cancellation signals and settles even when cancellation metadata cannot persist", async () => {
+  await withTempDir(async (dir) => {
+    const api = createFakeApi();
+    asyncShellExtension(api);
+    const handle = startManagedAsyncJob(api, createContext(dir), {
+      jobId: "job_20260910193000_cancelmeta",
+      command: "cancel metadata failure",
+      cwd: dir,
+      executable: process.execPath,
+      args: ["-e", "setInterval(()=>{},1000)"],
+      notifyOnExit: false
+    });
+    const metaPath = path.join(handle.snapshot().logDir, "meta.json");
+    await rm(metaPath);
+    await mkdir(metaPath);
+    assert.doesNotThrow(() => handle.cancel("SIGTERM"));
+    const completion = await waitWithRefTimeout(handle.completion);
+    assert.equal(completion.status, "failed");
+    assert.match(completion.error ?? "", /Cancellation metadata persistence failed/);
+    assert.match(completion.error ?? "", /Terminal metadata persistence failed/);
+  });
+});
+
+test("shell_read remains available and reports unacknowledged state when acknowledgement persistence fails", async () => {
+  await withTempDir(async (dir) => {
+    const api = createFakeApi();
+    asyncShellExtension(api);
+    const context = createContext(dir);
+    const shellRead = required(api.registeredTools.find((tool) => tool.name === "shell_read"), "shell_read tool");
+    assert.ok(shellRead.execute);
+    const handle = startManagedAsyncJob(api, context, {
+      jobId: "job_20260910193000_ackmeta",
+      command: "ack metadata failure",
+      cwd: dir,
+      executable: process.execPath,
+      args: ["-e", "process.stdout.write('available')"],
+      notifyOnExit: false
+    });
+    await waitWithRefTimeout(handle.completion);
+    const metaPath = path.join(handle.snapshot().logDir, "meta.json");
+    await rm(metaPath);
+    await mkdir(metaPath);
+    const result = await shellRead.execute("read-ack-failure", { jobId: handle.jobId, mode: "tail" } as never, new AbortController().signal, undefined, context);
+    const job = (result.details as { job: { status: string; completionNotified: boolean; error?: string } }).job;
+    assert.equal(job.status, "failed");
+    assert.equal(job.completionNotified, false);
+    assert.match(job.error ?? "", /Completion acknowledgement persistence failed/);
+    assert.match(JSON.stringify(result.content), /available/);
+  });
+});
+
+test("partial batch startup failure releases earlier job barriers", async () => {
+  await withTempDir(async (dir) => {
+    const api = createFakeApi();
+    asyncShellExtension(api);
+    const shellStart = required(api.registeredTools.find((tool) => tool.name === "shell_start"), "shell_start tool");
+    assert.ok(shellStart.execute);
+    const context = createContext(dir, true);
+    await assert.rejects(shellStart.execute(
+      "partial-start-failure",
+      { commands: [
+        { command: "sleep 0.5", cwd: dir, job_name: "started-before-failure" },
+        { command: "never", cwd: dir, shell: "bad\0shell", job_name: "invalid-spawn" }
+      ] } as never,
+      new AbortController().signal,
+      undefined,
+      context
+    ), /null bytes|must be a string without null bytes|invalid/i);
+    for (let attempt = 0; attempt < 160 && api.sentMessages.length === 0; attempt += 1) await delay(25);
+    assert.equal(api.sentMessages.length, 1);
+    assert.match(JSON.stringify(api.sentMessages[0]?.message), /started-before-failure/);
   });
 });
 
