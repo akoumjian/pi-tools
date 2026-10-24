@@ -343,17 +343,19 @@ export function prepareWorkerCacheLineage(input: {
   return record;
 }
 export function continueWorkerCacheLineage(record: WorkerCacheLineageRecord, workerStateDir: string, hostGeneration: string): WorkerCacheLineageRecord | undefined {
-  if (!/^run_[A-Za-z0-9_-]+$/.test(hostGeneration) || record.mode !== "eligible" || !validateWorkerCacheLineageRecord(record)) return undefined;
-  let status: WorkerCacheLineageSummary; try { status = readLineageSummary(record); } catch { return undefined; }
+  if (!/^run_[A-Za-z0-9_-]+$/.test(hostGeneration)) throw new Error("Retained cache-lineage continuation requires an exact fresh host generation.");
+  if (record.mode === "fresh") return undefined;
+  if (!validateWorkerCacheLineageRecord(record)) throw new Error("Retained cache-lineage metadata is corrupt or unsupported.");
+  let status: WorkerCacheLineageSummary; try { status = readLineageSummary(record); } catch (error) { throw new Error(`Retained cache-lineage summary is missing or corrupt: ${error instanceof Error ? error.message : String(error)}`); }
   if (status.mode !== "eligible" && status.mode !== "adopted") return undefined;
-  const snapshot = readNoFollowBounded(record.snapshotFile, WORKER_CACHE_LINEAGE_MAX_BYTES);
-  if (sha256(snapshot) !== record.snapshotSha256) return undefined;
+  let snapshot: string; try { snapshot = readNoFollowBounded(record.snapshotFile, WORKER_CACHE_LINEAGE_MAX_BYTES); } catch (error) { throw new Error(`Retained cache-lineage snapshot is missing or unreadable: ${error instanceof Error ? error.message : String(error)}`); }
+  if (sha256(snapshot) !== record.snapshotSha256) throw new Error("Retained cache-lineage snapshot integrity mismatch.");
   mkdirSync(workerStateDir, { recursive: true, mode: 0o700 });
   const clone: Extract<WorkerCacheLineageRecord, { mode: "eligible" }> = { ...record, hostGeneration, snapshotFile: path.join(workerStateDir, "cache-lineage.json"), adoptionFile: path.join(workerStateDir, "cache-lineage-adopted.json"), fallbackFile: path.join(workerStateDir, "cache-lineage-fallback.json"), retirementFile: path.join(workerStateDir, "cache-lineage-retired.json"), summaryFile: path.join(workerStateDir, "cache-lineage-summary.json") };
   writePrivateText(clone.snapshotFile, snapshot);
   if (status.mode === "adopted") {
-    readAdoption(record.adoptionFile, record, readWorkerSnapshot(record));
-    writePrivateText(clone.adoptionFile, readNoFollowBounded(record.adoptionFile, 4096));
+    let adoption: string; try { readAdoption(record.adoptionFile, record, readWorkerSnapshot(record)); adoption = readNoFollowBounded(record.adoptionFile, 4096); } catch (error) { throw new Error(`Retained cache-lineage adoption evidence is missing or corrupt: ${error instanceof Error ? error.message : String(error)}`); }
+    writePrivateText(clone.adoptionFile, adoption);
   }
   writeLineageSummary(clone, status.mode);
   return clone;

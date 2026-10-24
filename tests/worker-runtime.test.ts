@@ -23,7 +23,7 @@ async function fixture(role: "work" | "review" | "integration", run: (root: stri
   await writeFile(beadsTasksFile, JSON.stringify([{ id: "personal-test", title: "Test", status: "in_progress", priority: 1, issue_type: "task", design: "Canonical design." }]));
   const bdPath = path.join(root, "fake-bd.mjs");
   await writeFile(bdPath, `#!/usr/bin/env node
-import { readFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 const args = process.argv.slice(2);
 const tasks = JSON.parse(readFileSync(process.env.FAKE_BEADS_TASKS_FILE, "utf8"));
 if (args.includes("where")) {
@@ -37,6 +37,7 @@ if (args.includes("where")) {
   const ids = args.filter((arg) => arg.startsWith("--id=")).map((arg) => arg.slice(5));
   process.stdout.write(JSON.stringify(ids.map((id) => tasks.find((task) => task.id === id)).filter(Boolean)));
 } else if (args.includes("update")) {
+  appendFileSync(process.env.FAKE_BEADS_UPDATE_LOG, JSON.stringify(args) + "\\n");
   process.stdout.write(JSON.stringify({ ok: true }));
 } else {
   process.stderr.write("unsupported fake bd command"); process.exit(2);
@@ -51,7 +52,7 @@ if (args.includes("where")) {
     PI_WORKER_TASK_IDS: JSON.stringify(["personal-test"]), PI_WORKER_AUTHORIZATION_FILE: path.join(root, "state", "host-authorization.json"),
     PI_WORKER_PROCESS_NONCE: "test-nonce", PI_WORKER_PARENT_PID: String(process.pid),
     PI_WORKER_BD_PATH: bdPath, PI_WORKER_BEADS_ROUTE: JSON.stringify(beadsRoute), BEADS_DIR: beadsDir,
-    FAKE_BEADS_ROUTE: JSON.stringify(beadsRoute), FAKE_BEADS_TASKS_FILE: beadsTasksFile
+    FAKE_BEADS_ROUTE: JSON.stringify(beadsRoute), FAKE_BEADS_TASKS_FILE: beadsTasksFile, FAKE_BEADS_UPDATE_LOG: path.join(root, "fake-beads-updates.jsonl")
   };
   await writeFile(values.PI_WORKER_AUTHORIZATION_FILE!, JSON.stringify({ version: 2, workerId: values.PI_WORKER_ID, runId: values.PI_WORKER_RUN_ID, processNonce: values.PI_WORKER_PROCESS_NONCE }));
   const old = new Map(Object.keys(values).map((key) => [key, process.env[key]])); Object.assign(process.env, values);
@@ -155,10 +156,12 @@ test("review runtime exposes only read-only Beads branches with four-item bounds
   });
 });
 
-test("status-less Beads updates remain JSON-safe and omit the optional status field", async () => {
-  await fixture("work", async () => {
+test("status-less Beads updates remain JSON-safe and retries cannot duplicate durable notes", async () => {
+  await fixture("work", async (root) => {
     const result = await executeWorkerBeadsHostRequest({ action: "update", taskId: "personal-test", note: "durable status-less note" });
     assert.deepEqual(result.details, { taskId: "personal-test", recorded: true }); assert.equal(JSON.stringify(result).includes('"status"'), false);
+    const replay = await executeWorkerBeadsHostRequest({ action: "update", taskId: "personal-test", note: "durable status-less note" }); assert.deepEqual(replay.details, result.details); assert.equal((await readFile(process.env.FAKE_BEADS_UPDATE_LOG!, "utf8")).trim().split("\n").length, 1);
+    const uncertainPayload = sha256(JSON.stringify({ taskId: "personal-test", note: "uncertain note", status: null })); await writeFile(path.join(root, "state", "beads-updates", `${uncertainPayload}.json`), JSON.stringify({ version: 1, workerId: process.env.PI_WORKER_ID, runId: process.env.PI_WORKER_RUN_ID, payloadSha256: uncertainPayload, state: "admitting" })); await assert.rejects(() => executeWorkerBeadsHostRequest({ action: "update", taskId: "personal-test", note: "uncertain note" }), /outcome is uncertain/); assert.equal((await readFile(process.env.FAKE_BEADS_UPDATE_LOG!, "utf8")).trim().split("\n").length, 1);
     await assert.rejects(() => executeWorkerBeadsHostRequest({ action: "update", taskId: "personal-test", note: 12345 }), /strict schema/);
   });
 });

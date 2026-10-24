@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -10,6 +10,7 @@ import { SessionManager, type ExtensionAPI, type ExtensionContext, type ToolDefi
 import { registerWorkerExtension } from "../extensions/worker/index.js";
 import { getWorker, getWorkerRun, listWorkers, openWorkerRegistry, storePreparedSet } from "../extensions/worker/registry.js";
 import type { ManagedAsyncJobHandle, JobMeta } from "../extensions/async-shell/index.js";
+import { asyncJobProcessStartToken } from "../extensions/_shared/async-job.js";
 import { prepareWorkerMerges } from "../extensions/worker/merge.js";
 
 const model = (provider: string, id: string) => ({ id, name: id, provider, api: "openai-responses", baseUrl: "https://example.invalid", reasoning: true, thinkingLevelMap: { xhigh: "xhigh" }, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 10000 }) as Model<Api>;
@@ -28,7 +29,7 @@ async function fixture(options: { launchThrows?: boolean; mountThrows?: boolean;
   const context = { cwd: root, hasUI: false, mode: "rpc", sessionManager: session, modelRegistry: { hasConfiguredAuth: () => true, getAll: () => [model("openai-codex", "gpt-5.6-sol"), model("anthropic", "claude-opus-5-5")] }, thinkingLevel: "xhigh", isIdle: () => true, hasPendingMessages: () => false, ui: { notify(message: string) { notifications.push(message); } } } as unknown as ExtensionContext;
   registerWorkerExtension(api, {
     runtimeRoot, roots: { stateRoot: workersRoot, workspaceRoot: workersRoot }, codeRoot: root, preparedRoot: path.join(runtimeRoot, "prepared"), targetRoot: root, sbxPath: "/fake/sbx", ...(options.sandboxRelease ? { sandboxRelease: options.sandboxRelease } : {}), random, now: () => new Date(`2026-01-01T00:00:${String(counter).padStart(2, "0")}.000Z`),
-    waitForHostIdentity: async () => {},
+    waitForHostIdentity: async () => {}, cancellationResultGraceMs: 20, cancellationEofGraceMs: 20,
     createSandbox: async (_sbx: string, reference: any) => { if (options.mountThrows && reference.mounts.some((mount: any) => mount.readOnly && mount.source.includes(`${path.sep}evidence${path.sep}runs${path.sep}`))) throw new Error("review mount probe failure"); created.push(reference.runId); if (sandboxGate) await sandboxGate; return { ...reference, createEvidenceSha256: (++counter).toString(16).padStart(64, "0") }; }, removeSandbox: (_sbx: string, reference: any) => { removed.push(reference.runId); if (options.removeAlwaysThrows || options.removeThrowsOnce && removeFailures++ === 0) throw new Error(options.removeAlwaysThrows ? "persistent sandbox cleanup failure" : "transient sandbox cleanup failure"); },
     launch: (_api, _context, input) => { if (options.launchThrows) throw new Error("launch probe failure"); let resolve!: (job: JobMeta) => void; const completion = new Promise<JobMeta>((done) => { resolve = done; });
       const running = job(input.record.jobId, "running"); const handle: ManagedAsyncJobHandle = { jobId: input.record.jobId, completion, snapshot: () => running, cancel: () => resolve(job(input.record.jobId, "cancelled")) }; launches.push({ ...input, resolve, handle }); return handle; }
@@ -85,6 +86,24 @@ test("turn_end returns without awaiting deferred Sandbox readiness", async () =>
 });
 
 
+test("an exact stale cancellation request is idempotent and cannot block exact removal", async () => {
+  const f=await fixture(); let child: ReturnType<typeof spawn> | undefined; try {
+    const started=receipt(await f.call("worker_run",{runs:[{action:"start",role:"work",taskIds:["personal-test"],instructions:"stale cancel request"}]})); await f.event("turn_end"); const launch=f.launches[0]!; const token=`cancel-stale-${Date.now()}`; child=spawn(process.execPath,["-e","setTimeout(()=>process.exit(0),200)"],{env:{...process.env,PI_WORKER_JOB_TOKEN:token},stdio:"ignore"}); await waitFor(()=>Boolean(child?.pid&&asyncJobProcessStartToken(child.pid))); const startToken=asyncJobProcessStartToken(child.pid!);
+    writeFileSync(launch.runtime.processFile,`${JSON.stringify({version:2,workerId:started.workerId,runId:started.runId,pid:child.pid,processToken:token,processStartToken:startToken,nonce:launch.runtime.processNonce,hostConfigFile:path.join(launch.runtime.runDir,"host.json"),startedAt:new Date().toISOString()})}\n`); writeFileSync(path.join(launch.runtime.runDir,"cancel-request.json"),`${JSON.stringify({version:1,workerId:started.workerId,runId:started.runId,requestedAt:new Date().toISOString()})}\n`); setTimeout(()=>launch.resolve(job(launch.record.jobId,"exited",0)),220);
+    const result=await f.call("worker_control",{action:"cancel",workerId:started.workerId}); assert.equal((result.details as any).cancellation,"cancelled"); assert.deepEqual(f.removed,[started.runId]);
+  } finally { if(child?.pid) try{child.kill("SIGKILL");}catch{} await f.close(); }
+});
+
+test("accepted result survives missing guest settlement through EOF and exact Sandbox removal", async () => {
+  const f = await fixture(); try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "accepted result" }] })); await f.event("turn_end");
+    const launch = f.launches[0]!; writeFileSync(launch.runtime.resultFile, `${JSON.stringify({ version: 2, workerId: started.workerId, runId: started.runId, acceptedAt: new Date().toISOString(), result: { outcome: "completed", summary: "accepted before guest settlement" } }, null, 2)}\n`);
+    setTimeout(() => launch.resolve(job(launch.record.jobId, "exited", 0)), 5);
+    const cancelled = await f.call("worker_control", { action: "cancel", workerId: started.workerId }); assert.equal((cancelled.details as any).cancellation, "not_active");
+    const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; assert.equal(run.outcome, "completed"); assert.equal(run.outcomeSource, "worker"); assert.equal(run.summary, "accepted before guest settlement"); assert.equal(getWorker(db, started.workerId)!.status, "idle"); db.close(); assert.deepEqual(f.removed, [started.runId]);
+  } finally { await f.close(); }
+});
+
 test("cancellation waits for a deferred launch boundary before proving termination", async () => {
   const f = await fixture({ deferSandbox: true }); try {
     const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "cancel during readiness" }] }));
@@ -94,6 +113,13 @@ test("cancellation waits for a deferred launch boundary before proving terminati
     const db = f.registry(); const worker = getWorker(db, started.workerId)!; const run = getWorkerRun(db, started.workerId, started.runId)!; db.close();
     assert.equal(worker.status, "idle"); assert.equal(run.outcome, "cancelled"); assert.equal(f.launches.length, 0);
   } finally { f.releaseSandbox(); await f.close(); }
+});
+
+test("stale interrupted discard restores owner removal and deletes evidence before registry authority", async () => {
+  const f=await fixture(); const secondHandlers=new Map<string,Function[]>(); try {
+    const started=receipt(await f.call("worker_run",{runs:[{action:"start",role:"work",taskIds:["personal-test"],instructions:"discard recovery"}]})); await f.call("worker_control",{action:"cancel",workerId:started.workerId}); let db=f.registry(); const worker=getWorker(db,started.workerId)!; const protectedDirectory=path.join(f.runtimeRoot,"supervision",started.workerId,"evidence","protected"); mkdirSync(protectedDirectory,{recursive:true}); writeFileSync(path.join(protectedDirectory,"evidence.txt"),"evidence\n",{mode:0o400}); chmodSync(protectedDirectory,0o500); db.database.prepare("UPDATE workers SET operation_kind='discard',operation_nonce='1-stale' WHERE worker_id=?").run(started.workerId); db.close(); await f.event("session_shutdown");
+    const secondApi={registerTool(){},registerCommand(){},registerMessageRenderer(){},sendMessage(){},on(name:string,handler:Function){secondHandlers.set(name,[...(secondHandlers.get(name)??[]),handler]);}} as unknown as ExtensionAPI; registerWorkerExtension(secondApi,{runtimeRoot:f.runtimeRoot,roots:{stateRoot:f.workersRoot,workspaceRoot:f.workersRoot},codeRoot:f.root,preparedRoot:path.join(f.runtimeRoot,"prepared"),targetRoot:f.root,sbxPath:"/fake/sbx",createSandbox:async()=>{throw new Error("discard recovery must not create")},removeSandbox:async()=>{},waitForHostIdentity:async()=>{},launch:()=>{throw new Error("discard recovery must not launch")}}); for(const handler of secondHandlers.get("session_start")??[]) handler({},f.context); db=f.registry(); assert.equal(getWorker(db,started.workerId),undefined); db.close(); assert.equal(existsSync(worker.workspaceRoot),false); assert.equal(existsSync(path.join(f.runtimeRoot,"supervision",started.workerId)),false);
+  } finally { for(const handler of secondHandlers.get("session_shutdown")??[]) await handler({},f.context); await f.close(); }
 });
 
 test("worker_control get content exposes complete settled candidates and artifact paths", async () => {
@@ -203,13 +229,18 @@ test("review snapshot rejects a worker-planted symlink in the retained subject s
     const subject = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "subject" }] })); await f.event("turn_end"); await complete(f, subject);
     const db = f.registry(); const worker = getWorker(db, subject.workerId)!; const sessionDirectory = path.dirname(worker.sessionFile!); db.close();
     const retained = `${sessionDirectory}-retained`; renameSync(sessionDirectory, retained); symlinkSync(retained, sessionDirectory, "dir");
-    await assert.rejects(() => f.call("worker_run", { runs: [{ action: "start", role: "review", reviewedRunId: subject.runId }] }), /may not traverse symbolic links/);
+    await assert.rejects(() => f.call("worker_run", { runs: [{ action: "start", role: "review", reviewedRunId: subject.runId }] }), /may not traverse symbolic links/); const after=f.registry(); assert.equal(getWorker(after,subject.workerId)!.reviewedByWorkerId,undefined); assert.equal(listWorkers(after,{parentSessionFile:path.resolve(f.session.getSessionFile()!)}).total,1); after.close();
   } finally { await f.close(); }
 });
 
 test("review starts fresh, mounts exact subject session range, cancellation releases lease, and resume recreates it", async () => {
   const f = await fixture(); try {
-    const subject = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "subject" }] })); await f.event("turn_end"); await complete(f, subject);
+    const subject = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "subject" }] })); await f.event("turn_end");
+    let subjectDb = f.registry(); const subjectWorkspace = getWorker(subjectDb, subject.workerId)!.workspaceRoot; subjectDb.close();
+    const eligibleRepo = path.join(subjectWorkspace, "repos", "eligible"); gitInit(eligibleRepo); writeFileSync(path.join(eligibleRepo, "result.txt"), "result\n"); git(eligibleRepo, "add", "."); git(eligibleRepo, "commit", "-m", "eligible");
+    const ineligibleRepo = path.join(subjectWorkspace, "repos", "dirty"); gitInit(ineligibleRepo); writeFileSync(path.join(ineligibleRepo, "result.txt"), "result\n"); git(ineligibleRepo, "add", "."); git(ineligibleRepo, "commit", "-m", "dirty"); writeFileSync(path.join(ineligibleRepo, "untracked.txt"), "dirty\n");
+    mkdirSync(path.join(subjectWorkspace, "artifacts"), { recursive: true }); writeFileSync(path.join(subjectWorkspace, "artifacts", "review.txt"), "review evidence\n");
+    await complete(f, subject, { outcome: "completed", summary: "subject", repositories: ["repos/eligible", "repos/dirty"], artifacts: ["artifacts/review.txt"] });
     const extra = path.join(f.root, "spec.txt"); writeFileSync(extra, "spec\n");
     const review = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "review", reviewedRunId: subject.runId, additionalInputs: [extra] }] }));
     await f.event("turn_end");
@@ -217,7 +248,7 @@ test("review starts fresh, mounts exact subject session range, cancellation rele
     const header = JSON.parse(readFileSync(reviewer.sessionFile!, "utf8").split("\n")[0]!); assert.equal(header.parentSession, undefined);
     const context = JSON.parse(readFileSync(runtime.contextFile, "utf8")); const subjectRun = getWorkerRun(db, subject.workerId, subject.runId)!;
     assert.equal(runtime.sandbox.mounts.some((mount: any) => mount.source === path.dirname(runtime.contextFile) && mount.readOnly), true);
-    assert.deepEqual(context.session.sourceRange, { startLine: subjectRun.sessionStartLine, endLine: subjectRun.sessionEndLine }); assert.match(runtime.contextFile, new RegExp(review.runId)); assert.notEqual(context.session.path, subjectRow.sessionFile); assert.match(runtime.prompt, new RegExp(reviewer.workspaceRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))); assert.doesNotMatch(runtime.prompt, /Writable workspace:\n\/workspace(?:\n|$)/); db.close();
+    assert.deepEqual(context.session.sourceRange, { startLine: subjectRun.sessionStartLine, endLine: subjectRun.sessionEndLine }); assert.match(runtime.contextFile, new RegExp(review.runId)); assert.notEqual(context.session.path, subjectRow.sessionFile); assert.equal(context.repositories.length, 1); assert.equal(context.repositories[0].eligible, true); assert.equal(context.skippedRepositories.length, 1); assert.match(context.skippedRepositories[0].reason, /working tree|eligible|dirty/i); assert.equal(context.artifacts.length, 1); assert.equal(readFileSync(context.artifacts[0], "utf8"), "review evidence\n"); assert.equal(execFileSync("git", ["-C", path.join(context.subjectWorkspace, context.repositories[0].path), "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), context.repositories[0].commit); assert.equal(git(eligibleRepo, "for-each-ref", "--format=%(refname)", "refs/heads/pi-worker-review-"), ""); assert.match(runtime.prompt, new RegExp(reviewer.workspaceRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))); assert.equal(runtime.prompt.includes(extra), false); assert.doesNotMatch(runtime.prompt, /Writable workspace:\n\/workspace(?:\n|$)/); db.close();
     await f.call("worker_control", { action: "cancel", workerId: review.workerId }); db = f.registry(); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, undefined); db.close();
     const resumed = receipt(await f.call("worker_run", { runs: [{ action: "resume", workerId: review.workerId, instructions: "continue" }] })); await f.event("turn_end"); db = f.registry(); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, review.workerId); const resumedRuntime = getWorkerRun(db, review.workerId, resumed.runId)!.runtime as any; assert.notEqual(resumedRuntime.sandbox.sandboxName, runtime.sandbox.sandboxName); assert.equal((getWorker(db, review.workerId)!.runtime?.inputs as any[]).length, 1); db.close();
     await f.call("worker_control", { action: "cancel", workerId: review.workerId }); await f.call("worker_control", { action: "discard", workerId: review.workerId }); db = f.registry(); assert.equal(getWorker(db, review.workerId), undefined); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, undefined); db.close();
@@ -314,6 +345,14 @@ test("persistent accepted-result cleanup failure retains accepted authority and 
     const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; const worker = getWorker(db, started.workerId)!; const runtime = run.runtime as any; db.close();
     assert.equal(run.status, "running"); assert.equal(run.outcome, undefined); assert.equal(worker.status, "running"); assert.equal(runtime.settlementRecoveryAttempts, 3); assert.match(worker.recoveryError!, /Accepted result completed remains retained/); assert.equal(existsSync(runtime.resultFile), true); assert.equal(JSON.parse(readFileSync(runtime.resultFile, "utf8")).result.outcome, "completed"); assert.equal(f.removed.length, 3);
     await assert.rejects(() => f.call("worker_run", { runs: [{ action: "resume", workerId: started.workerId, instructions: "must remain contained" }] }), /not idle/);
+  } finally { await f.close(); }
+});
+
+test("first version-4 resume after retained legacy metadata is explicitly disclosed", async () => {
+  const f=await fixture(); try {
+    const started=receipt(await f.call("worker_run",{runs:[{action:"start",role:"work",taskIds:["personal-test"],instructions:"legacy transition"}]})); await f.event("turn_end"); await f.call("worker_control",{action:"cancel",workerId:started.workerId});
+    const db=f.registry(); const retained=getWorkerRun(db,started.workerId,started.runId)!; const legacy={...(retained.runtime as any),version:3}; db.database.prepare("UPDATE runs SET runtime_json=? WHERE worker_id=? AND run_id=?").run(JSON.stringify(legacy),started.workerId,started.runId); db.close();
+    const resumed=receipt(await f.call("worker_run",{runs:[{action:"resume",workerId:started.workerId,instructions:"enter v4"}]})); const check=f.registry(); const runtime=getWorkerRun(check,resumed.workerId,resumed.runId)!.runtime as any; check.close(); assert.match(runtime.prompt,/first version-4 Docker Sandbox run/); assert.match(runtime.prompt,/old runtime was not reattached or trusted/); await f.call("worker_control",{action:"cancel",workerId:resumed.workerId});
   } finally { await f.close(); }
 });
 

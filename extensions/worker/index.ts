@@ -20,7 +20,7 @@ import {
   abandonWorkerDiscard, activeRunsForParent, claimPreparedSetApply, clearWorkerRecoveryError, claimWorkerCancellation, claimWorkerDiscard, claimWorkerDelivery, claimWorkerRun,
   countWorkers, createWorkerRunBatch, finalizeClaimedWorkerRun, finalizeWorkerDiscard, finalizeWorkerRunLaunch, findWorkerRunById, finishPreparedSetApply,
   getWorker, getWorkerRun, listWorkerRuns, listWorkers, markWorkerDeliveryDelivered, openWorkerRegistry, pendingWorkerDeliveries,
-  readPreparedSetRecord, recordWorkerSettlementRecovery, recoverInterruptedClaimsForParent, reconcileWorkerDeliveries, registerParentRuntime, releasePreparedSetApply, releaseWorkerDeliveryClaim, releaseWorkerRunClaim, setWorkerRecoveryError, storePreparedSet,
+  readPreparedSetRecord, recordWorkerSettlementRecovery, recoverInterruptedClaimsForParent, reconcileWorkerDeliveries, registerParentRuntime, leaseWorkerForReview, releasePreparedSetApply, releaseWorkerDeliveryClaim, releaseWorkerReviewLease, releaseWorkerRunClaim, setWorkerRecoveryError, storePreparedSet,
   subscribeWorkerRegistryChanges, updatePreparedSetStatus, updateWorkerRuntimeMetadata, workerRegistryDataVersion,
   type WorkerBatchCreateItem, type WorkerRegistry, type WorkerRegistryRecord, type WorkerRepositoryResult, type WorkerRole, type WorkerRunRecord
 } from "./registry.js";
@@ -70,6 +70,7 @@ type PlannedRun = {
   request: WorkerRunInputV2["runs"][number]; role: WorkerRole; workerId: string; runId: string; jobId: string; paths: WorkerPaths;
   taskIds: string[]; modelSelection: string; binding?: WorkerRunRecord["binding"]; workerRuntime: WorkerRuntime; runRuntime: RunRuntime;
   newWorker: boolean; expectedVersion?: number; reviewedRunId?: string; preparedId?: string; consumedPrepared?: boolean; operationRepositories?: Array<Record<string, unknown>>;
+  preflightReviewLease?: boolean;
 };
 type WorkerOperationSnapshot =
   | { scope: "worker_run"; runId: string; operation: WorkerOperation }
@@ -80,6 +81,8 @@ export type WorkerExtensionDependencies = {
   removeSandbox?: (sbxPath: string, reference: WorkerSandboxReference) => void | Promise<void>;
   launch?: (api: ExtensionAPI, context: ExtensionContext, input: { record: WorkerLaunchRecord; runtime: RunRuntime }) => ManagedAsyncJobHandle;
   waitForHostIdentity?: (runtime: RunRuntime, workerId: string, runId: string) => Promise<void>;
+  cancellationResultGraceMs?: number;
+  cancellationEofGraceMs?: number;
 };
 
 export default function workerExtension(api: ExtensionAPI): void { registerWorkerExtension(api); }
@@ -96,6 +99,8 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   const createSandbox = overrides.createSandbox ?? (testLaunch ? ((_sbx, reference) => ({ ...reference, createEvidenceSha256: "f".repeat(64) })) : createWorkerSandboxAsync);
   const removeSandbox = overrides.removeSandbox ?? (testLaunch ? (() => {}) : settleWorkerSandboxAsync);
   const verifyHostIdentity = overrides.waitForHostIdentity ?? waitForWorkerHostIdentity;
+  const cancellationResultGraceMs = overrides.cancellationResultGraceMs ?? 5_000;
+  const cancellationEofGraceMs = overrides.cancellationEofGraceMs ?? 12_000;
   let registry: WorkerRegistry | undefined;
   let runtimeGeneration = 0;
   let deliveryTimer: NodeJS.Timeout | undefined;
@@ -359,7 +364,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
             retained.cacheLineage ??= { ...prepareWorkerCacheLineage({ stateRoot: roots.stateRoot, workerStateDir: lineageDir, parentSessionFile, parentSessionId: context.sessionManager.getSessionId(), route: parseWorkerModelSelection(worker.modelSelection!), now: now() }), hostGeneration: reservedRunId };
             if (retained.cacheLineage.mode === "eligible" && priorFingerprint) retained.cacheLineage.runtimeFingerprint = priorFingerprint;
           }
-          const plan = finishPlanSafely({ request, role, workerId: worker.workerId, ...(reservedRunId ? { runId: reservedRunId } : {}), paths, taskIds: unique([...worker.taskIds, ...(request.additionalTaskIds ?? [])]), modelSelection: worker.modelSelection!, binding, workerRuntime: { version: 2, inputs: retainedInputs, ...retained }, newWorker: false, expectedVersion: worker.version, contextFile, reviewedRunId, preparedId, operationRepositories, pendingWorkSessionId, mounts, parentSessionFile, context });
+          const plan = finishPlanSafely({ request, role, workerId: worker.workerId, ...(reservedRunId ? { runId: reservedRunId } : {}), paths, promptInputs: inputs, taskIds: unique([...worker.taskIds, ...(request.additionalTaskIds ?? [])]), modelSelection: worker.modelSelection!, binding, workerRuntime: { version: 2, inputs: retainedInputs, ...retained }, newWorker: false, expectedVersion: worker.version, contextFile, reviewedRunId, preparedId, operationRepositories, pendingWorkSessionId, mounts, parentSessionFile, context });
           plans.push(plan); continue;
         }
         const role = request.role;
@@ -377,13 +382,14 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         provisionWorkerPaths(paths);
         try { if (role === "work") cacheLineage = { ...prepareWorkerCacheLineage({ stateRoot: roots.stateRoot, workerStateDir: prepareCacheLineageDirectory(paths, reservedRunId), parentSessionFile, parentSessionId: context.sessionManager.getSessionId(), route: parseWorkerModelSelection(modelSelection), now: now() }), hostGeneration: reservedRunId }; }
         catch (error) { rmSync(paths.stateDir, { recursive: true, force: true }); throw error; }
-        let binding: WorkerRunRecord["binding"]; let reviewedRunId: string | undefined; let preparedId: string | undefined; let consumedPrepared = false;
+        let binding: WorkerRunRecord["binding"]; let reviewedRunId: string | undefined; let preparedId: string | undefined; let consumedPrepared = false; let preflightReviewLease = false;
         let contextFile: string | undefined; let mounts: WorkerSandboxMount[] = [];
         try {
           const pendingWorkSessionId = role === "work" ? randomUUID() : undefined;
           const mountedInputs = snapshotAdditionalInputs(runEvidenceDirectory(paths, reservedRunId), inputs);
           if (role === "review") {
             reviewedRunId = request.reviewedRunId; binding = { reviewedWorkerId: subject!.worker.workerId, reviewedRunId };
+            leaseWorkerForReview(getRegistry(), subject!.worker.workerId, workerId, now().toISOString()); preflightReviewLease = true;
             createWorkerSession({ workspaceRoot: paths.workspaceRoot, sessionDir: paths.sessionDir, sessionId: randomUUID() });
             contextFile = writeReviewContext(runEvidenceDirectory(paths, reservedRunId), workerPaths(roots, subject!.worker.workerId), workerId, reservedRunId, subject!.worker, subject!.run, mountedInputs);
             mounts = [{ source: path.dirname(contextFile), readOnly: true }];
@@ -392,12 +398,13 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
             createWorkerSession({ workspaceRoot: paths.workspaceRoot, sessionDir: paths.sessionDir, sessionId: randomUUID() });
             contextFile = writeIntegrationContext(paths, runEvidenceDirectory(paths, reservedRunId), moved, mountedInputs, false); mounts = [{ source: path.dirname(contextFile), readOnly: true }];
           }
-          const plan = finishPlan({ request, role, workerId, ...(reservedRunId ? { runId: reservedRunId } : {}), paths, taskIds: role === "review" ? subject!.run.taskIds : taskIds, modelSelection, binding,
-            workerRuntime: { version: 2, inputs, ...(repositoryBaselines ? { repositoryBaselines } : {}), ...(cacheLineage ? { cacheLineage } : {}) }, newWorker: true, contextFile, reviewedRunId, preparedId, consumedPrepared, operationRepositories: snapshotOperationRepositories(integrationSet?.repositories), pendingWorkSessionId, mounts, parentSessionFile, context });
+          const plan = finishPlan({ request, role, workerId, ...(reservedRunId ? { runId: reservedRunId } : {}), paths, promptInputs: mountedInputs, taskIds: role === "review" ? subject!.run.taskIds : taskIds, modelSelection, binding,
+            workerRuntime: { version: 2, inputs, ...(repositoryBaselines ? { repositoryBaselines } : {}), ...(cacheLineage ? { cacheLineage } : {}) }, newWorker: true, ...(preflightReviewLease ? { preflightReviewLease: true } : {}), contextFile, reviewedRunId, preparedId, consumedPrepared, operationRepositories: snapshotOperationRepositories(integrationSet?.repositories), pendingWorkSessionId, mounts, parentSessionFile, context });
           plans.push(plan);
         } catch (error) {
+          if (preflightReviewLease && subject) { try { releaseWorkerReviewLease(getRegistry(), subject.worker.workerId, workerId, now().toISOString()); } catch {} }
           if (consumedPrepared && preparedId) { try { restoreConsumedPreparedMergeSet(parentSessionFile, preparedId, paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, trustedSet: trustedPreparedSet(getRegistry(), parentSessionFile, preparedId) }); } catch {} }
-          rmSync(paths.stateDir, { recursive: true, force: true });
+          removeOwnerTree(paths.stateDir); removeOwnerTree(paths.supervisionDir); removeOwnerTree(paths.evidenceDir);
           throw error;
         }
       }
@@ -405,15 +412,16 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     } catch (error) { rollbackPlans(plans, parentSessionFile); throw error; }
   }
 
-  function finishPlanSafely(input: Omit<PlannedRun, "runId" | "jobId" | "runRuntime"> & { runId?: string; contextFile?: string; pendingWorkSessionId?: string; mounts: WorkerSandboxMount[]; parentSessionFile: string; context: ExtensionContext }): PlannedRun {
+  function finishPlanSafely(input: Omit<PlannedRun, "runId" | "jobId" | "runRuntime"> & { runId?: string; contextFile?: string; pendingWorkSessionId?: string; promptInputs: RetainedInput[]; mounts: WorkerSandboxMount[]; parentSessionFile: string; context: ExtensionContext }): PlannedRun {
     try { return finishPlan(input); } catch (error) {
       if (input.consumedPrepared && input.preparedId) { try { restoreConsumedPreparedMergeSet(input.parentSessionFile, input.preparedId, input.paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, trustedSet: trustedPreparedSet(getRegistry(), input.parentSessionFile, input.preparedId) }); } catch {} }
-      if (input.newWorker) { rmSync(input.paths.stateDir, { recursive: true, force: true }); rmSync(input.paths.supervisionDir, { recursive: true, force: true }); rmSync(input.paths.evidenceDir, { recursive: true, force: true }); } else if (input.contextFile) rmSync(path.dirname(input.contextFile), { recursive: true, force: true });
+      if (input.newWorker) { removeOwnerTree(input.paths.stateDir); removeOwnerTree(input.paths.supervisionDir); removeOwnerTree(input.paths.evidenceDir); }
+      else if (input.runId) { removeOwnerTree(path.join(input.paths.supervisionDir, "runs", input.runId)); removeOwnerTree(path.join(input.paths.evidenceDir, "runs", input.runId)); removeOwnerTree(path.join(input.paths.stateDir, "cache-lineage", input.runId)); }
       throw error;
     }
   }
 
-  function finishPlan(input: Omit<PlannedRun, "runId" | "jobId" | "runRuntime"> & { runId?: string; contextFile?: string; pendingWorkSessionId?: string; mounts: WorkerSandboxMount[]; parentSessionFile: string; context: ExtensionContext }): PlannedRun {
+  function finishPlan(input: Omit<PlannedRun, "runId" | "jobId" | "runRuntime"> & { runId?: string; contextFile?: string; pendingWorkSessionId?: string; promptInputs: RetainedInput[]; mounts: WorkerSandboxMount[]; parentSessionFile: string; context: ExtensionContext }): PlannedRun {
     assertWorkerStoragePaths(input.paths);
     const runId = input.runId ?? createWorkerRunId(now(), random()); const jobId = createAsyncJobId(now(), random());
     const runDir = path.join(input.paths.supervisionDir, "runs", runId); mkdirSync(runDir, { recursive: true, mode: 0o700 });
@@ -434,7 +442,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const interruptionWarnings = interruptedPreviously ? inspectInterruptedGitState(input.paths.workspaceRoot) : [];
     const prompt = renderWorkerRuntimePrompt(input.role, { workerId: input.workerId, runId, workspaceRoot: input.paths.workspaceRoot,
       codeRoot, taskIds: input.taskIds, roleInstructions,
-      instructions: request.instructions, repositoryBaselines: input.workerRuntime.repositoryBaselines, additionalInputs: contextInputs(input.workerRuntime.inputs),
+      instructions: request.instructions, repositoryBaselines: input.workerRuntime.repositoryBaselines, additionalInputs: immutablePromptInputs(input.promptInputs),
       reviewSubjectPath: input.contextFile && input.role === "review" ? (JSON.parse(readFileSync(input.contextFile, "utf8")) as { subjectWorkspace: string }).subjectWorkspace : undefined, reviewContextPath: input.role === "review" ? input.contextFile : undefined, integrationContextPath: input.role === "integration" ? input.contextFile : undefined, resumed: !input.newWorker,
       cacheLineageMarker: input.workerRuntime.cacheLineage?.mode === "eligible" ? input.workerRuntime.cacheLineage.marker : undefined, initialSession: Boolean(input.pendingWorkSessionId),
       cancelledPreviously: interruptedPreviously, interruptionWarnings, runtimeChange: legacyRuntimeTransition ? "This is the first version-4 Docker Sandbox run after retained legacy metadata; the old runtime was not reattached or trusted, a fresh immutable Sandbox was created, and executable contracts were refreshed." : runtimeChanged ? `Approved runtime changed from ${previousRuntime!.runtimeFingerprint.slice(0, 12)} to ${runtimeFingerprint.slice(0, 12)} (release ${previousRuntime!.releaseOrdinal} -> ${sandbox.releaseOrdinal}); executable contracts were refreshed and cache lineage is fresh.` : undefined });
@@ -442,14 +450,15 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       sandbox, runtimeFingerprint, releaseOrdinal: sandbox.releaseOrdinal, ...(input.contextFile ? { contextFile: input.contextFile } : {}), inputs: input.workerRuntime.inputs,
       repositoryBefore: snapshotWorkerRepositories(input.paths.workspaceRoot), ...(input.pendingWorkSessionId ? { pendingWorkSessionId: input.pendingWorkSessionId } : {}), ...(interruptionWarnings.length ? { interruptionWarnings } : {}) };
     return { request, role: input.role, workerId: input.workerId, runId, jobId, paths: input.paths, taskIds: input.taskIds, modelSelection: input.modelSelection, ...(input.binding ? { binding: input.binding } : {}), workerRuntime: input.workerRuntime, runRuntime,
-      newWorker: input.newWorker, ...(input.expectedVersion === undefined ? {} : { expectedVersion: input.expectedVersion }), ...(input.reviewedRunId ? { reviewedRunId: input.reviewedRunId } : {}), ...(input.preparedId ? { preparedId: input.preparedId } : {}), ...(input.consumedPrepared ? { consumedPrepared: true } : {}), ...(input.operationRepositories ? { operationRepositories: input.operationRepositories } : {}) };
+      newWorker: input.newWorker, ...(input.preflightReviewLease ? { preflightReviewLease: true } : {}), ...(input.expectedVersion === undefined ? {} : { expectedVersion: input.expectedVersion }), ...(input.reviewedRunId ? { reviewedRunId: input.reviewedRunId } : {}), ...(input.preparedId ? { preparedId: input.preparedId } : {}), ...(input.consumedPrepared ? { consumedPrepared: true } : {}), ...(input.operationRepositories ? { operationRepositories: input.operationRepositories } : {}) };
   }
 
   function rollbackPlans(plans: PlannedRun[], parentSessionFile: string): void {
     for (const plan of [...plans].reverse()) {
+      if (plan.preflightReviewLease && plan.reviewedRunId && plan.binding && "reviewedWorkerId" in plan.binding) { try { releaseWorkerReviewLease(getRegistry(), plan.binding.reviewedWorkerId, plan.workerId, now().toISOString()); } catch {} }
       if (plan.consumedPrepared && plan.preparedId) { try { restoreConsumedPreparedMergeSet(parentSessionFile, plan.preparedId, plan.paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, trustedSet: trustedPreparedSet(getRegistry(), parentSessionFile, plan.preparedId) }); } catch {} }
-      if (plan.newWorker) { rmSync(plan.paths.stateDir, { recursive: true, force: true }); rmSync(plan.paths.supervisionDir, { recursive: true, force: true }); rmSync(plan.paths.evidenceDir, { recursive: true, force: true }); }
-      else { rmSync(plan.runRuntime.runDir, { recursive: true, force: true }); if (plan.runRuntime.contextFile) rmSync(path.dirname(plan.runRuntime.contextFile), { recursive: true, force: true }); }
+      if (plan.newWorker) { removeOwnerTree(plan.paths.stateDir); removeOwnerTree(plan.paths.supervisionDir); removeOwnerTree(plan.paths.evidenceDir); }
+      else { removeOwnerTree(plan.runRuntime.runDir); if (plan.runRuntime.contextFile) removeOwnerTree(path.dirname(plan.runRuntime.contextFile)); }
     }
   }
 
@@ -575,27 +584,61 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       await waitForRuntimeAdmissions(runtime, authorizationFile);
       const attached = active.get(worker.workerId);
       if (existsSync(runtime.resultFile)) {
-        for (let attempt = 0; attempt < 100 && !existsSync(runtime.settledFile); attempt += 1) await delay(50);
-        if (!existsSync(runtime.settledFile)) throw new Error("A worker result committed during cancellation but typed settlement is not yet complete.");
-        const exited = attached?.runId === runId ? await Promise.race([attached.handle.completion.then(() => true), delay(10_000).then(() => false)]) : false;
-        if (!exited) await removeSandbox(sbx(), runtime.sandbox);
-        await proveWorkerHostExited(runtime, worker.workerId, runId);
+        const accepted = readWorkerRuntimeResult(runtime.resultFile);
+        if (accepted.workerId !== worker.workerId || accepted.runId !== runId) throw new Error("Worker result identity mismatch during cancellation.");
+        const deadline = Date.now() + cancellationResultGraceMs;
+        while (!existsSync(runtime.settledFile) && Date.now() < deadline) await delay(Math.min(50, Math.max(1, deadline - Date.now())));
+        if (!existsSync(runtime.settledFile)) {
+          requestWorkerCancellation(runtime, worker.workerId, runId);
+          if (attached?.runId === runId) await Promise.race([attached.handle.completion, delay(cancellationEofGraceMs)]);
+          await removeSandbox(sbx(), runtime.sandbox); await proveWorkerHostExited(runtime, worker.workerId, runId);
+          finalizeAcceptedCancellation(worker, run, runtime, nonce, accepted);
+          active.delete(worker.workerId); deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration); return "not_active";
+        }
+        if (attached?.runId === runId) await Promise.race([attached.handle.completion, delay(cancellationEofGraceMs)]);
+        await removeSandbox(sbx(), runtime.sandbox); await proveWorkerHostExited(runtime, worker.workerId, runId);
         releaseWorkerRunClaim(getRegistry(), worker.workerId, runId, "cancellation", nonce);
         await settleCompletedRun(worker.workerId, runId, { status: "exited", exitCode: 0 });
         return "not_active";
       }
       const launching = starting.get(worker.workerId); if (launching?.runId === runId) await launching.completion;
       const liveAttached = active.get(worker.workerId); let supervisedProcess: ReturnType<typeof readWorkerHostProcess> | undefined;
-      if (existsSync(runtime.processFile)) { supervisedProcess = readWorkerHostProcess(runtime.processFile); if (supervisedProcess.workerId !== worker.workerId || supervisedProcess.runId !== runId || supervisedProcess.nonce !== runtime.processNonce) throw new Error("Worker host process identity mismatch during cancellation."); if (isAsyncJobProcessIdentityAlive(supervisedProcess)) writeFileSync(path.join(runtime.runDir, "cancel-request.json"), `${JSON.stringify({ version: 1, workerId: worker.workerId, runId, requestedAt: now().toISOString() })}\n`, { flag: "wx", mode: 0o600 }); }
-      if (liveAttached?.runId === runId) await Promise.race([liveAttached.handle.completion, delay(12_000)]);
+      if (existsSync(runtime.processFile)) { supervisedProcess = readWorkerHostProcess(runtime.processFile); if (supervisedProcess.workerId !== worker.workerId || supervisedProcess.runId !== runId || supervisedProcess.nonce !== runtime.processNonce) throw new Error("Worker host process identity mismatch during cancellation."); if (isAsyncJobProcessIdentityAlive(supervisedProcess)) writeCancellationRequest(runtime, worker.workerId, runId); }
+      if (liveAttached?.runId === runId) await Promise.race([liveAttached.handle.completion, delay(cancellationEofGraceMs)]);
       else if (supervisedProcess) for (let attempt = 0; attempt < 120 && isAsyncJobProcessIdentityAlive(supervisedProcess); attempt += 1) await delay(100);
-      await removeSandbox(sbx(), runtime.sandbox);
-      await proveWorkerHostExited(runtime, worker.workerId, runId);
-
-
+      await removeSandbox(sbx(), runtime.sandbox); await proveWorkerHostExited(runtime, worker.workerId, runId);
       finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId: worker.workerId, runId, claimKind: "cancellation", claimNonce: nonce, outcome: "cancelled", outcomeSource: "system", summary: "Worker run was cancelled by its parent.", sessionEndLine: worker.sessionFile ? safeCountLines(worker.sessionFile, workerPaths(roots, worker.workerId).sessionDir) : undefined, settledAt: now().toISOString() });
       active.delete(worker.workerId); deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration); return "cancelled";
     } catch (error) { recordRecovery(worker.workerId, runId, error); throw new Error(`Worker ${worker.workerId}/${runId} cancellation requires recovery: ${sanitizeError(error)}`); }
+  }
+
+  function requestWorkerCancellation(runtime: RunRuntime, workerId: string, runId: string): void {
+    if (!existsSync(runtime.processFile)) return;
+    const supervised = readWorkerHostProcess(runtime.processFile);
+    if (supervised.workerId !== workerId || supervised.runId !== runId || supervised.nonce !== runtime.processNonce) throw new Error("Worker host process identity mismatch during cancellation.");
+    if (isAsyncJobProcessIdentityAlive(supervised)) writeCancellationRequest(runtime, workerId, runId);
+  }
+
+  function writeCancellationRequest(runtime: RunRuntime, workerId: string, runId: string): void {
+    const file = path.join(runtime.runDir, "cancel-request.json");
+    if (existsSync(file)) {
+      const retained = JSON.parse(readBoundedNoFollowFile(file, runtime.runDir, 4096, "worker cancellation request").toString("utf8")) as { version?: unknown; workerId?: unknown; runId?: unknown };
+      if (retained.version === 1 && retained.workerId === workerId && retained.runId === runId) return;
+      throw new Error("Retained worker cancellation request identity mismatch.");
+    }
+    try { writeFileSync(file, `${JSON.stringify({ version: 1, workerId, runId, requestedAt: now().toISOString() })}\n`, { flag: "wx", mode: 0o600 }); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") return writeCancellationRequest(runtime, workerId, runId); throw error; }
+  }
+
+  function finalizeAcceptedCancellation(worker: WorkerRegistryRecord, run: WorkerRunRecord, runtime: RunRuntime, nonce: string, accepted: ReturnType<typeof readWorkerRuntimeResult>): void {
+    const reported = accepted.result.repositories ?? []; const artifacts = accepted.result.artifacts ?? []; const errors: Array<{ scope: "run" | "repositories" | "artifacts"; message: string }> = [];
+    let repositories: WorkerRepositoryResult[] = [];
+    try {
+      assertWorkerStoragePaths(workerPaths(roots, worker.workerId));
+      const inventory = inventoryWorkerRepositories({ workspaceRoot: worker.workspaceRoot, workerId: worker.workerId, runId: run.runId, reported, before: runtime.repositoryBefore }); repositories = inventory.repositories;
+      errors.push(...inventory.errors.map((message) => ({ scope: "repositories" as const, message: sanitizeError(message) })));
+    } catch (storageError) { errors.push({ scope: "run", message: `Accepted worker result was retained, but post-containment storage inventory was unavailable: ${sanitizeError(storageError)}` }); }
+    finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId: worker.workerId, runId: run.runId, claimKind: "cancellation", claimNonce: nonce, outcome: accepted.result.outcome, outcomeSource: "worker", summary: accepted.result.summary.slice(0, 2048), ...(accepted.result.question ? { question: accepted.result.question } : {}), repositories, artifacts, errors, sessionEndLine: worker.sessionFile ? safeCountLines(worker.sessionFile, workerPaths(roots, worker.workerId).sessionDir) : undefined, settledAt: now().toISOString() });
   }
 
   async function waitForRuntimeAdmissions(runtime: RunRuntime, authorizationFile: string): Promise<void> {
@@ -622,26 +665,29 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       if (row.operation_nonce.startsWith(`${generation}-`)) continue;
       const paths = workerPaths(roots, row.worker_id); const stateTrash = `${paths.stateDir}.discard-${row.operation_nonce}`;
       const separateWorkspace = path.resolve(row.workspace_root).startsWith(`${path.resolve(paths.stateDir)}${path.sep}`) ? undefined : `${row.workspace_root}.discard-${row.operation_nonce}`;
-      const irreversible = (!existsSync(paths.stateDir) && !existsSync(stateTrash)) || Boolean(separateWorkspace && !existsSync(row.workspace_root) && !existsSync(separateWorkspace));
-      if (irreversible) { rmSync(paths.stateDir, { recursive: true, force: true }); rmSync(stateTrash, { recursive: true, force: true }); if (separateWorkspace) { rmSync(row.workspace_root, { recursive: true, force: true }); rmSync(separateWorkspace, { recursive: true, force: true }); } finalizeWorkerDiscard(getRegistry(), row.worker_id, row.operation_nonce); continue; }
-      restoreDiscardPath(stateTrash, paths.stateDir); if (separateWorkspace) restoreDiscardPath(separateWorkspace, row.workspace_root);
+      try {
+        for (const candidate of [paths.stateDir, stateTrash, paths.supervisionDir, paths.evidenceDir, row.workspace_root, separateWorkspace].filter((item): item is string => Boolean(item))) prepareOwnerRemovalTree(candidate);
+        if (existsSync(paths.stateDir)) { if (existsSync(stateTrash)) throw new Error("Interrupted discard retained both state and trash directories."); renameSync(paths.stateDir, stateTrash); }
+        if (separateWorkspace && existsSync(row.workspace_root)) { if (existsSync(separateWorkspace)) throw new Error("Interrupted discard retained both workspace and trash directories."); renameSync(row.workspace_root, separateWorkspace); }
+        removeOwnerTree(paths.supervisionDir); removeOwnerTree(paths.evidenceDir); removeOwnerTree(stateTrash); if (separateWorkspace) removeOwnerTree(separateWorkspace);
+        finalizeWorkerDiscard(getRegistry(), row.worker_id, row.operation_nonce);
+      } catch (error) {
+        abandonWorkerDiscard(getRegistry(), row.worker_id, row.operation_nonce, `Interrupted discard cleanup failed: ${sanitizeError(error)}`, now().toISOString());
+      }
     }
-  }
-  function restoreDiscardPath(trash: string, destination: string): void {
-    if (!existsSync(trash)) return;
-    if (existsSync(destination)) { rmSync(trash, { recursive: true, force: true }); return; }
-    renameSync(trash, destination);
   }
 
   async function discardWorker(worker: WorkerRegistryRecord): Promise<void> {
     const nonce = claimNonce(); claimWorkerDiscard(getRegistry(), worker.workerId, worker.version, nonce, now().toISOString());
     const paths = workerPaths(roots, worker.workerId); const stateTrash = `${paths.stateDir}.discard-${nonce}`; const separateWorkspace = path.resolve(paths.workspaceRoot).startsWith(`${path.resolve(paths.stateDir)}${path.sep}`) ? undefined : `${paths.workspaceRoot}.discard-${nonce}`;
     try {
+      for (const candidate of [paths.stateDir, paths.supervisionDir, paths.evidenceDir, separateWorkspace ? paths.workspaceRoot : undefined].filter((item): item is string => Boolean(item))) prepareOwnerRemovalTree(candidate);
+      if (existsSync(stateTrash) || (separateWorkspace && existsSync(separateWorkspace))) throw new Error("Discard trash destination already exists.");
       if (existsSync(paths.stateDir)) renameSync(paths.stateDir, stateTrash); if (separateWorkspace && existsSync(paths.workspaceRoot)) renameSync(paths.workspaceRoot, separateWorkspace);
-      rmSync(stateTrash, { recursive: true, force: true }); rmSync(paths.supervisionDir, { recursive: true, force: true }); rmSync(paths.evidenceDir, { recursive: true, force: true }); if (separateWorkspace) rmSync(separateWorkspace, { recursive: true, force: true }); finalizeWorkerDiscard(getRegistry(), worker.workerId, nonce);
+      removeOwnerTree(paths.supervisionDir); removeOwnerTree(paths.evidenceDir); removeOwnerTree(stateTrash); if (separateWorkspace) removeOwnerTree(separateWorkspace); finalizeWorkerDiscard(getRegistry(), worker.workerId, nonce);
     } catch (error) {
-      const irreversible = (!existsSync(paths.stateDir) && !existsSync(stateTrash)) || Boolean(separateWorkspace && !existsSync(paths.workspaceRoot) && !existsSync(separateWorkspace));
-      if (!irreversible) { try { if (existsSync(stateTrash) && !existsSync(paths.stateDir)) renameSync(stateTrash, paths.stateDir); if (separateWorkspace && existsSync(separateWorkspace) && !existsSync(paths.workspaceRoot)) renameSync(separateWorkspace, paths.workspaceRoot); } catch {} abandonWorkerDiscard(getRegistry(), worker.workerId, nonce, sanitizeError(error), now().toISOString()); }
+      try { if (existsSync(stateTrash) && !existsSync(paths.stateDir)) renameSync(stateTrash, paths.stateDir); if (separateWorkspace && existsSync(separateWorkspace) && !existsSync(paths.workspaceRoot)) renameSync(separateWorkspace, paths.workspaceRoot); } catch {}
+      abandonWorkerDiscard(getRegistry(), worker.workerId, nonce, sanitizeError(error), now().toISOString());
       throw error;
     }
   }
@@ -712,6 +758,23 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   function recordRecovery(workerId: string, runId: string, error: unknown): void { try { const message = sanitizeError(error); setWorkerRecoveryError(getRegistry(), workerId, runId, message, now().toISOString()); const worker = getWorker(getRegistry(), workerId); const run = worker && getWorkerRun(getRegistry(), workerId, runId); if (worker && run) deliverRecovery(worker, run, message); } catch {} }
 }
 
+function prepareOwnerRemovalTree(root: string): void {
+  let rootMetadata: ReturnType<typeof lstatSync>;
+  try { rootMetadata = lstatSync(root); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+  if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) return;
+  const pending = [root]; let visited = 0;
+  while (pending.length) {
+    const directory = pending.pop()!; if (++visited > 1_000_000) throw new Error(`Owner-removal preflight exceeds 1000000 directories beneath ${root}.`);
+    const metadata = lstatSync(directory); if (!metadata.isDirectory() || metadata.isSymbolicLink()) continue; chmodSync(directory, 0o700);
+    for (const name of readdirSync(directory)) { const candidate = path.join(directory, name); const child = lstatSync(candidate); if (child.isDirectory() && !child.isSymbolicLink()) pending.push(candidate); }
+  }
+}
+function removeOwnerTree(root: string): void { prepareOwnerRemovalTree(root); rmSync(root, { recursive: true, force: true }); }
+
+function immutablePromptInputs(inputs: RetainedInput[]): Array<{ sourcePath: string; mountedPath: string; type: "file" | "directory" }> {
+  return inputs.map((item) => ({ sourcePath: item.mountedPath, mountedPath: item.mountedPath, type: item.type }));
+}
+
 function updateWorkerActivityStatus(registry: WorkerRegistry, context: ExtensionContext): void {
   if (context.mode !== "tui" || !context.hasUI || typeof context.ui?.setStatus !== "function" || !context.ui.theme) return;
   let count = 0;
@@ -746,7 +809,7 @@ export function snapshotAdditionalInputs(directory: string, inputs: RetainedInpu
   return inputs.map((item, index) => {
     const original = realpathSync(item.sourcePath); const name = `${String(index + 1).padStart(3, "0")}-${createHash("sha256").update(original).digest("hex").slice(0, 12)}-${path.basename(original)}`; const target = path.join(root, name);
     const metadata = lstatSync(original);
-    if (metadata.isFile()) { mkdirSync(target, { mode: 0o700 }); const mountedPath = path.join(target, path.basename(original)); snapshotOrdinaryNode(original, mountedPath, budget); chmodSync(target, 0o500); return { ...item, source: target, target, mountedPath }; }
+    if (metadata.isFile()) { mkdirSync(target, { mode: 0o700 }); const mountedPath = path.join(target, path.basename(original)); snapshotOrdinaryNode(original, mountedPath, budget); chmodSync(target, 0o700); return { ...item, source: target, target, mountedPath }; }
     snapshotOrdinaryNode(original, target, budget);
     return { ...item, source: target, target, mountedPath: target };
   });
@@ -754,7 +817,7 @@ export function snapshotAdditionalInputs(directory: string, inputs: RetainedInpu
 function snapshotOrdinaryNode(source: string, target: string, budget: { nodes: number; bytes: number }): void {
   if (++budget.nodes > 10_000) throw new Error("Additional-input snapshot exceeds 10000 ordinary filesystem nodes.");
   const metadata = lstatSync(source); if (metadata.isSymbolicLink()) throw new Error(`Additional-input snapshots reject symbolic links: ${source}.`);
-  if (metadata.isDirectory()) { mkdirSync(target, { mode: 0o700 }); for (const name of readdirSync(source).sort()) snapshotOrdinaryNode(path.join(source, name), path.join(target, name), budget); chmodSync(target, 0o500); return; }
+  if (metadata.isDirectory()) { mkdirSync(target, { mode: 0o700 }); for (const name of readdirSync(source).sort()) snapshotOrdinaryNode(path.join(source, name), path.join(target, name), budget); chmodSync(target, 0o700); return; }
   if (!metadata.isFile()) throw new Error(`Additional-input snapshots accept ordinary files and directories only: ${source}.`);
   if ((budget.bytes += metadata.size) > 256 * 1024 * 1024) throw new Error("Additional-input snapshot exceeds 256 MiB.");
   const descriptor = openSync(source, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0)); try { const current = fstatSync(descriptor); if (!current.isFile() || current.dev !== metadata.dev || current.ino !== metadata.ino || current.size !== metadata.size) throw new Error(`Additional input changed during snapshot: ${source}.`); writeFileSync(target, readFileSync(descriptor), { mode: 0o400, flag: "wx" }); } finally { closeSync(descriptor); }
@@ -772,26 +835,43 @@ function writeReviewContext(directory: string, subjectPaths: WorkerPaths, review
   const selected = lines.slice(startLine - 1, endLine).join("\n");
   writeFileSync(sessionFile, `${selected}${selected && !selected.endsWith("\n") ? "\n" : ""}`, { mode: 0o400 });
   const subjectWorkspace = path.join(directory, "subject"); mkdirSync(subjectWorkspace, { mode: 0o700 });
-  const materializedRepositories = subjectRun.repositories.map((repository, index) => {
+  const skippedRepositories: Array<{ candidateId: string; path: string; reason: string }> = [];
+  const materializedRepositories: WorkerRepositoryResult[] = [];
+  for (const [index, repository] of subjectRun.repositories.entries()) {
+    if (!repository.eligible || !/^[0-9a-f]{40}$/.test(repository.commit)) {
+      skippedRepositories.push({ candidateId: repository.candidateId, path: repository.path, reason: repository.eligible ? "The reported commit is not an exact lowercase 40-hex object ID." : (repository.issues?.join("; ") || "Repository was not eligible at result acceptance.") });
+      continue;
+    }
     const source = path.join(subjectWorker.workspaceRoot, repository.path); assertContainedOrdinaryDirectory(subjectWorker.workspaceRoot, source, "review candidate repository");
     if (trustedGit(source, ["rev-parse", `${repository.commit}^{commit}`]).trim() !== repository.commit) throw new Error("Review candidate commit is unavailable from its reported repository.");
-    const bundle = path.join(directory, `.candidate-${index + 1}.bundle`); const target = path.join(subjectWorkspace, `${String(index + 1).padStart(3, "0")}-${repository.candidateId}`);
-    trustedGit(source, ["bundle", "create", bundle, repository.commit], { maxBuffer: 128 * 1024 * 1024 });
-    try { execFileSync("git", trustedGitArgs(["clone", "--no-checkout", "--", bundle, target]), { env: trustedGitEnvironment(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 16 * 1024 * 1024 }); trustedGit(target, ["checkout", "--detach", repository.commit]); } finally { rmSync(bundle, { force: true }); }
+    const target = path.join(subjectWorkspace, `${String(index + 1).padStart(3, "0")}-${repository.candidateId}`);
+    const branch = `pi-worker-review-${createHash("sha256").update(`${reviewerWorkerId}\0${contextId}\0${repository.candidateId}`).digest("hex").slice(0, 24)}`;
+    const sourceRef = `refs/heads/${branch}`;
+    trustedGit(source, ["update-ref", sourceRef, repository.commit, "0".repeat(40)]);
+    try {
+      execFileSync("git", trustedGitArgs(["clone", "--no-local", "--no-checkout", "--single-branch", "--branch", branch, "--no-tags", "--", source, target]), { env: trustedGitEnvironment(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 16 * 1024 * 1024 });
+    } finally {
+      trustedGit(source, ["update-ref", "-d", sourceRef, repository.commit]);
+    }
+    trustedGit(target, ["checkout", "--detach", repository.commit]);
+    try { trustedGit(target, ["remote", "remove", "origin"]); } catch {}
+    try { trustedGit(target, ["branch", "-D", branch]); } catch {}
     if (trustedGit(target, ["rev-parse", "HEAD"]).trim() !== repository.commit) throw new Error("Materialized review candidate commit mismatch.");
-    makeReadonlyTree(target, { nodes: 0, bytes: 0 }); return { ...repository, path: path.relative(subjectWorkspace, target) };
-  });
-  chmodSync(subjectWorkspace, 0o500);
+    makeReadonlyTree(target, { nodes: 0, bytes: 0 }); materializedRepositories.push({ ...repository, path: path.relative(subjectWorkspace, target) });
+  }
+  chmodSync(subjectWorkspace, 0o700);
   const artifactRoot = path.join(directory, "artifacts"); mkdirSync(artifactRoot, { mode: 0o700 }); const artifactBudget = { nodes: 0, bytes: 0 };
-  const materializedArtifacts = subjectRun.artifacts.map((artifact, index) => { const source = path.resolve(subjectWorker.workspaceRoot, artifact); assertContainedPathWithoutSymlinks(subjectWorker.workspaceRoot, source, "review subject artifact"); const target = path.join(artifactRoot, `${String(index + 1).padStart(3, "0")}-${createHash("sha256").update(source).digest("hex").slice(0, 12)}-${path.basename(source)}`); snapshotOrdinaryNode(source, target, artifactBudget); return target; }); chmodSync(artifactRoot, 0o500);
+  const materializedArtifacts = subjectRun.artifacts.map((artifact, index) => { const source = path.resolve(subjectWorker.workspaceRoot, artifact); assertContainedPathWithoutSymlinks(subjectWorker.workspaceRoot, source, "review subject artifact"); const target = path.join(artifactRoot, `${String(index + 1).padStart(3, "0")}-${createHash("sha256").update(source).digest("hex").slice(0, 12)}-${path.basename(source)}`); snapshotOrdinaryNode(source, target, artifactBudget); return target; }); chmodSync(artifactRoot, 0o700);
   const file = path.join(directory, "context.json");
-  const value = { version: 2, reviewerWorkerId, reviewedWorkerId: subjectWorker.workerId, reviewedRunId: subjectRun.runId, subjectWorkspace, session: { path: sessionFile, sourceRange: { startLine, endLine }, snapshotRange: { startLine: 1, endLine: endLine - startLine + 1 } }, repositories: materializedRepositories, artifacts: materializedArtifacts, candidates: materializedRepositories.map(({ candidateId, path, reported, changed, dirty, eligible, issues }) => ({ candidateId, path, reported, changed, dirty, eligible, ...(issues ? { issues } : {}) })), additionalInputs: contextInputs(inputs) };
+  const materializedByCandidate = new Map(materializedRepositories.map((repository) => [repository.candidateId, repository]));
+  const candidates = subjectRun.repositories.map(({ candidateId, path: reportedPath, reported, changed, dirty, eligible, issues }) => { const materialized = materializedByCandidate.get(candidateId); return { candidateId, reportedPath, reported, changed, dirty, eligible, materialized: Boolean(materialized), ...(materialized ? { path: materialized.path } : {}), ...(issues ? { issues } : {}) }; });
+  const value = { version: 2, reviewerWorkerId, reviewedWorkerId: subjectWorker.workerId, reviewedRunId: subjectRun.runId, subjectWorkspace, session: { path: sessionFile, sourceRange: { startLine, endLine }, snapshotRange: { startLine: 1, endLine: endLine - startLine + 1 } }, repositories: materializedRepositories, skippedRepositories, artifacts: materializedArtifacts, candidates, additionalInputs: contextInputs(inputs) };
   writeReadonlyJson(file, value); return file;
 }
 function makeReadonlyTree(root: string, budget: { nodes: number; bytes: number }): void {
   if (++budget.nodes > 250_000) throw new Error("Review candidate snapshot exceeds 250000 filesystem nodes.");
   const metadata = lstatSync(root); if (metadata.isSymbolicLink()) throw new Error(`Review candidate snapshots reject symbolic links: ${root}.`);
-  if (metadata.isDirectory()) { for (const name of readdirSync(root).sort()) makeReadonlyTree(path.join(root, name), budget); chmodSync(root, 0o500); }
+  if (metadata.isDirectory()) { for (const name of readdirSync(root).sort()) makeReadonlyTree(path.join(root, name), budget); chmodSync(root, 0o700); }
   else if (metadata.isFile()) { if ((budget.bytes += metadata.size) > 2 * 1024 * 1024 * 1024) throw new Error("Review candidate snapshot exceeds 2 GiB."); chmodSync(root, 0o400); }
   else throw new Error(`Review candidate contains an unsupported filesystem node: ${root}.`);
 }

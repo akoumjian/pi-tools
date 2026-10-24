@@ -314,12 +314,28 @@ async function executeTaskUpdate(params: WorkerTaskUpdate): Promise<AgentToolRes
   if (workerRuntimeRole() === "review") throw new Error("Review workers cannot update Beads tasks.");
   const runtime = workerTaskRuntime(); if (!runtime.taskIds.has(params.taskId)) throw new Error(`Worker ${runtime.workerId} is not authorized to mutate Beads task ${params.taskId}.`);
   verifyPersonalBeadsRoute(runtime);
-  const args = ["update", params.taskId, `--append-notes=${params.note.trim()}`]; if (params.status) args.push("--status", params.status); args.push("--actor", `worker:${runtime.workerId}`, "--json");
+  const note = params.note.trim(); const args = ["update", params.taskId, `--append-notes=${note}`]; if (params.status) args.push("--status", params.status); args.push("--actor", `worker:${runtime.workerId}`, "--json");
   const identity = workerRuntimeIdentity(); const admissionFile = beginWorkerMutationAdmission(identity);
-  try { assertRuntimeAuthorization(identity, "worker_beads_tasks"); execFileSync(runtime.bdPath, args, { cwd: runtime.workspaceRoot, env: process.env, encoding: "utf8", maxBuffer: MAX_WORKER_BEADS_OUTPUT_BYTES, timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] }); }
-  catch (error) { if (error instanceof Error && error.message.includes("revoked")) throw error; throw new Error(`worker_beads_tasks could not record an update for ${params.taskId}.`); }
+  const payloadSha256 = createHash("sha256").update(JSON.stringify({ taskId: params.taskId, note, status: params.status ?? null })).digest("hex");
+  const journalRoot = path.join(path.dirname(identity.resultFile), "beads-updates"); const journalFile = path.join(journalRoot, `${payloadSha256}.json`);
+  try {
+    assertRuntimeAuthorization(identity, "worker_beads_tasks"); mkdirSync(journalRoot, { recursive: true, mode: 0o700 });
+    const rootMetadata = lstatSync(journalRoot); if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) throw new Error("Worker Beads update journal is not an ordinary host directory.");
+    if (existsSync(journalFile)) {
+      const prior = JSON.parse(readFileSync(journalFile, "utf8")) as { version?: unknown; workerId?: unknown; runId?: unknown; payloadSha256?: unknown; state?: unknown };
+      if (prior.version !== 1 || prior.workerId !== identity.workerId || prior.runId !== identity.runId || prior.payloadSha256 !== payloadSha256) throw new Error("Retained worker Beads update journal identity mismatch.");
+      if (prior.state === "recorded") return taskUpdateResult(params.taskId, params.status);
+      throw new Error(`Retained worker Beads update outcome is uncertain for ${params.taskId}; inspect the central task before attempting a different note.`);
+    }
+    writeFileSync(journalFile, `${JSON.stringify({ version: 1, workerId: identity.workerId, runId: identity.runId, payloadSha256, state: "admitting", admittedAt: new Date().toISOString() })}\n`, { flag: "wx", mode: 0o600 });
+    assertRuntimeAuthorization(identity, "worker_beads_tasks"); execFileSync(runtime.bdPath, args, { cwd: runtime.workspaceRoot, env: process.env, encoding: "utf8", maxBuffer: MAX_WORKER_BEADS_OUTPUT_BYTES, timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] });
+    writeAtomicJson(journalFile, { version: 1, workerId: identity.workerId, runId: identity.runId, payloadSha256, state: "recorded", recordedAt: new Date().toISOString() });
+  } catch (error) { if (error instanceof Error && (error.message.includes("revoked") || error.message.includes("journal") || error.message.includes("outcome is uncertain"))) throw error; throw new Error(`worker_beads_tasks could not record an update for ${params.taskId}.`); }
   finally { rmSync(admissionFile, { force: true }); }
-  return { content: [{ type: "text", text: `Recorded a durable worker note on ${params.taskId}${params.status ? ` and set status ${params.status}` : ""}.` }], details: { taskId: params.taskId, ...(params.status ? { status: params.status } : {}), recorded: true } };
+  return taskUpdateResult(params.taskId, params.status);
+}
+function taskUpdateResult(taskId: string, status?: string): AgentToolResult<{ taskId: string; status?: string; recorded: true }> {
+  return { content: [{ type: "text", text: `Recorded a durable worker note on ${taskId}${status ? ` and set status ${status}` : ""}.` }], details: { taskId, ...(status ? { status } : {}), recorded: true } };
 }
 
 function assignedTaskIds(): Set<string> {

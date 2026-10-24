@@ -383,6 +383,9 @@ test("Codex lineage restores the exact parent prefix and appends only managed-wo
     if (continued?.mode !== "eligible") throw new Error("Expected continued eligible lineage.");
     assert.notEqual(continued.snapshotFile, record.snapshotFile); assert.equal(continued.marker, record.marker); assert.equal(continued.runtimeFingerprint, record.runtimeFingerprint); assert.equal(continued.hostGeneration, "run_20260924120002_bbbbbbbb");
     assert.deepEqual(summarizeWorkerCacheLineage(continued), { mode: "adopted" }); assert.equal(existsSync(continued.adoptionFile), true);
+    const retainedSnapshot = readFileSync(record.snapshotFile, "utf8"); rmSync(record.snapshotFile); assert.throws(() => continueWorkerCacheLineage(record, path.join(root, "missing-snapshot"), "run_20260924120003_cccccccc"), /snapshot is missing or unreadable/); writeFileSync(record.snapshotFile, retainedSnapshot);
+    writeFileSync(record.snapshotFile, `${retainedSnapshot}corrupt`); assert.throws(() => continueWorkerCacheLineage(record, path.join(root, "corrupt-snapshot"), "run_20260924120004_dddddddd"), /snapshot integrity mismatch/); writeFileSync(record.snapshotFile, retainedSnapshot);
+    const retainedAdoption = readFileSync(record.adoptionFile, "utf8"); rmSync(record.adoptionFile); assert.throws(() => continueWorkerCacheLineage(record, path.join(root, "missing-adoption"), "run_20260924120005_eeeeeeee"), /adoption evidence is missing or corrupt/); writeFileSync(record.adoptionFile, retainedAdoption);
 
     const headers: Record<string, string> = {
       "session-id": "child-local-session",
