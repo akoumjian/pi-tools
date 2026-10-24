@@ -22,7 +22,7 @@ import {
   getWorker, getWorkerDeliveryForRun, getWorkerRun, listWorkerRuns, listWorkers, markWorkerDeliveryDelivered, markWorkerDeliverySendStarted, openWorkerRegistry, pendingWorkerDeliveries,
   currentParentRuntime, latestParentRuntimeMembers, parentRuntimeMemberForGeneration, promoteParentRuntime, readPreparedSetRecord, recordWorkerSettlementRecovery, reconcileWorkerDeliveries, registerParentRuntimeAndRecoverClaims, releasePreparedSetApply, releaseWorkerDeliveryClaim, releaseWorkerRunClaim, recoverProvablyDeadWorkerDeliveryClaim, recoverProvablyDeadWorkerRunClaim, requestWorkerCancellation, requestWorkerFailure, retireParentRuntime, setClaimedWorkerTerminalIntent, setWorkerRecoveryError, storePreparedSet,
   subscribeWorkerRegistryChanges, updateClaimedWorkerRunRuntime, updatePreparedSetStatus, updateWorkerRuntimeMetadata, workerRegistryDataVersion,
-  type ParentRuntimeIdentity, type ParentRuntimeMember, type WorkerBatchCreateItem, type WorkerLifecycleClaimRecoveryCandidate, type WorkerRegistry, type WorkerRegistryRecord, type WorkerRepositoryResult, type WorkerRole, type WorkerRunRecord, type WorkerTerminalIntent
+  type ParentRuntimeIdentity, type ParentRuntimeMember, type WorkerBatchCreateItem, type WorkerDeliveryRecord, type WorkerLifecycleClaimRecoveryCandidate, type WorkerRegistry, type WorkerRegistryRecord, type WorkerRepositoryResult, type WorkerRole, type WorkerRunRecord, type WorkerTerminalIntent
 } from "./registry.js";
 import { readWorkerRuntimeResult } from "./runtime.js";
 import { cleanupReviewOverlayAsync, createReviewOverlayAsync, type ReviewOverlayRecord } from "./review-workspace.js";
@@ -129,6 +129,8 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   const starting = new Map<string, { runId: string; completion: Promise<void> }>();
   const terminalRecoveries = new Map<string, Promise<"cancelled" | "failed" | "not_active">>();
   const deliveredRecovery = new Set<string>();
+  let unconfirmedWarningGeneration = 0;
+  const warnedUnconfirmedRuns = new Set<string>();
   const lifecycleClaimProbeAt = new Map<string, number>();
   const getRegistry = () => registry ??= openWorkerRegistry(runtimeRoot);
   const operationSnapshots = new Map<string, WorkerOperationSnapshot>();
@@ -182,6 +184,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       deliveredRecovery.clear();
       observedDataVersion = workerRegistryDataVersion(getRegistry());
       recoverDeadDeliveryClaims(exactParent);
+      warnUnconfirmedCompletionSends(exactParent);
       deliverPendingCompletions(api, getRegistry(), exactParent, runtimeGeneration);
       void Promise.resolve().then(() => reconcileActiveRuns(launchInputs, exactParent)).catch(() => {});
       if (deliveryTimer) clearInterval(deliveryTimer);
@@ -512,7 +515,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       if (uncertain) return "unknown";
       const identity: ParentRuntimeIdentity = { runtimeId: registration.runtimeId, pid: process.pid, processStartToken: parentProcessStartToken };
       const promoted = promoteParentRuntime(getRegistry(), { parentSessionFile, expectedGeneration: current.generation, expectedRuntimeId: current.runtimeId, identity, now: now().toISOString() });
-      if (promoted !== undefined) { registration.generation = promoted; runtimeGeneration = promoted; return "current"; }
+      if (promoted !== undefined) { registration.generation = promoted; runtimeGeneration = promoted; warnUnconfirmedCompletionSends(parentSessionFile); return "current"; }
     }
     return "superseded";
   }
@@ -866,6 +869,9 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     if (!worker.activeRunId) return "not_active"; const runId = worker.activeRunId;
     const recoveringRun = getWorkerRun(getRegistry(), worker.workerId, runId); const recoveringRuntime = recoveringRun?.runtime as RunRuntime | undefined;
     if (recoveringRun && !recoveringRun.terminalIntent && validAcceptedResultEvidence(worker, recoveringRun)) {
+      // The attached handle still owns normal completion. Do not enter
+      // containment merely because cancellation observed accepted evidence.
+      if (active.get(worker.workerId)?.runId === runId) return "superseded";
       if (ensureCurrentRuntimeAuthority(worker.parentSessionFile) === "current" && recoveringRun.claimKind) recoverDeadLifecycleClaim(worker.workerId, recoveringRun, true);
       await settleCompletedRun(worker.workerId, runId, { status: "exited", exitCode: 0 });
       // A live settlement owner needs no recovery and the accepted result has
@@ -1017,7 +1023,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const parent = requireParentSession(context); const db = getRegistry();
     if (params.action === "list") {
       const page = listWorkers(db, { parentSessionFile: parent, status: params.status, role: params.role, limit: params.limit, offset: params.offset }); const counts = countWorkers(db, parent);
-      const workers = page.workers.map((worker) => { const latest = worker.latestRunId ? getWorkerRun(db, worker.workerId, worker.latestRunId) : undefined; return { workerId: worker.workerId, role: worker.role, status: worker.status, ...(worker.activeRunId ? { activeRunId: worker.activeRunId } : {}), ...(latest?.outcome ? { latestResult: { runId: latest.runId, outcome: latest.outcome, outcomeSource: latest.outcomeSource } } : {}), taskIds: worker.taskIds, ...(worker.modelSelection ? { modelSelection: worker.modelSelection } : {}), ...(worker.recoveryError ? { recoveryRequired: true } : {}), lastActivityAt: worker.updatedAt }; });
+      const workers = page.workers.map((worker) => { const latest = worker.latestRunId ? getWorkerRun(db, worker.workerId, worker.latestRunId) : undefined; const notification = latest ? publicDeliveryNotification(getWorkerDeliveryForRun(db, worker.workerId, latest.runId)) : undefined; return { workerId: worker.workerId, role: worker.role, status: worker.status, ...(worker.activeRunId ? { activeRunId: worker.activeRunId } : {}), ...(latest?.outcome ? { latestResult: { runId: latest.runId, outcome: latest.outcome, outcomeSource: latest.outcomeSource } } : {}), ...(notification ? { notification } : {}), taskIds: worker.taskIds, ...(worker.modelSelection ? { modelSelection: worker.modelSelection } : {}), ...(worker.recoveryError ? { recoveryRequired: true } : {}), lastActivityAt: worker.updatedAt }; });
       return resultText(`${page.total} workers · ${counts.running} running, ${counts.queued} queued, ${counts.idle} idle`, { workers, total: page.total, counts, ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset }) });
     }
     const worker = ownedWorker(params.workerId, parent);
@@ -1025,6 +1031,19 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     if (params.action === "get") { const run = getWorkerRun(db, worker.workerId, params.runId); if (!run) throw new Error(`Unknown run ${params.runId} for worker ${worker.workerId}.`); const details = exactRun(worker, run, getWorkerDeliveryForRun(db, worker.workerId, run.runId)); return resultText(`${run.outcome ?? run.status} · ${worker.role} · ${worker.workerId.slice(-8)}`, details); }
     if (params.action === "cancel") { const cancellation = await cancelWorker(worker); const current = getWorker(db, worker.workerId) ?? worker; return resultText(`${cancellation.replaceAll("_", " ")} · ${worker.workerId.slice(-8)}`, { cancellation, worker: workerListItem(current) }); }
     await discardWorker(worker); return resultText(`discarded · ${worker.role} · ${worker.workerId.slice(-8)}`, { workerId: worker.workerId, discarded: true });
+  }
+
+  function warnUnconfirmedCompletionSends(parentSessionFile: string): void {
+    const context = currentContext;
+    if (context?.mode !== "tui" || !context.hasUI || typeof context.ui?.notify !== "function") return;
+    try {
+      if (unconfirmedWarningGeneration !== runtimeGeneration) { unconfirmedWarningGeneration = runtimeGeneration; warnedUnconfirmedRuns.clear(); }
+      for (const delivery of pendingWorkerDeliveries(getRegistry(), parentSessionFile)) {
+        if (!delivery.sendStartedAt || delivery.state === "delivered" || warnedUnconfirmedRuns.has(delivery.runId)) continue;
+        warnedUnconfirmedRuns.add(delivery.runId);
+        context.ui.notify(`Worker ${delivery.workerId}/${delivery.runId} completed, but its notification is send_started_unconfirmed and will not be replayed automatically. Use /worker:show ${delivery.workerId} ${delivery.runId} for the retained result.`, "warning");
+      }
+    } catch { /* UI-only visibility must never affect lifecycle or model delivery. */ }
   }
 
   function recoverDeadDeliveryClaims(parentSessionFile: string): void {
@@ -1191,9 +1210,14 @@ function delay(ms: number): Promise<void> { return new Promise((resolve) => setT
 function resultText(_text: string, details: any): AgentToolResult<any> { return { content: [{ type: "text", text: JSON.stringify(details) }], details }; }
 function slimRun(run: WorkerRunRecord) { return { runId: run.runId, status: run.status, ...(run.outcome ? { outcome: run.outcome, outcomeSource: run.outcomeSource } : {}), createdAt: run.createdAt, ...(run.startedAt ? { startedAt: run.startedAt } : {}), ...(run.settledAt ? { settledAt: run.settledAt } : {}) }; }
 function workerListItem(worker: WorkerRegistryRecord) { return { workerId: worker.workerId, role: worker.role, status: worker.status, ...(worker.activeRunId ? { activeRunId: worker.activeRunId } : {}), taskIds: worker.taskIds, ...(worker.modelSelection ? { modelSelection: worker.modelSelection } : {}), ...(worker.recoveryError ? { recoveryRequired: true } : {}), lastActivityAt: worker.updatedAt }; }
-function exactRun(worker: WorkerRegistryRecord, run: WorkerRunRecord, delivery?: import("./registry.js").WorkerDeliveryRecord) { return { workerId: worker.workerId, role: worker.role, runId: run.runId, status: run.status, taskIds: run.taskIds, ...(run.modelSelection ? { modelSelection: run.modelSelection } : {}), createdAt: run.createdAt, ...(run.startedAt ? { startedAt: run.startedAt } : {}), ...(run.settledAt ? { settledAt: run.settledAt } : {}), ...(run.jobId ? { jobId: run.jobId } : {}), ...(run.stdoutLog ? { stdoutLog: run.stdoutLog } : {}), ...(run.stderrLog ? { stderrLog: run.stderrLog } : {}), ...(worker.sessionId ? { sessionId: worker.sessionId } : {}), ...(worker.sessionFile ? { sessionFile: worker.sessionFile } : {}), sessionRange: { ...(run.sessionStartLine === undefined ? {} : { startLine: run.sessionStartLine }), ...(run.sessionEndLine === undefined ? {} : { endLine: run.sessionEndLine }) }, workspaceRoot: worker.workspaceRoot, ...(run.binding ? { binding: run.binding } : {}), ...(worker.recoveryError ? { recoveryError: worker.recoveryError } : {}), ...((run.runtime as RunRuntime | undefined)?.interruptionWarnings?.length ? { warnings: (run.runtime as RunRuntime).interruptionWarnings } : {}), ...(run.status === "settled" ? { outcome: run.outcome, outcomeSource: run.outcomeSource, ...(delivery ? { notification: delivery.sendStartedAt && delivery.state !== "delivered" ? { state: "send_started_unconfirmed", runtimeGeneration: delivery.runtimeGeneration, sendStartedAt: delivery.sendStartedAt } : { state: delivery.state, ...(delivery.runtimeGeneration === undefined ? {} : { runtimeGeneration: delivery.runtimeGeneration }), ...(delivery.deliveredAt ? { deliveredAt: delivery.deliveredAt } : {}) } } : {}), ...(run.summary ? { summary: run.summary } : {}), ...(run.question ? { question: run.question } : {}), repositories: run.repositories.map(({ path: relativePath, commit, source, reported, changed, dirty, eligible, issues }) => ({ repositoryPath: path.join(worker.workspaceRoot, relativePath), commit, ...(source ? { source } : {}), reported, changed, dirty, eligible, ...(issues ? { issues } : {}) })), artifacts: run.artifacts, errors: run.errors } : {}) }; }
-function compactWorkerList(value: any): string { const workers = Array.isArray(value?.workers) ? value.workers : []; return workers.length ? workers.map((worker: any) => `${worker.status} · ${worker.role} · ${worker.workerId}`).join("\n") : "No workers."; }
-function formatExactRun(value: any): string { return `${value.outcome ?? value.status} · ${value.role} · ${value.workerId}\nrun ${value.runId}\n${value.taskIds?.length ?? 0} tasks · ${value.repositories?.length ?? 0} repositories · ${value.artifacts?.length ?? 0} artifacts${value.recoveryError ? `\nrecovery: ${value.recoveryError}` : ""}`; }
+function publicDeliveryNotification(delivery: WorkerDeliveryRecord | undefined) {
+  if (!delivery) return undefined;
+  if (delivery.sendStartedAt && delivery.state !== "delivered") return { state: "send_started_unconfirmed" as const, runId: delivery.runId, ...(delivery.runtimeGeneration === undefined ? {} : { runtimeGeneration: delivery.runtimeGeneration }), sendStartedAt: delivery.sendStartedAt };
+  return { state: delivery.state, runId: delivery.runId, ...(delivery.runtimeGeneration === undefined ? {} : { runtimeGeneration: delivery.runtimeGeneration }), ...(delivery.deliveredAt ? { deliveredAt: delivery.deliveredAt } : {}) };
+}
+function exactRun(worker: WorkerRegistryRecord, run: WorkerRunRecord, delivery?: WorkerDeliveryRecord) { const notification = publicDeliveryNotification(delivery); return { workerId: worker.workerId, role: worker.role, runId: run.runId, status: run.status, taskIds: run.taskIds, ...(run.modelSelection ? { modelSelection: run.modelSelection } : {}), createdAt: run.createdAt, ...(run.startedAt ? { startedAt: run.startedAt } : {}), ...(run.settledAt ? { settledAt: run.settledAt } : {}), ...(run.jobId ? { jobId: run.jobId } : {}), ...(run.stdoutLog ? { stdoutLog: run.stdoutLog } : {}), ...(run.stderrLog ? { stderrLog: run.stderrLog } : {}), ...(worker.sessionId ? { sessionId: worker.sessionId } : {}), ...(worker.sessionFile ? { sessionFile: worker.sessionFile } : {}), sessionRange: { ...(run.sessionStartLine === undefined ? {} : { startLine: run.sessionStartLine }), ...(run.sessionEndLine === undefined ? {} : { endLine: run.sessionEndLine }) }, workspaceRoot: worker.workspaceRoot, ...(run.binding ? { binding: run.binding } : {}), ...(worker.recoveryError ? { recoveryError: worker.recoveryError } : {}), ...((run.runtime as RunRuntime | undefined)?.interruptionWarnings?.length ? { warnings: (run.runtime as RunRuntime).interruptionWarnings } : {}), ...(run.status === "settled" ? { outcome: run.outcome, outcomeSource: run.outcomeSource, ...(notification ? { notification } : {}), ...(run.summary ? { summary: run.summary } : {}), ...(run.question ? { question: run.question } : {}), repositories: run.repositories.map(({ path: relativePath, commit, source, reported, changed, dirty, eligible, issues }) => ({ repositoryPath: path.join(worker.workspaceRoot, relativePath), commit, ...(source ? { source } : {}), reported, changed, dirty, eligible, ...(issues ? { issues } : {}) })), artifacts: run.artifacts, errors: run.errors } : {}) }; }
+function compactWorkerList(value: any): string { const workers = Array.isArray(value?.workers) ? value.workers : []; return workers.length ? workers.map((worker: any) => `${worker.status} · ${worker.role} · ${worker.workerId}${worker.notification?.state === "send_started_unconfirmed" ? " · send_started_unconfirmed" : ""}`).join("\n") : "No workers."; }
+function formatExactRun(value: any): string { return `${value.outcome ?? value.status} · ${value.role} · ${value.workerId}\nrun ${value.runId}\n${value.taskIds?.length ?? 0} tasks · ${value.repositories?.length ?? 0} repositories · ${value.artifacts?.length ?? 0} artifacts${value.notification?.state === "send_started_unconfirmed" ? "\nnotification: send_started_unconfirmed; it will not be replayed automatically" : ""}${value.recoveryError ? `\nrecovery: ${value.recoveryError}` : ""}`; }
 function boundedWorkerText(theme: any, text: string, color: string, bold: boolean, maximumWidth: number): Component {
   const safe = sanitizeWorkerOperationText(text);
   return {

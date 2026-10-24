@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { SessionManager, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { registerWorkerExtension } from "../extensions/worker/index.js";
-import { currentParentRuntime, getWorker, getWorkerRun, listWorkers, openWorkerRegistry, registerParentRuntime, settleWorkerRun, storePreparedSet } from "../extensions/worker/registry.js";
+import { currentParentRuntime, getWorker, getWorkerRun, listWorkers, markWorkerDeliverySendStarted, openWorkerRegistry, registerParentRuntime, settleWorkerRun, storePreparedSet } from "../extensions/worker/registry.js";
 import type { ManagedAsyncJobHandle, JobMeta } from "../extensions/async-shell/index.js";
 import type { ReviewOverlayRecord } from "../extensions/worker/review-workspace.js";
 import { prepareWorkerMerges } from "../extensions/worker/merge.js";
@@ -21,7 +21,7 @@ const model = (provider: string, id: string) => ({ id, name: id, provider, api: 
 type Launch = { record: any; runtime: any; resolve(job: JobMeta): void; handle: ManagedAsyncJobHandle };
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
-async function fixture(options: { sendMessageThrows?: boolean; launchThrows?: boolean; overlayThrows?: boolean; removeThrowsOnce?: boolean; removeAlwaysThrows?: boolean; deferRemove?: boolean; containerThrows?: boolean; deferContainer?: boolean; cleanupFailsWhileContainerLive?: boolean; staleOnReload?: boolean; launchReadsContext?: boolean; revokeClaimDuringLaunchOnce?: boolean; dockerOutage?: boolean; ownerWaitTimeoutMs?: number; ownerProbeIntervalMs?: number; readProcessStartToken?: (pid: number) => string | undefined; probeHostIdentity?: () => "alive" | "dead" | "unknown"; beforeCreateRunBatch?: () => void | Promise<void>; signalHostIdentity?: (_identity: any, signal: NodeJS.Signals) => boolean } = {}) {
+async function fixture(options: { tui?: boolean; sendMessageThrows?: boolean; launchThrows?: boolean; overlayThrows?: boolean; removeThrowsOnce?: boolean; removeAlwaysThrows?: boolean; deferRemove?: boolean; containerThrows?: boolean; deferContainer?: boolean; cleanupFailsWhileContainerLive?: boolean; staleOnReload?: boolean; launchReadsContext?: boolean; revokeClaimDuringLaunchOnce?: boolean; dockerOutage?: boolean; ownerWaitTimeoutMs?: number; ownerProbeIntervalMs?: number; readProcessStartToken?: (pid: number) => string | undefined; probeHostIdentity?: () => "alive" | "dead" | "unknown"; beforeCreateRunBatch?: () => void | Promise<void>; signalHostIdentity?: (_identity: any, signal: NodeJS.Signals) => boolean } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "pi-worker-v2-lifecycle-"));
   const runtimeRoot = path.join(root, "runtime"); const workersRoot = path.join(runtimeRoot, "workers"); mkdirSync(workersRoot, { recursive: true });
   const session = SessionManager.create(root, path.join(root, "parent-session"), { id: `parent-${Date.now()}` }); writeFileSync(session.getSessionFile()!, `${JSON.stringify(session.getHeader())}\n`, { mode: 0o600 });
@@ -32,7 +32,7 @@ async function fixture(options: { sendMessageThrows?: boolean; launchThrows?: bo
   if (options.deferContainer) blockContainer();
   if (options.deferRemove) removeGate = new Promise<void>((resolve) => { releaseRemove = resolve; });
   const random = () => `${(++counter).toString(16).padStart(8, "0")}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`;
-  const baseContext = { cwd: root, hasUI: false, mode: "rpc", sessionManager: session, modelRegistry: { hasConfiguredAuth: () => true, getAll: () => [model("openai-codex", "gpt-5.6-sol"), model("anthropic", "claude-opus-5-5")] }, thinkingLevel: "xhigh", isIdle: () => true, hasPendingMessages: () => false, ui: { notify(message: string) { notifications.push(message); } } } as unknown as ExtensionContext;
+  const baseContext = { cwd: root, hasUI: options.tui ?? false, mode: options.tui ? "tui" : "rpc", sessionManager: session, modelRegistry: { hasConfiguredAuth: () => true, getAll: () => [model("openai-codex", "gpt-5.6-sol"), model("anthropic", "claude-opus-5-5")] }, thinkingLevel: "xhigh", isIdle: () => true, hasPendingMessages: () => false, ui: { notify(message: string) { notifications.push(message); } } } as unknown as ExtensionContext;
   const dependencies = {
     runtimeRoot, roots: { stateRoot: workersRoot, workspaceRoot: workersRoot }, codeRoot: root, preparedRoot: path.join(runtimeRoot, "prepared"), targetRoot: root, dockerPath: "/fake/docker", random, now: () => new Date(`2026-01-01T00:00:${String(counter).padStart(2, "0")}.000Z`),
     waitForHostIdentity: async () => {}, ...(options.probeHostIdentity ? { probeHostIdentity: options.probeHostIdentity } : {}), ...(options.signalHostIdentity ? { signalHostIdentity: options.signalHostIdentity } : {}),
@@ -414,6 +414,37 @@ test("a started completion send is surfaced as unconfirmed and never replayed", 
   } finally { await f.close(); }
 });
 
+test("Escape-like lost completion remains visible across reload without replay or duplicate UI warning", async () => {
+  const f = await fixture({ tui: true }); try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "queued completion visibility" }] })); await f.event("turn_end"); await complete(f, started);
+    assert.equal(f.messageAttempts.filter((message) => message.details?.runId === started.runId).length, 1, "the original completion send starts once");
+    const listed = await f.call("worker_control", { action: "list" }); assert.equal((listed.details as any).workers[0].notification.state, "send_started_unconfirmed"); assert.equal((listed.details as any).workers[0].notification.runId, started.runId); assert.deepEqual((listed.details as any).counts, { queued: 0, running: 0, idle: 1 }); assert.equal((listed.details as any).total, 1);
+    await f.commands.get("worker:list").handler("", f.context); assert.match(f.notifications.at(-1)!, /send_started_unconfirmed/);
+    await f.commands.get("worker:show").handler(`${started.workerId} ${started.runId}`, f.context); assert.match(f.notifications.at(-1)!, /send_started_unconfirmed/);
+    const beforeWarnings = f.notifications.filter((message) => /completed, but its notification is send_started_unconfirmed/.test(message)).length; assert.equal(beforeWarnings, 0);
+    const current = await f.reload();
+    assert.equal(f.notifications.filter((message) => /completed, but its notification is send_started_unconfirmed/.test(message)).length, 1, "reload warns once for the exact run and new runtime generation");
+    assert.equal(f.messageAttempts.filter((message) => message.details?.runId === started.runId).length, 1, "reload must not replay an ambiguous send");
+    await current.event("session_start"); assert.equal(f.notifications.filter((message) => /completed, but its notification is send_started_unconfirmed/.test(message)).length, 1, "repeated startup in one runtime generation is deduped");
+  } finally { await f.close(); }
+});
+
+test("owner crash promotion emits one UI-only unconfirmed warning without model replay", async () => {
+  const f = await fixture({ tui: true }); let owner: Awaited<ReturnType<typeof spawnDeliveryClaimOwner>> | undefined; try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "crashed ambiguous notifier" }] })); await f.event("turn_end");
+    owner = await spawnDeliveryClaimOwner(f, started);
+    let db = f.registry(); settleWorkerRun(db, { parentSessionFile: realpathSync(f.session.getSessionFile()!), workerId: started.workerId, runId: started.runId, outcome: "completed", outcomeSource: "worker", summary: "retained after notifier crash", settledAt: new Date().toISOString() }); db.close();
+    const claimed = await owner.claim(); db = f.registry(); assert.equal(markWorkerDeliverySendStarted(db, claimed.deliveryId, claimed.generation, new Date().toISOString()), true); db.close();
+    await stopLifecycleClaimOwner(owner.child);
+    await waitFor(() => f.notifications.some((message) => message.includes(`${started.workerId}/${started.runId}`)), 4_000);
+    assert.equal(f.notifications.filter((message) => message.includes(`${started.workerId}/${started.runId}`)).length, 1);
+    assert.equal(f.messageAttempts.filter((message) => message.details?.runId === started.runId).length, 0, "promotion warning is UI-only and never replays the send");
+    db = f.registry(); const parent = realpathSync(f.session.getSessionFile()!); assert.ok(currentParentRuntime(db, parent)!.generation > claimed.generation); const delivery = db.database.prepare("SELECT state,send_started_at FROM deliveries WHERE run_id=?").get(started.runId) as any; db.close(); assert.equal(delivery.state, "claimed"); assert.ok(delivery.send_started_at);
+    await f.event("session_start"); assert.equal(f.notifications.filter((message) => message.includes(`${started.workerId}/${started.runId}`)).length, 1, "same-generation promotion notice remains deduped");
+    const launch = f.launches.find((candidate) => candidate.record.runId === started.runId); if (launch) launch.resolve(job(launch.record.jobId, "exited", 0));
+  } finally { if (owner) await stopLifecycleClaimOwner(owner.child); await f.close(); }
+});
+
 test("cancel during a live accepted settlement returns result-preserved superseded without intent", async () => {
   const f = await fixture(); let owner: Awaited<ReturnType<typeof spawnLifecycleClaimOwner>> | undefined; try {
     const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "live accepted settlement" }] })); await f.event("turn_end");
@@ -437,6 +468,21 @@ test("cancel during this runtime's live accepted settlement returns superseded a
     f.releaseRemove(); await waitFor(() => { const state = f.registry(); const current = getWorkerRun(state, started.workerId, started.runId); state.close(); return current?.status === "settled"; });
     db = f.registry(); run = getWorkerRun(db, started.workerId, started.runId)!; db.close(); assert.equal(run.outcome, "completed"); assert.equal(run.summary, "own accepted settlement");
   } finally { f.releaseRemove(); await f.close(); }
+});
+
+test("cancel in an attached accepted-result window is side-effect-free through a greater-than-five-second host exit", async () => {
+  const f = await fixture(); try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "cancel slow attached accepted host" }] })); await f.event("turn_end");
+    const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: "accepted before slow attached exit" });
+    const began = Date.now(); const result = await f.call("worker_control", { action: "cancel", workerId: started.workerId }); assert.equal((result.details as any).cancellation, "superseded"); assert.ok(Date.now() - began < 1_000, "accepted cancellation must not wait on or contain the attached host");
+    await new Promise((resolve) => setTimeout(resolve, 5_200));
+    let db = f.registry(); let run = getWorkerRun(db, started.workerId, started.runId)!; let worker = getWorker(db, started.workerId)!; db.close();
+    assert.equal(run.status, "running"); assert.equal(run.terminalIntent, undefined); assert.equal(worker.recoveryError, undefined); assert.equal(f.cancelledHandles, 0); assert.equal(f.removed.length, 0);
+    assert.equal(f.messages.filter((message) => message.details?.event === "worker_recovery_required" && message.details?.runId === started.runId).length, 0);
+    launch.resolve(job(launch.record.jobId, "exited", 0)); await waitFor(() => { const state = f.registry(); const current = getWorkerRun(state, started.workerId, started.runId); state.close(); return current?.status === "settled"; }, 4_000);
+    db = f.registry(); run = getWorkerRun(db, started.workerId, started.runId)!; worker = getWorker(db, started.workerId)!; db.close(); assert.equal(run.outcome, "completed"); assert.equal(run.summary, "accepted before slow attached exit"); assert.equal(worker.recoveryError, undefined); assert.equal(f.removed.length, 1);
+    assert.equal(f.messages.filter((message) => message.details?.event === "worker_recovery_required" && message.details?.runId === started.runId).length, 0);
+  } finally { await f.close(); }
 });
 
 test("an attached host may exit more than five seconds after accepted evidence without recovery noise", async () => {
