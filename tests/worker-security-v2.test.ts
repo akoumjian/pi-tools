@@ -69,3 +69,28 @@ test("inventory retains structured repository policy failures and interrupted-st
     assert.match(inspectInterruptedGitState(workspace).join(" "), /repos\/parent\/repo: Repository policy validation failed/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+
+test("inventory fails closed when repository HEAD changes during inspection and sanitizes remote controls", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-inventory-race-"));
+  try {
+    const workspace = path.join(root, "workspace"); mkdirSync(workspace, { recursive: true });
+    const repo = repository(workspace);
+    execFileSync("git", ["-C", repo, "remote", "add", "origin", "https://example.invalid/\u001b[31mrepo"]);
+    let changed = false;
+    const inventory = inventoryWorkerRepositories({ workspaceRoot: workspace, workerId: "worker_race", runId: "run_race", reported: ["repo"] }, {
+      afterHeadRead(repositoryPath) {
+        if (changed) return;
+        changed = true;
+        writeFileSync(path.join(repositoryPath, "raced.txt"), "race\n");
+        execFileSync("git", ["-C", repositoryPath, "add", "raced.txt"]);
+        execFileSync("git", ["-C", repositoryPath, "commit", "-qm", "race"]);
+      }
+    });
+    assert.equal(inventory.repositories.length, 1);
+    assert.equal(inventory.repositories[0]?.eligible, false);
+    assert.equal(inventory.repositories[0]?.commit, "unknown");
+    assert.match(inventory.repositories[0]?.issues?.join(" ") ?? "", /HEAD changed during inventory/);
+    assert.doesNotMatch(inventory.repositories[0]?.source ?? "", /\u001b/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
