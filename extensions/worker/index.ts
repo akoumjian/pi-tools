@@ -7,6 +7,10 @@ import { defineTool, type AgentToolResult, type ExtensionAPI, type ExtensionCont
 import { resolveExtensionModel, assertChildAgentRouteAllowed, parseModelThinkingPair } from "../_shared/model-spec.js";
 import { throwIfAborted } from "../_shared/cancellation.js";
 import { asyncJobProcessStartToken, createAsyncJobId, isAsyncJobProcessIdentityAlive, signalAsyncJobProcessIdentity } from "../_shared/async-job.js";
+import * as asyncJobProcessPackage from "../_shared/async-job-process.js";
+import * as atomicJsonPackage from "../_shared/atomic-json.js";
+import { createPiToolsPackageGenerationGuard } from "../_shared/package-generation.js";
+import * as workerJobSettlementPackage from "../_shared/worker-job-settlement.js";
 import { handleAsyncShellViewerCommand, reconcileTerminatedPersistedAsyncShellJobsForOwner, unsettledPersistedAsyncShellJobsForOwner, type JobMeta, type ManagedAsyncJobHandle } from "../async-shell/index.js";
 import { createWorkerContainerAsync, planWorkerContainer, resolveDockerPath, settleWorkerContainerAsync, type WorkerContainerReference } from "../_shared/worker-container.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
@@ -81,11 +85,18 @@ export type WorkerExtensionDependencies = {
   launch?: (api: ExtensionAPI, context: ExtensionContext, input: { record: WorkerLaunchRecord; runtime: RunRuntime }) => ManagedAsyncJobHandle;
   createOverlay?: (input: Parameters<typeof createReviewOverlayAsync>[0]) => ReviewOverlayRecord | Promise<ReviewOverlayRecord>; cleanupOverlay?: (dockerPath: string, overlay: ReviewOverlayRecord) => void | Promise<void>;
   waitForHostIdentity?: (runtime: RunRuntime, workerId: string, runId: string) => Promise<void>;
+  assertPackageGeneration?: () => void;
 };
 
 export default function workerExtension(api: ExtensionAPI): void { registerWorkerExtension(api); }
 
 export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExtensionDependencies = {}): void {
+  const assertCurrentPackageGeneration = overrides.assertPackageGeneration ?? createPiToolsPackageGenerationGuard(import.meta.url, [
+    { name: "async-job-process", path: "extensions/_shared/async-job-process.js", fingerprint: asyncJobProcessPackage.PI_TOOLS_MODULE_FINGERPRINT },
+    { name: "atomic-json", path: "extensions/_shared/atomic-json.js", fingerprint: atomicJsonPackage.PI_TOOLS_MODULE_FINGERPRINT },
+    { name: "worker-job-settlement", path: "extensions/_shared/worker-job-settlement.js", fingerprint: workerJobSettlementPackage.PI_TOOLS_MODULE_FINGERPRINT }
+  ]);
+  assertCurrentPackageGeneration();
   const roots = overrides.roots ?? defaultWorkerRoots();
   const runtimeRoot = overrides.runtimeRoot ?? path.dirname(roots.stateRoot);
   const now = overrides.now ?? (() => new Date());
@@ -105,6 +116,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   let currentContext: ExtensionContext | undefined;
   let unsubscribeActivity: (() => void) | undefined;
   let activityGeneration = 0;
+  let generationMismatchNotifiedForRuntime = -1;
   const pending = new Map<string, PendingRun>();
   const active = new Map<string, ActiveRun>();
   const starting = new Map<string, { runId: string; completion: Promise<void> }>();
@@ -176,6 +188,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   });
   api.on("input", (_event, context) => repaintWorkerActivity(context));
   api.on("turn_end", (_event, context) => {
+    assertCurrentPackageGeneration();
     const parentFile = context.sessionManager.getSessionFile(); if (!parentFile) return;
     const parent = realpathOrResolve(parentFile); const parentSessionId = context.sessionManager.getSessionId();
     const launches = [...pending.values()].filter((item) => item.parentSessionFile === parent && item.parentSessionId === parentSessionId);
@@ -222,6 +235,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     },
     execute: async (toolCallId: string, params: WorkerRunInputV2, signal: AbortSignal, onUpdate: any, context: ExtensionContext): Promise<AgentToolResult<any>> => {
       clearOperationSnapshot(toolCallId);
+      assertCurrentPackageGeneration();
       throwIfAborted(signal);
       const parentSessionFile = requireParentSession(context);
       const planned = preflightBatch(params, context, parentSessionFile);
@@ -272,6 +286,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     renderCall: (args: unknown, theme: any) => compactCall(theme, workerControlCallLabel(args)),
     renderResult: (result: AgentToolResult<any>, _options: unknown, theme: any) => compactResult(theme, result, "worker control"),
     execute: async (_callId: string, params: WorkerControlInputV2, signal: AbortSignal, _update: any, context: ExtensionContext): Promise<AgentToolResult<any>> => {
+      assertCurrentPackageGeneration();
       throwIfAborted(signal); return control(params, context);
     }
   });
@@ -285,6 +300,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     parameters: WorkerMergeTestParams, executionMode: "sequential",
     renderCall: (args, theme, context) => compactCall(theme, "testing merge", mergeCallOperationHint(args, renderArgumentsComplete(context))), renderResult: (result, _options, theme) => compactResult(theme, result as any, "merge test", mergeResultOperationHint(safeResultDetails(result))),
     async execute(_id, params, signal, _update, context) {
+      assertCurrentPackageGeneration();
       throwIfAborted(signal); const parent = requireParentSession(context);
       const resolved = params.repositories.map((request) => ({ ...request, candidateRef: request.candidateRef ?? "HEAD" }));
       const set = prepareWorkerMerges(parent, resolved, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, sourceForCandidate: managedCandidateWarnings(parent) });
@@ -306,6 +322,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     },
     async execute(toolCallId, params, signal, _update, context) {
       clearOperationSnapshot(toolCallId);
+      assertCurrentPackageGeneration();
       throwIfAborted(signal); const parent = requireParentSession(context); const trustedSet = trustedPreparedSet(getRegistry(), parent, params.preparedId); if (!["ready", "partial", "failed"].includes(trustedSet.status)) throw new Error(`Prepared set ${params.preparedId} is not ready.`);
       const operation = mergeOperation(trustedSet.repositories);
       const nonce = claimNonce(); if (!claimPreparedSetApply(getRegistry(), params.preparedId, parent, nonce, now().toISOString())) throw new Error(`Prepared set ${params.preparedId} is already being applied or changed state.`);
@@ -465,6 +482,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const nonce = claimNonce(); if (!claimWorkerRun(getRegistry(), item.workerId, item.runId, "launch", nonce, ["queued"])) return;
     let handle: ManagedAsyncJobHandle | undefined; let launchAdmission: string | undefined;
     try {
+      assertCurrentPackageGeneration();
       let worker = getWorker(getRegistry(), item.workerId)!; const run = getWorkerRun(getRegistry(), item.workerId, item.runId)!; const paths = workerPaths(roots, item.workerId);
       if ((!worker.sessionId || !worker.sessionFile) && worker.role === "work" && item.runtime.pendingWorkSessionId) {
         const forked = forkWorkerSession({ parentSessionFile: worker.parentSessionFile, workspaceRoot: worker.workspaceRoot, sessionDir: paths.sessionDir, sessionId: item.runtime.pendingWorkSessionId });
@@ -561,6 +579,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   }
 
   async function cancelWorker(worker: WorkerRegistryRecord): Promise<"cancelled" | "not_active"> {
+    assertCurrentPackageGeneration();
     if (!worker.activeRunId) return "not_active"; const runId = worker.activeRunId;
     const recoveringRun = getWorkerRun(getRegistry(), worker.workerId, runId); const recoveringRuntime = recoveringRun?.runtime as RunRuntime | undefined;
     if (worker.recoveryError && recoveringRun?.status === "running" && recoveringRuntime && existsSync(recoveringRuntime.settledFile) && existsSync(recoveringRuntime.resultFile)) {
@@ -632,6 +651,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   }
 
   async function discardWorker(worker: WorkerRegistryRecord): Promise<void> {
+    assertCurrentPackageGeneration();
     const nonce = claimNonce(); claimWorkerDiscard(getRegistry(), worker.workerId, worker.version, nonce, now().toISOString());
     const paths = workerPaths(roots, worker.workerId); const stateTrash = `${paths.stateDir}.discard-${nonce}`; const separateWorkspace = path.resolve(paths.workspaceRoot).startsWith(`${path.resolve(paths.stateDir)}${path.sep}`) ? undefined : `${paths.workspaceRoot}.discard-${nonce}`;
     try {
@@ -659,7 +679,17 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   }
 
   function reconcileActiveRuns(context: ExtensionContext, parentSessionFile: string): void {
-    for (const { worker, run } of activeRunsForParent(getRegistry(), parentSessionFile)) {
+    const activeRuns = activeRunsForParent(getRegistry(), parentSessionFile);
+    if (activeRuns.length === 0) return;
+    try { assertCurrentPackageGeneration(); }
+    catch (error) {
+      if (generationMismatchNotifiedForRuntime !== runtimeGeneration) {
+        generationMismatchNotifiedForRuntime = runtimeGeneration;
+        try { context.ui.notify(sanitizeError(error), "error"); } catch {}
+      }
+      return;
+    }
+    for (const { worker, run } of activeRuns) {
       const runtime = run.runtime as RunRuntime; if (!runtime || runtime.version !== 2 || run.claimKind) { if (worker.recoveryError) deliverRecovery(worker, run, worker.recoveryError); continue; }
       if (worker.recoveryError) {
         if (run.status === "running" && existsSync(runtime.settledFile) && existsSync(runtime.resultFile)) clearWorkerRecoveryError(getRegistry(), worker.workerId, run.runId, now().toISOString());

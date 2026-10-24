@@ -33,7 +33,7 @@ npm install
 npm run validate
 ```
 
-Fully restart Pi after installing or updating the package so the new extension code is loaded.
+Fully restart Pi after installing or updating the package so the new extension code is loaded. `/reload` is supported for same-generation context/configuration changes, not package-code activation; worker tools fail closed if they detect a mixed generation.
 
 ### Update an installed git dependency
 

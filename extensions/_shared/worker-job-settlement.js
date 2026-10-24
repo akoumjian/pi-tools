@@ -2,6 +2,8 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { isAsyncJobExecutionAlive } from "./async-job-process.js";
 
+export const PI_TOOLS_MODULE_FINGERPRINT = "8f0425ce94d41954b06da147ed8983a91a5a55431fd7bf6da3e193d17003d8fb";
+
 const OWNER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const PROCESS_TOKEN_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const JOB_STATUSES = new Set(["running", "exited", "failed", "cancelled", "unknown"]);
