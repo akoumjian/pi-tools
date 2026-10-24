@@ -7,6 +7,8 @@ import {
   claimPreparedSetApply,
   claimWorkerCancellation,
   claimWorkerDelivery,
+  claimWorkerRun,
+  claimWorkerTerminalIntent,
   createWorkerAndRun,
   createWorkerRunBatch,
   discardWorkerRegistryRecord,
@@ -24,6 +26,9 @@ import {
   reconcileWorkerDeliveries,
   recoverInterruptedClaimsForParent,
   registerParentRuntime,
+  registerParentRuntimeAndRecoverClaims,
+  releaseWorkerRunClaim,
+  setClaimedWorkerTerminalIntent,
   releaseWorkerReviewLease,
   releaseWorkerDeliveryClaim,
   settleWorkerRun,
@@ -151,9 +156,37 @@ test("runtime generations recover only stale lifecycle claims for deterministic 
     recoverInterruptedClaimsForParent(f.registry, parent, 3, "2026-01-01T00:00:02.500Z"); assert.equal(getWorkerRun(f.registry, workerId, runId)?.claimKind, undefined);
     f.registry.database.prepare("UPDATE runs SET claim_kind='cancellation',claim_nonce='2-old' WHERE run_id=?").run(runId);
     recoverInterruptedClaimsForParent(f.registry, parent, 3, "2026-01-01T00:00:03.000Z");
-    assert.equal(getWorkerRun(f.registry, workerId, runId)?.claimKind, undefined); assert.match(getWorker(f.registry, workerId)?.recoveryError ?? "", /cancellation retry/);
+    assert.equal(getWorkerRun(f.registry, workerId, runId)?.claimKind, undefined); assert.match(getWorker(f.registry, workerId)?.recoveryError ?? "", /containment recovery/);
     f.registry.database.prepare("UPDATE workers SET status='idle',active_run_id=NULL,operation_kind='discard',operation_nonce='2-old' WHERE worker_id=?").run(workerId);
     recoverInterruptedClaimsForParent(f.registry, parent, 3, "2026-01-01T00:00:04.000Z"); assert.equal(getWorker(f.registry, workerId)?.operationKind, undefined);
+  } finally { f.close(); }
+});
+
+test("runtime registration atomically preserves live foreign claims and fences old generations", () => {
+  const f = fixture(); try {
+    const workerId = "worker_20260101000000_atomic11"; const runId = "run_20260101000000_atomic11"; const parent = "/sessions/atomic.jsonl";
+    createWorkerAndRun(f.registry, { workerId, parentSessionFile: parent, role: "work", status: "queued", activeRunId: runId, taskIds: ["personal-test"], workspaceRoot: "/workspace/atomic", createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }, queuedRun(workerId, runId));
+    const generation1 = registerParentRuntime(f.registry, parent, "first", "2026-01-01T00:00:01.000Z");
+    assert.equal(claimWorkerRun(f.registry, workerId, runId, "launch", "1-owner", ["queued"], generation1), true);
+    let observed = 0; const generation2 = registerParentRuntimeAndRecoverClaims(f.registry, parent, "second", "2026-01-01T00:00:02.000Z", (claim) => { observed += 1; assert.equal(claim.claimNonce, "1-owner"); return true; });
+    assert.equal(generation2, 2); assert.equal(observed, 1); assert.equal(getWorkerRun(f.registry, workerId, runId)?.claimNonce, "1-owner");
+    assert.equal(releaseWorkerRunClaim(f.registry, workerId, runId, "launch", "1-owner"), true);
+    assert.equal(claimWorkerRun(f.registry, workerId, runId, "launch", "1-stale", ["queued"], generation1), false, "an old process cannot claim in the post-registration gap");
+    assert.equal(claimWorkerRun(f.registry, workerId, runId, "launch", "2-current", ["queued"], generation2), true);
+  } finally { f.close(); }
+});
+
+test("terminal cleanup intent survives claim release and blocks every launch reclaim", () => {
+  const f = fixture(); try {
+    const workerId = "worker_20260101000000_intent11"; const runId = "run_20260101000000_intent11"; const parent = "/sessions/intent.jsonl";
+    createWorkerAndRun(f.registry, { workerId, parentSessionFile: parent, role: "work", status: "queued", activeRunId: runId, taskIds: ["personal-test"], workspaceRoot: "/workspace/intent", createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }, queuedRun(workerId, runId));
+    const generation = registerParentRuntime(f.registry, parent, "runtime", "2026-01-01T00:00:01.000Z");
+    assert.equal(claimWorkerRun(f.registry, workerId, runId, "launch", "1-owner", ["queued"], generation), true);
+    assert.equal(setClaimedWorkerTerminalIntent(f.registry, { workerId, runId, claimKind: "launch", claimNonce: "1-owner", terminalIntent: "failure", terminalError: "pre-host failed", now: "2026-01-01T00:00:02.000Z" }), "failure");
+    assert.equal(releaseWorkerRunClaim(f.registry, workerId, runId, "launch", "1-owner"), true);
+    assert.equal(claimWorkerRun(f.registry, workerId, runId, "launch", "1-relaunch", ["queued"], generation), false);
+    assert.equal(claimWorkerTerminalIntent(f.registry, { workerId, runId, terminalIntent: "failure", claimKind: "settlement", claimNonce: "1-cleanup", now: "2026-01-01T00:00:03.000Z", runtimeGeneration: generation }), true);
+    const run = getWorkerRun(f.registry, workerId, runId)!; assert.equal(run.terminalIntent, "failure"); assert.equal(run.terminalError, "pre-host failed"); assert.equal(run.claimKind, "settlement");
   } finally { f.close(); }
 });
 
@@ -215,8 +248,8 @@ test("registry applies an ordered idempotent v2 migration while mixed live opene
     oldOpener.database.prepare("UPDATE registry_meta SET value='old-live-build-fingerprint' WHERE key='schema_hash'").run();
     migrated = openWorkerRegistry(root);
     const version = migrated.database.prepare("SELECT value FROM registry_meta WHERE key='schema_version'").get() as { value: string };
-    const columns = migrated.database.prepare("PRAGMA table_info(prepared_sets)").all() as Array<{ name: string }>;
-    assert.equal(version.value, "3"); assert.equal(columns.some((column) => column.name === "apply_nonce"), true);
+    const columns = migrated.database.prepare("PRAGMA table_info(prepared_sets)").all() as Array<{ name: string }>; const runColumns = migrated.database.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>;
+    assert.equal(version.value, "4"); assert.equal(columns.some((column) => column.name === "apply_nonce"), true); assert.equal(runColumns.some((column) => column.name === "terminal_intent"), true);
     const legacyHash = migrated.database.prepare("SELECT value FROM registry_meta WHERE key='schema_hash'").get() as { value: string };
     assert.equal(legacyHash.value, "old-live-build-fingerprint", "migration must not overwrite another live build's diagnostic hash");
     oldOpener.database.prepare("UPDATE registry_meta SET value='old-opener-still-live' WHERE key='schema_hash'").run();
