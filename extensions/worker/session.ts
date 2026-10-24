@@ -96,11 +96,13 @@ export function verifyWorkerSession(input: {
 
 export function readWorkerSessionText(sessionFile: string, sessionDir: string, maximumBytes = 128 * 1024 * 1024): string {
   const rootPath = path.resolve(sessionDir);
-  if (lstatSync(rootPath).isSymbolicLink() || !lstatSync(rootPath).isDirectory()) throw new Error("Worker session directory must be an ordinary directory.");
-  const root = realpathSync(rootPath); const lexical = path.resolve(sessionFile); const relative = path.relative(root, lexical);
+  const rootStat = lstatSync(rootPath); if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) throw new Error("Worker session directory must be an ordinary directory.");
+  const root = realpathSync(rootPath); const lexical = path.resolve(sessionFile); const relative = path.relative(rootPath, lexical);
   if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error("Worker session file must remain beneath its retained session directory.");
-  let current = root;
+  let current = rootPath;
   for (const component of relative.split(path.sep)) { current = path.join(current, component); if (lstatSync(current).isSymbolicLink()) throw new Error("Worker session file may not traverse symbolic links."); }
+  const exact = realpathSync(lexical); const exactRelative = path.relative(root, exact);
+  if (exactRelative === "" || exactRelative === ".." || exactRelative.startsWith(`..${path.sep}`) || path.isAbsolute(exactRelative)) throw new Error("Worker session file resolves outside its retained session directory.");
   const descriptor = openSync(lexical, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
   try { const metadata = fstatSync(descriptor); if (!metadata.isFile() || metadata.size > maximumBytes) throw new Error(`Worker session must be an ordinary file no larger than ${maximumBytes} bytes.`); return readFileSync(descriptor, "utf8"); }
   finally { closeSync(descriptor); }

@@ -8,13 +8,13 @@ import path from "node:path";
 import test from "node:test";
 import { Check } from "typebox/value";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import workerRuntimeExtension, { readWorkerRuntimeResult } from "../extensions/worker/runtime.js";
+import workerRuntimeExtension, { executeWorkerBeadsHostRequest, executeWorkerResultHostRequest, readWorkerRuntimeResult } from "../extensions/worker/runtime.js";
 import { buildWorkerRpcArgs, type WorkerHostConfig } from "../extensions/worker/runner.js";
 
 const sha256 = (value: string): string => createHash("sha256").update(value, "utf8").digest("hex");
 
 type FakeApi = ExtensionAPI & { tools: ToolDefinition[] };
-function fakeApi(): FakeApi { const tools: ToolDefinition[] = []; return { tools, registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, on() {}, sendMessage() {} } as unknown as FakeApi; }
+function fakeApi(): FakeApi { const tools: ToolDefinition[] = []; return { tools, registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, on() {}, sendMessage() {}, requestHost(service: string, payload: unknown) { if (service === "worker_result_submit") return executeWorkerResultHostRequest(payload); if (service === "worker_beads_tasks") return executeWorkerBeadsHostRequest(payload); if (service === "worker_runtime_hello" || service === "worker_runtime_state") return Promise.resolve({ accepted: true }); throw new Error(`unexpected host service ${service}`); } } as unknown as FakeApi; }
 async function fixture(role: "work" | "review" | "integration", run: (root: string, api: FakeApi) => Promise<void>) {
   const root = await mkdtemp(path.join(tmpdir(), "pi-worker-runtime-"));
   await mkdir(path.join(root, "state", "async-shell"), { recursive: true });
@@ -45,7 +45,7 @@ if (args.includes("where")) {
   await chmod(bdPath, 0o700);
   const beadsRoute = { prefix: "personal", path: beadsDir, databasePath: path.join(beadsDir, "database") };
   const values: Record<string, string> = {
-    PI_WORKER_ID: "worker_20260101000000_aaaaaaaa", PI_WORKER_RUN_ID: "run_20260101000000_aaaaaaaa", PI_WORKER_ROLE: role,
+    PI_WORKER_ID: "worker_20260101000000_aaaaaaaa", PI_WORKER_RUN_ID: "run_20260101000000_aaaaaaaa", PI_WORKER_ROLE: role, PI_WORKER_HOST_RPC: "1",
     PI_WORKER_RESULT_FILE: path.join(root, "state", "result.json"), PI_WORKER_WORKSPACE_ROOT: root,
     PI_WORKER_STATE_ROOT: root, PI_WORKER_SUPERVISION_ROOT: path.join(root, "state"), PI_WORKER_ASYNC_JOB_ROOT: path.join(root, "state", "async-shell"),
     PI_WORKER_TASK_IDS: JSON.stringify(["personal-test"]), PI_WORKER_AUTHORIZATION_FILE: path.join(root, "state", "host-authorization.json"),
@@ -129,8 +129,7 @@ test("runtime rejects a result-file parent that resolves outside trusted state",
     try {
       await symlink(outside, path.join(root, "state", "escape"));
       process.env.PI_WORKER_RESULT_FILE = path.join(root, "state", "escape", "result.json");
-      const tool = api.tools.find((candidate) => candidate.name === "worker_result_submit")!;
-      await assert.rejects(() => tool.execute!("call", { outcome: "completed", summary: "probe" }, undefined, undefined, undefined as never), /supervision\/worker-root boundary/);
+      await assert.rejects(() => executeWorkerResultHostRequest({ outcome: "completed", summary: "probe" }), /supervision\/worker-root boundary/);
       assert.equal(existsSync(path.join(outside, "result.json")), false);
     } finally { if (prior === undefined) delete process.env.PI_WORKER_RESULT_FILE; else process.env.PI_WORKER_RESULT_FILE = prior; await rm(outside, { recursive: true, force: true }); }
   });
@@ -139,11 +138,9 @@ test("runtime rejects a result-file parent that resolves outside trusted state",
 test("durable authorization revocation blocks result submission and Beads calls", async () => {
   await fixture("work", async (root, api) => {
     await rm(process.env.PI_WORKER_AUTHORIZATION_FILE!, { force: true });
-    const result = api.tools.find((candidate) => candidate.name === "worker_result_submit")!;
-    await assert.rejects(() => result.execute!("call", { outcome: "completed", summary: "late" }, undefined, undefined, undefined as never), /revoked/);
-    const beads = api.tools.find((candidate) => candidate.name === "worker_beads_tasks")!;
-    await assert.rejects(() => beads.execute!("call", { action: "assigned" }, undefined, undefined, undefined as never), /revoked/);
-    await assert.rejects(() => beads.execute!("call", { action: "design", taskId: "personal-test" }, undefined, undefined, undefined as never), /revoked/);
+    await assert.rejects(() => executeWorkerResultHostRequest({ outcome: "completed", summary: "late" }), /revoked/);
+    await assert.rejects(() => executeWorkerBeadsHostRequest({ action: "assigned" }), /revoked/);
+    await assert.rejects(() => executeWorkerBeadsHostRequest({ action: "design", taskId: "personal-test" }), /revoked/);
     assert.equal(existsSync(path.join(root, "state", "result.json")), false);
   });
 });

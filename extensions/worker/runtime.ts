@@ -47,6 +47,7 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
   let runtimeSequence = 0;
   let agentPhase: "active" | "idle" | "shutting_down" = "idle";
   let admissionState: "open" | "submitting" | "accepted" = "open";
+  let uncertainSubmissionSha256: string | undefined;
   const publishAdmissionState = () => Reflect.set(globalThis, Symbol.for("pi.worker.admission-state"), admissionState);
   publishAdmissionState();
   let stateDelivery = Promise.resolve();
@@ -84,9 +85,8 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
     parameters: workerRuntimeRole() === "review" ? WorkerBeadsTasksReadParams : WorkerBeadsTasksParams, executionMode: "sequential",
     async execute(_id, params): Promise<AgentToolResult<unknown>> {
       validateBeadsAction(params);
-      if (remoteHost) return requestHost<AgentToolResult<unknown>>("worker_beads_tasks", params);
-      assertRuntimeOpen("worker_beads_tasks");
-      return executeWorkerBeadsHostRequest(params);
+      if (!remoteHost) throw new Error("worker_beads_tasks requires the managed RPC host runtime.");
+      return requestHost<AgentToolResult<unknown>>("worker_beads_tasks", params);
     }
   }));
   api.registerTool(defineTool({
@@ -100,7 +100,7 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
     ],
     parameters: workerRuntimeRole() === "review" ? WorkerReviewResultSubmitParams : WorkerWorkResultSubmitParams, executionMode: "sequential",
     async execute(_id, params): Promise<AgentToolResult<WorkerResultDetails>> {
-      if (!remoteHost) return executeWorkerResultHostRequest(params, { reconcileGuestJobs: true });
+      if (!remoteHost) throw new Error("worker_result_submit requires the managed RPC host runtime.");
       const guest = workerGuestIdentity();
       const validation = validateAndNormalizeWorkerResult(params, guest.workspaceRoot);
       if (validation.errors.length) return rejectedResult(validation.errors);
@@ -108,8 +108,13 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
         try { return await requestHost<AgentToolResult<WorkerResultDetails>>("worker_result_submit", params); }
         catch (error) { const message = error instanceof Error ? error.message : String(error); return rejectedResult([{ code: /revoked/.test(message) ? "authorization_revoked" : "operational_failure", path: "run", message }]); }
       }
-      if (admissionState === "submitting") return rejectedResult([{ code: "operational_failure", path: "run", message: "Worker result admission is already in progress." }]);
-      let submissionAttempted = false; let hostAccepted = false;
+      const submissionSha256 = createHash("sha256").update(canonicalJson(params)).digest("hex");
+      if (admissionState === "submitting") {
+        if (uncertainSubmissionSha256 !== submissionSha256) return rejectedResult([{ code: "operational_failure", path: "run", message: "A different worker result is already in uncertain host admission; authority remains sealed." }]);
+        try { const recovered = await requestHost<AgentToolResult<WorkerResultDetails>>("worker_result_submit", params); if (recovered.details.status === "accepted") { admissionState = "accepted"; uncertainSubmissionSha256 = undefined; publishAdmissionState(); try { await sendRuntimeState(); } catch {} } return recovered; }
+        catch (error) { const message = error instanceof Error ? error.message : String(error); return rejectedResult([{ code: /revoked/.test(message) ? "authorization_revoked" : "operational_failure", path: "run", message }]); }
+      }
+      let submissionAttempted = false; let hostAccepted = false; uncertainSubmissionSha256 = submissionSha256;
       try {
         admissionState = "submitting"; publishAdmissionState();
         await reconcileGuestOwnedWork(guest);
@@ -117,7 +122,7 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
         submissionAttempted = true;
         const result = await requestHost<AgentToolResult<WorkerResultDetails>>("worker_result_submit", params);
         hostAccepted = result.details.status === "accepted";
-        admissionState = hostAccepted ? "accepted" : "open"; publishAdmissionState();
+        admissionState = hostAccepted ? "accepted" : "open"; uncertainSubmissionSha256 = undefined; publishAdmissionState();
         await sendRuntimeState();
         return result;
       } catch (error) {
@@ -125,13 +130,13 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
           try {
             const recovered = await requestHost<AgentToolResult<WorkerResultDetails>>("worker_result_submit", params);
             if (recovered.details.status === "accepted") {
-              hostAccepted = true; admissionState = "accepted"; publishAdmissionState();
+              hostAccepted = true; admissionState = "accepted"; uncertainSubmissionSha256 = undefined; publishAdmissionState();
               try { await sendRuntimeState(); } catch {}
               return recovered;
             }
           } catch {}
         }
-        admissionState = hostAccepted ? "accepted" : "open"; publishAdmissionState();
+        admissionState = hostAccepted ? "accepted" : submissionAttempted ? "submitting" : "open"; if (!submissionAttempted) uncertainSubmissionSha256 = undefined; publishAdmissionState();
         const message = error instanceof Error ? error.message : String(error);
         return rejectedResult([{ code: /revoked/.test(message) ? "authorization_revoked" : "operational_failure", path: "run", message }]);
       }
@@ -139,8 +144,12 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
   }));
 }
 
-export async function executeWorkerBeadsHostRequest(params: any): Promise<AgentToolResult<unknown>> {
+export async function executeWorkerBeadsHostRequest(payload: unknown): Promise<AgentToolResult<unknown>> {
   assertRuntimeOpen("worker_beads_tasks");
+  const params = validateToolArguments(
+    { name: "worker_beads_tasks", description: "Validate a host-side worker Beads request.", parameters: workerRuntimeRole() === "review" ? WorkerBeadsTasksReadParams : WorkerBeadsTasksParams } as Tool,
+    { type: "toolCall", id: "host-worker-beads", name: "worker_beads_tasks", arguments: payload } as ToolCall
+  ) as any;
   validateBeadsAction(params);
   if (params.action === "update") return executeTaskUpdate({ taskId: params.taskId!, note: params.note!, status: params.status });
   if (params.action === "design") return executeTaskDesignRead(params.taskId!, params.offset, params.limit, params.expectedSha256);
@@ -150,9 +159,13 @@ export async function executeWorkerBeadsHostRequest(params: any): Promise<AgentT
   return executeTaskRead(read);
 }
 
-export async function executeWorkerResultHostRequest(params: WorkerResultSubmitInput, options: { reconcileGuestJobs?: boolean } = {}): Promise<AgentToolResult<WorkerResultDetails>> {
+export async function executeWorkerResultHostRequest(payload: unknown): Promise<AgentToolResult<WorkerResultDetails>> {
   const identity = workerRuntimeIdentity();
   assertRuntimeAuthorization(identity, "worker_result_submit");
+  const params = validateToolArguments(
+    { name: "worker_result_submit", description: "Validate a host-side worker result.", parameters: workerRuntimeRole() === "review" ? WorkerReviewResultSubmitParams : WorkerWorkResultSubmitParams } as Tool,
+    { type: "toolCall", id: "host-worker-result", name: "worker_result_submit", arguments: payload } as ToolCall
+  ) as WorkerResultSubmitInput;
   const validation = validateAndNormalizeWorkerResult(params, identity.workspaceRoot);
   if (validation.errors.length) return rejectedResult(validation.errors);
   const normalizedResult = { ...params, ...(validation.repositories.length ? { repositories: validation.repositories } : {}), ...(validation.artifacts.length ? { artifacts: validation.artifacts } : {}) } as AcceptedWorkerResult["result"];
@@ -166,7 +179,6 @@ export async function executeWorkerResultHostRequest(params: WorkerResultSubmitI
   }
   const admissionFile = beginWorkerResultAdmission(identity);
   try {
-    if (options.reconcileGuestJobs) await reconcileGuestOwnedWork(identity);
     assertRuntimeAuthorization(identity, "worker_result_submit");
     writeAtomicJson(identity.resultFile, accepted);
     return { content: [{ type: "text", text: `Worker result accepted for ${identity.workerId}/${identity.runId}.` }], details: { status: "accepted", outcome: params.outcome } };

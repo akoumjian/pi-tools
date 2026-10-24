@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "allowJs": true,
+    "rootDir": ".",
+    "outDir": "dist/worker-host",
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": ["extensions/**/*.ts", "extensions/**/*.js"],
+  "exclude": ["tests/**", ".pi/**", "dist/**"]
+}

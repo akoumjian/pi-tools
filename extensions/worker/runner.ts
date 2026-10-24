@@ -16,7 +16,7 @@ export type WorkerLaunchRecord = {
   workerId: string; runId: string; jobId: string; sessionId: string; sessionFile: string; workerRoot: string; workspaceRoot: string;
   taskIds: string[]; role: WorkerRole; modelSelection: string; cacheLineage?: WorkerCacheLineageRecord;
 };
-export type WorkerRuntimeProvenance = { protocolVersion: 1; sandboxName: string; creationNonce: string; piRevision: string; profileRevision: string; piToolsRevision: string; piDocparserRevision: string; resourceManifestSha256: string; imageDigest: string; kitSha256: string; extensionPaths: string[] };
+export type WorkerRuntimeProvenance = { protocolVersion: 1; sandboxName: string; creationNonce: string; piRevision: string; profileRevision: string; piToolsRevision: string; piDocparserRevision: string; resourceManifestSha256: string; imageDigest: string; kitSha256: string; extensionPaths: string[]; observedSandboxId: string; observedRuntimeSha256: string };
 export type WorkerHostConfig = {
   version: 2; backend: "docker-sandbox"; workerId: string; runId: string; sessionId: string; sessionFile: string; sessionDir: string;
   workerRoot: string; workspaceRoot: string; supervisionRoot: string; asyncJobRoot: string; taskIds: string[]; role: WorkerRole; cacheLineage?: WorkerCacheLineageRecord;
@@ -41,7 +41,8 @@ export function launchWorkerHost(api: ExtensionAPI, context: ExtensionContext, i
   mkdirSync(input.runDir, { recursive: true, mode: 0o700 });
   const bdPath = input.bdPath ?? resolveExecutable("bd");
   const configFile = path.join(input.runDir, "host.json"); const authorizationFile = path.join(input.runDir, "host-authorization.json"); const launchManifestFile = path.join(input.runDir, "sandbox-launch.json");
-  const runtimeProvenance: WorkerRuntimeProvenance = { protocolVersion: 1, sandboxName: input.sandbox.sandboxName, creationNonce: input.sandbox.creationNonce, piRevision: input.sandbox.revisions.pi, profileRevision: input.sandbox.revisions.profile, piToolsRevision: input.sandbox.revisions.piTools, piDocparserRevision: input.sandbox.revisions.piDocparser, resourceManifestSha256: input.sandbox.resourceManifestSha256, imageDigest: input.sandbox.imageDigest, kitSha256: input.sandbox.kitSha256, extensionPaths: [...input.sandbox.extensionPaths] };
+  if (!input.sandbox.observedSandboxId || !input.sandbox.observedRuntimeSha256 || !input.sandbox.createEvidenceSha256) throw new Error("Worker Sandbox host observation is required before supervisor launch.");
+  const runtimeProvenance: WorkerRuntimeProvenance = { protocolVersion: 1, sandboxName: input.sandbox.sandboxName, creationNonce: input.sandbox.creationNonce, piRevision: input.sandbox.revisions.pi, profileRevision: input.sandbox.revisions.profile, piToolsRevision: input.sandbox.revisions.piTools, piDocparserRevision: input.sandbox.revisions.piDocparser, resourceManifestSha256: input.sandbox.resourceManifestSha256, imageDigest: input.sandbox.imageDigest, kitSha256: input.sandbox.kitSha256, extensionPaths: [...input.sandbox.extensionPaths], observedSandboxId: input.sandbox.observedSandboxId, observedRuntimeSha256: input.sandbox.observedRuntimeSha256 };
   const config: WorkerHostConfig = {
     version: 2, backend: "docker-sandbox", workerId: record.workerId, runId: record.runId, sessionId: record.sessionId,
     sessionFile: record.sessionFile, sessionDir: path.dirname(record.sessionFile), workerRoot: record.workerRoot, workspaceRoot: record.workspaceRoot,

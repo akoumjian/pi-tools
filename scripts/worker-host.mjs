@@ -4,10 +4,10 @@ import { existsSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import path from "node:path";
-import { RpcClient } from "@earendil-works/pi-coding-agent";
-import { captureAsyncJobProcessIdentity } from "../extensions/_shared/async-job-process.js";
-import { writeAtomicJson } from "../extensions/_shared/atomic-json.js";
-import { executeWorkerBeadsHostRequest, executeWorkerResultHostRequest } from "../extensions/worker/runtime.js";
+import { RpcClient } from "./worker-rpc/rpc-client.js";
+import { captureAsyncJobProcessIdentity } from "../dist/worker-host/extensions/_shared/async-job-process.js";
+import { writeAtomicJson } from "../dist/worker-host/extensions/_shared/atomic-json.js";
+import { executeWorkerBeadsHostRequest, executeWorkerResultHostRequest } from "../dist/worker-host/extensions/worker/runtime.js";
 
 const execFileAsync = promisify(execFile);
 const configFile = process.argv[2];
@@ -28,6 +28,7 @@ let acceptedHello;
 let runtimeState;
 let revoked = false;
 let hostAdmissionState = "open";
+let resultAdmission;
 let admittedMutations = 0;
 const mutationDrainWaiters = new Set();
 const client = new RpcClient({
@@ -56,19 +57,20 @@ const client = new RpcClient({
     worker_result_submit: async (payload) => {
       assertAuthorized("worker_result_submit");
       if (!acceptedHello || !runtimeState) throw new Error("Worker runtime compatibility and state are required before result submission.");
-      if (hostAdmissionState === "submitting") throw new Error("Worker result admission is already in progress.");
       const recoveringAcceptedResult = hostAdmissionState === "accepted";
+      if (hostAdmissionState === "submitting") { await resultAdmission; return executeWorkerResultHostRequest(payload); }
       if (!recoveringAcceptedResult) {
         if (runtimeState.admissionState !== "submitting" || runtimeState.activeJobCount !== 0 || runtimeState.pendingCompletionFollowUp) throw new Error("Worker runtime is not quiescent for result admission.");
         hostAdmissionState = "submitting";
-        await drainAdmittedMutations();
-      }
+        resultAdmission = (async () => { await drainAdmittedMutations(); return executeWorkerResultHostRequest(payload); })();
+      } else resultAdmission = Promise.resolve().then(() => executeWorkerResultHostRequest(payload));
       try {
-        const result = await executeWorkerResultHostRequest(payload);
+        const result = await resultAdmission;
         if (result?.details?.status === "accepted") { hostAdmissionState = "accepted"; revoked = true; }
         else if (!recoveringAcceptedResult) hostAdmissionState = "open";
         return result;
       } catch (error) { if (!recoveringAcceptedResult) hostAdmissionState = "open"; throw error; }
+      finally { resultAdmission = undefined; }
     },
     worker_beads_tasks: async (payload) => {
       assertAuthorized("worker_beads_tasks");
@@ -137,17 +139,31 @@ function assertLaunchAuthorization() {
   const value = JSON.parse(readFileSync(config.authorizationFile, "utf8"));
   if (value?.version !== 2 || value.workerId !== config.workerId || value.runId !== config.runId || value.processNonce !== config.processNonce || value.sandboxName !== config.sandbox.sandboxName || value.creationNonce !== config.sandbox.creationNonce) throw new Error(`Worker host launch authorization is no longer valid for ${config.workerId}/${config.runId}.`);
 }
-async function drainAdmittedMutations() { if (admittedMutations === 0) return; await new Promise((resolve) => mutationDrainWaiters.add(resolve)); }
+async function drainAdmittedMutations() {
+  if (admittedMutations === 0) return;
+  let resolveDrain; const drained = new Promise((resolve) => { resolveDrain = resolve; mutationDrainWaiters.add(resolve); });
+  const outcome = await Promise.race([drained.then(() => "drained"), delay(15_000).then(() => "timeout")]);
+  mutationDrainWaiters.delete(resolveDrain);
+  if (outcome !== "drained" || admittedMutations !== 0) throw new Error("Timed out draining admitted worker mutations before authority settlement.");
+}
 function validateHello(value) {
   const expected = config.runtimeProvenance;
-  if (!value || value.version !== 1 || value.workerId !== config.workerId || value.runId !== config.runId || value.role !== config.role || value.sessionId !== config.sessionId || value.protocolVersion !== 1 || value.sandboxName !== config.sandbox.sandboxName || value.creationNonce !== config.sandbox.creationNonce) throw new Error("Worker runtime hello identity mismatch.");
-  for (const key of ["piRevision", "profileRevision", "piToolsRevision", "piDocparserRevision", "resourceManifestSha256", "imageDigest", "kitSha256"]) if (value[key] !== expected[key]) throw new Error(`Worker runtime hello ${key} mismatch.`);
-  if (JSON.stringify(value.extensionPaths) !== JSON.stringify(expected.extensionPaths)) throw new Error("Worker runtime hello extensionPaths mismatch.");
+  const keys = ["version","workerId","runId","role","sessionId","protocolVersion","sandboxName","creationNonce","piRevision","profileRevision","piToolsRevision","piDocparserRevision","resourceManifestSha256","imageDigest","kitSha256","extensionPaths","observedSandboxId","observedRuntimeSha256"];
+  assertExactObject(value, keys, "Worker runtime hello");
+  if (value.version !== 1 || value.workerId !== config.workerId || value.runId !== config.runId || value.role !== config.role || value.sessionId !== config.sessionId || value.protocolVersion !== 1 || value.sandboxName !== config.sandbox.sandboxName || value.creationNonce !== config.sandbox.creationNonce) throw new Error("Worker runtime hello identity mismatch.");
+  for (const key of ["piRevision", "profileRevision", "piToolsRevision", "piDocparserRevision", "resourceManifestSha256", "imageDigest", "kitSha256", "observedSandboxId", "observedRuntimeSha256"]) if (value[key] !== expected[key]) throw new Error(`Worker runtime hello ${key} mismatch.`);
+  if (!Array.isArray(value.extensionPaths) || value.extensionPaths.length > 64 || value.extensionPaths.some((item) => typeof item !== "string" || item.length < 1 || item.length > 4096) || JSON.stringify(value.extensionPaths) !== JSON.stringify(expected.extensionPaths)) throw new Error("Worker runtime hello extensionPaths mismatch.");
   return value;
 }
 function validateState(value) {
-  if (!value || value.version !== 1 || value.workerId !== config.workerId || value.runId !== config.runId || !Number.isSafeInteger(value.sequence) || value.sequence < 1 || !["active", "idle", "shutting_down"].includes(value.agentPhase) || !Number.isSafeInteger(value.activeJobCount) || value.activeJobCount < 0 || typeof value.pendingCompletionFollowUp !== "boolean" || !["open", "submitting", "accepted"].includes(value.admissionState)) throw new Error("Invalid worker runtime state.");
+  assertExactObject(value, ["version","workerId","runId","sequence","agentPhase","activeJobCount","pendingCompletionFollowUp","admissionState"], "Worker runtime state");
+  if (value.version !== 1 || value.workerId !== config.workerId || value.runId !== config.runId || !Number.isSafeInteger(value.sequence) || value.sequence < 1 || !["active", "idle", "shutting_down"].includes(value.agentPhase) || !Number.isSafeInteger(value.activeJobCount) || value.activeJobCount < 0 || value.activeJobCount > 10000 || typeof value.pendingCompletionFollowUp !== "boolean" || !["open", "submitting", "accepted"].includes(value.admissionState)) throw new Error("Invalid worker runtime state.");
   return value;
+}
+function assertExactObject(value, keys, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object.`);
+  const actual = Object.keys(value).sort(); const expected = [...keys].sort();
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error(`${label} fields are invalid.`);
 }
 function assertSessionIdentity(state) { if (state.sessionId !== config.sessionId) throw new Error(`Worker RPC session mismatch: expected ${config.sessionId}, found ${state.sessionId}.`); }
 function observePromptStart(rpcClient) {
@@ -162,7 +178,7 @@ function waitForResultSettlement(rpcClient, resultFile, timeoutMs) {
     let finished = false; let checking = false; let timeout;
     const finish = (error) => { if (finished) return; finished = true; if (timeout !== undefined) clearTimeout(timeout); unsubscribe(); if (error) reject(error); else resolve(); };
     const reconcile = async () => { if (checking || finished) return; checking = true; let idleSince;
-      try { while (!finished) { const state = await rpcClient.getState(); const rpcActive = state.isStreaming || state.isCompacting || state.pendingMessageCount !== 0; const typedIdle = runtimeState?.admissionState === "accepted" && runtimeState?.agentPhase === "idle" && runtimeState?.activeJobCount === 0 && !runtimeState?.pendingCompletionFollowUp; if (existsSync(resultFile) && !rpcActive && typedIdle) return finish(); if (!rpcActive && runtimeState?.admissionState === "open" && runtimeState?.agentPhase === "idle" && runtimeState?.activeJobCount === 0) { idleSince ??= Date.now(); if (Date.now() - idleSince >= 5_000) return finish(new Error("Worker turn settled without worker_result_submit.")); } else idleSince = undefined; await delay(50); } }
+      try { while (!finished) { const state = await rpcClient.getState(); const rpcActive = state.isStreaming || state.isCompacting || state.pendingMessageCount !== 0; const typedIdle = runtimeState?.admissionState === "accepted" && runtimeState?.agentPhase === "idle" && runtimeState?.activeJobCount === 0 && !runtimeState?.pendingCompletionFollowUp; if (existsSync(resultFile) && !rpcActive && typedIdle) return finish(); if (!existsSync(resultFile) && !rpcActive && runtimeState?.admissionState === "open" && runtimeState?.agentPhase === "idle" && runtimeState?.activeJobCount === 0 && !runtimeState?.pendingCompletionFollowUp) { idleSince ??= Date.now(); if (Date.now() - idleSince >= 5_000) return finish(new Error("Worker turn settled without worker_result_submit.")); } else idleSince = undefined; await delay(50); } }
       catch (error) { finish(error); } finally { checking = false; } };
     const unsubscribe = rpcClient.onEvent((event) => { if (event.type === "agent_end" || event.type === "message_end") void reconcile(); });
     if (timeoutMs !== undefined) timeout = setTimeout(() => finish(new Error(`Worker result settlement timed out after ${timeoutMs}ms.`)), timeoutMs);

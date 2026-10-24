@@ -58,9 +58,9 @@ export function renderWorkerActivityStatus(count: number, theme: Pick<Theme, "fg
 }
 
 type RunRuntime = {
-  version: 3; prompt: string; runDir: string; resultFile: string; settledFile: string; processFile: string; processNonce: string;
+  version: 4; prompt: string; runDir: string; resultFile: string; settledFile: string; processFile: string; processNonce: string;
   sandbox: WorkerSandboxReference; contextFile?: string; inputs: RetainedInput[];
-  repositoryBefore: RepositorySnapshot[]; pendingWorkSessionId?: string; interruptionWarnings?: string[];
+  repositoryBefore: RepositorySnapshot[]; pendingWorkSessionId?: string; interruptionWarnings?: string[]; runtimeFingerprint: string; releaseOrdinal: number;
 };
 type WorkerRuntime = { version: 2; inputs: RetainedInput[]; repositoryBaselines?: Array<{ path: string; resolvedCommit: string }>; cacheLineage?: WorkerCacheLineageRecord };
 type PendingRun = { workerId: string; runId: string; parentSessionFile: string; parentSessionId: string; runtime: RunRuntime };
@@ -336,27 +336,32 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
           } else verifyRetainedSession(worker, paths);
           const latest = worker.latestRunId ? getWorkerRun(getRegistry(), worker.workerId, worker.latestRunId) : undefined;
           const binding = latest?.binding; provisionWorkerPaths(paths);
-          const role = worker.role; const inputs = validateAdditionalInputs({ values: request.additionalInputs, existing: runtimeInputs(worker), role, workspaceRoot: paths.workspaceRoot, runtimeRoot });
-          let contextFile: string | undefined; let reviewedRunId: string | undefined; let preparedId: string | undefined; let operationRepositories: Array<Record<string, unknown>> | undefined; const pendingWorkSessionId = !worker.sessionId && role === "work" ? randomUUID() : undefined; const reservedRunId = role === "review" ? createWorkerRunId(now(), random()) : undefined;
+          const role = worker.role; const retainedInputs = validateAdditionalInputs({ values: request.additionalInputs, existing: runtimeInputs(worker), role, workspaceRoot: paths.workspaceRoot, runtimeRoot });
+          let contextFile: string | undefined; let reviewedRunId: string | undefined; let preparedId: string | undefined; let operationRepositories: Array<Record<string, unknown>> | undefined; const pendingWorkSessionId = !worker.sessionId && role === "work" ? randomUUID() : undefined; const reservedRunId = createWorkerRunId(now(), random());
+          const inputs = snapshotAdditionalInputs(runEvidenceDirectory(paths, reservedRunId), retainedInputs);
           const mounts: WorkerSandboxMount[] = inputMounts(inputs);
           if (role === "review") {
             if (!binding || !("reviewedRunId" in binding)) throw new Error(`Review worker ${worker.workerId} lost its reviewed-run binding.`);
             const subject = reviewSubject(binding.reviewedRunId, parentSessionFile, worker.workerId); reviewedRunId = binding.reviewedRunId;
-            contextFile = writeReviewContext(paths, workerPaths(roots, subject.worker.workerId), request.workerId, reservedRunId!, subject.worker, subject.run, inputs);
-            mounts.push({ source: subject.worker.workspaceRoot, readOnly: true }, { source: contextFile, readOnly: true }, { source: reviewSessionFile(contextFile), readOnly: true });
+            contextFile = writeReviewContext(runEvidenceDirectory(paths, reservedRunId), workerPaths(roots, subject.worker.workerId), request.workerId, reservedRunId, subject.worker, subject.run, inputs);
+            mounts.splice(0, mounts.length, { source: subject.worker.workspaceRoot, readOnly: true }, { source: path.dirname(contextFile), readOnly: true });
           } else if (role === "integration") {
             if (!binding || !("preparedId" in binding)) throw new Error(`Integration worker ${worker.workerId} lost its prepared-set binding.`); preparedId = binding.preparedId;
             const trustedSet = trustedPreparedSet(getRegistry(), parentSessionFile, preparedId, paths.workspaceRoot); operationRepositories = snapshotOperationRepositories(trustedSet.repositories);
-            contextFile = writeIntegrationContext(paths, trustedSet, inputs, true); mounts.push({ source: contextFile, readOnly: true });
+            contextFile = writeIntegrationContext(paths, runEvidenceDirectory(paths, reservedRunId), trustedSet, inputs, true); mounts.splice(0, mounts.length, { source: path.dirname(contextFile), readOnly: true });
           }
           const retained = retainedWorkerRuntime(worker);
-          if (pendingWorkSessionId) retained.cacheLineage = prepareWorkerCacheLineage({ stateRoot: roots.stateRoot, workerStateDir: paths.stateDir, parentSessionFile, parentSessionId: context.sessionManager.getSessionId(), route: parseWorkerModelSelection(worker.modelSelection!), now: now() });
-          const plan = finishPlanSafely({ request, role, workerId: worker.workerId, ...(reservedRunId ? { runId: reservedRunId } : {}), paths, taskIds: unique([...worker.taskIds, ...(request.additionalTaskIds ?? [])]), modelSelection: worker.modelSelection!, binding, workerRuntime: { version: 2, inputs, ...retained }, newWorker: false, expectedVersion: worker.version, contextFile, reviewedRunId, preparedId, operationRepositories, pendingWorkSessionId, mounts, parentSessionFile, context });
+          if (role === "work") {
+            const priorFingerprint = retained.cacheLineage?.mode === "eligible" ? retained.cacheLineage.runtimeFingerprint : undefined;
+            retained.cacheLineage = prepareWorkerCacheLineage({ stateRoot: roots.stateRoot, workerStateDir: path.join(paths.stateDir, "cache-lineage", reservedRunId), parentSessionFile, parentSessionId: context.sessionManager.getSessionId(), route: parseWorkerModelSelection(worker.modelSelection!), now: now() });
+            if (retained.cacheLineage.mode === "eligible" && priorFingerprint) retained.cacheLineage.runtimeFingerprint = priorFingerprint;
+          }
+          const plan = finishPlanSafely({ request, role, workerId: worker.workerId, ...(reservedRunId ? { runId: reservedRunId } : {}), paths, taskIds: unique([...worker.taskIds, ...(request.additionalTaskIds ?? [])]), modelSelection: worker.modelSelection!, binding, workerRuntime: { version: 2, inputs: retainedInputs, ...retained }, newWorker: false, expectedVersion: worker.version, contextFile, reviewedRunId, preparedId, operationRepositories, pendingWorkSessionId, mounts, parentSessionFile, context });
           plans.push(plan); continue;
         }
         const role = request.role;
         const modelSelection = resolveModel(role, role === "work" ? request.modelSelection : undefined, context);
-        const workerId = createWorkerId(now(), random()); const paths = workerPaths(roots, workerId); const reservedRunId = role === "review" ? createWorkerRunId(now(), random()) : undefined;
+        const workerId = createWorkerId(now(), random()); const paths = workerPaths(roots, workerId); const reservedRunId = createWorkerRunId(now(), random());
         const taskIds = role === "review" ? [] : unique(request.taskIds);
         let subject: ReturnType<typeof reviewSubject> | undefined;
         let repositoryBaselines: Array<{ path: string; resolvedCommit: string }> | undefined;
@@ -367,21 +372,22 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         else if (role === "review") { subject = reviewSubject(request.reviewedRunId, parentSessionFile); inputs = validateAdditionalInputs({ values: request.additionalInputs, role, workspaceRoot: paths.workspaceRoot, runtimeRoot }); }
         else { integrationSet = trustedPreparedSet(getRegistry(), parentSessionFile, request.preparedId); inputs = validateAdditionalInputs({ values: request.additionalInputs, role, workspaceRoot: paths.workspaceRoot, runtimeRoot }); }
         provisionWorkerPaths(paths);
-        try { if (role === "work") cacheLineage = prepareWorkerCacheLineage({ stateRoot: roots.stateRoot, workerStateDir: paths.stateDir, parentSessionFile, parentSessionId: context.sessionManager.getSessionId(), route: parseWorkerModelSelection(modelSelection), now: now() }); }
+        try { if (role === "work") cacheLineage = prepareWorkerCacheLineage({ stateRoot: roots.stateRoot, workerStateDir: path.join(paths.stateDir, "cache-lineage", reservedRunId), parentSessionFile, parentSessionId: context.sessionManager.getSessionId(), route: parseWorkerModelSelection(modelSelection), now: now() }); }
         catch (error) { rmSync(paths.stateDir, { recursive: true, force: true }); throw error; }
         let binding: WorkerRunRecord["binding"]; let reviewedRunId: string | undefined; let preparedId: string | undefined; let consumedPrepared = false;
         let contextFile: string | undefined; let mounts: WorkerSandboxMount[] = [];
         try {
           const pendingWorkSessionId = role === "work" ? randomUUID() : undefined;
+          const mountedInputs = snapshotAdditionalInputs(runEvidenceDirectory(paths, reservedRunId), inputs);
           if (role === "review") {
             reviewedRunId = request.reviewedRunId; binding = { reviewedWorkerId: subject!.worker.workerId, reviewedRunId };
             createWorkerSession({ workspaceRoot: paths.workspaceRoot, sessionDir: paths.sessionDir, sessionId: randomUUID() });
-            contextFile = writeReviewContext(paths, workerPaths(roots, subject!.worker.workerId), workerId, reservedRunId!, subject!.worker, subject!.run, inputs);
-            mounts = [{ source: subject!.worker.workspaceRoot, readOnly: true }, { source: contextFile, readOnly: true }, { source: reviewSessionFile(contextFile), readOnly: true }, ...inputMounts(inputs)];
+            contextFile = writeReviewContext(runEvidenceDirectory(paths, reservedRunId), workerPaths(roots, subject!.worker.workerId), workerId, reservedRunId, subject!.worker, subject!.run, mountedInputs);
+            mounts = [{ source: subject!.worker.workspaceRoot, readOnly: true }, { source: path.dirname(contextFile), readOnly: true }];
           } else if (role === "integration") {
             preparedId = request.preparedId; const trustedSet = integrationSet!; const moved = consumePreparedMergeSet(parentSessionFile, preparedId, workerId, paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, trustedSet }); consumedPrepared = true; binding = { preparedId };
             createWorkerSession({ workspaceRoot: paths.workspaceRoot, sessionDir: paths.sessionDir, sessionId: randomUUID() });
-            contextFile = writeIntegrationContext(paths, moved, inputs, false); mounts = [...inputMounts(inputs), { source: contextFile, readOnly: true }];
+            contextFile = writeIntegrationContext(paths, runEvidenceDirectory(paths, reservedRunId), moved, mountedInputs, false); mounts = [{ source: path.dirname(contextFile), readOnly: true }];
           }
           const plan = finishPlan({ request, role, workerId, ...(reservedRunId ? { runId: reservedRunId } : {}), paths, taskIds: role === "review" ? subject!.run.taskIds : taskIds, modelSelection, binding,
             workerRuntime: { version: 2, inputs, ...(repositoryBaselines ? { repositoryBaselines } : {}), ...(cacheLineage ? { cacheLineage } : {}) }, newWorker: true, contextFile, reviewedRunId, preparedId, consumedPrepared, operationRepositories: snapshotOperationRepositories(integrationSet?.repositories), pendingWorkSessionId, mounts, parentSessionFile, context });
@@ -399,7 +405,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   function finishPlanSafely(input: Omit<PlannedRun, "runId" | "jobId" | "runRuntime"> & { runId?: string; contextFile?: string; pendingWorkSessionId?: string; mounts: WorkerSandboxMount[]; parentSessionFile: string; context: ExtensionContext }): PlannedRun {
     try { return finishPlan(input); } catch (error) {
       if (input.consumedPrepared && input.preparedId) { try { restoreConsumedPreparedMergeSet(input.parentSessionFile, input.preparedId, input.paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, trustedSet: trustedPreparedSet(getRegistry(), input.parentSessionFile, input.preparedId) }); } catch {} }
-      if (input.newWorker) { rmSync(input.paths.stateDir, { recursive: true, force: true }); rmSync(input.paths.supervisionDir, { recursive: true, force: true }); } else if (input.contextFile) rmSync(input.contextFile, { force: true });
+      if (input.newWorker) { rmSync(input.paths.stateDir, { recursive: true, force: true }); rmSync(input.paths.supervisionDir, { recursive: true, force: true }); rmSync(input.paths.evidenceDir, { recursive: true, force: true }); } else if (input.contextFile) rmSync(path.dirname(input.contextFile), { recursive: true, force: true });
       throw error;
     }
   }
@@ -412,10 +418,14 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const codeRoot = overrides.codeRoot ?? (testLaunch ? input.context.cwd : path.join(homedir(), "Code"));
     const sandbox = planWorkerSandbox({ workerId: input.workerId, runId, creationNonce: nonce, workerRoot: input.paths.stateDir, codeRoot, mounts: input.mounts.map((mount) => ({ source: mount.source, ...(mount.readOnly ? { readOnly: true } : {}) })), ...(sandboxRelease ? { release: sandboxRelease } : {}) });
     const runtimeFingerprint = createHash("sha256").update(JSON.stringify({ imageDigest: sandbox.imageDigest, kitSha256: sandbox.kitSha256, resourceManifestSha256: sandbox.resourceManifestSha256, revisions: sandbox.revisions })).digest("hex");
-    if (input.workerRuntime.cacheLineage?.mode === "eligible") input.workerRuntime.cacheLineage = input.workerRuntime.cacheLineage.runtimeFingerprint && input.workerRuntime.cacheLineage.runtimeFingerprint !== runtimeFingerprint ? { version: 1, mode: "fresh", reason: "Approved Sandbox runtime changed; prior cache lineage was retired." } : { ...input.workerRuntime.cacheLineage, runtimeFingerprint };
     const roleInstructions = roleInstructionsFor(input.role);
+    const cacheBoundaryFingerprint = createHash("sha256").update(JSON.stringify({ runtimeFingerprint, role: input.role, modelSelection: input.modelSelection, roleInstructions, taskIds: [...input.taskIds].sort(), repositoryBaselines: input.workerRuntime.repositoryBaselines ?? [] })).digest("hex");
+    if (input.workerRuntime.cacheLineage?.mode === "eligible") input.workerRuntime.cacheLineage = input.workerRuntime.cacheLineage.runtimeFingerprint && input.workerRuntime.cacheLineage.runtimeFingerprint !== cacheBoundaryFingerprint ? { version: 1, mode: "fresh", reason: "Trusted runtime, tool, role, model, assignment, or fork boundary changed; prior cache generation was retired." } : { ...input.workerRuntime.cacheLineage, runtimeFingerprint: cacheBoundaryFingerprint };
     const request = input.request;
     const previousRun = !input.newWorker ? getWorkerRun(getRegistry(), input.workerId, getWorker(getRegistry(), input.workerId)?.latestRunId ?? "") : undefined;
+    const previousRuntime = previousRun?.runtime as RunRuntime | undefined;
+    if (previousRuntime?.releaseOrdinal !== undefined && sandbox.releaseOrdinal < previousRuntime.releaseOrdinal) throw new Error(`Worker runtime downgrade refused: release ${sandbox.releaseOrdinal} is older than retained release ${previousRuntime.releaseOrdinal}.`);
+    const runtimeChanged = Boolean(previousRuntime?.runtimeFingerprint && previousRuntime.runtimeFingerprint !== runtimeFingerprint);
     const interruptedPreviously = previousRun?.outcome === "cancelled" || (previousRun?.outcome === "failed" && previousRun.outcomeSource === "system");
     const interruptionWarnings = interruptedPreviously ? inspectInterruptedGitState(input.paths.workspaceRoot) : [];
     const prompt = renderWorkerRuntimePrompt(input.role, { workerId: input.workerId, runId, workspaceRoot: input.paths.workspaceRoot,
@@ -423,9 +433,9 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       instructions: request.instructions, repositoryBaselines: input.workerRuntime.repositoryBaselines, additionalInputs: contextInputs(input.workerRuntime.inputs),
       reviewSubjectPath: input.contextFile && input.role === "review" ? (JSON.parse(readFileSync(input.contextFile, "utf8")) as { subjectWorkspace: string }).subjectWorkspace : undefined, reviewContextPath: input.role === "review" ? input.contextFile : undefined, integrationContextPath: input.role === "integration" ? input.contextFile : undefined, resumed: !input.newWorker,
       cacheLineageMarker: input.workerRuntime.cacheLineage?.mode === "eligible" ? input.workerRuntime.cacheLineage.marker : undefined, initialSession: Boolean(input.pendingWorkSessionId),
-      cancelledPreviously: interruptedPreviously, interruptionWarnings });
-    const runRuntime: RunRuntime = { version: 3, prompt, runDir, resultFile: path.join(runDir, "result.json"), settledFile: path.join(runDir, "settled.json"), processFile: path.join(runDir, "host-process.json"), processNonce: nonce,
-      sandbox, ...(input.contextFile ? { contextFile: input.contextFile } : {}), inputs: input.workerRuntime.inputs,
+      cancelledPreviously: interruptedPreviously, interruptionWarnings, runtimeChange: runtimeChanged ? `Approved runtime changed from ${previousRuntime!.runtimeFingerprint.slice(0, 12)} to ${runtimeFingerprint.slice(0, 12)} (release ${previousRuntime!.releaseOrdinal} -> ${sandbox.releaseOrdinal}); executable contracts were refreshed and cache lineage is fresh.` : undefined });
+    const runRuntime: RunRuntime = { version: 4, prompt, runDir, resultFile: path.join(runDir, "result.json"), settledFile: path.join(runDir, "settled.json"), processFile: path.join(runDir, "host-process.json"), processNonce: nonce,
+      sandbox, runtimeFingerprint, releaseOrdinal: sandbox.releaseOrdinal, ...(input.contextFile ? { contextFile: input.contextFile } : {}), inputs: input.workerRuntime.inputs,
       repositoryBefore: snapshotWorkerRepositories(input.paths.workspaceRoot), ...(input.pendingWorkSessionId ? { pendingWorkSessionId: input.pendingWorkSessionId } : {}), ...(interruptionWarnings.length ? { interruptionWarnings } : {}) };
     return { request, role: input.role, workerId: input.workerId, runId, jobId, paths: input.paths, taskIds: input.taskIds, modelSelection: input.modelSelection, ...(input.binding ? { binding: input.binding } : {}), workerRuntime: input.workerRuntime, runRuntime,
       newWorker: input.newWorker, ...(input.expectedVersion === undefined ? {} : { expectedVersion: input.expectedVersion }), ...(input.reviewedRunId ? { reviewedRunId: input.reviewedRunId } : {}), ...(input.preparedId ? { preparedId: input.preparedId } : {}), ...(input.consumedPrepared ? { consumedPrepared: true } : {}), ...(input.operationRepositories ? { operationRepositories: input.operationRepositories } : {}) };
@@ -434,8 +444,8 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   function rollbackPlans(plans: PlannedRun[], parentSessionFile: string): void {
     for (const plan of [...plans].reverse()) {
       if (plan.consumedPrepared && plan.preparedId) { try { restoreConsumedPreparedMergeSet(parentSessionFile, plan.preparedId, plan.paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, trustedSet: trustedPreparedSet(getRegistry(), parentSessionFile, plan.preparedId) }); } catch {} }
-      if (plan.newWorker) { rmSync(plan.paths.stateDir, { recursive: true, force: true }); rmSync(plan.paths.supervisionDir, { recursive: true, force: true }); }
-      else { rmSync(plan.runRuntime.runDir, { recursive: true, force: true }); if (plan.runRuntime.contextFile) rmSync(plan.runRuntime.contextFile, { force: true }); }
+      if (plan.newWorker) { rmSync(plan.paths.stateDir, { recursive: true, force: true }); rmSync(plan.paths.supervisionDir, { recursive: true, force: true }); rmSync(plan.paths.evidenceDir, { recursive: true, force: true }); }
+      else { rmSync(plan.runRuntime.runDir, { recursive: true, force: true }); if (plan.runRuntime.contextFile) rmSync(path.dirname(plan.runRuntime.contextFile), { recursive: true, force: true }); }
     }
   }
 
@@ -467,6 +477,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       const record: WorkerLaunchRecord = { workerId: worker.workerId, runId: run.runId, jobId: run.jobId!, sessionId, sessionFile, workerRoot: paths.stateDir, workspaceRoot: worker.workspaceRoot, taskIds: run.taskIds, role: worker.role, modelSelection: worker.modelSelection!, ...(worker.runtime?.cacheLineage ? { cacheLineage: worker.runtime.cacheLineage as WorkerCacheLineageRecord } : {}) };
       assertRunClaim(item.workerId, item.runId, "launch", nonce);
       item.runtime.sandbox = await createSandbox(sbx(), item.runtime.sandbox);
+      writeReadonlyJson(path.join(item.runtime.runDir, "sandbox-created.json"), { version: 1, workerId: item.workerId, runId: item.runId, creationNonce: item.runtime.sandbox.creationNonce, sandboxName: item.runtime.sandbox.sandboxName, sandboxId: item.runtime.sandbox.observedSandboxId, imageReference: item.runtime.sandbox.imageReference, imageDigest: item.runtime.sandbox.imageDigest, kitReference: item.runtime.sandbox.kitReference, kitSha256: item.runtime.sandbox.kitSha256, createEvidenceSha256: item.runtime.sandbox.createEvidenceSha256, observedRuntimeSha256: item.runtime.sandbox.observedRuntimeSha256, observedCpu: item.runtime.sandbox.observedCpu, observedMemoryBytes: item.runtime.sandbox.observedMemoryBytes, observedAt: now().toISOString() });
       launchAdmission = path.join(item.runtime.runDir, "launch-admitting.json"); writeFileSync(launchAdmission, `${JSON.stringify({ version: 2, workerId: item.workerId, runId: item.runId, pid: process.pid, processStartToken: asyncJobProcessStartToken(process.pid), startedAt: now().toISOString() })}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
       assertRunClaim(item.workerId, item.runId, "launch", nonce);
       handle = launch(context, record, item.runtime); await verifyHostIdentity(item.runtime, item.workerId, item.runId); assertRunClaim(item.workerId, item.runId, "launch", nonce); const snapshot = handle.snapshot();
@@ -503,7 +514,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     let outcome: any = "failed"; let outcomeSource: "worker" | "system" = "system"; let summary = "Worker run failed before accepting a result."; let question: string | undefined;
     let reported: string[] = []; let artifacts: string[] = []; const errors: Array<{ scope: "run" | "repositories" | "artifacts"; message: string }> = [];
     try {
-      if (job.status === "exited" && job.exitCode === 0) {
+      if (existsSync(runtime.settledFile) && existsSync(runtime.resultFile)) {
         const settled = readWorkerHostSettlement(runtime.settledFile); if (settled.workerId !== workerId || settled.runId !== runId || settled.sessionId !== worker.sessionId || path.resolve(settled.resultFile) !== path.resolve(runtime.resultFile)) throw new Error("Worker host settlement identity mismatch.");
         const accepted = readWorkerRuntimeResult(runtime.resultFile); if (accepted.workerId !== workerId || accepted.runId !== runId) throw new Error("Worker result identity mismatch.");
         outcome = accepted.result.outcome; outcomeSource = "worker"; summary = accepted.result.summary; question = accepted.result.question; reported = accepted.result.repositories ?? []; artifacts = accepted.result.artifacts ?? [];
@@ -513,34 +524,26 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       const workerStorage = workerPaths(roots, workerId); assertWorkerStoragePaths(workerStorage);
       const inventory = inventoryWorkerRepositories({ workspaceRoot: worker.workspaceRoot, workerId, runId, reported, before: runtime.repositoryBefore });
       errors.push(...inventory.errors.map((message) => ({ scope: "repositories" as const, message: sanitizeError(message) })));
-      finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind: "settlement", claimNonce: nonce, outcome, outcomeSource, summary: summary.slice(0, 2048), ...(question ? { question } : {}), repositories: inventory.repositories, artifacts, errors, sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile, workerPaths(roots, worker.workerId).sessionDir) : undefined, settledAt: now().toISOString() });
+      finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind: "settlement", claimNonce: nonce, outcome, outcomeSource, summary: summary.slice(0, 2048), ...(question ? { question } : {}), repositories: inventory.repositories, artifacts, errors, sessionEndLine: worker.sessionFile ? safeCountLines(worker.sessionFile, workerPaths(roots, worker.workerId).sessionDir) : undefined, settledAt: now().toISOString() });
       if (currentContext?.sessionManager.getSessionFile() && realpathOrResolve(currentContext.sessionManager.getSessionFile()!) === worker.parentSessionFile) deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration);
     } catch (error) {
       const message = sanitizeError(error);
       const attempts = recordWorkerSettlementRecovery(getRegistry(), { workerId, runId, claimNonce: nonce, error: message, now: now().toISOString() });
       let accepted: ReturnType<typeof readWorkerRuntimeResult> | undefined;
       try { if (existsSync(runtime.resultFile)) accepted = readWorkerRuntimeResult(runtime.resultFile); } catch {}
-      if (attempts >= 3) {
-        const retained = accepted ? ` Accepted result ${accepted.result.outcome} remains retained at ${runtime.resultFile}.` : ` Settlement evidence remains retained beneath ${runtime.runDir}.`;
-        finalizeClaimedWorkerRun(getRegistry(), {
-          parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind: "settlement", claimNonce: nonce,
-          outcome: "failed", outcomeSource: "system", summary: `Worker result settlement failed after ${attempts} deterministic attempts.`,
-          artifacts: accepted?.result.artifacts ?? [], errors: [{ scope: "run", message: `${message}${retained}` }],
-          sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile, workerPaths(roots, worker.workerId).sessionDir) : undefined, settledAt: now().toISOString()
-        });
-        if (currentContext?.sessionManager.getSessionFile() && realpathOrResolve(currentContext.sessionManager.getSessionFile()!) === worker.parentSessionFile) deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration);
-      } else {
-        releaseWorkerRunClaim(getRegistry(), workerId, runId, "settlement", nonce);
-        const current = getWorker(getRegistry(), workerId); const currentRun = current && getWorkerRun(getRegistry(), workerId, runId);
-        if (current && currentRun) deliverRecovery(current, currentRun, `${message} (settlement attempt ${attempts}/3)`);
-      }
+      releaseWorkerRunClaim(getRegistry(), workerId, runId, "settlement", nonce);
+      if (attempts < 3) { await delay(attempts * 100); await settleCompletedRun(workerId, runId, job); return; }
+      const recoveryMessage = `${message} (settlement containment attempt ${attempts}; ${accepted ? `Accepted result ${accepted.result.outcome}` : "Terminal evidence"} remains retained and the run will not finalize before exact Sandbox removal)`;
+      setWorkerRecoveryError(getRegistry(), workerId, runId, recoveryMessage, now().toISOString());
+      const current = getWorker(getRegistry(), workerId); const currentRun = current && getWorkerRun(getRegistry(), workerId, runId);
+      if (current && currentRun) deliverRecovery(current, currentRun, recoveryMessage);
     }
   }
 
   async function failClaimedRun(workerId: string, runId: string, claimKind: "launch" | "settlement", claimNonce: string, error: unknown): Promise<void> {
     const worker = getWorker(getRegistry(), workerId); const run = worker && getWorkerRun(getRegistry(), workerId, runId); if (!worker || !run || run.claimKind !== claimKind || run.claimNonce !== claimNonce) return; const runtime = run.runtime as RunRuntime;
     try { await removeSandbox(sbx(), runtime.sandbox);
-      finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind, claimNonce, outcome: "failed", outcomeSource: "system", summary: "Worker run failed before accepting a result.", errors: [{ scope: "run", message: sanitizeError(error) }], sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile, workerPaths(roots, worker.workerId).sessionDir) : undefined, settledAt: now().toISOString() });
+      finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind, claimNonce, outcome: "failed", outcomeSource: "system", summary: "Worker run failed before accepting a result.", errors: [{ scope: "run", message: sanitizeError(error) }], sessionEndLine: worker.sessionFile ? safeCountLines(worker.sessionFile, workerPaths(roots, worker.workerId).sessionDir) : undefined, settledAt: now().toISOString() });
     } catch (cleanupError) { recordRecovery(workerId, runId, cleanupError); }
   }
 
@@ -555,25 +558,29 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const nonce = claimNonce();
     if (!claimWorkerCancellation(getRegistry(), worker.workerId, runId, nonce, now().toISOString())) return "not_active";
     pending.delete(runId); const run = getWorkerRun(getRegistry(), worker.workerId, runId)!; const runtime = run.runtime as RunRuntime;
+    if (!runtime || runtime.version !== 4) { releaseWorkerRunClaim(getRegistry(), worker.workerId, runId, "cancellation", nonce); throw new Error(`Worker ${worker.workerId}/${runId} uses unsupported retained runtime schema; cancellation refuses an unproved legacy target.`); }
     try {
       const authorizationFile = path.join(runtime.runDir, "host-authorization.json"); rmSync(authorizationFile, { force: true });
       await waitForRuntimeAdmissions(runtime, authorizationFile);
+      const attached = active.get(worker.workerId);
       if (existsSync(runtime.resultFile)) {
         for (let attempt = 0; attempt < 100 && !existsSync(runtime.settledFile); attempt += 1) await delay(50);
         if (!existsSync(runtime.settledFile)) throw new Error("A worker result committed during cancellation but typed settlement is not yet complete.");
+        const exited = attached?.runId === runId ? await Promise.race([attached.handle.completion.then(() => true), delay(10_000).then(() => false)]) : false;
+        if (!exited) await removeSandbox(sbx(), runtime.sandbox);
+        await proveWorkerHostExited(runtime, worker.workerId, runId);
         releaseWorkerRunClaim(getRegistry(), worker.workerId, runId, "cancellation", nonce);
         await settleCompletedRun(worker.workerId, runId, { status: "exited", exitCode: 0 });
         return "not_active";
       }
-      const launching = starting.get(worker.workerId); if (launching?.runId === runId) await launching.completion;
-      const attached = active.get(worker.workerId); if (attached?.runId === runId) { attached.handle.cancel("SIGTERM"); }
+      const launching = starting.get(worker.workerId); if (launching?.runId === runId) await launching.completion; if (attached?.runId === runId) { attached.handle.cancel("SIGTERM"); }
       else if (existsSync(runtime.processFile)) { const process = readWorkerHostProcess(runtime.processFile); if (process.workerId !== worker.workerId || process.runId !== runId || process.nonce !== runtime.processNonce) throw new Error("Worker host process identity mismatch during cancellation."); if (isAsyncJobProcessIdentityAlive(process)) signalAsyncJobProcessIdentity(process, "SIGTERM"); }
       if (attached?.runId === runId) await Promise.race([attached.handle.completion, delay(5_000)]);
       await removeSandbox(sbx(), runtime.sandbox);
       await proveWorkerHostExited(runtime, worker.workerId, runId);
 
 
-      finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId: worker.workerId, runId, claimKind: "cancellation", claimNonce: nonce, outcome: "cancelled", outcomeSource: "system", summary: "Worker run was cancelled by its parent.", sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile, workerPaths(roots, worker.workerId).sessionDir) : undefined, settledAt: now().toISOString() });
+      finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId: worker.workerId, runId, claimKind: "cancellation", claimNonce: nonce, outcome: "cancelled", outcomeSource: "system", summary: "Worker run was cancelled by its parent.", sessionEndLine: worker.sessionFile ? safeCountLines(worker.sessionFile, workerPaths(roots, worker.workerId).sessionDir) : undefined, settledAt: now().toISOString() });
       active.delete(worker.workerId); deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration); return "cancelled";
     } catch (error) { recordRecovery(worker.workerId, runId, error); throw new Error(`Worker ${worker.workerId}/${runId} cancellation requires recovery: ${sanitizeError(error)}`); }
   }
@@ -618,7 +625,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const paths = workerPaths(roots, worker.workerId); const stateTrash = `${paths.stateDir}.discard-${nonce}`; const separateWorkspace = path.resolve(paths.workspaceRoot).startsWith(`${path.resolve(paths.stateDir)}${path.sep}`) ? undefined : `${paths.workspaceRoot}.discard-${nonce}`;
     try {
       if (existsSync(paths.stateDir)) renameSync(paths.stateDir, stateTrash); if (separateWorkspace && existsSync(paths.workspaceRoot)) renameSync(paths.workspaceRoot, separateWorkspace);
-      rmSync(stateTrash, { recursive: true, force: true }); rmSync(paths.supervisionDir, { recursive: true, force: true }); if (separateWorkspace) rmSync(separateWorkspace, { recursive: true, force: true }); finalizeWorkerDiscard(getRegistry(), worker.workerId, nonce);
+      rmSync(stateTrash, { recursive: true, force: true }); rmSync(paths.supervisionDir, { recursive: true, force: true }); rmSync(paths.evidenceDir, { recursive: true, force: true }); if (separateWorkspace) rmSync(separateWorkspace, { recursive: true, force: true }); finalizeWorkerDiscard(getRegistry(), worker.workerId, nonce);
     } catch (error) {
       const irreversible = (!existsSync(paths.stateDir) && !existsSync(stateTrash)) || Boolean(separateWorkspace && !existsSync(paths.workspaceRoot) && !existsSync(separateWorkspace));
       if (!irreversible) { try { if (existsSync(stateTrash) && !existsSync(paths.stateDir)) renameSync(stateTrash, paths.stateDir); if (separateWorkspace && existsSync(separateWorkspace) && !existsSync(paths.workspaceRoot)) renameSync(separateWorkspace, paths.workspaceRoot); } catch {} abandonWorkerDiscard(getRegistry(), worker.workerId, nonce, sanitizeError(error), now().toISOString()); }
@@ -642,7 +649,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
 
   function reconcileActiveRuns(context: ExtensionContext, parentSessionFile: string): void {
     for (const { worker, run } of activeRunsForParent(getRegistry(), parentSessionFile)) {
-      const runtime = run.runtime as RunRuntime; if (!runtime || runtime.version !== 3 || run.claimKind) { if (worker.recoveryError) deliverRecovery(worker, run, worker.recoveryError); continue; }
+      const runtime = run.runtime as RunRuntime; if (!runtime || runtime.version !== 4) { const message = `Unsupported retained worker runtime schema ${runtime && typeof runtime === "object" ? (runtime as any).version ?? "unknown" : "missing"}; exact manual containment/migration is required and no downgrade will be attempted.`; setWorkerRecoveryError(getRegistry(), worker.workerId, run.runId, message, now().toISOString()); deliverRecovery(worker, run, message); continue; } if (run.claimKind) { if (worker.recoveryError) deliverRecovery(worker, run, worker.recoveryError); continue; }
       if (worker.recoveryError) {
         if (run.status === "running" && existsSync(runtime.settledFile) && existsSync(runtime.resultFile)) clearWorkerRecoveryError(getRegistry(), worker.workerId, run.runId, now().toISOString());
         else if (run.status === "queued") clearWorkerRecoveryError(getRegistry(), worker.workerId, run.runId, now().toISOString());
@@ -699,20 +706,44 @@ function updateWorkerActivityStatus(registry: WorkerRegistry, context: Extension
   context.ui.setStatus(WORKER_ACTIVITY_STATUS_KEY, renderWorkerActivityStatus(count, context.ui.theme));
 }
 
-function assertWorkerStoragePaths(paths: WorkerPaths): void {
+export function assertWorkerStoragePaths(paths: WorkerPaths): void {
   const state = lstatSync(paths.stateDir); if (!state.isDirectory() || state.isSymbolicLink()) throw new Error("Worker root must remain an ordinary directory.");
-  assertContainedOrdinaryDirectory(paths.stateDir, paths.sessionDir, "worker session directory");
-  assertContainedOrdinaryDirectory(paths.stateDir, path.join(paths.stateDir, "async-shell"), "worker async directory");
-  assertContainedOrdinaryDirectory(path.dirname(paths.workspaceRoot), paths.workspaceRoot, "worker workspace");
-  for (const [directory, label] of [[paths.reposDir, "repository"], [paths.scratchDir, "scratch"], [paths.cacheDir, "cache"], [paths.artifactsDir, "artifact"], [paths.tempDir, "temporary"]] as const) assertContainedOrdinaryDirectory(paths.workspaceRoot, directory, `worker ${label} directory`);
-  for (const name of ["config", "data", "state"]) assertContainedOrdinaryDirectory(paths.cacheDir, path.join(paths.cacheDir, name), `worker cache ${name} directory`);
+  ensureContainedOrdinaryDirectory(paths.stateDir, paths.sessionDir, "worker session directory");
+  ensureContainedOrdinaryDirectory(paths.stateDir, path.join(paths.stateDir, "async-shell"), "worker async directory");
+  ensureContainedOrdinaryDirectory(path.dirname(paths.workspaceRoot), paths.workspaceRoot, "worker workspace");
+  for (const [directory, label] of [[paths.reposDir, "repository"], [paths.scratchDir, "scratch"], [paths.cacheDir, "cache"], [paths.artifactsDir, "artifact"], [paths.tempDir, "temporary"]] as const) ensureContainedOrdinaryDirectory(paths.workspaceRoot, directory, `worker ${label} directory`);
+  for (const name of ["config", "data", "state"]) ensureContainedOrdinaryDirectory(paths.cacheDir, path.join(paths.cacheDir, name), `worker cache ${name} directory`);
+}
+function ensureContainedOrdinaryDirectory(root: string, directory: string, label: string): void {
+  try { assertContainedOrdinaryDirectory(root, directory, label); return; } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  assertContainedOrdinaryDirectory(root, directory, label);
 }
 
-function writeReviewContext(paths: WorkerPaths, subjectPaths: WorkerPaths, reviewerWorkerId: string, contextId: string, subjectWorker: WorkerRegistryRecord, subjectRun: WorkerRunRecord, inputs: RetainedInput[]): string {
+function runEvidenceDirectory(paths: WorkerPaths, runId: string): string { return path.join(paths.evidenceDir, "runs", runId, "inputs"); }
+export function snapshotAdditionalInputs(directory: string, inputs: RetainedInput[]): RetainedInput[] {
+  const root = path.join(directory, "additional"); rmSync(root, { recursive: true, force: true }); mkdirSync(root, { recursive: true, mode: 0o700 });
+  const budget = { nodes: 0, bytes: 0 };
+  return inputs.map((item, index) => {
+    const original = realpathSync(item.sourcePath); const name = `${String(index + 1).padStart(3, "0")}-${createHash("sha256").update(original).digest("hex").slice(0, 12)}-${path.basename(original)}`; const target = path.join(root, name);
+    snapshotOrdinaryNode(original, target, budget);
+    return { ...item, source: target, target, mountedPath: target };
+  });
+}
+function snapshotOrdinaryNode(source: string, target: string, budget: { nodes: number; bytes: number }): void {
+  if (++budget.nodes > 10_000) throw new Error("Additional-input snapshot exceeds 10000 ordinary filesystem nodes.");
+  const metadata = lstatSync(source); if (metadata.isSymbolicLink()) throw new Error(`Additional-input snapshots reject symbolic links: ${source}.`);
+  if (metadata.isDirectory()) { mkdirSync(target, { mode: 0o700 }); for (const name of readdirSync(source).sort()) snapshotOrdinaryNode(path.join(source, name), path.join(target, name), budget); chmodSync(target, 0o500); return; }
+  if (!metadata.isFile()) throw new Error(`Additional-input snapshots accept ordinary files and directories only: ${source}.`);
+  if ((budget.bytes += metadata.size) > 256 * 1024 * 1024) throw new Error("Additional-input snapshot exceeds 256 MiB.");
+  const descriptor = openSync(source, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0)); try { const current = fstatSync(descriptor); if (!current.isFile() || current.dev !== metadata.dev || current.ino !== metadata.ino || current.size !== metadata.size) throw new Error(`Additional input changed during snapshot: ${source}.`); writeFileSync(target, readFileSync(descriptor), { mode: 0o400, flag: "wx" }); } finally { closeSync(descriptor); }
+}
+function writeReviewContext(directory: string, subjectPaths: WorkerPaths, reviewerWorkerId: string, contextId: string, subjectWorker: WorkerRegistryRecord, subjectRun: WorkerRunRecord, inputs: RetainedInput[]): string {
   if (path.resolve(subjectWorker.workspaceRoot) !== path.resolve(subjectPaths.workspaceRoot)) throw new Error("Review subject workspace identity mismatch.");
   assertContainedOrdinaryDirectory(path.dirname(subjectPaths.workspaceRoot), subjectWorker.workspaceRoot, "review subject workspace");
-  const root = path.join(paths.stateDir, ".run-inputs"); rmSync(root, { recursive: true, force: true });
-  const directory = path.join(root, contextId); mkdirSync(directory, { recursive: true, mode: 0o700 });
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
   const sessionFile = path.join(directory, "session.jsonl");
   const session = readBoundedNoFollowFile(subjectWorker.sessionFile!, subjectPaths.stateDir, 128 * 1024 * 1024, "review subject session");
   const sessionText = new TextDecoder("utf-8", { fatal: true }).decode(session); const lines = sessionText.split("\n");
@@ -751,9 +782,8 @@ function trustedPreparedSet(registry: WorkerRegistry, parentSessionFile: string,
   return { version: 1, preparedId: record.preparedId, parentSessionFile: record.parentSessionFile, status: (["ready", "partial", "failed"] as string[]).includes(record.status) ? "ready" : "resolution_required", order: record.order, repositories: repositories as any, createdAt: record.createdAt };
 }
 function assertIntegrationTargetsCurrent(set: ReturnType<typeof readPreparedMergeSet>): void { for (const repository of set.repositories) { const current = trustedGit(repository.targetRepo, ["rev-parse", repository.targetRef]).trim(); if (current !== repository.expectedCommit) throw new Error(`Target ${repository.id} moved from ${repository.expectedCommit} to ${current}; run worker_merge_test again before integration.`); } }
-function writeIntegrationContext(paths: WorkerPaths, set: ReturnType<typeof readPreparedMergeSet>, inputs: RetainedInput[], resumed: boolean): string {
-  const root = path.join(paths.stateDir, ".run-inputs"); rmSync(root, { recursive: true, force: true }); mkdirSync(root, { recursive: true, mode: 0o700 });
-  const directory = path.join(root, `integration-${Date.now()}-${randomUUID().slice(0, 8)}`); mkdirSync(directory, { recursive: true, mode: 0o700 }); const file = path.join(directory, "context.json");
+function writeIntegrationContext(paths: WorkerPaths, directory: string, set: ReturnType<typeof readPreparedMergeSet>, inputs: RetainedInput[], resumed: boolean): string {
+  mkdirSync(directory, { recursive: true, mode: 0o700 }); const file = path.join(directory, "context.json");
   const preparedId = set.preparedId;
   const value = { version: 2, preparedId, status: set.status, order: set.order, resumed, repositories: set.repositories.map((item: any) => ({ id: item.id, path: path.relative(paths.workspaceRoot, item.preparedPath).split(path.sep).join("/"), method: item.method, status: item.status, dependsOn: item.dependsOn, target: { repo: item.targetRepo, ref: item.targetRef, commit: item.expectedCommit, privateRef: item.targetPrivateRef }, candidate: { repo: item.candidateRepo, commit: item.candidateCommit, privateRef: item.candidatePrivateRef }, mergeBase: item.mergeBase, conflicts: item.conflicts ?? [], mergeMessages: item.mergeMessages ?? [], overlapCount: item.overlapCount })), additionalInputs: contextInputs(inputs) };
   writeReadonlyJson(file, value); return file;
@@ -769,6 +799,7 @@ function resolveModel(role: WorkerRole, explicit: string | undefined, context: E
 function requireParentSession(context: ExtensionContext): string { const file = context.sessionManager.getSessionFile(); if (!file) throw new Error("Managed workers require a persisted parent session."); return realpathOrResolve(file); }
 function realpathOrResolve(value: string): string { try { return realpathSync(value); } catch { return path.resolve(value); } }
 function countLines(file: string, sessionDir: string): number { const text = readWorkerSessionText(file, sessionDir); return text === "" ? 0 : text.split("\n").length - (text.endsWith("\n") ? 1 : 0); }
+function safeCountLines(file: string, sessionDir: string): number | undefined { try { return countLines(file, sessionDir); } catch { return undefined; } }
 function validateRunRequestBounds(request: WorkerRunInputV2["runs"][number]): void {
   if (Buffer.byteLength(request.instructions ?? "") > 12 * 1024) throw new Error("instructions must be at most 12 KiB UTF-8.");
   for (const value of ("additionalInputs" in request ? request.additionalInputs : undefined) ?? []) if (Buffer.byteLength(value) > 4096) throw new Error("additionalInputs paths must be at most 4 KiB UTF-8.");
@@ -783,7 +814,7 @@ function validateRunRequestBounds(request: WorkerRunInputV2["runs"][number]): vo
 function unique(values: string[]): string[] { const result = [...new Set(values.map((value) => value.trim()).filter(Boolean))]; if (result.length !== values.length) throw new Error("Worker task IDs and batch identities must be unique."); return result; }
 function sanitizeError(error: unknown): string { return String(error instanceof Error ? error.message : error).replaceAll(/[\r\n\t]+/g, " ").slice(0, 2048); }
 function testWorkerSandboxRelease(): WorkerSandboxRelease {
-  return { schemaVersion: 1, protocolVersion: 1, status: "approved", kit: { reference: "/test/pi-worker-kit", sha256: "a".repeat(64) }, image: { reference: `example.invalid/pi-worker@sha256:${"b".repeat(64)}`, digest: "b".repeat(64) }, revisions: { pi: "1".repeat(40), profile: "2".repeat(40), piTools: "3".repeat(40), piDocparser: "4".repeat(40) }, guest: { piCli: "/usr/local/bin/pi", rpcLauncher: "/opt/pi-worker/launch.mjs", codingAgentDir: "/run/pi-worker/agent", resourceManifestSha256: "c".repeat(64), extensionPaths: ["/opt/pi-tools/extensions/worker/runtime.ts"], searxngUrl: "http://host.docker.internal:18888" } };
+  return { schemaVersion: 1, protocolVersion: 1, releaseOrdinal: 1, status: "approved", kit: { reference: "/test/pi-worker-kit", sha256: "a".repeat(64) }, image: { reference: `example.invalid/pi-worker@sha256:${"b".repeat(64)}`, digest: "b".repeat(64) }, revisions: { pi: "1".repeat(40), profile: "2".repeat(40), piTools: "3".repeat(40), piDocparser: "4".repeat(40) }, guest: { piCli: "/usr/local/bin/pi", rpcLauncher: "/opt/pi-worker/launch.mjs", codingAgentDir: "/run/pi-worker/agent", resourceManifestSha256: "c".repeat(64), extensionPaths: ["/opt/pi-tools/extensions/worker/runtime.ts"], searxngUrl: "http://host.docker.internal:18888" } };
 }
 
 function delay(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)); }

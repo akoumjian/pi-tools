@@ -17,7 +17,7 @@ const model = (provider: string, id: string) => ({ id, name: id, provider, api: 
 type Launch = { record: any; runtime: any; resolve(job: JobMeta): void; handle: ManagedAsyncJobHandle };
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
-async function fixture(options: { launchThrows?: boolean; mountThrows?: boolean; removeThrowsOnce?: boolean; removeAlwaysThrows?: boolean; deferSandbox?: boolean } = {}) {
+async function fixture(options: { launchThrows?: boolean; mountThrows?: boolean; removeThrowsOnce?: boolean; removeAlwaysThrows?: boolean; deferSandbox?: boolean; sandboxRelease?: any } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "pi-worker-v2-lifecycle-"));
   const runtimeRoot = path.join(root, "runtime"); const workersRoot = path.join(runtimeRoot, "workers"); mkdirSync(workersRoot, { recursive: true });
   const session = SessionManager.create(root, path.join(root, "parent-session"), { id: `parent-${Date.now()}` }); writeFileSync(session.getSessionFile()!, `${JSON.stringify(session.getHeader())}\n`, { mode: 0o600 });
@@ -27,9 +27,9 @@ async function fixture(options: { launchThrows?: boolean; mountThrows?: boolean;
   const api = { registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand(name: string, command: any) { commands.set(name, command); }, registerMessageRenderer(name: string, renderer: Function) { renderers.set(name, renderer); }, on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, sendMessage(message: any) { messages.push(message); } } as unknown as ExtensionAPI;
   const context = { cwd: root, hasUI: false, mode: "rpc", sessionManager: session, modelRegistry: { hasConfiguredAuth: () => true, getAll: () => [model("openai-codex", "gpt-5.6-sol"), model("anthropic", "claude-opus-5-5")] }, thinkingLevel: "xhigh", isIdle: () => true, hasPendingMessages: () => false, ui: { notify(message: string) { notifications.push(message); } } } as unknown as ExtensionContext;
   registerWorkerExtension(api, {
-    runtimeRoot, roots: { stateRoot: workersRoot, workspaceRoot: workersRoot }, codeRoot: root, preparedRoot: path.join(runtimeRoot, "prepared"), targetRoot: root, sbxPath: "/fake/sbx", random, now: () => new Date(`2026-01-01T00:00:${String(counter).padStart(2, "0")}.000Z`),
+    runtimeRoot, roots: { stateRoot: workersRoot, workspaceRoot: workersRoot }, codeRoot: root, preparedRoot: path.join(runtimeRoot, "prepared"), targetRoot: root, sbxPath: "/fake/sbx", ...(options.sandboxRelease ? { sandboxRelease: options.sandboxRelease } : {}), random, now: () => new Date(`2026-01-01T00:00:${String(counter).padStart(2, "0")}.000Z`),
     waitForHostIdentity: async () => {},
-    createSandbox: async (_sbx: string, reference: any) => { if (options.mountThrows && reference.mounts.some((mount: any) => mount.readOnly && mount.source.includes(".run-inputs"))) throw new Error("review mount probe failure"); created.push(reference.runId); if (sandboxGate) await sandboxGate; return { ...reference, createEvidenceSha256: (++counter).toString(16).padStart(64, "0") }; }, removeSandbox: (_sbx: string, reference: any) => { removed.push(reference.runId); if (options.removeAlwaysThrows || options.removeThrowsOnce && removeFailures++ === 0) throw new Error(options.removeAlwaysThrows ? "persistent sandbox cleanup failure" : "transient sandbox cleanup failure"); },
+    createSandbox: async (_sbx: string, reference: any) => { if (options.mountThrows && reference.mounts.some((mount: any) => mount.readOnly && mount.source.includes(`${path.sep}evidence${path.sep}runs${path.sep}`))) throw new Error("review mount probe failure"); created.push(reference.runId); if (sandboxGate) await sandboxGate; return { ...reference, createEvidenceSha256: (++counter).toString(16).padStart(64, "0") }; }, removeSandbox: (_sbx: string, reference: any) => { removed.push(reference.runId); if (options.removeAlwaysThrows || options.removeThrowsOnce && removeFailures++ === 0) throw new Error(options.removeAlwaysThrows ? "persistent sandbox cleanup failure" : "transient sandbox cleanup failure"); },
     launch: (_api, _context, input) => { if (options.launchThrows) throw new Error("launch probe failure"); let resolve!: (job: JobMeta) => void; const completion = new Promise<JobMeta>((done) => { resolve = done; });
       const running = job(input.record.jobId, "running"); const handle: ManagedAsyncJobHandle = { jobId: input.record.jobId, completion, snapshot: () => running, cancel: () => resolve(job(input.record.jobId, "cancelled")) }; launches.push({ ...input, resolve, handle }); return handle; }
   });
@@ -216,7 +216,7 @@ test("review starts fresh, mounts exact subject session range, cancellation rele
     let db = f.registry(); const reviewer = getWorker(db, review.workerId)!; const subjectRow = getWorker(db, subject.workerId)!; assert.equal(subjectRow.reviewedByWorkerId, review.workerId); const run = getWorkerRun(db, review.workerId, review.runId)!; const runtime = run.runtime as any;
     const header = JSON.parse(readFileSync(reviewer.sessionFile!, "utf8").split("\n")[0]!); assert.equal(header.parentSession, undefined);
     const context = JSON.parse(readFileSync(runtime.contextFile, "utf8")); const subjectRun = getWorkerRun(db, subject.workerId, subject.runId)!;
-    assert.equal(runtime.sandbox.mounts.some((mount: any) => mount.source === context.session.path && mount.readOnly), true);
+    assert.equal(runtime.sandbox.mounts.some((mount: any) => mount.source === path.dirname(runtime.contextFile) && mount.readOnly), true);
     assert.deepEqual(context.session.sourceRange, { startLine: subjectRun.sessionStartLine, endLine: subjectRun.sessionEndLine }); assert.match(runtime.contextFile, new RegExp(review.runId)); assert.notEqual(context.session.path, subjectRow.sessionFile); assert.match(runtime.prompt, new RegExp(reviewer.workspaceRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))); assert.doesNotMatch(runtime.prompt, /Writable workspace:\n\/workspace(?:\n|$)/); db.close();
     await f.call("worker_control", { action: "cancel", workerId: review.workerId }); db = f.registry(); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, undefined); db.close();
     const resumed = receipt(await f.call("worker_run", { runs: [{ action: "resume", workerId: review.workerId, instructions: "continue" }] })); await f.event("turn_end"); db = f.registry(); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, review.workerId); const resumedRuntime = getWorkerRun(db, review.workerId, resumed.runId)!.runtime as any; assert.notEqual(resumedRuntime.sandbox.sandboxName, runtime.sandbox.sandboxName); assert.equal((getWorker(db, review.workerId)!.runtime?.inputs as any[]).length, 1); db.close();
@@ -267,13 +267,13 @@ test("integration starts in a fresh session, receives full conflict context, and
     let db = f.registry(); let worker = getWorker(db, started.workerId)!; let run = getWorkerRun(db, started.workerId, started.runId)!; let runtime = run.runtime as any;
     const header = JSON.parse(readFileSync(worker.sessionFile!, "utf8").split("\n")[0]!); assert.equal(header.parentSession, undefined);
     const context = JSON.parse(readFileSync(runtime.contextFile, "utf8")); assert.equal(context.repositories[0].conflicts.length, 1); assert.equal(context.repositories[0].mergeBase.length >= 40, true);
-    const movedRepo = path.join(worker.workspaceRoot, context.repositories[0].path); assert.equal(existsSync(movedRepo), true); assert.equal(runtime.sandbox.mounts.some((mount: any) => mount.source === runtime.contextFile && mount.readOnly), true); db.close();
+    const movedRepo = path.join(worker.workspaceRoot, context.repositories[0].path); assert.equal(existsSync(movedRepo), true); assert.equal(runtime.sandbox.mounts.some((mount: any) => mount.source === path.dirname(runtime.contextFile) && mount.readOnly), true); db.close();
     await f.call("worker_control", { action: "cancel", workerId: started.workerId });
     const plantedTarget = path.join(f.root, "planted-run-input-target"); mkdirSync(plantedTarget); const runInputs = path.join(path.dirname(worker.workspaceRoot), ".run-inputs"); rmSync(runInputs, { recursive: true, force: true }); symlinkSync(plantedTarget, runInputs, "dir");
     const extra = path.join(f.root, "extra.txt"); writeFileSync(extra, "extra\n"); const resumed = receipt(await f.call("worker_run", { runs: [{ action: "resume", workerId: started.workerId, instructions: "continue", additionalInputs: [extra] }] })); assert.deepEqual(readdirSync(plantedTarget), []);
 
     db = f.registry(); worker = getWorker(db, resumed.workerId)!; run = getWorkerRun(db, resumed.workerId, resumed.runId)!; runtime = run.runtime as any; const updated = JSON.parse(readFileSync(runtime.contextFile, "utf8"));
-    assert.equal(updated.additionalInputs.length, 2); assert.equal(existsSync(movedRepo), true); assert.equal(runtime.sandbox.mounts.some((mount: any) => mount.source === runtime.contextFile), true); assert.equal((worker.runtime?.inputs as any[]).length, 2); db.close();
+    assert.equal(updated.additionalInputs.length, 2); assert.equal(existsSync(movedRepo), true); assert.equal(runtime.sandbox.mounts.some((mount: any) => mount.source === path.dirname(runtime.contextFile)), true); assert.equal((worker.runtime?.inputs as any[]).length, 2); db.close();
     await f.call("worker_control", { action: "cancel", workerId: resumed.workerId }); await f.call("worker_control", { action: "discard", workerId: resumed.workerId }); db = f.registry(); assert.equal(getWorker(db, resumed.workerId), undefined); const retainedPrepared = db.database.prepare("SELECT prepared_id FROM prepared_sets WHERE prepared_id=?").get(prepared.preparedId); assert.equal(retainedPrepared, undefined); db.close();
   } finally { await f.close(); }
 });
@@ -305,14 +305,25 @@ test("verified accepted result settlement retries after transient cleanup recove
 
 
 
-test("persistent accepted-result settlement failure is bounded, retained, and system-failed without cancellation", async () => {
+test("persistent accepted-result cleanup failure retains accepted authority and active containment for recovery", async () => {
   const f = await fixture({ removeAlwaysThrows: true }); try {
     const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "settle persistently" }] })); await f.event("turn_end");
     const db0 = f.registry(); const workspace = getWorker(db0, started.workerId)!.workspaceRoot; db0.close(); const repo = path.join(workspace, "repos", "interrupted"); gitInit(repo); writeFileSync(path.join(repo, "dirty.txt"), "dirty\n"); writeFileSync(path.join(repo, ".git", "index.lock"), "retained\n");
-    await complete(f, started, { outcome: "completed", summary: "accepted before cleanup failure", repositories: ["repos/interrupted"] });
-    let db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; const worker = getWorker(db, started.workerId)!; const runtime = run.runtime as any; db.close();
-    assert.equal(run.outcome, "failed"); assert.equal(run.outcomeSource, "system"); assert.equal(worker.status, "idle"); assert.equal(runtime.settlementRecoveryAttempts, 3); assert.match(run.errors[0]!.message, /Accepted result completed remains retained/); assert.equal(existsSync(runtime.resultFile), true); assert.equal(JSON.parse(readFileSync(runtime.resultFile, "utf8")).result.outcome, "completed"); assert.equal(f.removed.length, 3);
-    const resumed = receipt(await f.call("worker_run", { runs: [{ action: "resume", workerId: started.workerId, instructions: "inspect retained failure" }] })); db = f.registry(); const resumedRun = getWorkerRun(db, resumed.workerId, resumed.runId)!; db.close(); assert.match((resumedRun.runtime as any).prompt, /system-failed/); assert.match(((resumedRun.runtime as any).interruptionWarnings ?? []).join(" "), /index.lock/);
+    const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: "accepted before cleanup failure", repositories: ["repos/interrupted"] }); launch.resolve(job(launch.record.jobId, "exited", 0));
+    await waitFor(() => { const side=f.registry(); const run=getWorkerRun(side,started.workerId,started.runId); side.close(); return Number((run?.runtime as any)?.settlementRecoveryAttempts ?? 0) >= 3; });
+    const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; const worker = getWorker(db, started.workerId)!; const runtime = run.runtime as any; db.close();
+    assert.equal(run.status, "running"); assert.equal(run.outcome, undefined); assert.equal(worker.status, "running"); assert.equal(runtime.settlementRecoveryAttempts, 3); assert.match(worker.recoveryError!, /Accepted result completed remains retained/); assert.equal(existsSync(runtime.resultFile), true); assert.equal(JSON.parse(readFileSync(runtime.resultFile, "utf8")).result.outcome, "completed"); assert.equal(f.removed.length, 3);
+    await assert.rejects(() => f.call("worker_run", { runs: [{ action: "resume", workerId: started.workerId, instructions: "must remain contained" }] }), /not idle/);
+  } finally { await f.close(); }
+});
+
+test("resume rejects runtime downgrade and discloses an approved monotonic runtime upgrade", async () => {
+  const release: any = { schemaVersion: 1, protocolVersion: 1, releaseOrdinal: 2, status: "approved", kit: { reference: "/kit", sha256: "a".repeat(64) }, image: { reference: `example.invalid/worker@sha256:${"b".repeat(64)}`, digest: "b".repeat(64) }, revisions: { pi: "1".repeat(40), profile: "2".repeat(40), piTools: "3".repeat(40), piDocparser: "4".repeat(40) }, guest: { piCli: "/usr/bin/pi", rpcLauncher: "/opt/pi-worker/launch.mjs", codingAgentDir: "/run/pi-worker/agent", resourceManifestSha256: "c".repeat(64), extensionPaths: ["/opt/pi-tools/extensions/worker/runtime.ts"], searxngUrl: "http://host.docker.internal:18888" } };
+  const f = await fixture({ sandboxRelease: release }); try {
+    const started=receipt(await f.call("worker_run",{runs:[{action:"start",role:"work",taskIds:["personal-test"],instructions:"release two"}]})); await f.event("turn_end"); await complete(f,started);
+    release.releaseOrdinal=1; await assert.rejects(()=>f.call("worker_run",{runs:[{action:"resume",workerId:started.workerId,instructions:"must reject downgrade"}]}),/downgrade refused/);
+    release.releaseOrdinal=3; release.image={reference:`example.invalid/worker@sha256:${"d".repeat(64)}`,digest:"d".repeat(64)};
+    const resumed=receipt(await f.call("worker_run",{runs:[{action:"resume",workerId:started.workerId,instructions:"adopt approved upgrade"}]})); const db=f.registry(); const runtime=getWorkerRun(db,resumed.workerId,resumed.runId)!.runtime as any; db.close(); assert.equal(runtime.releaseOrdinal,3); assert.match(runtime.prompt,/Approved runtime changed/); assert.match(runtime.prompt,/executable contracts were refreshed/);
   } finally { await f.close(); }
 });
 
