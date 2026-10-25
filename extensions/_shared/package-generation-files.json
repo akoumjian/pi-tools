@@ -21,6 +21,7 @@
     "extensions/_shared/worker-contract.ts",
     "extensions/_shared/worker-id.ts",
     "extensions/_shared/worker-job-settlement.js",
+    "extensions/_shared/worker-rpc-prompt.js",
     "extensions/_shared/workspace-sandbox.ts",
     "extensions/async-shell/index.ts",
     "extensions/async-shell/retention.ts",
@@ -48,7 +49,7 @@
     "worker-roles/work.md"
   ],
   "moduleFingerprints": {
-    "extensions/_shared/async-job-process.js": "cf0ffb8bd4c0d4c44099b22fe039fd64cc27fa3b1192a39c2eef95f328630c66",
+    "extensions/_shared/async-job-process.js": "3ba95ef7bdb27b427d5c612c20565507096eec581a5793fe82ef05b6a6a45c65",
     "extensions/_shared/atomic-json.js": "cb528fd2286edb4638677a3804b78a9b2ca96d084efb97503c3d200ce2c4ee2c",
     "extensions/_shared/worker-job-settlement.js": "8f0425ce94d41954b06da147ed8983a91a5a55431fd7bf6da3e193d17003d8fb"
   }

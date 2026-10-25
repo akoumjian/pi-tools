@@ -181,7 +181,7 @@ const resultContracts = {
     progress: "not applicable: one bounded lifecycle action",
     error: "unknown ownership, invalid state, and cleanup uncertainty remain visible",
     details: "internal slim registry-backed lifecycle records",
-    content: "compact exact worker/run result without delivery bookkeeping"
+    content: "compact exact worker/run result, including bounded notification state when present"
   },
   worker_merge_test: {
     success: "content reports a fresh prepared set with exact candidates, targets, methods, commits, paths, conflicts, and warnings",

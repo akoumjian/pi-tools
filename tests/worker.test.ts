@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync } from "node:child_process";
+import { mkdirSync } from "node:fs";
 import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -105,6 +106,7 @@ test("parent tool labels and approved copy remain exact and schemas carry field 
   assert.equal(control.label, "Manage Workers"); assert.equal(control.description, "List and manage durable workers owned by the current parent session. Use `list` for compact worker discovery, `runs` to list one worker’s execution history, and `get` to inspect one exact active or settled run, including logs, session and workspace access, and submitted repository or artifact outputs. Use `cancel` to stop active work while preserving retained state. Use `discard` to permanently delete an idle worker and all retained state.");
   assert.equal(apply.label, "Apply Prepared Repository Merges"); assert.match(apply.description, /Applying multiple repositories is not atomic/);
   const schemaText = JSON.stringify(WorkerRunParams); for (const phrase of ["Continue a previous worker", "One or more Beads task IDs", "Additional files or directories", "When to deliver the asynchronous result"]) assert.match(schemaText, new RegExp(phrase));
+  const controlGuidance = JSON.stringify(control.promptGuidelines); for (const phrase of ["notification", "send_started_unconfirmed", "delivered", "runtimeGeneration", "sendStartedAt"]) assert.match(controlGuidance, new RegExp(phrase), `provider-visible worker_control output guidance includes ${phrase}`);
 });
 
 test("worker package-generation mismatch registers no launchable tools", () => {
@@ -159,6 +161,7 @@ test("deferred turn_end launch rechecks generation and settles failed before lau
     });
     const model = { id: "gpt-5.6-sol", name: "gpt-5.6-sol", provider: "openai-codex", api: "openai-responses", baseUrl: "https://example.invalid", reasoning: true, thinkingLevelMap: { xhigh: "xhigh" }, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 10000 } as Model<Api>;
     const context = { cwd: root, sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "parent" }, modelRegistry: { hasConfiguredAuth: () => true, getAll: () => [model] }, isIdle: () => true, hasPendingMessages: () => false, ui: { notify() {} } } as unknown as ExtensionContext;
+    for (const handler of handlers.get("session_start") ?? []) await handler({}, context);
     const result = await tools.find((tool) => tool.name === "worker_run")!.execute!("generation-launch", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "Implement." }] }, new AbortController().signal, undefined, context);
     const receipt = (result.details as { runs: Array<{ workerId: string; runId: string }> }).runs[0]!;
     for (const handler of handlers.get("turn_end") ?? []) await handler({}, context);
@@ -172,6 +175,7 @@ test("deferred turn_end launch rechecks generation and settles failed before lau
     } finally { registry.close(); }
     assert.equal(launches, 0);
     assert.ok(checks >= 4, `expected registration, tool, turn_end, and launch checks; got ${checks}`);
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, context);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -276,7 +280,7 @@ test("package mismatch stays process-local and a clean restart auto-fails a dead
       assertPackageGeneration() {}
     });
     for (const handler of restartedHandlers.get("session_start") ?? []) await handler({}, context);
-    for (let attempt = 0; attempt < 100 && getWorkerRun(registry, dead.workerId, dead.runId)?.status !== "settled"; attempt += 1) {
+    for (let attempt = 0; attempt < 500 && getWorkerRun(registry, dead.workerId, dead.runId)?.status !== "settled"; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     const settled = getWorkerRun(registry, dead.workerId, dead.runId)!;
@@ -313,6 +317,8 @@ function addDeadSupervisedWorker(registry: WorkerRegistry, parentSessionFile: st
   const timestamp = "2026-01-01T00:00:00.000Z";
   const runDir = path.join(root, "dead-run");
   const workspaceRoot = path.join(root, "dead-workspace");
+  mkdirSync(runDir, { recursive: true });
+  mkdirSync(workspaceRoot, { recursive: true });
   const runtime = {
     version: 2, prompt: "test", runDir, resultFile: path.join(runDir, "result.json"), settledFile: path.join(runDir, "settled.json"),
     processFile: path.join(runDir, "process.json"), processNonce: "dead-process", inputs: [], repositoryBefore: [],

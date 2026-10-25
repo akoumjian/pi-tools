@@ -195,8 +195,16 @@ const samples: Record<RetainedToolName, unknown> = {
     details: { runs: [{ action: "start", role: "work", workerId: "worker_20260910190000_12345678", runId: "run_20260910190000_87654321", status: "queued", taskIds: ["personal-test"], completionDelivery: "steer", modelSelection: "openai-codex/gpt-test:xhigh" }] }
   },
   worker_control: {
-    content: [text("0 workers")],
-    details: { workers: [], total: 0, counts: { idle: 0, queued: 0, running: 0 } }
+    content: [text("1 worker")],
+    details: {
+      workers: [{
+        workerId: "worker_20260910190000_12345678", role: "work", status: "idle",
+        latestResult: { runId: "run_20260910190000_87654321", outcome: "completed", outcomeSource: "worker" },
+        notification: { state: "send_started_unconfirmed", runId: "run_20260910190000_87654321", runtimeGeneration: 7, sendStartedAt: "2026-09-10T19:00:01.000Z" },
+        taskIds: ["personal-test"], modelSelection: "openai-codex/gpt-test:xhigh", lastActivityAt: "2026-09-10T19:00:02.000Z"
+      }],
+      total: 1, counts: { idle: 1, queued: 0, running: 0 }
+    }
   },
   worker_merge_test: {
     content: [text("ready")],
@@ -217,6 +225,58 @@ test("authoritative output schemas accept representative runtime results and gen
     assert.equal(Check(schema, { ...(samples[name] as object), isError: true }), false, `${name} rejects raw execute isError`);
   }
   assert.equal(Check(RuntimeErrorResultSchema, { content: [text("Tool failed")], details: {} }), true);
+});
+
+test("worker_control publishes strict bounded notification shapes for list and get", () => {
+  const list = structuredClone(samples.worker_control) as any;
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, list), true, "list accepts send-started ambiguity visibility");
+  assert.equal(list.details.workers[0].notification.state, "send_started_unconfirmed");
+
+  const exactGet = {
+    content: [text("settled worker")],
+    details: {
+      workerId: "worker_20260910190000_12345678", role: "work", runId: "run_20260910190000_87654321", status: "settled",
+      taskIds: ["personal-test"], modelSelection: "openai-codex/gpt-test:xhigh", createdAt: "2026-09-10T19:00:00.000Z",
+      startedAt: "2026-09-10T19:00:00.500Z", settledAt: "2026-09-10T19:00:01.000Z", jobId: "job_test",
+      stdoutLog: "/tmp/stdout.log", stderrLog: "/tmp/stderr.log", sessionRange: { startLine: 1, endLine: 2 }, workspaceRoot: "/workspace",
+      outcome: "completed", outcomeSource: "worker",
+      notification: { state: "delivered", runId: "run_20260910190000_87654321", runtimeGeneration: 7, deliveredAt: "2026-09-10T19:00:02.000Z" },
+      repositories: [], artifacts: [], errors: []
+    }
+  };
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, exactGet), true, "get accepts exact delivered notification evidence");
+
+  const getBase = {
+    workerId: "worker_20260910190000_12345678", role: "work", runId: "run_20260910190000_87654321", taskIds: ["personal-test"],
+    modelSelection: "openai-codex/gpt-test:xhigh", createdAt: "2026-09-10T19:00:00.000Z", sessionRange: {}, workspaceRoot: "/workspace"
+  };
+  const queuedGet = { content: [text("queued")], details: { ...getBase, status: "queued" } };
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, queuedGet), true, "queued pre-launch get may omit host job and log evidence");
+  const launchFailedGet = { content: [text("launch failed")], details: { ...getBase, status: "settled", settledAt: "2026-09-10T19:00:01.000Z", outcome: "failed", outcomeSource: "system", repositories: [], artifacts: [], errors: [{ scope: "run", message: "failed before host launch" }] } };
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, launchFailedGet), true, "settled failure before host publication may omit host job and log evidence");
+  const runningGet = { content: [text("running")], details: { ...getBase, status: "running", startedAt: "2026-09-10T19:00:00.500Z", jobId: "job_test", stdoutLog: "/tmp/stdout.log", stderrLog: "/tmp/stderr.log" } };
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, runningGet), true, "launched running get requires complete host evidence");
+  const malformedQueued: any = structuredClone(queuedGet); malformedQueued.details.hostPid = 123;
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, malformedQueued), false, "queued get rejects unknown lifecycle extras");
+  const incompleteRunning: any = structuredClone(runningGet); delete incompleteRunning.details.stderrLog;
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, incompleteRunning), false, "launched running get rejects partial host evidence");
+  const launchedSettledWithoutLogs: any = structuredClone(exactGet); delete launchedSettledWithoutLogs.details.stderrLog;
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, launchedSettledWithoutLogs), false, "launched settled get cannot fall back to a pre-launch shape");
+  const partialLaunchFailure: any = structuredClone(launchFailedGet); partialLaunchFailure.details.stdoutLog = "/tmp/stdout.log";
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, partialLaunchFailure), false, "pre-launch host evidence is all-or-none");
+
+  const missingBoundary = structuredClone(list); delete missingBoundary.details.workers[0].notification.sendStartedAt;
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, missingBoundary), false, "unconfirmed state requires its persisted send boundary");
+  const missingGeneration = structuredClone(list); delete missingGeneration.details.workers[0].notification.runtimeGeneration;
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, missingGeneration), false, "claimed send-started state requires its exact runtime generation");
+  const unknownState = structuredClone(list); unknownState.details.workers[0].notification.state = "unknown";
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, unknownState), false, "notification states are closed literals");
+  const extraField = structuredClone(list); extraField.details.workers[0].notification.replay = true;
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, extraField), false, "notification shape rejects replay authority");
+  const invalidGeneration = structuredClone(list); invalidGeneration.details.workers[0].notification.runtimeGeneration = 0;
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, invalidGeneration), false, "runtime generations are positive integers");
+  const wrongDeliveredShape: any = structuredClone(exactGet); wrongDeliveredShape.details.notification.sendStartedAt = "2026-09-10T19:00:01.000Z";
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, wrongDeliveredShape), false, "delivered shape cannot masquerade as send-started ambiguity");
 });
 
 test("conditional output variants preserve runtime-only boundaries", () => {
