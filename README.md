@@ -11,7 +11,7 @@ Reusable extensions for the [Pi coding agent](https://pi.dev/). The package focu
 - provider-safe resend of the current context after any failure or cancellation via `/retry`, plus bounded automatic retry of outage-class errors Pi core does not classify
 - provider-free active-context clipboard snapshots via `/context:copy`
 - robust chunked context compaction via `/compacter`
-- durable Docker-confined managed workers with exact-session lifecycle and deterministic merge preparation
+- durable Docker Sandbox managed workers with exact-session lifecycle and deterministic merge preparation
 - TUI niceties: tmux/scrollback compatibility, theme preview, compact tool renderers, file-reference picker
 
 Profile-specific assets (personal AGENTS context, auth, model defaults, themes) live in a separate consumer package or local Pi profile, not in this repository.
@@ -144,7 +144,7 @@ Each extension below documents what it does, what it provides, and how to set it
 
 **Provides.** `worker_run`, `worker_control`, `worker_merge_test`, `worker_merge_apply`; worker-only `worker_result_submit` and `worker_beads_tasks` (including digest-fenced canonical Beads design continuation); trusted width-bounded operation hints plus compact exact-session `wN` worker activity beside direct-shell `shN`; `/worker:list`, `/worker:show`, `/worker:view`, `/worker:logs`, `/worker:cancel`, and `/worker:discard`.
 
-**Setup.** Node 22.19+, Pi, Docker Desktop or a rootful Docker Engine, the pinned worker image, central `bd`, and role model preferences in `config/worker-settings.json`.
+**Setup.** Node 22.19+, Pi, Docker Desktop or a rootful Docker Engine, Docker `sbx`, an approved immutable worker kit/image manifest, central `bd`, and role model preferences in `config/worker-settings.json`.
 
 ---
 

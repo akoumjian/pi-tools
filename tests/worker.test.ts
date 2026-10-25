@@ -165,8 +165,8 @@ test("deferred turn_end launch rechecks generation and settles failed before lau
     const result = await tools.find((tool) => tool.name === "worker_run")!.execute!("generation-launch", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "Implement." }] }, new AbortController().signal, undefined, context);
     const receipt = (result.details as { runs: Array<{ workerId: string; runId: string }> }).runs[0]!;
     for (const handler of handlers.get("turn_end") ?? []) await handler({}, context);
-    await new Promise((resolve) => setTimeout(resolve, 100));
     const registry = openWorkerRegistry(runtimeRoot);
+    for (let attempt = 0; attempt < 500 && getWorkerRun(registry, receipt.workerId, receipt.runId)?.status !== "settled"; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
     try {
       const run = getWorkerRun(registry, receipt.workerId, receipt.runId)!;
       assert.equal(run.status, "settled");
@@ -320,9 +320,9 @@ function addDeadSupervisedWorker(registry: WorkerRegistry, parentSessionFile: st
   mkdirSync(runDir, { recursive: true });
   mkdirSync(workspaceRoot, { recursive: true });
   const runtime = {
-    version: 2, prompt: "test", runDir, resultFile: path.join(runDir, "result.json"), settledFile: path.join(runDir, "settled.json"),
-    processFile: path.join(runDir, "process.json"), processNonce: "dead-process", inputs: [], repositoryBefore: [],
-    container: { version: 1, workerId, runId, name: "pi-worker-dead", nonce: "dead-container", image: "test", codeRoot: root, workspaceRoot }
+    version: 4, prompt: "test", runDir, resultFile: path.join(runDir, "result.json"), settledFile: path.join(runDir, "settled.json"),
+    processFile: path.join(runDir, "process.json"), processNonce: "dead-process", inputs: [], repositoryBefore: [], runtimeFingerprint: "dead-runtime", releaseOrdinal: 1,
+    sandbox: { kind: "docker-sandbox", workerId, runId, sandboxName: "pi-worker-dead", creationNonce: "dead-sandbox", workingDirectory: workspaceRoot, workspaceRoot }
   };
   createWorkerAndRun(registry, {
     workerId, parentSessionFile, role: "work", status: "running", activeRunId: runId, taskIds: ["personal-test"],

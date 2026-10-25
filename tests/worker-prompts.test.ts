@@ -39,14 +39,14 @@ test("work resume prompt retains exact session semantics and lists additional in
 
 test("review start and resume prompts are independent and name only trusted launch paths", () => {
   const start = renderWorkerRuntimePrompt("review", { ...base, instructions: undefined, reviewSubjectPath: "/review/subject", reviewContextPath: "/review/context.json" });
-  assert.match(start, /^You are worker worker_1, run run_2, starting an independent review\./); assert.match(start, /Reviewed workspace:\n\/review\/subject/); assert.match(start, /writable disposable view/); assert.doesNotMatch(start, /Assigned Beads|Parent review instructions|artifacts\//);
+  assert.match(start, /^You are worker worker_1, run run_2, starting an independent review\./); assert.match(start, /Reviewed workspace:\n\/review\/subject/); assert.match(start, /reviewed workspace is read-only.*separate writable reviewer workspace/i); assert.doesNotMatch(start, /Assigned Beads|Parent review instructions|artifacts\//);
   const resume = renderWorkerRuntimePrompt("review", { ...base, resumed: true, reviewSubjectPath: "/review/subject", reviewContextPath: "/review/context.json" });
-  assert.match(resume, /resuming a prior review session/); assert.match(resume, /fresh writable disposable view of the same reviewed run/); assert.match(resume, /Parent instructions:/); assert.doesNotMatch(resume, /fork/);
+  assert.match(resume, /resuming a prior review session/); assert.match(resume, /reviewed workspace remains read-only.*retained writable reviewer workspace/i); assert.match(resume, /Parent instructions:/); assert.doesNotMatch(resume, /fork/);
 });
 
 test("integration prompts include ordinary conflict-state and retained-repository guidance", () => {
-  const start = renderWorkerRuntimePrompt("integration", { ...base, integrationContextPath: "/integration/context.json" }); assert.match(start, /starting repository integration/); assert.match(start, /ordinary Git conflict state produced by `worker_merge_test`/);
-  const resume = renderWorkerRuntimePrompt("integration", { ...base, resumed: true, integrationContextPath: "/integration/context.json" }); assert.match(resume, /prepared repositories and prior integration work remain/); assert.doesNotMatch(resume, /fork|snapshot/i);
+  const start = renderWorkerRuntimePrompt("integration", { ...base, integrationContextPath: "/worker/integration-context.json" }); assert.match(start, /starting repository integration/); assert.match(start, /ordinary Git conflict state produced by `worker_merge_test`/);
+  const resume = renderWorkerRuntimePrompt("integration", { ...base, resumed: true, integrationContextPath: "/worker/integration-context.json" }); assert.match(resume, /prepared repositories and prior integration work remain/); assert.doesNotMatch(resume, /fork|snapshot/i);
 });
 
 test("cancelled resume adds only the trusted interrupted-operation warning", () => { assert.match(renderWorkerRuntimePrompt("work", { ...base, resumed: true, cancelledPreviously: true }), /Do not remove locks or abort Git state/); });

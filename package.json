@@ -14,14 +14,17 @@
   ],
   "scripts": {
     "check": "tsc --noEmit",
-    "pretest": "rm -rf .pi/test-build",
+    "pretest": "npm run build:host && rm -rf .pi/test-build",
     "test": "PI_TOOLS_CONFIG_DIR=config tsc -p tsconfig.test.json && cp -R skills .pi/test-build/skills && cp -R worker-roles .pi/test-build/worker-roles && PI_TOOLS_CONFIG_DIR=config node --test .pi/test-build/tests/*.test.js",
     "validate": "npm run check && npm test && git diff --check",
     "pi": "pi -e .",
     "dev:pi": "node scripts/dev-pi.mjs",
     "dev:pi:reset": "node scripts/dev-pi.mjs reset",
     "dev:pi:status": "node scripts/dev-pi.mjs status",
-    "review:provider-context": "node scripts/review-provider-context.mjs"
+    "review:provider-context": "node scripts/review-provider-context.mjs",
+    "build:host": "rm -rf dist/worker-host && tsc -p tsconfig.worker-host.json",
+    "prepare": "npm run build:host",
+    "prepack": "npm run build:host"
   },
   "pi": {
     "extensions": [
@@ -50,7 +53,8 @@
     "@mozilla/readability": "^0.6.0",
     "jsdom": "^27.0.1",
     "pi-docparser": "github:akoumjian/pi-docparser#pi-0.84-peer-range",
-    "turndown": "^7.2.4"
+    "turndown": "^7.2.4",
+    "typebox": "^1.3.7"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "^0.81.1 || ^0.84.4",
@@ -73,11 +77,13 @@
     "config/",
     "docs/",
     "extensions/",
+    "dist/worker-host/",
     "worker-roles/",
     "skills/",
     "scripts/dev-pi.mjs",
     "scripts/review-provider-context.mjs",
+    "scripts/worker-rpc/",
     "scripts/worker-host.mjs",
-    "scripts/worker-shell-host.mjs"
+    "scripts/worker-sbx-rpc.mjs"
   ]
 }

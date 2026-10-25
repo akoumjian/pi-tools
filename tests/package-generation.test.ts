@@ -126,7 +126,10 @@ test("checked-in generation manifest covers local worker runtime imports and exc
     "extensions/_shared/worker-job-settlement.js",
     "extensions/_shared/worker-rpc-prompt.js",
     "extensions/worker/index.ts",
-    "scripts/worker-host.mjs"
+    "extensions/worker/sandbox.ts",
+    "scripts/worker-host.mjs",
+    "scripts/worker-rpc/rpc-client.js",
+    "scripts/worker-sbx-rpc.mjs"
   ]) assert.ok(manifest.files.includes(required), required);
   for (const file of manifest.files) assert.equal(existsSync(path.join(repoRoot, file)), true, file);
   assert.deepEqual(Object.keys(manifest.moduleFingerprints), [
@@ -145,7 +148,7 @@ test("checked-in generation manifest covers local worker runtime imports and exc
     "extensions/worker/runtime.ts",
     "extensions/async-shell/index.ts",
     "scripts/worker-host.mjs",
-    "scripts/worker-shell-host.mjs"
+    "scripts/worker-sbx-rpc.mjs"
   ]);
   const missing = [...discovered].filter((file) => !manifest.files.includes(file));
   assert.deepEqual(missing, [], `generation manifest misses local runtime imports: ${missing.join(", ")}`);
@@ -169,6 +172,7 @@ function discoverLocalImports(entries: string[]): Set<string> {
 
 function resolveLocalImport(from: string, specifier: string): string | undefined {
   const requested = path.posix.normalize(path.posix.join(path.posix.dirname(from), specifier));
+  if (requested.startsWith("dist/worker-host/")) return undefined; // generated from manifest-covered extension sources
   const candidates = [requested];
   if (requested.endsWith(".js")) candidates.push(`${requested.slice(0, -3)}.ts`);
   if (!path.posix.extname(requested)) candidates.push(`${requested}.ts`, `${requested}.js`, `${requested}.mjs`);

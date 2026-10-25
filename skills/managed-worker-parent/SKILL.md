@@ -13,7 +13,7 @@ Handle sequential work directly because workers incur startup, context-transfer,
 
 Start a `work` worker for substantial self-contained assignments. Batch runs only when the assignments are independent and benefit from parallel execution.
 
-The parent remains responsible for grounding, task assignment, scope, and durable decisions.
+The parent remains responsible for grounding, task assignment, scope, and durable decisions. Every execution/resume receives a fresh immutable Docker Sandbox; only the worker's durable root and explicit read-only inputs cross runs. Never bypass a launch failure with a host-Pi or ordinary-Docker fallback.
 
 ### 2. Handle the Result
 
@@ -56,7 +56,7 @@ Applying a prepared set is sequential rather than atomic. If application is part
 
 ### 5. Finish
 
-Pushing, publication, release, grounding updates, semantic acceptance, and Beads closure remain parent-owned.
+Pushing, publication, release, grounding updates, semantic acceptance, and Beads closure remain parent-owned. Package-code upgrades require a full Pi process restart; `/reload` is not sufficient to activate new package code.
 
 Cancel only active work. Discard an idle worker only when no further review, resume, merge, or recovery access is needed.
 
@@ -66,4 +66,5 @@ Cancel only active work. Discard an idle worker only when no further review, res
 - Workers may update only assigned Beads tasks and never close them.
 - Review outcomes are advisory and never authorize repository application.
 - Workers never modify authoritative repositories, push, publish, release, or write parent grounding.
-- Worker workspaces, sessions, and run evidence remain retained until explicit discard.
+- Worker workspaces, sessions, and run evidence remain retained until explicit discard; Sandbox removal never means logical-worker discard.
+- Review subjects and prepared evidence are read-only; reviewers and integration workers write only in their own retained roots.

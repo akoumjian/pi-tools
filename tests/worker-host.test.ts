@@ -1,662 +1,145 @@
 import assert from "node:assert/strict";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import test from "node:test";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { defaultWorkerExtensionPaths, launchWorkerHost, type WorkerLaunchRecord } from "../extensions/worker/runner.js";
-import { readWorkerRuntimeResult } from "../extensions/worker/runtime.js";
-import { previewAsyncShellPrune } from "../extensions/async-shell/index.js";
-import { forkWorkerSession } from "../extensions/worker/session.js";
-const WORKER_RECORD_VERSION = 1;
-type WorkerRecord = {
-  version: number; workerId: string; sessionId: string; sessionFile?: string; workspaceRoot: string; taskIds: string[];
-  route: { provider: string; model: string; thinkingLevel: string }; role?: "work" | "review" | "integration";
-  activeRun?: { runId: string; jobId: string; status: string }; [key: string]: unknown;
-};
+import { buildWorkerRpcArgs, type WorkerHostConfig } from "../extensions/worker/runner.js";
+import { assertWorkerSandboxReference, createWorkerSandboxAsync, planWorkerSandbox, settleWorkerSandboxAsync, type WorkerSandboxRelease } from "../extensions/worker/sandbox.js";
 
-const TEST_BEADS_ROUTE = { prefix: "personal" as const, path: "/test/central-beads", databasePath: "/test/central-beads/database" };
+const revisions = { pi: "1".repeat(40), profile: "2".repeat(40), piTools: "3".repeat(40), piDocparser: "4".repeat(40) };
+const extensionPaths = ["/opt/profile/extensions", "/opt/pi-tools/extensions/worker/runtime.ts"];
+const recordedUpdateTrailer=`
+╭──────────────────────────────────────────────────────────────────────────────────╮
+│ Docker Sandboxes Update Available                                                │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│ v0.49.1  →  v0.49.2                                                              │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│ Release notes  https://github.com/docker/sbx-releases/releases/tag/v0.49.2       │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│ To upgrade     brew upgrade docker/tap/sbx                                       │
+╰──────────────────────────────────────────────────────────────────────────────────╯
 
-async function withTempDir(run: (directory: string) => Promise<void>): Promise<void> {
-  const directory = await mkdtemp(path.join(tmpdir(), "pi-worker-host-"));
-  try {
-    await run(directory);
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-}
+`;
+const runtimeJson = JSON.stringify({ protocolVersion: 1, stagedLockSha256: "e".repeat(64), piRevision: revisions.pi, profileRevision: revisions.profile, piToolsRevision: revisions.piTools, piDocparserRevision: revisions.piDocparser, resourceManifestSha256: "c".repeat(64), extensionPaths });
+const release: WorkerSandboxRelease = { schemaVersion: 1, protocolVersion: 1, releaseOrdinal: 1, status: "approved", kit: { reference: "/immutable/pi-kit", sha256: "a".repeat(64) }, image: { reference: `example.invalid/pi@sha256:${"b".repeat(64)}`, digest: "b".repeat(64) }, sandbox: { version: "v0.49.1", buildCommit: "c5b19951af121b439800029695f88bf1139a0b0b", template: { id: "template-id-1234", repository: "docker.io/akoumjian/pi-worker-r1-deadbeef", tag: "loaded", flavor: "pi-managed-worker" } }, revisions, guest: { stagedLockSha256: "e".repeat(64), piCli: "/usr/local/bin/pi", rpcLauncher: "/opt/pi-worker/launch.mjs", codingAgentDir: "/run/pi-worker/agent", resourceManifestSha256: "c".repeat(64), runtimeProvenanceSha256: createHash("sha256").update(runtimeJson).digest("hex"), extensionPaths, searxngUrl: "http://host.docker.internal:18888" } };
 
-async function waitForPath(filePath: string, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!existsSync(filePath) && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-  if (!existsSync(filePath)) throw new Error(`Timed out waiting for ${filePath}`);
-}
+async function temp(run: (root: string) => Promise<void>) { const root = await mkdtemp(path.join(tmpdir(), "pi-worker-sbx-")); try { await run(root); } finally { await rm(root, { recursive: true, force: true }); } }
 
-async function waitForPidExit(pid: number, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      process.kill(pid, 0);
-    } catch {
-      return true;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-  return false;
-}
+test("Sandbox planning freezes exact runtime provenance and deterministic mounts", async () => temp(async (root) => {
+  const workerRoot = path.join(root, "worker"); const codeRoot = path.join(root, "Code"); const input = path.join(root, "input.txt"); await mkdir(workerRoot); await mkdir(codeRoot); await writeFile(input, "evidence\n");
+  const planned = planWorkerSandbox({ workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_bbbbbbbb", creationNonce: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", workerRoot, codeRoot, mounts: [{ source: input, readOnly: true }, { source: input, readOnly: true }], release });
+  assert.equal(planned.kind, "docker-sandbox"); assert.equal(planned.imageDigest, "b".repeat(64)); assert.equal(planned.kitSha256, "a".repeat(64)); assert.deepEqual(planned.mounts, [{ source: input, readOnly: true }]); assert.equal(planned.extensionPaths.length, 2); assert.ok(planned.sandboxName.endsWith(`-${planned.creationNonce}`)); assert.equal(planned.sandboxName.length, 60);
+}));
 
-function assistantMessage(text: string) {
-  return {
-    role: "assistant" as const,
-    content: [{ type: "text" as const, text }],
-    api: "openai-responses" as const,
-    provider: "openai",
-    model: "test",
-    usage: {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 0,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
-    },
-    stopReason: "stop" as const,
-    timestamp: Date.now()
-  };
-}
 
-function launchRecord(record: WorkerRecord): WorkerLaunchRecord {
-  if (!record.activeRun || !record.sessionFile) throw new Error("test record is not launchable");
-  return { workerId: record.workerId, runId: record.activeRun.runId, jobId: record.activeRun.jobId, sessionId: record.sessionId, sessionFile: record.sessionFile, workspaceRoot: record.workspaceRoot, taskIds: record.taskIds, role: record.role ?? "work", modelSelection: `${record.route.provider}/${record.route.model}:${record.route.thinkingLevel}` };
-}
+test("exact Sandbox references reject writable extension paths, duplicate extensions, and credential-bearing service URLs", async () => temp(async (root) => {
+  const workerRoot = path.join(root, "worker"); const codeRoot = path.join(root, "Code"); await mkdir(workerRoot); await mkdir(codeRoot);
+  const planned = planWorkerSandbox({ workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_bbbbbbbb", creationNonce: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", workerRoot, codeRoot, mounts: [], release });
+  assert.throws(() => assertWorkerSandboxReference({ ...planned, extensionPaths: ["/worker/extensions/runtime.ts"] }), /Invalid exact/);
+  assert.throws(() => assertWorkerSandboxReference({ ...planned, extensionPaths: [planned.extensionPaths[0]!, planned.extensionPaths[0]!] }), /Invalid exact/);
+  assert.throws(() => assertWorkerSandboxReference({ ...planned, searxngUrl: "https://secret@example.invalid" }), /Invalid exact/);
+  assert.throws(() => assertWorkerSandboxReference({ ...planned, sandboxName: planned.sandboxName.slice(0, -1) }), /nonce|exact/i);
+  assert.throws(() => assertWorkerSandboxReference({ ...planned, inspectEvidenceSha256: "not-a-digest" }), /inspect evidence/);
+}));
 
-test("worker host completes an exact-fork fake-provider run while ignoring workspace startup poison", async () => {
-  await withTempDir(async (directory) => {
-    const parentCwd = path.join(directory, "parent");
-    const parentSessionDir = path.join(directory, "parent-sessions");
-    const stateDir = path.join(directory, "state");
-    const workspaceRoot = path.join(stateDir, "workspace");
-    const sessionDir = path.join(stateDir, "session");
-    const runDir = path.join(stateDir, "runs", "run-test");
-    const resultFile = path.join(runDir, "result.json");
-    await Promise.all([
-      mkdir(parentCwd, { recursive: true }),
-      mkdir(workspaceRoot, { recursive: true }),
-      mkdir(sessionDir, { recursive: true }),
-      mkdir(path.join(stateDir, "async-shell"), { recursive: true }),
-      mkdir(path.join(workspaceRoot, ".pi", "extensions"), { recursive: true })
-    ]);
+test("Sandbox create and terminal removal use one exact name and verify absence", async () => temp(async (root) => {
+  const workerRoot = path.join(root, "worker"); const codeRoot = path.join(root, "Code"); await mkdir(workerRoot); await mkdir(codeRoot); const log = path.join(root, "sbx.log"); const state = path.join(root, "state");
+  const fake = path.join(root, "sbx"); await writeFile(fake, `#!/bin/sh
+printf '%s\n' "$*" >> ${JSON.stringify(log)}
+if [ "$1" = version ]; then printf 'sbx version v0.49.1 c5b19951af121b439800029695f88bf1139a0b0b\n'
+elif [ "$1 $2 $3" = "template ls --json" ]; then printf '%s\n' '[{"id":"${release.sandbox.template.id}","repository":"${release.sandbox.template.repository}","tag":"${release.sandbox.template.tag}","flavor":"${release.sandbox.template.flavor}","created_at":"2026-10-25T00:00:00Z","size":123}]'
+elif [ "$1" = create ]; then printf 'ID: sandbox-id-1234\nName: %s\n' "$3"; printf '%s\n' "$3" > ${JSON.stringify(state)}
+elif [ "$1" = inspect ] && [ "$3" = --json ]; then printf '{"name":"%s","id":"sandbox-id-1234","status":"running","agent":"shell","workspace":"%s"}\n' "$2" ${JSON.stringify(workerRoot)}; printf '%s' '${recordedUpdateTrailer}'
+elif [ "$1" = exec ]; then printf 'cpu=8\nmemoryBytes=17179869184\nruntime=%s\nresource=%s\n' '${runtimeJson}' '${release.guest.resourceManifestSha256}'
+elif [ "$1" = stop ]; then :
+elif [ "$1" = rm ]; then rm -f ${JSON.stringify(state)}
+elif [ "$1 $2" = "ls --json" ]; then if test -e ${JSON.stringify(state)}; then n=$(cat ${JSON.stringify(state)}); printf '[{"id":"sandbox-id-1234","name":"%s","status":"running","agent":"shell","workspace":"${workerRoot}"}]\n' "$n"; printf '%s' '${recordedUpdateTrailer}'; else printf '[]\n'; printf '%s' '${recordedUpdateTrailer}'; fi
+elif [ "$1" = ls ]; then test -e ${JSON.stringify(state)} && cat ${JSON.stringify(state)} || :
+else exit 64
+fi
+`); await chmod(fake, 0o755);
+  const planned = planWorkerSandbox({ workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_bbbbbbbb", creationNonce: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", workerRoot, codeRoot, mounts: [], release });
+  const bareVersion=path.join(root,"sbx-bare-version");await writeFile(bareVersion,"#!/bin/sh\nprintf 'v0.49.1\\n'\n");await chmod(bareVersion,0o755);await assert.rejects(createWorkerSandboxAsync(bareVersion,planned),/recorded v0\.49\.1 contract/);
+  const created = await createWorkerSandboxAsync(fake, planned); assert.match(created.createEvidenceSha256 ?? "", /^[a-f0-9]{64}$/); assert.equal(created.observedCpu, 8); assert.equal(created.observedMemoryBytes, 17_179_869_184); await settleWorkerSandboxAsync(fake, created);
+  const commands = await readFile(log, "utf8"); assert.match(commands, new RegExp(`create --name ${planned.sandboxName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`)); assert.match(commands, new RegExp(`stop ${planned.sandboxName}`)); assert.match(commands, new RegExp(`rm --force ${planned.sandboxName}`));
+  const exactFake=await readFile(fake,"utf8");await writeFile(fake,exactFake.replace("Docker Sandboxes Update Available","unexpected banner"));await assert.rejects(createWorkerSandboxAsync(fake,planned),/Sandbox inspect JSON was malformed/);
+}));
 
-    const parent = SessionManager.create(parentCwd, parentSessionDir, { id: "parent-session-e2e" });
-    parent.appendMessage({ role: "user", content: "PARENT_EXACT_MARKER", timestamp: Date.now() });
-    parent.appendMessage(assistantMessage("The exact parent marker is durable."));
-    const parentSessionFile = parent.getSessionFile();
-    assert.ok(parentSessionFile);
-    const forked = forkWorkerSession({
-      parentSessionFile,
-      workspaceRoot,
-      sessionDir,
-      sessionId: "worker-session-e2e"
-    });
-
-    await Promise.all([
-      writeFile(path.join(workspaceRoot, ".pi", "SYSTEM.md"), "WORKSPACE_SYSTEM_POISON\n"),
-      writeFile(path.join(workspaceRoot, ".pi", "APPEND_SYSTEM.md"), "WORKSPACE_SYSTEM_POISON\n"),
-      writeFile(path.join(workspaceRoot, ".pi", "settings.json"), `${JSON.stringify({ extensions: [".pi/extensions/poison.ts"] })}\n`),
-      writeFile(path.join(workspaceRoot, ".pi", "extensions", "poison.ts"), "import { writeFileSync } from 'node:fs'; writeFileSync('poison-loaded', 'yes'); export default function() {}\n")
-    ]);
-
-    const record: WorkerRecord = {
-      version: WORKER_RECORD_VERSION,
-      workerId: "worker_20260910200000_e2etest1",
-      sessionId: forked.sessionId,
-      sessionFile: forked.sessionFile,
-      parentSessionFile,
-      workspaceRoot,
-      taskIds: ["personal-workere2e"],
-      route: { provider: "worker-faux", model: "worker-faux-1", thinkingLevel: "off" },
-      status: "running",
-      activeRun: { runId: "run-test", jobId: "job_20260910200000_e2etest1", status: "running" },
-      updatedAt: new Date().toISOString()
-    };
-    const fakeProviderExtension = fileURLToPath(new URL("./fixtures/worker-faux-provider.js", import.meta.url));
-    const api = { sendMessage(): void {} } as unknown as ExtensionAPI;
-    const context = {
-      cwd: parentCwd,
-      sessionManager: { getSessionId: () => "parent-session-e2e" },
-      isIdle: () => true
-    } as ExtensionContext;
-    const launched = launchWorkerHost(api, context, {
-      record: launchRecord(record),
-      shellExecution: { kind: "native-test" },
-      prompt: "WORKER_PROMPT_MARKER: verify the managed worker lifecycle.",
-      resultFile,
-      runDir,
-      processFile: path.join(runDir, "host-process.json"),
-      processNonce: "host-process-e2e",
-      bdPath: process.execPath,
-      beadsRoute: TEST_BEADS_ROUTE,
-      extensionPaths: [...defaultWorkerExtensionPaths(), fakeProviderExtension]
-    });
-    const config = JSON.parse(await readFile(launched.configFile, "utf8")) as { extensionPaths: string[]; rpcArgs: string[]; timeoutMs?: number };
-    assert.ok(config.extensionPaths.includes(fakeProviderExtension));
-    assert.ok(config.rpcArgs.includes(fakeProviderExtension));
-    assert.equal(config.timeoutMs, undefined);
-
-    const keepAlive = setInterval(() => {}, 100);
-    const job = await launched.handle.completion.finally(() => clearInterval(keepAlive));
-    assert.equal(job.status, "exited", await readFile(job.stderrLog, "utf8"));
-    assert.equal(job.exitCode, 0);
-    const expectedManagedBy = { kind: "worker-host", workerId: record.workerId, runId: "run-test" };
-    assert.deepEqual(job.managedBy, expectedManagedBy, "launchWorkerHost must mark its actual async host job");
-    const persistedHostMeta = JSON.parse(await readFile(path.join(job.logDir, "meta.json"), "utf8")) as { managedBy?: unknown };
-    assert.deepEqual(persistedHostMeta.managedBy, expectedManagedBy);
-    assert.throws(() => previewAsyncShellPrune({ cwd: parentCwd }, [job.jobId]), /managed-worker evidence; ordinary prune refused/);
-
-    const accepted = readWorkerRuntimeResult(resultFile);
-    assert.equal(accepted.workerId, record.workerId);
-    assert.equal(accepted.runId, "run-test");
-    assert.equal(accepted.result.outcome, "completed");
-    assert.match(accepted.result.summary, /verified the exact fork/);
-    assert.match(accepted.result.summary, /verified the exact fork/);
-    assert.equal(existsSync(path.join(workspaceRoot, "poison-loaded")), false);
-    assert.equal(existsSync(path.join(workspaceRoot, "post-handoff-side-effect")), false);
-    const workerSession = await readFile(forked.sessionFile, "utf8");
-    assert.match(workerSession, /PARENT_EXACT_MARKER/);
-    assert.match(workerSession, /WORKER_PROMPT_MARKER/);
-    assert.doesNotMatch(workerSession, /WORKSPACE_SYSTEM_POISON/);
-  });
+test("RPC arguments retain immutable explicit extensions and complete built-in tools", () => {
+  const sandbox = { ...planWorkerSandbox } as never;
+  const config = { provider: "openai-codex", model: "gpt", thinkingLevel: "xhigh", sessionFile: "/worker/session.jsonl", sessionDir: "/worker", sandbox: { extensionPaths: release.guest.extensionPaths } } as WorkerHostConfig;
+  const args = buildWorkerRpcArgs(config); assert.equal(args.includes("--no-builtin-tools"), false); assert.equal(args.includes("--tools"), false); assert.equal(args.includes("--no-extensions"), true); for (const extension of release.guest.extensionPaths) assert.ok(args.includes(extension));
 });
 
-test("worker host fails when the initial prompt is rejected before an agent turn starts", async () => {
-  await withTempDir(async (directory) => {
-    const parentCwd = path.join(directory, "parent");
-    const workspaceRoot = path.join(directory, "workspace");
-    const stateDir = path.join(directory, "state");
-    const sessionDir = path.join(stateDir, "session");
-    const runDir = path.join(stateDir, "runs", "run-preflight-failure");
-    const resultFile = path.join(runDir, "result.json");
-    await Promise.all([
-      mkdir(parentCwd, { recursive: true }),
-      mkdir(workspaceRoot, { recursive: true }),
-      mkdir(sessionDir, { recursive: true })
-    ]);
-    const parent = SessionManager.create(parentCwd, path.join(directory, "parent-sessions"), { id: "parent-session-preflight-failure" });
-    parent.appendMessage({ role: "user", content: "parent preflight failure context", timestamp: Date.now() });
-    parent.appendMessage(assistantMessage("Ready for the preflight failure probe."));
-    const parentSessionFile = parent.getSessionFile();
-    assert.ok(parentSessionFile);
-    const forked = forkWorkerSession({ parentSessionFile, workspaceRoot, sessionDir, sessionId: "worker-session-preflight-failure" });
-    const record: WorkerRecord = {
-      version: WORKER_RECORD_VERSION,
-      workerId: "worker_20260910200000_preflt01",
-      sessionId: forked.sessionId,
-      sessionFile: forked.sessionFile,
-      parentSessionFile,
-      workspaceRoot,
-      taskIds: ["personal-workere2e"],
-      route: { provider: "worker-faux", model: "worker-faux-1", thinkingLevel: "off" },
-      status: "running",
-      activeRun: { runId: "run-preflight-failure", jobId: "job_20260910200000_preflt01", status: "running" },
-      updatedAt: new Date().toISOString()
-    };
-    const failureExtension = fileURLToPath(new URL("./fixtures/worker-preflight-failure.js", import.meta.url));
-    const launched = launchWorkerHost({ sendMessage(): void {} } as unknown as ExtensionAPI, {
-      cwd: parentCwd,
-      sessionManager: { getSessionId: () => "parent-session-preflight-failure" },
-      isIdle: () => true
-    } as ExtensionContext, {
-      record: launchRecord(record),
-      shellExecution: { kind: "native-test" },
-      prompt: "This prompt must fail before the worker turn starts.",
-      resultFile,
-      runDir,
-      processFile: path.join(runDir, "host-process.json"),
-      processNonce: "host-process-preflight-failure",
-      bdPath: process.execPath,
-      beadsRoute: TEST_BEADS_ROUTE,
-      extensionPaths: [...defaultWorkerExtensionPaths(), failureExtension]
-    });
-    const keepAlive = setInterval(() => {}, 100);
-    const job = await launched.handle.completion.finally(() => clearInterval(keepAlive));
-    assert.equal(job.status, "failed");
-    const stderr = await readFile(job.stderrLog, "utf8");
-    assert.match(stderr, /No API key found for worker-faux|Intentionally unavailable worker test credential/);
-    assert.doesNotMatch(stderr, /prompt response did not begin an agent turn/, "the checked response must preserve the immediate rejection cause");
-    assert.equal(existsSync(resultFile), false);
+test("sbx RPC shim forwards byte streams and only non-secret launch environment", async () => temp(async (root) => {
+  const output = path.join(root, "output.json"); const fake = path.join(root, "sbx");
+  await writeFile(fake, `#!/bin/sh\nnode -e 'let s="";process.stdin.on("data",c=>s+=c);process.stdin.on("end",()=>{require("fs").writeFileSync(process.argv[1],JSON.stringify({argv:process.argv.slice(2),input:s,secret:process.env.REAL_TOKEN}))})' ${JSON.stringify(output)} "$@"\n`); await chmod(fake, 0o755);
+  const manifest = path.join(root, "manifest.json"); await writeFile(manifest, JSON.stringify({ version: 1, sbxPath: fake, sandbox: { kind: "docker-sandbox", sandboxName: "pi-worker-run", workingDirectory: "/worker/workspace", workspaceRoot: "/worker/workspace", rpcLauncher: "/opt/pi-worker/launch.mjs" }, guestEnvironment: { PI_WORKER_ID: "worker_test", OPENAI_CODEX_SENTINEL: "header.payload.signature" } }));
+  const shim = path.resolve("scripts/worker-sbx-rpc.mjs"); const child = spawn(process.execPath, [shim, "--mode", "rpc", "--session", "/worker/session.jsonl"], { env: { ...process.env, REAL_TOKEN: "must-not-cross", PI_WORKER_SANDBOX_LAUNCH_MANIFEST: manifest }, stdio: ["pipe", "pipe", "pipe"] }); child.stdin.end('{"type":"probe"}\n'); const code = await new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("exit", resolve); }); assert.equal(code, 0);
+  const captured = JSON.parse(await readFile(output, "utf8")); assert.equal(captured.input, '{"type":"probe"}\n'); assert.equal(captured.secret, "must-not-cross", "fake host process sees host env but guest receives only explicit env arguments"); const joined = captured.argv.join(" "); assert.match(joined, /^exec --workdir \/worker\/workspace pi-worker-run env /); assert.match(joined, /PI_WORKER_ID=worker_test/); assert.doesNotMatch(joined, /must-not-cross/); assert.match(joined, /\/opt\/pi-worker\/launch\.mjs --mode rpc/);
+}));
+
+test("packaged worker-host spawns through the real shim and fake sbx, admits typed RPC, settles, and exits on EOF", async () => temp(async (root) => {
+  const workerId = "worker_20260101000000_aaaaaaaa"; const runId = "run_20260101000000_bbbbbbbb"; const sessionId = "session-spawned-host";
+  const workerRoot = path.join(root, "worker"); const workspaceRoot = path.join(workerRoot, "workspace"); const sessionDir = path.join(workerRoot, "session"); const runDir = path.join(root, "supervision", runId); await mkdir(workspaceRoot, { recursive: true }); await mkdir(sessionDir, { recursive: true }); await mkdir(runDir, { recursive: true }); await mkdir(path.join(workerRoot, "async-shell"));
+  const sessionFile = path.join(sessionDir, "session.jsonl"); await writeFile(sessionFile, `${JSON.stringify({ type: "session", id: sessionId, cwd: workspaceRoot })}\n`);
+  const fakeRpc = path.resolve("tests/fixtures/worker-sandbox-rpc-fixture.mjs"); const sbxLog = path.join(root, "sbx.log"); const fakeSbx = path.join(root, "sbx");
+  await writeFile(fakeSbx, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(sbxLog)}\nif [ "$1" = exec ]; then while [ "$1" != env ]; do shift; done; shift; while echo "$1" | grep -q '='; do export "$1"; shift; done; shift; exec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeRpc)} "$@"; fi\nexit 0\n`); await chmod(fakeSbx, 0o755);
+  const beadsDir = path.join(root, "beads"); await mkdir(beadsDir); const fakeBd = path.join(root, "bd");
+  await writeFile(fakeBd, `#!/bin/sh
+if echo "$*" | grep -q 'where --json'; then printf '%s\n' '{"prefix":"personal","path":"${beadsDir}","database_path":"${path.join(beadsDir, "db")}"}'
+elif echo "$*" | grep -q 'search'; then printf '%s\n' '[{"id":"personal-test","title":"Test","status":"in_progress","priority":1,"issue_type":"task","design":"Spawned design"}]'
+elif echo "$*" | grep -q 'show'; then printf '%s\n' '[{"id":"personal-test","title":"Test","status":"in_progress","priority":1,"issue_type":"task","design":"Spawned design"}]'
+elif echo "$*" | grep -q 'update'; then printf '%s\n' '{"ok":true}'
+else exit 9; fi
+`); await chmod(fakeBd, 0o755);
+  const provenance = { protocolVersion: 1, sandboxName: "pi-worker-spawned", creationNonce: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", piRevision: "1".repeat(40), profileRevision: "2".repeat(40), piToolsRevision: "3".repeat(40), piDocparserRevision: "4".repeat(40), stagedLockSha256: "e".repeat(64), resourceManifestSha256: "a".repeat(64), runtimeProvenanceSha256: "e".repeat(64), imageDigest: "b".repeat(64), kitSha256: "c".repeat(64), sbxVersion: "v0.49.1", sbxBuildCommit: "c5b19951af121b439800029695f88bf1139a0b0b", templateId: "template-id-1234", templateRepository: "docker.io/akoumjian/pi-worker-r1-deadbeef", templateTag: "loaded", templateFlavor: "pi-managed-worker", inspectEvidenceSha256: "f".repeat(64), sbxVersionEvidenceSha256: "9".repeat(64), extensionPaths: ["/opt/pi-tools/runtime.ts"], observedSandboxId: "sandbox-id-1234", observedRuntimeSha256: "d".repeat(64) };
+  const sandbox = { kind: "docker-sandbox", sandboxName: provenance.sandboxName, creationNonce: provenance.creationNonce, workingDirectory: workspaceRoot, workspaceRoot, rpcLauncher: "/opt/pi-worker/launch.mjs" };
+  const launchManifestFile = path.join(runDir, "launch.json"); const launchText = `${JSON.stringify({ version: 1, sbxPath: fakeSbx, sandbox, guestEnvironment: { FAKE_TRACE: path.join(root, "rpc.trace"), FAKE_WORKER_IDENTITY: JSON.stringify({ workerId, runId, role: "work", sessionId, ...provenance }) } }, null, 2)}\n`; await writeFile(launchManifestFile, launchText);
+  const resultFile = path.join(runDir, "result.json"); const settledFile = path.join(runDir, "settled.json"); const processFile = path.join(runDir, "process.json"); const authorizationFile = path.join(runDir, "authorization.json"); const configFile = path.join(runDir, "host.json");
+  await writeFile(authorizationFile, `${JSON.stringify({ version: 2, workerId, runId, processNonce: "process-nonce", sandboxName: sandbox.sandboxName, creationNonce: sandbox.creationNonce })}\n`);
+  const config = { version: 2, backend: "docker-sandbox", workerId, runId, role: "work", sessionId, sessionFile, sessionDir, workerRoot, workspaceRoot, asyncJobRoot: path.join(workerRoot, "async-shell"), taskIds: ["personal-test"], resultFile, settledFile, helloFile: path.join(runDir, "hello.json"), stateFile: path.join(runDir, "state.json"), processFile, processNonce: "process-nonce", hostConfigFile: configFile, cancellationFile: path.join(runDir, "cancel-request.json"), supervisionRoot: runDir, authorizationFile, launchManifestFile, launchManifestSha256: createHash("sha256").update(launchText).digest("hex"), prompt: "spawned host probe", sandbox, sandboxShimPath: path.resolve("scripts/worker-sbx-rpc.mjs"), sbxPath: fakeSbx, runtimeProvenance: provenance, rpcArgs: ["--session", sessionFile] };
+  await writeFile(configFile, `${JSON.stringify(config)}\n`);
+  const host = spawn(process.execPath, [path.resolve("scripts/worker-host.mjs"), configFile], { detached: true, cwd: workspaceRoot, env: { ...process.env, PI_WORKER_JOB_TOKEN: "job-token-spawned", PI_WORKER_ID: workerId, PI_WORKER_RUN_ID: runId, PI_WORKER_RESULT_FILE: resultFile, PI_WORKER_WORKSPACE_ROOT: workspaceRoot, PI_WORKER_STATE_ROOT: workerRoot, PI_WORKER_SUPERVISION_ROOT: runDir, PI_WORKER_ASYNC_JOB_ROOT: path.join(workerRoot, "async-shell"), PI_WORKER_TASK_IDS: JSON.stringify(["personal-test"]), PI_WORKER_ROLE: "work", PI_WORKER_BD_PATH: fakeBd, PI_WORKER_BEADS_ROUTE: JSON.stringify({ prefix: "personal", path: beadsDir, databasePath: path.join(beadsDir, "db") }), BEADS_DIR: beadsDir, PI_WORKER_AUTHORIZATION_FILE: authorizationFile, PI_WORKER_PROCESS_NONCE: "process-nonce" }, stdio: ["ignore", "pipe", "pipe"] });
+  const killTimer = setTimeout(() => { if (host.pid) try { process.kill(-host.pid, "SIGKILL"); } catch {} }, 30_000);
+  const [code, stdout, stderr] = await Promise.all([new Promise<number | null>((resolve, reject) => { host.once("error", reject); host.once("exit", resolve); }), collectStream(host.stdout), collectStream(host.stderr)]);
+  clearTimeout(killTimer); assert.equal(code, 0, `${stderr}\nstdout=${stdout}\nsbx=${existsSync(sbxLog) ? await readFile(sbxLog, "utf8") : "missing"}\nrpc=${existsSync(path.join(root, "rpc.trace")) ? await readFile(path.join(root, "rpc.trace"), "utf8") : "missing"}`); assert.equal(existsSync(resultFile), true); assert.equal(existsSync(settledFile), true); assert.match(stdout, /worker_host_result/); const trace = await readFile(path.join(root, "rpc.trace"), "utf8"); for (const label of ["additional-field-rejected", "assigned", "get", "search", "design", "update-status-less", "update-with-status", "result-additional-field-rejected", "identical-retry-after-response-loss", "conflicting-retry-rejected"]) assert.match(trace, new RegExp(`checked:${label}`)); assert.match(trace, /eof/); const sbxArgs = await readFile(sbxLog, "utf8"); assert.match(sbxArgs, new RegExp(`exec --workdir ${workspaceRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} ${sandbox.sandboxName}`));
+}));
+
+async function collectStream(stream: NodeJS.ReadableStream): Promise<string> { let value = ""; for await (const chunk of stream) value += chunk; return value; }
+
+test("sbx RPC shim propagates guest signal termination as nonzero", async () => temp(async (root) => {
+  const fake=path.join(root,"sbx-signal"); await writeFile(fake,"#!/bin/sh\nkill -TERM $$\n"); await chmod(fake,0o755); const manifest=path.join(root,"manifest.json"); await writeFile(manifest,JSON.stringify({version:1,sbxPath:fake,sandbox:{kind:"docker-sandbox",sandboxName:"pi-worker-signal",workingDirectory:"/worker/workspace",workspaceRoot:"/worker/workspace",rpcLauncher:"/opt/pi-worker/launch.mjs"},guestEnvironment:{}})); const child=spawn(process.execPath,[path.resolve("scripts/worker-sbx-rpc.mjs"),"--mode","rpc"],{env:{...process.env,PI_WORKER_SANDBOX_LAUNCH_MANIFEST:manifest},stdio:["ignore","pipe","pipe"]}); const code=await new Promise<number|null>((resolve,reject)=>{child.once("error",reject);child.once("exit",resolve)}); assert.equal(code,143);
+}));
+
+test("spawned supervisor covers ordering, every result branch, missing-result grace, mutation-drained cancellation, and EOF-to-stop escalation", async () => {
+  for (const scenario of ["missing", "review-repair", "ignore-eof", "cancel", "cancel-mutation", "cancel-result", "ordering", "outcome-completed", "outcome-needs_input", "outcome-blocked", "outcome-approve", "outcome-request_changes"]) await temp(async (root) => {
+    const workerId="worker_20260101000000_aaaaaaaa", runId="run_20260101000000_bbbbbbbb", sessionId=`session-${scenario}`, role=scenario === "review-repair" || scenario === "outcome-approve" || scenario === "outcome-request_changes" ? "review" : "work";
+    const workerRoot=path.join(root,"worker"), workspaceRoot=path.join(workerRoot,"workspace"), sessionDir=path.join(workerRoot,"session"), runDir=path.join(root,"supervision",runId);
+    await mkdir(workspaceRoot,{recursive:true}); await writeFile(path.join(workspaceRoot,"report.md"),"# spawned review\n"); await mkdir(sessionDir,{recursive:true}); await mkdir(path.join(workerRoot,"async-shell")); await mkdir(runDir,{recursive:true});
+    const sessionFile=path.join(sessionDir,"session.jsonl"); await writeFile(sessionFile,`${JSON.stringify({type:"session",id:sessionId,cwd:workspaceRoot})}\n`);
+    const rpcTrace=path.join(root,"rpc.trace"), sbxTrace=path.join(root,"sbx.trace"), execPid=path.join(root,"exec.pid"), fakeSbx=path.join(root,"sbx"), fakeRpc=path.resolve("tests/fixtures/worker-sandbox-rpc-fixture.mjs");
+    const settledFile=path.join(runDir,"settled.json"), beadsDir=path.join(root,"beads"), fakeBd=path.join(root,"bd"); await mkdir(beadsDir); await writeFile(fakeBd,`#!/usr/bin/env node\nconst args=process.argv.slice(2); if(args.includes("where")) process.stdout.write(${JSON.stringify(JSON.stringify({prefix:"personal",path:"__BEADS__",database_path:"__DB__"}))}.replace("__BEADS__",${JSON.stringify(beadsDir)}).replace("__DB__",${JSON.stringify(path.join(beadsDir,"db"))})); else if(args.includes("update")){Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,1000);process.stdout.write('{"ok":true}');} else process.stdout.write('[]');\n`); await chmod(fakeBd,0o755);
+    await writeFile(fakeSbx,`#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(sbxTrace)}\nif [ "$1" = exec ]; then echo $$ > ${JSON.stringify(execPid)}; while [ "$1" != env ]; do shift; done; shift; while echo "$1" | grep -q '='; do export "$1"; shift; done; shift; exec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeRpc)} "$@"; fi\nif [ "$1" = stop ]; then echo 'sbx-stop' >> ${JSON.stringify(rpcTrace)}; if test -e ${JSON.stringify(settledFile)}; then echo 'stop:settled=yes' >> ${JSON.stringify(sbxTrace)}; else echo 'stop:settled=no' >> ${JSON.stringify(sbxTrace)}; fi; test -e ${JSON.stringify(execPid)} && kill -KILL "$(cat ${JSON.stringify(execPid)})" 2>/dev/null || :; fi\nexit 0\n`); await chmod(fakeSbx,0o755);
+    const provenance={protocolVersion:1,sandboxName:`pi-case-${scenario.replaceAll("_","-")}`,creationNonce:"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",piRevision:"1".repeat(40),profileRevision:"2".repeat(40),piToolsRevision:"3".repeat(40),piDocparserRevision:"4".repeat(40),stagedLockSha256:"e".repeat(64),resourceManifestSha256:"a".repeat(64),runtimeProvenanceSha256:"e".repeat(64),imageDigest:"b".repeat(64),kitSha256:"c".repeat(64),sbxVersion:"v0.49.1",sbxBuildCommit:"c5b19951af121b439800029695f88bf1139a0b0b",templateId:"template-id-1234",templateRepository:"docker.io/akoumjian/pi-worker-r1-deadbeef",templateTag:"loaded",templateFlavor:"pi-managed-worker",inspectEvidenceSha256:"f".repeat(64),sbxVersionEvidenceSha256:"9".repeat(64),extensionPaths:["/opt/pi-tools/runtime.ts"],observedSandboxId:"sandbox-id-1234",observedRuntimeSha256:"d".repeat(64)};
+    const sandbox={kind:"docker-sandbox",sandboxName:provenance.sandboxName,creationNonce:provenance.creationNonce,workingDirectory:workspaceRoot,workspaceRoot,rpcLauncher:"/opt/pi-worker/launch.mjs"};
+    const launchManifestFile=path.join(runDir,"launch.json"), launchText=`${JSON.stringify({version:1,sbxPath:fakeSbx,sandbox,guestEnvironment:{FAKE_TRACE:rpcTrace,FAKE_SCENARIO:scenario,FAKE_WORKER_IDENTITY:JSON.stringify({workerId,runId,role,sessionId,...provenance})}})}\n`; await writeFile(launchManifestFile,launchText);
+    const resultFile=path.join(runDir,"result.json"), processFile=path.join(runDir,"process.json"), authorizationFile=path.join(runDir,"authorization.json"), cancellationFile=path.join(runDir,"cancel-request.json"), configFile=path.join(runDir,"host.json");
+    await writeFile(authorizationFile,`${JSON.stringify({version:2,workerId,runId,processNonce:"process-nonce",sandboxName:sandbox.sandboxName,creationNonce:sandbox.creationNonce})}\n`);
+    const config={version:2,backend:"docker-sandbox",workerId,runId,role,sessionId,sessionFile,sessionDir,workerRoot,workspaceRoot,supervisionRoot:runDir,asyncJobRoot:path.join(workerRoot,"async-shell"),taskIds:["personal-test"],resultFile,settledFile,helloFile:path.join(runDir,"hello.json"),stateFile:path.join(runDir,"state.json"),processFile,processNonce:"process-nonce",hostConfigFile:configFile,cancellationFile,authorizationFile,launchManifestFile,launchManifestSha256:createHash("sha256").update(launchText).digest("hex"),prompt:"race probe",sandbox,sandboxShimPath:path.resolve("scripts/worker-sbx-rpc.mjs"),sbxPath:fakeSbx,runtimeProvenance:provenance,rpcArgs:["--session",sessionFile]}; await writeFile(configFile,`${JSON.stringify(config)}\n`);
+    const host=spawn(process.execPath,[path.resolve("scripts/worker-host.mjs"),configFile],{cwd:workspaceRoot,env:{...process.env,PI_WORKER_JOB_TOKEN:`job-${scenario}`,PI_WORKER_ID:workerId,PI_WORKER_RUN_ID:runId,PI_WORKER_RESULT_FILE:resultFile,PI_WORKER_WORKSPACE_ROOT:workspaceRoot,PI_WORKER_STATE_ROOT:workerRoot,PI_WORKER_SUPERVISION_ROOT:runDir,PI_WORKER_ASYNC_JOB_ROOT:path.join(workerRoot,"async-shell"),PI_WORKER_TASK_IDS:JSON.stringify(["personal-test"]),PI_WORKER_ROLE:role,PI_WORKER_BD_PATH:fakeBd,PI_WORKER_BEADS_ROUTE:JSON.stringify({prefix:"personal",path:beadsDir,databasePath:path.join(beadsDir,"db")}),BEADS_DIR:beadsDir,PI_WORKER_AUTHORIZATION_FILE:authorizationFile,PI_WORKER_PROCESS_NONCE:"process-nonce"},stdio:["ignore","pipe","pipe"]});
+    if(scenario==="cancel" || scenario==="cancel-mutation" || scenario==="cancel-result"){ await waitForText(rpcTrace,scenario==="cancel-result"?"result-sent":"cancel-ready",15_000); await writeFile(cancellationFile,`${JSON.stringify({version:1,workerId,runId})}\n`); }
+    const [code,,stderr]=await Promise.all([new Promise<number|null>((resolve,reject)=>{host.once("error",reject);host.once("exit",resolve)}),collectStream(host.stdout),collectStream(host.stderr)]);
+    const rpc=await readFile(rpcTrace,"utf8"), sbx=await readFile(sbxTrace,"utf8"); assert.match(rpc,/eof/); assert.doesNotMatch(rpc,/signal:/);
+    if(scenario==="missing"){assert.notEqual(code,0);assert.match(stderr,/without worker_result_submit/);assert.doesNotMatch(sbx,/^stop /m);}
+    if(scenario==="review-repair"){assert.equal(code,0,stderr);assert.equal(JSON.parse(await readFile(resultFile,"utf8")).result.outcome,"approve");assert.match(rpc,/checked:review-repair/);}
+    if(scenario==="ignore-eof"){assert.equal(existsSync(settledFile),true);assert.match(sbx,/^stop /m);assert.match(sbx,/stop:settled=yes/);assert.ok(rpc.indexOf("eof")>=0 && rpc.indexOf("eof")<rpc.indexOf("sbx-stop"));}
+    if(scenario==="cancel" || scenario==="cancel-mutation" || scenario==="cancel-result"){assert.notEqual(code,0);assert.doesNotMatch(sbx,/^stop /m);if(scenario==="cancel-mutation")assert.match(rpc,/mutation-response:success/);assert.ok(rpc.indexOf("mutation-response:success")<rpc.indexOf("eof"));if(scenario==="cancel-result"){assert.equal(existsSync(resultFile),true);assert.equal(JSON.parse(await readFile(resultFile,"utf8")).result.outcome,"completed");}}
+    if(scenario==="ordering"){assert.equal(code,0,stderr);for(const label of ["state-before-hello-rejected","mismatched-hello-rejected","duplicate-hello-rejected","state-additional-field-rejected","state-sequence-replay-rejected"])assert.match(rpc,new RegExp(`checked:${label}`));}
+    if(scenario.startsWith("outcome-")){assert.equal(code,0,stderr);assert.equal(JSON.parse(await readFile(resultFile,"utf8")).result.outcome,scenario.slice(8));assert.match(rpc,new RegExp(`checked:${scenario}`));}
   });
 });
-
-test("worker host permits pre-prompt compaction to exceed the prompt-start watchdog", async () => {
-  await withTempDir(async (directory) => {
-    const parentCwd = path.join(directory, "parent");
-    const workspaceRoot = path.join(directory, "workspace");
-    const stateDir = path.join(directory, "state");
-    const sessionDir = path.join(stateDir, "session");
-    const runDir = path.join(stateDir, "runs", "run-preprompt-compaction");
-    const resultFile = path.join(runDir, "result.json");
-    await Promise.all([
-      mkdir(parentCwd, { recursive: true }),
-      mkdir(workspaceRoot, { recursive: true }),
-      mkdir(sessionDir, { recursive: true }),
-      mkdir(path.join(stateDir, "async-shell"), { recursive: true })
-    ]);
-    const parent = SessionManager.create(parentCwd, path.join(directory, "parent-sessions"), { id: "parent-session-preprompt-compaction" });
-    for (let index = 0; index < 8; index += 1) {
-      parent.appendMessage({ role: "user", content: `parent compaction context ${index} ${"x".repeat(20_000)}`, timestamp: Date.now() + index * 2 });
-      parent.appendMessage(assistantMessage(`Parent compaction response ${index}.`));
-    }
-    const highUsage = assistantMessage("The parent context is near the worker model threshold.");
-    parent.appendMessage({
-      ...highUsage,
-      provider: "worker-faux",
-      model: "worker-faux-1",
-      usage: { ...highUsage.usage, input: 120_000, totalTokens: 120_000 }
-    });
-    const parentSessionFile = parent.getSessionFile();
-    assert.ok(parentSessionFile);
-    const forked = forkWorkerSession({ parentSessionFile, workspaceRoot, sessionDir, sessionId: "worker-session-preprompt-compaction" });
-    const record: WorkerRecord = {
-      version: WORKER_RECORD_VERSION,
-      workerId: "worker_20260910200000_compact1",
-      sessionId: forked.sessionId,
-      sessionFile: forked.sessionFile,
-      parentSessionFile,
-      workspaceRoot,
-      taskIds: ["personal-workere2e"],
-      route: { provider: "worker-faux", model: "worker-faux-1", thinkingLevel: "off" },
-      status: "running",
-      activeRun: { runId: "run-preprompt-compaction", jobId: "job_20260910200000_compact1", status: "running" },
-      updatedAt: new Date().toISOString()
-    };
-    const compactionExtension = fileURLToPath(new URL("./fixtures/worker-compaction-faux-provider.js", import.meta.url));
-    const startedAt = Date.now();
-    const launched = launchWorkerHost({ sendMessage(): void {} } as unknown as ExtensionAPI, {
-      cwd: parentCwd,
-      sessionManager: { getSessionId: () => "parent-session-preprompt-compaction" },
-      isIdle: () => true
-    } as ExtensionContext, {
-      record: launchRecord(record),
-      shellExecution: { kind: "native-test" },
-      prompt: "Complete after compacting the inherited parent context.",
-      resultFile,
-      runDir,
-      processFile: path.join(runDir, "host-process.json"),
-      processNonce: "host-process-preprompt-compaction",
-      bdPath: process.execPath,
-      beadsRoute: TEST_BEADS_ROUTE,
-      extensionPaths: [...defaultWorkerExtensionPaths(), compactionExtension]
-    });
-    const keepAlive = setInterval(() => {}, 100);
-    const job = await launched.handle.completion.finally(() => clearInterval(keepAlive));
-    const workerSession = await readFile(forked.sessionFile, "utf8");
-    assert.equal(job.status, "exited", `${await readFile(job.stderrLog, "utf8")}\nSTDOUT:\n${await readFile(job.stdoutLog, "utf8")}\nSESSION TAIL:\n${workerSession.slice(-8_000)}`);
-    assert.equal(job.exitCode, 0);
-    assert.ok(Date.now() - startedAt >= 5_500, "pre-prompt compaction must outlive the five-second post-response watchdog");
-    assert.equal(readWorkerRuntimeResult(resultFile).result.outcome, "completed");
-    assert.match(workerSession, /"type":"compaction"/);
-  });
-});
-
-test("worker host detects an RPC child exit after agent_start without waiting for cancellation", async () => {
-  await withTempDir(async (directory) => {
-    const parentCwd = path.join(directory, "parent");
-    const workspaceRoot = path.join(directory, "workspace");
-    const stateDir = path.join(directory, "state");
-    const sessionDir = path.join(stateDir, "session");
-    const runDir = path.join(stateDir, "runs", "run-rpc-exit");
-    const resultFile = path.join(runDir, "result.json");
-    await Promise.all([
-      mkdir(parentCwd, { recursive: true }),
-      mkdir(workspaceRoot, { recursive: true }),
-      mkdir(sessionDir, { recursive: true }),
-      mkdir(path.join(stateDir, "async-shell"), { recursive: true })
-    ]);
-    const parent = SessionManager.create(parentCwd, path.join(directory, "parent-sessions"), { id: "parent-session-rpc-exit" });
-    parent.appendMessage({ role: "user", content: "parent RPC exit context", timestamp: Date.now() });
-    parent.appendMessage(assistantMessage("Ready for the RPC exit probe."));
-    const parentSessionFile = parent.getSessionFile();
-    assert.ok(parentSessionFile);
-    const forked = forkWorkerSession({ parentSessionFile, workspaceRoot, sessionDir, sessionId: "worker-session-rpc-exit" });
-    const record: WorkerRecord = {
-      version: WORKER_RECORD_VERSION,
-      workerId: "worker_20260910200000_rpcexit1",
-      sessionId: forked.sessionId,
-      sessionFile: forked.sessionFile,
-      parentSessionFile,
-      workspaceRoot,
-      taskIds: ["personal-workere2e"],
-      route: { provider: "worker-faux", model: "worker-faux-1", thinkingLevel: "off" },
-      status: "running",
-      activeRun: { runId: "run-rpc-exit", jobId: "job_20260910200000_rpcexit1", status: "running" },
-      updatedAt: new Date().toISOString()
-    };
-    const exitExtension = fileURLToPath(new URL("./fixtures/worker-rpc-exit-faux-provider.js", import.meta.url));
-    const startedAt = Date.now();
-    const launched = launchWorkerHost({ sendMessage(): void {} } as unknown as ExtensionAPI, {
-      cwd: parentCwd,
-      sessionManager: { getSessionId: () => "parent-session-rpc-exit" },
-      isIdle: () => true
-    } as ExtensionContext, {
-      record: launchRecord(record),
-      shellExecution: { kind: "native-test" },
-      prompt: "Start and then terminate the RPC child.",
-      resultFile,
-      runDir,
-      processFile: path.join(runDir, "host-process.json"),
-      processNonce: "host-process-rpc-exit",
-      bdPath: process.execPath,
-      beadsRoute: TEST_BEADS_ROUTE,
-      timeoutMs: 15_000,
-      extensionPaths: [...defaultWorkerExtensionPaths(), exitExtension]
-    });
-    const keepAlive = setInterval(() => {}, 100);
-    const job = await launched.handle.completion.finally(() => clearInterval(keepAlive));
-    const stderr = await readFile(job.stderrLog, "utf8");
-    assert.equal(job.status, "failed", stderr);
-    assert.match(stderr, /Agent process exited/);
-    assert.ok(Date.now() - startedAt < 12_000, `RPC child exit should fail before the 15-second explicit backstop:\n${stderr}`);
-    assert.equal(existsSync(resultFile), false);
-  });
-});
-
-test("worker host waits for the settled follow-up turn after asynchronous shell completion", async () => {
-  await withTempDir(async (directory) => {
-    const parentCwd = path.join(directory, "parent");
-    const workspaceRoot = path.join(directory, "workspace");
-    const stateDir = path.join(directory, "state");
-    const sessionDir = path.join(stateDir, "session");
-    const runDir = path.join(stateDir, "runs", "run-multiturn");
-    const resultFile = path.join(runDir, "result.json");
-    await Promise.all([
-      mkdir(parentCwd, { recursive: true }),
-      mkdir(path.join(workspaceRoot, "cache", "config"), { recursive: true }),
-      mkdir(path.join(workspaceRoot, "cache", "data"), { recursive: true }),
-      mkdir(path.join(workspaceRoot, "cache", "state"), { recursive: true }),
-      mkdir(path.join(workspaceRoot, "tmp"), { recursive: true }),
-      mkdir(sessionDir, { recursive: true })
-    ]);
-    const parent = SessionManager.create(parentCwd, path.join(directory, "parent-sessions"), { id: "parent-session-multiturn" });
-    parent.appendMessage({ role: "user", content: "parent multiturn context", timestamp: Date.now() });
-    parent.appendMessage(assistantMessage("Ready for a multiturn run."));
-    const parentSessionFile = parent.getSessionFile();
-    assert.ok(parentSessionFile);
-    const forked = forkWorkerSession({ parentSessionFile, workspaceRoot, sessionDir, sessionId: "worker-session-multiturn" });
-    const record: WorkerRecord = {
-      version: WORKER_RECORD_VERSION,
-      workerId: "worker_20260910200000_multit01",
-      sessionId: forked.sessionId,
-      sessionFile: forked.sessionFile,
-      parentSessionFile,
-      workspaceRoot,
-      taskIds: ["personal-workere2e"],
-      route: { provider: "worker-multiturn-faux", model: "worker-multiturn-faux-1", thinkingLevel: "off" },
-      status: "running",
-      activeRun: { runId: "run-multiturn", jobId: "job_20260910200000_multit01", status: "running" },
-      updatedAt: new Date().toISOString()
-    };
-    const providerExtension = fileURLToPath(new URL("./fixtures/worker-multiturn-faux-provider.js", import.meta.url));
-    const launched = launchWorkerHost({ sendMessage(): void {} } as unknown as ExtensionAPI, {
-      cwd: parentCwd,
-      sessionManager: { getSessionId: () => "parent-session-multiturn" },
-      isIdle: () => true
-    } as ExtensionContext, {
-      record: launchRecord(record),
-      shellExecution: { kind: "native-test" },
-      prompt: "Complete the multiturn lifecycle.",
-      resultFile,
-      runDir,
-      processFile: path.join(runDir, "host-process.json"),
-      processNonce: "host-process-multiturn",
-      bdPath: process.execPath,
-      beadsRoute: TEST_BEADS_ROUTE,
-      extensionPaths: [...defaultWorkerExtensionPaths(), providerExtension]
-    });
-    const keepAlive = setInterval(() => {}, 100);
-    const job = await launched.handle.completion.finally(() => clearInterval(keepAlive));
-    assert.equal(job.status, "exited", `${await readFile(job.stderrLog, "utf8")}\nSTDOUT:\n${await readFile(job.stdoutLog, "utf8")}`);
-    assert.equal(job.exitCode, 0);
-    assert.equal(readWorkerRuntimeResult(resultFile).result.outcome, "completed");
-    assert.ok(existsSync(path.join(runDir, "settled.json")));
-    const jobsDirectory = path.join(stateDir, "async-shell", "jobs");
-    const entries = await readdir(jobsDirectory);
-    const published = entries.filter((entry) => entry.startsWith("job_"));
-    assert.equal(published.length, 13, "the initial job and all 12 post-idle jobs must be atomically published");
-    assert.deepEqual(entries.filter((entry) => entry.startsWith(".pending-")), []);
-    for (const jobId of published) {
-      const metadata = JSON.parse(await readFile(path.join(jobsDirectory, jobId, "meta.json"), "utf8"));
-      assert.equal(Number.isInteger(metadata.pid) && metadata.pid > 0, true, `${jobId} must publish a complete process identity`);
-    }
-  });
-});
-
-test("worker host fails promptly when a quiescent worker settles without typed result", async () => {
-  await withTempDir(async (directory) => {
-    const parentCwd = path.join(directory, "parent");
-    const workspaceRoot = path.join(directory, "workspace");
-    const stateDir = path.join(directory, "state");
-    const sessionDir = path.join(stateDir, "session");
-    const runDir = path.join(stateDir, "runs", "run-no-handoff");
-    await Promise.all([
-      mkdir(parentCwd, { recursive: true }),
-      mkdir(workspaceRoot, { recursive: true }),
-      mkdir(sessionDir, { recursive: true })
-    ]);
-    const parent = SessionManager.create(parentCwd, path.join(directory, "parent-sessions"), { id: "parent-session-no-handoff" });
-    parent.appendMessage({ role: "user", content: "parent no-handoff context", timestamp: Date.now() });
-    parent.appendMessage(assistantMessage("Ready for the no-handoff protocol probe."));
-    const parentSessionFile = parent.getSessionFile();
-    assert.ok(parentSessionFile);
-    const forked = forkWorkerSession({ parentSessionFile, workspaceRoot, sessionDir, sessionId: "worker-session-no-handoff" });
-    const record: WorkerRecord = {
-      version: WORKER_RECORD_VERSION,
-      workerId: "worker_20260925120000_nohand01",
-      sessionId: forked.sessionId,
-      sessionFile: forked.sessionFile,
-      parentSessionFile,
-      workspaceRoot,
-      taskIds: ["personal-workere2e"],
-      route: { provider: "worker-no-handoff-faux", model: "worker-no-handoff-faux-1", thinkingLevel: "off" },
-      status: "running",
-      activeRun: { runId: "run-no-handoff", jobId: "job_20260925120000_nohand01", status: "running" },
-      updatedAt: new Date().toISOString()
-    };
-    const providerExtension = fileURLToPath(new URL("./fixtures/worker-no-handoff-faux-provider.js", import.meta.url));
-    const launched = launchWorkerHost({ sendMessage(): void {} } as unknown as ExtensionAPI, {
-      cwd: parentCwd,
-      sessionManager: { getSessionId: () => "parent-session-no-handoff" },
-      isIdle: () => true
-    } as ExtensionContext, {
-      record: launchRecord(record),
-      shellExecution: { kind: "native-test" },
-      prompt: "Settle without a result.",
-      resultFile: path.join(runDir, "result.json"),
-      runDir,
-      processFile: path.join(runDir, "host-process.json"),
-      processNonce: "host-process-no-handoff",
-      bdPath: process.execPath,
-      beadsRoute: TEST_BEADS_ROUTE,
-      extensionPaths: [...defaultWorkerExtensionPaths(), providerExtension]
-    });
-    const keepAlive = setInterval(() => {}, 100);
-    const job = await launched.handle.completion.finally(() => clearInterval(keepAlive));
-    assert.equal(job.status, "failed");
-    assert.match(await readFile(job.stderrLog, "utf8"), /settled quiescent turn without the required typed worker_result_submit/);
-  });
-});
-
-test("review worker receives one bounded repair turn and submits the required typed result", async () => {
-  await withTempDir(async (directory) => {
-    const parentCwd = path.join(directory, "parent");
-    const workspaceRoot = path.join(directory, "workspace");
-    const stateDir = path.join(directory, "state");
-    const sessionDir = path.join(stateDir, "session");
-    const runDir = path.join(stateDir, "runs", "run-review-repair");
-    const resultFile = path.join(runDir, "result.json");
-    await Promise.all([mkdir(parentCwd, { recursive: true }), mkdir(workspaceRoot, { recursive: true }), mkdir(sessionDir, { recursive: true }), mkdir(path.join(stateDir, "async-shell"), { recursive: true })]);
-    const parent = SessionManager.create(parentCwd, path.join(directory, "parent-sessions"), { id: "parent-session-review-repair" });
-    parent.appendMessage({ role: "user", content: "parent review repair context", timestamp: Date.now() });
-    parent.appendMessage(assistantMessage("Ready for the review repair probe."));
-    const parentSessionFile = parent.getSessionFile(); assert.ok(parentSessionFile);
-    const forked = forkWorkerSession({ parentSessionFile, workspaceRoot, sessionDir, sessionId: "worker-session-review-repair" });
-    const record: WorkerRecord = {
-      version: WORKER_RECORD_VERSION, workerId: "worker_20260925120000_review01", sessionId: forked.sessionId, sessionFile: forked.sessionFile,
-      parentSessionFile, workspaceRoot, taskIds: ["personal-workere2e"], role: "review",
-      route: { provider: "worker-review-repair-faux", model: "worker-review-repair-faux-1", thinkingLevel: "off" }, status: "running",
-      activeRun: { runId: "run-review-repair", jobId: "job_20260925120000_review01", status: "running" }, updatedAt: new Date().toISOString()
-    };
-    const providerExtension = fileURLToPath(new URL("./fixtures/worker-review-repair-faux-provider.js", import.meta.url));
-    const launched = launchWorkerHost({ sendMessage(): void {} } as unknown as ExtensionAPI, {
-      cwd: parentCwd, sessionManager: { getSessionId: () => "parent-session-review-repair" }, isIdle: () => true
-    } as ExtensionContext, {
-      record: launchRecord(record), shellExecution: { kind: "native-test" }, prompt: "Review the candidate and submit a typed verdict.", resultFile, runDir,
-      processFile: path.join(runDir, "host-process.json"), processNonce: "host-process-review-repair", bdPath: process.execPath,
-      beadsRoute: TEST_BEADS_ROUTE, extensionPaths: [...defaultWorkerExtensionPaths(), providerExtension]
-    });
-    const keepAlive = setInterval(() => {}, 100);
-    const job = await launched.handle.completion.finally(() => clearInterval(keepAlive));
-    const repairSession = await readFile(forked.sessionFile, "utf8");
-    assert.equal(job.status, "exited", `${await readFile(job.stderrLog, "utf8")}\nSTDOUT:\n${await readFile(job.stdoutLog, "utf8")}\nSESSION TAIL:\n${repairSession.slice(-12_000)}`);
-    const accepted = readWorkerRuntimeResult(resultFile);
-    assert.equal(accepted.result.outcome, "approve");
-    assert.match(accepted.result.summary, /bounded typed-result repair turn/);
-    assert.deepEqual(accepted.result.artifacts, ["artifacts/review-repair.md"]);
-    assert.equal((repairSession.match(/Do not restate the verdict in prose/g) ?? []).length, 1, "repair instruction must be injected exactly once");
-  });
-});
-
-test("review worker gets only one repair turn before missing typed result fails closed", async () => {
-  await withTempDir(async (directory) => {
-    const parentCwd = path.join(directory, "parent"); const workspaceRoot = path.join(directory, "workspace"); const stateDir = path.join(directory, "state");
-    const sessionDir = path.join(stateDir, "session"); const runDir = path.join(stateDir, "runs", "run-review-no-handoff");
-    await Promise.all([mkdir(parentCwd, { recursive: true }), mkdir(workspaceRoot, { recursive: true }), mkdir(sessionDir, { recursive: true }), mkdir(path.join(stateDir, "async-shell"), { recursive: true })]);
-    const parent = SessionManager.create(parentCwd, path.join(directory, "parent-sessions"), { id: "parent-session-review-no-handoff" });
-    parent.appendMessage({ role: "user", content: "parent review no-handoff context", timestamp: Date.now() }); parent.appendMessage(assistantMessage("Ready for bounded review failure."));
-    const parentSessionFile = parent.getSessionFile(); assert.ok(parentSessionFile); const forked = forkWorkerSession({ parentSessionFile, workspaceRoot, sessionDir, sessionId: "worker-session-review-no-handoff" });
-    const record: WorkerRecord = { version: WORKER_RECORD_VERSION, workerId: "worker_20260925120000_review02", sessionId: forked.sessionId, sessionFile: forked.sessionFile,
-      parentSessionFile, workspaceRoot, taskIds: ["personal-workere2e"], role: "review", route: { provider: "worker-review-no-handoff-faux", model: "worker-review-no-handoff-faux-1", thinkingLevel: "off" }, status: "running",
-      activeRun: { runId: "run-review-no-handoff", jobId: "job_20260925120000_review02", status: "running" }, updatedAt: new Date().toISOString() };
-    const providerExtension = fileURLToPath(new URL("./fixtures/worker-review-no-handoff-faux-provider.js", import.meta.url));
-    const launched = launchWorkerHost({ sendMessage(): void {} } as unknown as ExtensionAPI, { cwd: parentCwd, sessionManager: { getSessionId: () => "parent-session-review-no-handoff" }, isIdle: () => true } as ExtensionContext, {
-      record: launchRecord(record), shellExecution: { kind: "native-test" }, prompt: "Review but omit typed submission twice.", resultFile: path.join(runDir, "result.json"), runDir,
-      processFile: path.join(runDir, "host-process.json"), processNonce: "host-process-review-no-handoff", bdPath: process.execPath, beadsRoute: TEST_BEADS_ROUTE,
-      extensionPaths: [...defaultWorkerExtensionPaths(), providerExtension]
-    });
-    const keepAlive = setInterval(() => {}, 100); const job = await launched.handle.completion.finally(() => clearInterval(keepAlive));
-    assert.equal(job.status, "failed"); assert.match(await readFile(job.stderrLog, "utf8"), /settled quiescent turn without the required typed worker_result_submit/);
-    const sessionText = await readFile(forked.sessionFile, "utf8"); assert.equal((sessionText.match(/Do not restate the verdict in prose/g) ?? []).length, 1);
-  });
-});
-
-test("cancelling a worker host leaves no worker-owned async-shell process alive", async () => {
-  await withTempDir(async (directory) => {
-    const parentCwd = path.join(directory, "parent");
-    const workspaceRoot = path.join(directory, "workspace");
-    const stateDir = path.join(directory, "state");
-    const sessionDir = path.join(stateDir, "session");
-    const runDir = path.join(stateDir, "runs", "run-cancel");
-    const resultFile = path.join(runDir, "result.json");
-    await Promise.all([
-      mkdir(parentCwd, { recursive: true }),
-      mkdir(path.join(workspaceRoot, "cache", "config"), { recursive: true }),
-      mkdir(path.join(workspaceRoot, "cache", "data"), { recursive: true }),
-      mkdir(path.join(workspaceRoot, "cache", "state"), { recursive: true }),
-      mkdir(path.join(workspaceRoot, "tmp"), { recursive: true }),
-      mkdir(sessionDir, { recursive: true })
-    ]);
-    const parent = SessionManager.create(parentCwd, path.join(directory, "parent-sessions"), { id: "parent-session-cancel" });
-    parent.appendMessage({ role: "user", content: "parent cancellation context", timestamp: Date.now() });
-    parent.appendMessage(assistantMessage("Ready for a cancellation run."));
-    const parentSessionFile = parent.getSessionFile();
-    assert.ok(parentSessionFile);
-    const forked = forkWorkerSession({
-      parentSessionFile,
-      workspaceRoot,
-      sessionDir,
-      sessionId: "worker-session-cancel"
-    });
-    const record: WorkerRecord = {
-      version: WORKER_RECORD_VERSION,
-      workerId: "worker_20260910200000_cancel01",
-      sessionId: forked.sessionId,
-      sessionFile: forked.sessionFile,
-      parentSessionFile,
-      workspaceRoot,
-      taskIds: ["personal-workere2e"],
-      route: { provider: "worker-cancel-faux", model: "worker-cancel-faux-1", thinkingLevel: "off" },
-      status: "running",
-      activeRun: { runId: "run-cancel", jobId: "job_20260910200000_cancel01", status: "running" },
-      updatedAt: new Date().toISOString()
-    };
-    const providerExtension = fileURLToPath(new URL("./fixtures/worker-cancel-faux-provider.js", import.meta.url));
-    const api = { sendMessage(): void {} } as unknown as ExtensionAPI;
-    const context = {
-      cwd: parentCwd,
-      sessionManager: { getSessionId: () => "parent-session-cancel" },
-      isIdle: () => true
-    } as ExtensionContext;
-    const launched = launchWorkerHost(api, context, {
-      record: launchRecord(record),
-      shellExecution: { kind: "native-test" },
-      prompt: "Start the cancellation probe.",
-      resultFile,
-      runDir,
-      processFile: path.join(runDir, "host-process.json"),
-      processNonce: "host-process-cancel",
-      bdPath: process.execPath,
-      beadsRoute: TEST_BEADS_ROUTE,
-      timeoutMs: 30_000,
-      extensionPaths: [...defaultWorkerExtensionPaths(), providerExtension]
-    });
-    const marker = path.join(workspaceRoot, "owned-shell.pid");
-    try {
-      try {
-        await waitForPath(marker, 30_000);
-      } catch (error) {
-        const snapshot = launched.handle.snapshot();
-        throw new Error(`${error instanceof Error ? error.message : String(error)}\nstdout:\n${await readFile(snapshot.stdoutLog, "utf8")}\nstderr:\n${await readFile(snapshot.stderrLog, "utf8")}`);
-      }
-      const ownedPid = Number.parseInt((await readFile(marker, "utf8")).trim(), 10);
-      assert.ok(Number.isInteger(ownedPid) && ownedPid > 0);
-      launched.handle.cancel("SIGTERM");
-      const keepAlive = setInterval(() => {}, 100);
-      const job = await launched.handle.completion.finally(() => clearInterval(keepAlive));
-      assert.equal(job.status, "cancelled");
-      assert.equal(await waitForPidExit(ownedPid, 5_000), true, `worker-owned process ${ownedPid} survived cancellation`);
-      assert.equal(existsSync(resultFile), false);
-    } finally {
-      if (launched.handle.snapshot().status === "running") launched.handle.cancel("SIGKILL");
-    }
-
-    await rm(marker, { force: true });
-    const timeoutRunDir = path.join(stateDir, "runs", "run-timeout");
-    const timeoutRecord: WorkerRecord = {
-      ...record,
-      activeRun: { runId: "run-timeout", jobId: "job_20260910200000_timeout1", status: "running" }
-    };
-    const timedOut = launchWorkerHost(api, context, {
-      record: launchRecord(timeoutRecord),
-      shellExecution: { kind: "native-test" },
-      prompt: "Start the timeout cleanup probe.",
-      resultFile: path.join(timeoutRunDir, "result.json"),
-      runDir: timeoutRunDir,
-      processFile: path.join(timeoutRunDir, "host-process.json"),
-      processNonce: "host-process-timeout",
-      bdPath: process.execPath,
-      beadsRoute: TEST_BEADS_ROUTE,
-      timeoutMs: 1_000,
-      extensionPaths: [...defaultWorkerExtensionPaths(), providerExtension]
-    });
-    await waitForPath(marker, 30_000);
-    const timeoutOwnedPid = Number.parseInt((await readFile(marker, "utf8")).trim(), 10);
-    const timeoutKeepAlive = setInterval(() => {}, 100);
-    const timeoutJob = await timedOut.handle.completion.finally(() => clearInterval(timeoutKeepAlive));
-    assert.equal(timeoutJob.status, "failed");
-    assert.equal(await waitForPidExit(timeoutOwnedPid, 5_000), true, `worker-owned process ${timeoutOwnedPid} survived host timeout cleanup`);
-  });
-});
+async function waitForText(file:string,text:string,timeout:number){const start=Date.now();while(Date.now()-start<timeout){try{if((await readFile(file,"utf8")).includes(text))return;}catch{}await new Promise((resolve)=>setTimeout(resolve,20));}throw new Error(`Timed out waiting for ${text} in ${file}`);}
