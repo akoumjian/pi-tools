@@ -21,7 +21,6 @@ const MAX_TOOL_BLOCK_RENDER_LINES = 24;
 const SESSION_INDEX_FINGERPRINT_BYTES = 4096;
 const MAX_VISIBILITY_CACHE_ENTRIES = 32;
 const MAX_VISIBILITY_ENTRY_IDS = 8_192;
-const MAX_VISIBILITY_CHECKPOINTS = 8_192;
 const MAX_PAGE_WRAP_CHARACTERS = 256 * 1024;
 const BIDI_CONTROLS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
 
@@ -960,7 +959,7 @@ function isRenderableSessionEntry(entry: WorkerSessionEntry): boolean {
 }
 
 const VISIBILITY_CHECKPOINT_LEVEL_CAPACITY = 1_024;
-const MAX_VISIBILITY_CHECKPOINT_LEVELS = Math.floor(MAX_VISIBILITY_CHECKPOINTS / VISIBILITY_CHECKPOINT_LEVEL_CAPACITY);
+const MAX_VISIBILITY_CHECKPOINT_LEVELS = 16;
 
 function recordRenderableCheckpoint(state: RunVisibilityState, line: number): void {
   appendCheckpoint(state.renderableCheckpointLevels, { line, count: state.renderedEntries });
@@ -1355,7 +1354,18 @@ function parseSessionEntriesForBlockPage(lines: Array<{ lineNumber: number; text
     const available = request.mode === "after" && request.block !== undefined && line.lineNumber === request.line ? Math.max(0, count - request.block)
       : request.mode === "before" && request.block !== undefined && line.lineNumber === request.line ? Math.min(count, Math.max(0, request.block)) : count;
     remainingBlocks -= available;
-    if (remainingBlocks <= 0) { truncated = source.slice(sourceIndex + 1).some((candidate) => candidate.text.trim().length > 0); break; }
+    if (remainingBlocks <= 0) {
+      let trailingMalformedEntries = 0;
+      for (const candidate of source.slice(sourceIndex + 1)) {
+        if (!candidate.text.trim()) continue;
+        let later: unknown;
+        try { later = JSON.parse(candidate.text); } catch { trailingMalformedEntries += 1; continue; }
+        if (!isSessionEntry(later)) { trailingMalformedEntries += 1; continue; }
+        if (renderableBlockCount({ ...later, lineNumber: candidate.lineNumber }) > 0) { truncated = true; break; }
+      }
+      if (!truncated) malformedEntries += trailingMalformedEntries;
+      break;
+    }
   }
   if (keepTail) entries.reverse();
   return { entries, malformedEntries, truncated };

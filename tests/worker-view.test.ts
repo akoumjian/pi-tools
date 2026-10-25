@@ -68,6 +68,13 @@ function assertLargeCheckpointTraversal(target: WorkerSessionViewTarget, expecte
   execFileSync(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(target), String(expectedEntries)], { timeout: 90_000, stdio: "pipe" });
 }
 
+
+function assertDeepCheckpointSamples(target: WorkerSessionViewTarget, expectedEntries: number): void {
+  const moduleUrl = new URL("../extensions/worker/view.js", import.meta.url).href;
+  const script = `import fs from "node:fs"; import { syncBuiltinESMExports } from "node:module"; import { performance } from "node:perf_hooks"; const original = fs.readSync; let bytes = 0; fs.readSync = function(...args) { const count = original.apply(this, args); bytes += count; return count; }; syncBuiltinESMExports(); const view = await import(${JSON.stringify(moduleUrl)}); const target = JSON.parse(process.argv[1]); const expected = Number(process.argv[2]); await view.loadWorkerSessionViewSnapshotAsync(target); const positions = [0.05, 0.2, 0.4, 0.6, 0.8].map((ratio) => Math.floor(expected * ratio)); const requests = [{ request: { mode: "first" }, first: 0 }]; for (const before of positions) { requests.push({ request: { mode: "after", line: before + 1 }, first: before }); requests.push({ request: { mode: "before", line: before + 2 }, last: before - 1 }); } let maximumBytes = 0; let maximumMilliseconds = 0; let maximumStall = 0; let ticks = 0; let lastTick = performance.now(); const timer = setInterval(() => { const now = performance.now(); maximumStall = Math.max(maximumStall, now - lastTick); lastTick = now; ticks += 1; }, 1); const verify = (page, sample) => { if (page.blocks.length === 0 || page.totalVisibleEntries !== expected || page.previousVisibleEntries + page.totalActiveEntries + page.nextVisibleEntries !== expected) throw new Error("invalid sampled page"); if (sample.first !== undefined && page.blocks[0]?.text !== "ENTRY-" + sample.first + "-" + "x".repeat(96)) throw new Error("wrong sampled first block"); if (sample.last !== undefined && page.blocks.at(-1)?.text !== "ENTRY-" + sample.last + "-" + "x".repeat(96)) throw new Error("wrong sampled last block"); }; const observe = (started) => { maximumBytes = Math.max(maximumBytes, bytes); maximumMilliseconds = Math.max(maximumMilliseconds, performance.now() - started); if (bytes > 8 * 1024 * 1024) throw new Error("deep sampled page reread " + bytes + " bytes"); }; for (const sample of requests) { bytes = 0; const started = performance.now(); const page = view.loadWorkerSessionViewSnapshot(target, {}, sample.request); observe(started); verify(page, sample); await new Promise((resolve) => setImmediate(resolve)); } for (const sample of requests) { bytes = 0; const started = performance.now(); const page = await view.loadWorkerSessionViewSnapshotAsync(target, sample.request); observe(started); verify(page, sample); await new Promise((resolve) => setImmediate(resolve)); } clearInterval(timer); if (maximumMilliseconds > 2000) throw new Error("deep sampled page took " + maximumMilliseconds + "ms"); if (ticks < requests.length || maximumStall > 1000) throw new Error("deep sampled event-loop stall " + maximumStall + "ms ticks=" + ticks);`;
+  execFileSync(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(target), String(expectedEntries)], { timeout: 120_000, stdio: "pipe" });
+}
+
 function assertCountSessionLinesReadFailure(target: WorkerSessionViewTarget, mode: "retry" | "fail" | "replace"): void {
   const moduleUrl = new URL("../extensions/worker/view.js", import.meta.url).href;
   const script = `import fs from "node:fs"; import { syncBuiltinESMExports } from "node:module"; const original = fs.readSync; let injected = 0; const mode = process.argv[2]; const target = JSON.parse(process.argv[1]); fs.readSync = function(fd, buffer, offset, length, position) { if (typeof position === "number" && position > 0 && (mode === "fail" || injected === 0)) { injected += 1; if (mode === "replace") { fs.renameSync(target.sessionFile, target.sessionFile + ".original"); fs.writeFileSync(target.sessionFile, "replacement\\n"); } return 0; } return original.call(this, fd, buffer, offset, length, position); }; syncBuiltinESMExports(); const view = await import(${JSON.stringify(moduleUrl)}); try { const count = view.countSessionLines(target.sessionFile); if (mode !== "retry") throw new Error("count unexpectedly succeeded"); if (count !== target.sessionEndLine) throw new Error("retry count mismatch " + count); } catch (error) { if (mode === "retry") throw error; if (error?.message !== "Worker session changed while counting lines; retry.") throw new Error("unstable count error: " + String(error?.message)); }`;
@@ -648,6 +655,58 @@ test("leveled checkpoints bound 60k, 100k, 140k-by-3KiB, and compacted traversal
   }
 });
 
+test("400k and 1M entry deep pages stay within read, latency, and event-loop bounds", () => {
+  for (const count of [400_000, 1_000_000]) {
+    const f = fixture();
+    try {
+      const fd = openSync(f.sessionFile, "w");
+      try {
+        writeSync(fd, line(header(f.target))); let chunk = "";
+        for (let index = 0; index < count; index += 1) {
+          chunk += line(message(`entry-${index}`, index === 0 ? null : `entry-${index - 1}`, `ENTRY-${index}-${"x".repeat(96)}`));
+          if (index % 1_000 === 999) { writeSync(fd, chunk); chunk = ""; }
+        }
+        if (chunk) writeSync(fd, chunk);
+      } finally { closeSync(fd); }
+      assertDeepCheckpointSamples({ ...f.target, sessionStartLine: 2, sessionEndLine: count + 1 }, count);
+    } finally { f.close(); }
+  }
+});
+
+test("16-level checkpoint simulation bounds memory and anchor gaps through 10M entries", () => {
+  type Checkpoint = { line: number; count: number };
+  const capacity = 1_024; const maximumLevels = 16; const levels: Checkpoint[][] = [[{ line: 0, count: 0 }]];
+  let peakRetained = 1;
+  const append = (checkpoint: Checkpoint) => {
+    let promoted = [checkpoint];
+    for (let level = 0; promoted.length > 0; level += 1) {
+      const targetLevel = Math.min(level, maximumLevels - 1);
+      const values = levels[targetLevel] ?? (levels[targetLevel] = []);
+      const last = values.at(-1);
+      if (last?.line === promoted[0]!.line && promoted.length === 1) values[values.length - 1] = promoted[0]!;
+      else values.push(...promoted);
+      if (values.length <= capacity) break;
+      const source = values.splice(0);
+      promoted = source.filter((_value, position) => position % 2 === 0 || position === source.length - 1);
+      if (targetLevel === maximumLevels - 1) {
+        while (promoted.length > capacity) promoted = promoted.filter((_value, position) => position % 2 === 0 || position === promoted.length - 1);
+        levels[targetLevel] = promoted; break;
+      }
+    }
+    peakRetained = Math.max(peakRetained, levels.reduce((total, level) => total + level.length, 0));
+  };
+  const entries = 10_000_000;
+  for (let lineNumber = 1; lineNumber <= entries; lineNumber += 1) append({ line: lineNumber, count: lineNumber });
+  const anchors = levels.flat().sort((left, right) => left.line - right.line).filter((value, index, values) => index === 0 || value.line !== values[index - 1]!.line);
+  let maximumGap = 0;
+  for (let index = 1; index < anchors.length; index += 1) maximumGap = Math.max(maximumGap, anchors[index]!.line - anchors[index - 1]!.line);
+  maximumGap = Math.max(maximumGap, entries - anchors.at(-1)!.line);
+  assert.ok(levels.every((level) => level.length <= capacity));
+  assert.ok(peakRetained <= 8_192, `retained ${peakRetained} checkpoints`);
+  assert.ok(maximumGap <= 20_000, `checkpoint gap ${maximumGap}`);
+  assert.equal(anchors.at(-1)?.count, entries);
+});
+
 test("countSessionLines retries transient zero reads and translates persistent snapshot failures", () => {
   const f = fixture();
   try {
@@ -671,6 +730,26 @@ test("forward oversized notices are counted once across rendered-block cursors",
     const second = loadWorkerSessionViewSnapshot(target, {}, { mode: "after", line: first.pageEndLine, block: first.pageEndBlock });
     assert.equal(second.skippedOversizedEntries, 1); assert.equal(second.blocks.length, 953); assert.equal(second.blocks.at(-1)?.text, "LAST");
     assert.equal(first.skippedOversizedEntries + second.skippedOversizedEntries, 1);
+  } finally { f.close(); }
+});
+
+test("exact-budget end pages include trailing oversized notices without inventing continuation", async () => {
+  const f = fixture();
+  try {
+    const assistant = { type: "message", id: "assistant", parentId: "opening", timestamp: "now", message: { role: "assistant", content: Array.from({ length: 2_047 }, (_, index) => ({ type: "text", text: `PART-${index}` })) } };
+    const hidden = { type: "custom", id: "hidden", parentId: "assistant", timestamp: "now", customType: "internal", data: { hidden: true } };
+    const huge = message("huge", "hidden", `HUGE-${"h".repeat(9 * 1024 * 1024)}`);
+    writeFileSync(f.sessionFile, line(header(f.target)) + line(message("opening", null, "OPENING")) + line(assistant) + "{bad json}\n" + line(hidden) + line(huge));
+    const target = { ...f.target, sessionStartLine: 2, sessionEndLine: 6 };
+    for (const page of [loadWorkerSessionViewSnapshot(target, {}, { mode: "first" }), await loadWorkerSessionViewSnapshotAsync(target, { mode: "first" })]) {
+      assert.equal(page.blocks.length, 2_048);
+      assert.equal(page.totalVisibleEntries, 2);
+      assert.equal(page.previousVisibleEntries + page.totalActiveEntries + page.nextVisibleEntries, 2);
+      assert.equal(page.skippedOversizedEntries, 1);
+      assert.equal(page.malformedEntries, 1);
+      assert.equal(page.hasNextPage, false);
+      assert.equal(page.pageEndLine, 6);
+    }
   } finally { f.close(); }
 });
 
