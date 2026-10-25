@@ -777,7 +777,7 @@ test("search_many terminates its owned rg child on interruption", async () => {
     const binDir = path.join(dir, "bin");
     await mkdir(binDir);
     const rgPath = path.join(binDir, "rg");
-    await writeFile(rgPath, "#!/bin/sh\nsleep 30\n", "utf8");
+    await writeFile(rgPath, "#!/bin/sh\nexec sleep 30\n", "utf8");
     await chmod(rgPath, 0o755);
     const previousPath = process.env.PATH;
     process.env.PATH = `${binDir}${path.delimiter}${previousPath ?? ""}`;

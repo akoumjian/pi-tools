@@ -464,7 +464,7 @@ const WorkerControlV2DetailsSchema = Type.Union([
   Type.Object({ workers: Type.Array(WorkerListItemV2Schema), total: NonNegativeIntegerSchema, counts: Type.Object({ idle: NonNegativeIntegerSchema, queued: NonNegativeIntegerSchema, running: NonNegativeIntegerSchema }, { additionalProperties: false }), nextOffset: Type.Optional(NonNegativeIntegerSchema) }, { additionalProperties: false }),
   Type.Object({ workerId: Type.String(), runs: Type.Array(WorkerSlimRunV2Schema), total: NonNegativeIntegerSchema, nextOffset: Type.Optional(NonNegativeIntegerSchema) }, { additionalProperties: false }),
   WorkerGetV2Schema,
-  Type.Object({ cancellation: Type.Union([Type.Literal("cancelled"),Type.Literal("not_active")]), worker: WorkerListItemV2Schema }, { additionalProperties: false }),
+  Type.Object({ cancellation: Type.Union([Type.Literal("cancelled"),Type.Literal("accepted_pending"),Type.Literal("superseded"),Type.Literal("not_active")]), worker: WorkerListItemV2Schema }, { additionalProperties: false }),
   Type.Object({ workerId: Type.String(), discarded: Type.Literal(true) }, { additionalProperties: false })
 ]);
 const WorkerMergeRepositoryV2Schema = Type.Object({

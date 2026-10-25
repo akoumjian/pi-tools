@@ -124,6 +124,7 @@ test("checked-in generation manifest covers local worker runtime imports and exc
     "extensions/_shared/async-job-process.js",
     "extensions/_shared/atomic-json.js",
     "extensions/_shared/worker-job-settlement.js",
+    "extensions/_shared/worker-rpc-prompt.js",
     "extensions/worker/index.ts",
     "scripts/worker-host.mjs"
   ]) assert.ok(manifest.files.includes(required), required);

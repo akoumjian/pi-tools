@@ -4,12 +4,15 @@ import { homedir } from "node:os";
 import path from "node:path";
 import type { DatabaseSync as SQLiteDatabaseSync, SQLInputValue } from "node:sqlite";
 
-export const WORKER_REGISTRY_SCHEMA_VERSION = 3;
+export const WORKER_REGISTRY_SCHEMA_VERSION = 5;
 export const DEFAULT_WORKER_RUNTIME_ROOT = path.join(homedir(), ".local", "share", "agent", "worker-runtime");
 
 export type WorkerRole = "work" | "review" | "integration";
 export type WorkerStatus = "idle" | "queued" | "running";
 export type WorkerRunStatus = "queued" | "running" | "settled";
+export type WorkerTerminalIntent = "cancellation" | "failure";
+export type ParentRuntimeIdentity = { runtimeId: string; pid: number; processStartToken: string };
+export type ParentRuntimeMember = ParentRuntimeIdentity & { generation: number; retired: boolean };
 export type WorkerOutcomeSource = "worker" | "system";
 export type WorkerOutcome =
   | "completed"
@@ -86,6 +89,8 @@ export type WorkerRunRecord = {
   runtime?: Record<string, unknown>;
   claimKind?: "launch" | "settlement" | "cancellation";
   claimNonce?: string;
+  terminalIntent?: WorkerTerminalIntent;
+  terminalError?: string;
   createdAt: string;
   startedAt?: string;
   settledAt?: string;
@@ -100,6 +105,7 @@ export type WorkerDeliveryRecord = {
   state: "pending" | "claimed" | "delivered";
   runtimeGeneration?: number;
   createdAt: string;
+  sendStartedAt?: string;
   deliveredAt?: string;
 };
 
@@ -186,6 +192,8 @@ CREATE TABLE IF NOT EXISTS runs (
   runtime_json TEXT NOT NULL DEFAULT '{}',
   claim_kind TEXT CHECK (claim_kind IS NULL OR claim_kind IN ('launch','settlement','cancellation')),
   claim_nonce TEXT,
+  terminal_intent TEXT CHECK (terminal_intent IS NULL OR terminal_intent IN ('cancellation','failure')),
+  terminal_error TEXT,
   created_at TEXT NOT NULL,
   started_at TEXT,
   settled_at TEXT
@@ -200,6 +208,7 @@ CREATE TABLE IF NOT EXISTS deliveries (
   state TEXT NOT NULL CHECK (state IN ('pending','claimed','delivered')),
   runtime_generation INTEGER,
   created_at TEXT NOT NULL,
+  send_started_at TEXT,
   delivered_at TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS deliveries_parent_state ON deliveries(parent_session_file, state, created_at);
@@ -209,6 +218,17 @@ CREATE TABLE IF NOT EXISTS parent_runtimes (
   runtime_id TEXT NOT NULL,
   updated_at TEXT NOT NULL
 ) STRICT;
+CREATE TABLE IF NOT EXISTS parent_runtime_members (
+  parent_session_file TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  runtime_id TEXT NOT NULL,
+  owner_pid INTEGER,
+  owner_start_token TEXT,
+  registered_at TEXT NOT NULL,
+  retired_at TEXT,
+  PRIMARY KEY (parent_session_file, generation)
+) STRICT;
+CREATE INDEX IF NOT EXISTS parent_runtime_members_latest ON parent_runtime_members(parent_session_file, runtime_id, generation DESC);
 CREATE TABLE IF NOT EXISTS prepared_sets (
   prepared_id TEXT PRIMARY KEY,
   parent_session_file TEXT NOT NULL,
@@ -283,6 +303,21 @@ function migrateWorkerRegistry(database: SQLiteDatabaseSync, fromVersion: number
       addColumnIfMissing(database, "runs", "claim_nonce", "TEXT");
       addColumnIfMissing(database, "prepared_sets", "warnings_json", "TEXT NOT NULL DEFAULT '[]'");
       addColumnIfMissing(database, "prepared_sets", "apply_nonce", "TEXT");
+    },
+    3: () => {
+      addColumnIfMissing(database, "runs", "terminal_intent", "TEXT");
+      addColumnIfMissing(database, "runs", "terminal_error", "TEXT");
+      // A v3 cancellation claim represented an accepted parent cancellation even
+      // though v3 had no owner-independent intent column. Never migrate that
+      // interrupted operation back into a launchable queued run.
+      database.exec("UPDATE runs SET terminal_intent='cancellation',terminal_error=NULL WHERE status IN ('queued','running') AND claim_kind='cancellation' AND terminal_intent IS NULL");
+    },
+    4: () => {
+      addColumnIfMissing(database, "deliveries", "send_started_at", "TEXT");
+      // v4 did not persist the send boundary, so every legacy claimed delivery
+      // may already have been attempted or accepted. Conservatively classify it
+      // as unconfirmed rather than replaying a possible duplicate.
+      database.exec("UPDATE deliveries SET send_started_at=COALESCE(delivered_at,created_at) WHERE state='claimed' AND send_started_at IS NULL");
     }
   };
   for (let version = fromVersion; version < WORKER_REGISTRY_SCHEMA_VERSION; version += 1) {
@@ -302,15 +337,72 @@ export function workerRegistryDataVersion(registry: WorkerRegistry): number {
   return Number(row.data_version);
 }
 
-export function registerParentRuntime(registry: WorkerRegistry, parentSessionFile: string, runtimeId: string, now: string): number {
+export function registerParentRuntime(registry: WorkerRegistry, parentSessionFile: string, runtimeId: string, now: string, owner?: Omit<ParentRuntimeIdentity, "runtimeId">): number {
+  return transaction(registry, () => registerParentRuntimeInTransaction(registry, parentSessionFile, { runtimeId, ...(owner ?? {}) }, now));
+}
+
+function registerParentRuntimeInTransaction(registry: WorkerRegistry, parentSessionFile: string, identity: { runtimeId: string; pid?: number; processStartToken?: string }, now: string): number {
+  const current = registry.database.prepare("SELECT generation FROM parent_runtimes WHERE parent_session_file = ?").get(parentSessionFile) as { generation: number } | undefined;
+  const generation = (current?.generation ?? 0) + 1;
+  registry.database.prepare(`INSERT INTO parent_runtimes(parent_session_file,generation,runtime_id,updated_at)
+    VALUES(?,?,?,?) ON CONFLICT(parent_session_file) DO UPDATE SET generation=excluded.generation,runtime_id=excluded.runtime_id,updated_at=excluded.updated_at`)
+    .run(parentSessionFile, generation, identity.runtimeId, now);
+  registry.database.prepare(`INSERT INTO parent_runtime_members(parent_session_file,generation,runtime_id,owner_pid,owner_start_token,registered_at,retired_at)
+    VALUES(?,?,?,?,?,?,NULL)`).run(parentSessionFile, generation, identity.runtimeId, nullable(identity.pid), nullable(identity.processStartToken), now);
+  return generation;
+}
+
+export function currentParentRuntime(registry: WorkerRegistry, parentSessionFile: string): { generation: number; runtimeId: string } | undefined {
+  return registry.database.prepare("SELECT generation,runtime_id AS runtimeId FROM parent_runtimes WHERE parent_session_file=?")
+    .get(parentSessionFile) as { generation: number; runtimeId: string } | undefined;
+}
+
+export function parentRuntimeMemberForGeneration(registry: WorkerRegistry, parentSessionFile: string, generation: number): ParentRuntimeMember | undefined {
+  const row = registry.database.prepare(`SELECT generation,runtime_id,owner_pid,owner_start_token,retired_at FROM parent_runtime_members
+    WHERE parent_session_file=? AND generation=?`).get(parentSessionFile, generation) as { generation: number; runtime_id: string; owner_pid: number | null; owner_start_token: string | null; retired_at: string | null } | undefined;
+  return row === undefined ? undefined : { generation: row.generation, runtimeId: row.runtime_id, pid: row.owner_pid ?? 0, processStartToken: row.owner_start_token ?? "", retired: row.retired_at !== null };
+}
+
+export function latestParentRuntimeMembers(registry: WorkerRegistry, parentSessionFile: string, afterGeneration: number, throughGeneration: number): ParentRuntimeMember[] {
+  const rows = registry.database.prepare(`SELECT m.generation,m.runtime_id,m.owner_pid,m.owner_start_token,m.retired_at
+    FROM parent_runtime_members m
+    WHERE m.parent_session_file=? AND m.generation>? AND m.generation<=?
+      AND m.generation=(SELECT MAX(n.generation) FROM parent_runtime_members n WHERE n.parent_session_file=m.parent_session_file AND n.runtime_id=m.runtime_id)
+    ORDER BY m.generation DESC`).all(parentSessionFile, afterGeneration, throughGeneration) as Array<{ generation: number; runtime_id: string; owner_pid: number | null; owner_start_token: string | null; retired_at: string | null }>;
+  return rows.map((row) => ({ generation: row.generation, runtimeId: row.runtime_id, pid: row.owner_pid ?? 0, processStartToken: row.owner_start_token ?? "", retired: row.retired_at !== null }));
+}
+
+export function promoteParentRuntime(registry: WorkerRegistry, input: { parentSessionFile: string; expectedGeneration: number; expectedRuntimeId: string; identity: ParentRuntimeIdentity; now: string }): number | undefined {
   return transaction(registry, () => {
-    const current = registry.database.prepare("SELECT generation FROM parent_runtimes WHERE parent_session_file = ?").get(parentSessionFile) as { generation: number } | undefined;
-    const generation = (current?.generation ?? 0) + 1;
-    registry.database.prepare(`INSERT INTO parent_runtimes(parent_session_file,generation,runtime_id,updated_at)
-      VALUES(?,?,?,?) ON CONFLICT(parent_session_file) DO UPDATE SET generation=excluded.generation,runtime_id=excluded.runtime_id,updated_at=excluded.updated_at`)
-      .run(parentSessionFile, generation, runtimeId, now);
-    return generation;
+    const member = registry.database.prepare(`SELECT retired_at FROM parent_runtime_members
+      WHERE parent_session_file=? AND runtime_id=? ORDER BY generation DESC LIMIT 1`).get(input.parentSessionFile, input.identity.runtimeId) as { retired_at: string | null } | undefined;
+    if (!member || member.retired_at !== null) return undefined;
+    const next = input.expectedGeneration + 1;
+    const updated = registry.database.prepare(`UPDATE parent_runtimes SET generation=?,runtime_id=?,updated_at=?
+      WHERE parent_session_file=? AND generation=? AND runtime_id=?`).run(next, input.identity.runtimeId, input.now, input.parentSessionFile, input.expectedGeneration, input.expectedRuntimeId);
+    if (Number(updated.changes) !== 1) return undefined;
+    registry.database.prepare(`INSERT INTO parent_runtime_members(parent_session_file,generation,runtime_id,owner_pid,owner_start_token,registered_at,retired_at)
+      VALUES(?,?,?,?,?,?,NULL)`).run(input.parentSessionFile, next, input.identity.runtimeId, input.identity.pid, input.identity.processStartToken, input.now);
+    // The caller proved the exact superseded runtime dead or retired before the
+    // generation CAS. Only a claim that had not crossed the send boundary is
+    // safe to replay; a started send is intentionally left unconfirmed.
+    registry.database.prepare(`UPDATE deliveries SET state='pending',runtime_generation=NULL
+      WHERE parent_session_file=? AND state='claimed' AND runtime_generation=? AND send_started_at IS NULL`)
+      .run(input.parentSessionFile, input.expectedGeneration);
+    return next;
   });
+}
+
+export function retireParentRuntime(registry: WorkerRegistry, parentSessionFile: string, runtimeId: string, now: string): void {
+  transaction(registry, () => {
+    registry.database.prepare("UPDATE parent_runtime_members SET retired_at=COALESCE(retired_at,?) WHERE parent_session_file=? AND runtime_id=?")
+      .run(now, parentSessionFile, runtimeId);
+  });
+}
+
+export function parentRuntimeGenerationMatches(registry: WorkerRegistry, parentSessionFile: string, runtimeGeneration: number): boolean {
+  const row = registry.database.prepare("SELECT generation FROM parent_runtimes WHERE parent_session_file=?").get(parentSessionFile) as { generation: number } | undefined;
+  return row?.generation === runtimeGeneration;
 }
 
 export function createWorkerAndRun(registry: WorkerRegistry, worker: Omit<WorkerRegistryRecord, "version">, run: WorkerRunRecord): void {
@@ -358,7 +450,7 @@ export function settleWorkerRun(registry: WorkerRegistry, input: {
     const deliveryId = `worker-run:${input.workerId}:${input.runId}`;
     const current = readRunRow(registry, input.runId);
     if (current.worker_id !== input.workerId || current.status === "settled") throw staleRun(input.workerId, input.runId);
-    registry.database.prepare(`UPDATE runs SET status='settled',outcome=?,outcome_source=?,summary=?,question=?,repositories_json=?,artifacts_json=?,errors_json=?,session_start_line=?,session_end_line=?,settled_at=?,claim_kind=NULL,claim_nonce=NULL WHERE run_id=? AND status IN ('queued','running')`)
+    registry.database.prepare(`UPDATE runs SET status='settled',outcome=?,outcome_source=?,summary=?,question=?,repositories_json=?,artifacts_json=?,errors_json=?,session_start_line=?,session_end_line=?,settled_at=?,claim_kind=NULL,claim_nonce=NULL,terminal_intent=NULL,terminal_error=NULL WHERE run_id=? AND status IN ('queued','running')`)
       .run(input.outcome, input.outcomeSource, nullable(input.summary), nullable(input.question), json(input.repositories ?? []), json(input.artifacts ?? []), json(input.errors ?? []), nullable(input.sessionStartLine), nullable(input.sessionEndLine), input.settledAt, input.runId);
     const worker = registry.database.prepare(`UPDATE workers SET status='idle',active_run_id=NULL,latest_run_id=?,recovery_error=NULL,version=version+1,updated_at=? WHERE worker_id=? AND active_run_id=?`)
       .run(input.runId, input.settledAt, input.workerId, input.runId);
@@ -413,6 +505,11 @@ export function pendingWorkerDeliveries(registry: WorkerRegistry, parentSessionF
   return rows.map(decodeDelivery);
 }
 
+export function getWorkerDeliveryForRun(registry: WorkerRegistry, workerId: string, runId: string): WorkerDeliveryRecord | undefined {
+  const row = registry.database.prepare("SELECT * FROM deliveries WHERE worker_id=? AND run_id=?").get(workerId, runId) as DeliveryRow | undefined;
+  return row === undefined ? undefined : decodeDelivery(row);
+}
+
 export function claimWorkerDelivery(registry: WorkerRegistry, deliveryId: string, parentSessionFile: string, runtimeGeneration: number): boolean {
   return transaction(registry, () => {
     const active = registry.database.prepare("SELECT generation FROM parent_runtimes WHERE parent_session_file=?").get(parentSessionFile) as { generation: number } | undefined;
@@ -423,10 +520,31 @@ export function claimWorkerDelivery(registry: WorkerRegistry, deliveryId: string
   });
 }
 
+/** Releases an exact pre-send claim after its runtime member was proved dead. */
+export function recoverProvablyDeadWorkerDeliveryClaim(registry: WorkerRegistry, input: { deliveryId: string; parentSessionFile: string; ownerGeneration: number; runtimeGeneration: number }): boolean {
+  return transaction(registry, () => {
+    if (!parentRuntimeGenerationMatches(registry, input.parentSessionFile, input.runtimeGeneration)) return false;
+    const result = registry.database.prepare(`UPDATE deliveries SET state='pending',runtime_generation=NULL
+      WHERE delivery_id=? AND parent_session_file=? AND state='claimed' AND runtime_generation=? AND send_started_at IS NULL`)
+      .run(input.deliveryId, input.parentSessionFile, input.ownerGeneration);
+    return Number(result.changes) === 1;
+  });
+}
+
 export function releaseWorkerDeliveryClaim(registry: WorkerRegistry, deliveryId: string, runtimeGeneration: number): void {
   transaction(registry, () => {
-    registry.database.prepare("UPDATE deliveries SET state='pending',runtime_generation=NULL WHERE delivery_id=? AND state='claimed' AND runtime_generation=?")
+    registry.database.prepare("UPDATE deliveries SET state='pending',runtime_generation=NULL WHERE delivery_id=? AND state='claimed' AND runtime_generation=? AND send_started_at IS NULL")
       .run(deliveryId, runtimeGeneration);
+  });
+}
+
+/** Durably crosses the no-replay boundary immediately before sendMessage. */
+export function markWorkerDeliverySendStarted(registry: WorkerRegistry, deliveryId: string, runtimeGeneration: number, now: string): boolean {
+  return transaction(registry, () => {
+    const result = registry.database.prepare(`UPDATE deliveries SET send_started_at=?
+      WHERE delivery_id=? AND state='claimed' AND runtime_generation=? AND send_started_at IS NULL`)
+      .run(now, deliveryId, runtimeGeneration);
+    return Number(result.changes) === 1;
   });
 }
 
@@ -446,9 +564,9 @@ export function discardWorkerRegistryRecord(registry: WorkerRegistry, workerId: 
 }
 
 function insertRun(registry: WorkerRegistry, run: WorkerRunRecord): void {
-  registry.database.prepare(`INSERT INTO runs(run_id,worker_id,status,task_ids_json,model_selection,completion_delivery,binding_json,job_id,stdout_log,stderr_log,session_start_line,session_end_line,outcome,outcome_source,summary,question,repositories_json,artifacts_json,errors_json,runtime_json,claim_kind,claim_nonce,created_at,started_at,settled_at)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-    run.runId, run.workerId, run.status, json(run.taskIds), nullable(run.modelSelection), run.completionDelivery, run.binding === undefined ? null : json(run.binding), nullable(run.jobId), nullable(run.stdoutLog), nullable(run.stderrLog), nullable(run.sessionStartLine), nullable(run.sessionEndLine), nullable(run.outcome), nullable(run.outcomeSource), nullable(run.summary), nullable(run.question), json(run.repositories), json(run.artifacts), json(run.errors), json(run.runtime ?? {}), nullable(run.claimKind), nullable(run.claimNonce), run.createdAt, nullable(run.startedAt), nullable(run.settledAt)
+  registry.database.prepare(`INSERT INTO runs(run_id,worker_id,status,task_ids_json,model_selection,completion_delivery,binding_json,job_id,stdout_log,stderr_log,session_start_line,session_end_line,outcome,outcome_source,summary,question,repositories_json,artifacts_json,errors_json,runtime_json,claim_kind,claim_nonce,terminal_intent,terminal_error,created_at,started_at,settled_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    run.runId, run.workerId, run.status, json(run.taskIds), nullable(run.modelSelection), run.completionDelivery, run.binding === undefined ? null : json(run.binding), nullable(run.jobId), nullable(run.stdoutLog), nullable(run.stderrLog), nullable(run.sessionStartLine), nullable(run.sessionEndLine), nullable(run.outcome), nullable(run.outcomeSource), nullable(run.summary), nullable(run.question), json(run.repositories), json(run.artifacts), json(run.errors), json(run.runtime ?? {}), nullable(run.claimKind), nullable(run.claimNonce), nullable(run.terminalIntent), nullable(run.terminalError), run.createdAt, nullable(run.startedAt), nullable(run.settledAt)
   );
 }
 
@@ -502,11 +620,12 @@ type RunRow = {
   run_id: string; worker_id: string; status: WorkerRunStatus; task_ids_json: string; model_selection: string | null; completion_delivery: "steer" | "followUp";
   binding_json: string | null; job_id: string | null; stdout_log: string | null; stderr_log: string | null; session_start_line: number | null; session_end_line: number | null;
   outcome: WorkerOutcome | null; outcome_source: WorkerOutcomeSource | null; summary: string | null; question: string | null; repositories_json: string; artifacts_json: string;
-  errors_json: string; runtime_json: string; claim_kind: "launch" | "settlement" | "cancellation" | null; claim_nonce: string | null; created_at: string; started_at: string | null; settled_at: string | null;
+  errors_json: string; runtime_json: string; claim_kind: "launch" | "settlement" | "cancellation" | null; claim_nonce: string | null;
+  terminal_intent: WorkerTerminalIntent | null; terminal_error: string | null; created_at: string; started_at: string | null; settled_at: string | null;
 };
 type DeliveryRow = {
   delivery_id: string; parent_session_file: string; worker_id: string; run_id: string; completion_delivery: "steer" | "followUp"; state: "pending" | "claimed" | "delivered";
-  runtime_generation: number | null; created_at: string; delivered_at: string | null;
+  runtime_generation: number | null; created_at: string; send_started_at: string | null; delivered_at: string | null;
 };
 
 function decodeWorker(row: WorkerRow): WorkerRegistryRecord {
@@ -529,6 +648,7 @@ function decodeRun(row: RunRow): WorkerRunRecord {
     ...(row.outcome === null ? {} : { outcome: row.outcome }), ...(row.outcome_source === null ? {} : { outcomeSource: row.outcome_source }),
     ...(row.summary === null ? {} : { summary: row.summary }), ...(row.question === null ? {} : { question: row.question }),
     repositories: parseJson<WorkerRepositoryResult[]>(row.repositories_json), artifacts: parseJson<string[]>(row.artifacts_json), errors: parseJson<WorkerScopedError[]>(row.errors_json), runtime: parseJson<Record<string, unknown>>(row.runtime_json), ...(row.claim_kind === null ? {} : { claimKind: row.claim_kind }), ...(row.claim_nonce === null ? {} : { claimNonce: row.claim_nonce }),
+    ...(row.terminal_intent === null ? {} : { terminalIntent: row.terminal_intent }), ...(row.terminal_error === null ? {} : { terminalError: row.terminal_error }),
     createdAt: row.created_at, ...(row.started_at === null ? {} : { startedAt: row.started_at }), ...(row.settled_at === null ? {} : { settledAt: row.settled_at })
   };
 }
@@ -536,7 +656,7 @@ function decodeDelivery(row: DeliveryRow): WorkerDeliveryRecord {
   return {
     deliveryId: row.delivery_id, parentSessionFile: row.parent_session_file, workerId: row.worker_id, runId: row.run_id,
     completionDelivery: row.completion_delivery, state: row.state, ...(row.runtime_generation === null ? {} : { runtimeGeneration: row.runtime_generation }),
-    createdAt: row.created_at, ...(row.delivered_at === null ? {} : { deliveredAt: row.delivered_at })
+    createdAt: row.created_at, ...(row.send_started_at === null ? {} : { sendStartedAt: row.send_started_at }), ...(row.delivered_at === null ? {} : { deliveredAt: row.delivered_at })
   };
 }
 
@@ -622,17 +742,67 @@ export function recordWorkerSettlementRecovery(registry: WorkerRegistry, input: 
   });
 }
 
-export function recoverInterruptedClaimsForParent(registry: WorkerRegistry, parentSessionFile: string, runtimeGeneration: number, now: string): void {
-  transaction(registry, () => {
-    const currentPrefix = `${runtimeGeneration}-%`;
-    const claimed = registry.database.prepare(`SELECT w.worker_id,w.active_run_id,r.claim_kind,r.claim_nonce FROM workers w JOIN runs r ON r.run_id=w.active_run_id WHERE w.parent_session_file=? AND r.claim_kind IS NOT NULL AND (r.claim_nonce IS NULL OR r.claim_nonce NOT LIKE ?)`).all(parentSessionFile, currentPrefix) as Array<{ worker_id: string; active_run_id: string; claim_kind: string; claim_nonce?: string }>;
-    for (const item of claimed) {
-      registry.database.prepare("UPDATE runs SET claim_kind=NULL,claim_nonce=NULL WHERE run_id=? AND worker_id=? AND claim_kind=? AND claim_nonce IS ?").run(item.active_run_id, item.worker_id, item.claim_kind, item.claim_nonce ?? null);
-      if (item.claim_kind === "cancellation") registry.database.prepare("UPDATE workers SET recovery_error=?,version=version+1,updated_at=? WHERE worker_id=?").run("Interrupted cancellation claim is ready for an exact cancellation retry.", now, item.worker_id);
-    }
-    registry.database.prepare("UPDATE workers SET operation_kind=NULL,operation_nonce=NULL,recovery_error=COALESCE(recovery_error,'Interrupted discard claim is ready for an exact discard retry.'),version=version+1,updated_at=? WHERE parent_session_file=? AND operation_kind='discard' AND (operation_nonce IS NULL OR operation_nonce NOT LIKE ?)").run(now, parentSessionFile, currentPrefix);
-    registry.database.prepare("UPDATE prepared_sets SET apply_nonce=NULL,updated_at=? WHERE parent_session_file=? AND apply_nonce IS NOT NULL AND apply_nonce NOT LIKE ?").run(now, parentSessionFile, currentPrefix);
+export type WorkerLifecycleClaimRecoveryCandidate = {
+  workerId: string;
+  runId: string;
+  claimKind: "launch" | "settlement" | "cancellation";
+  claimNonce: string;
+  runtime: Record<string, unknown>;
+};
+
+export function registerParentRuntimeAndRecoverClaims(
+  registry: WorkerRegistry,
+  parentSessionFile: string,
+  runtimeId: string,
+  now: string,
+  claimIsLive: (claim: WorkerLifecycleClaimRecoveryCandidate) => boolean,
+  owner?: Omit<ParentRuntimeIdentity, "runtimeId">
+): number {
+  return transaction(registry, () => {
+    const generation = registerParentRuntimeInTransaction(registry, parentSessionFile, { runtimeId, ...(owner ?? {}) }, now);
+    recoverInterruptedClaimsInTransaction(registry, parentSessionFile, generation, now, (claim) => {
+      try { return claimIsLive(claim); } catch { return true; }
+    });
+    return generation;
   });
+}
+
+export function recoverInterruptedClaimsForParent(registry: WorkerRegistry, parentSessionFile: string, runtimeGeneration: number, now: string, preservedClaimNonces: string[] = []): void {
+  transaction(registry, () => {
+    const preserved = new Set(preservedClaimNonces);
+    recoverInterruptedClaimsInTransaction(registry, parentSessionFile, runtimeGeneration, now, (claim) => preserved.has(claim.claimNonce));
+  });
+}
+
+function recoverInterruptedClaimsInTransaction(
+  registry: WorkerRegistry,
+  parentSessionFile: string,
+  runtimeGeneration: number,
+  now: string,
+  claimIsLive: (claim: WorkerLifecycleClaimRecoveryCandidate) => boolean
+): void {
+  const currentPrefix = `${runtimeGeneration}-%`;
+  const claimed = registry.database.prepare(`SELECT w.worker_id,w.active_run_id,r.claim_kind,r.claim_nonce,r.runtime_json
+    FROM workers w JOIN runs r ON r.run_id=w.active_run_id
+    WHERE w.parent_session_file=? AND r.claim_kind IS NOT NULL AND (r.claim_nonce IS NULL OR r.claim_nonce NOT LIKE ?)`)
+    .all(parentSessionFile, currentPrefix) as Array<{ worker_id: string; active_run_id: string; claim_kind: WorkerLifecycleClaimRecoveryCandidate["claimKind"]; claim_nonce: string | null; runtime_json: string }>;
+  for (const item of claimed) {
+    if (item.claim_nonce) {
+      const candidate: WorkerLifecycleClaimRecoveryCandidate = { workerId: item.worker_id, runId: item.active_run_id, claimKind: item.claim_kind, claimNonce: item.claim_nonce, runtime: parseJson<Record<string, unknown>>(item.runtime_json) };
+      if (claimIsLive(candidate)) continue;
+    }
+    registry.database.prepare(`UPDATE runs SET claim_kind=NULL,claim_nonce=NULL,
+      terminal_intent=CASE WHEN claim_kind='cancellation' THEN COALESCE(terminal_intent,'cancellation') ELSE terminal_intent END,
+      terminal_error=CASE WHEN claim_kind='cancellation' AND terminal_intent IS NULL THEN NULL ELSE terminal_error END
+      WHERE run_id=? AND worker_id=? AND claim_kind=? AND claim_nonce IS ?`)
+      .run(item.active_run_id, item.worker_id, item.claim_kind, item.claim_nonce);
+    if (item.claim_kind === "cancellation") registry.database.prepare("UPDATE workers SET recovery_error=?,version=version+1,updated_at=? WHERE worker_id=?")
+      .run("Interrupted cancellation claim is ready for exact containment recovery.", now, item.worker_id);
+  }
+  registry.database.prepare("UPDATE workers SET operation_kind=NULL,operation_nonce=NULL,recovery_error=COALESCE(recovery_error,'Interrupted discard claim is ready for an exact discard retry.'),version=version+1,updated_at=? WHERE parent_session_file=? AND operation_kind='discard' AND (operation_nonce IS NULL OR operation_nonce NOT LIKE ?)")
+    .run(now, parentSessionFile, currentPrefix);
+  registry.database.prepare("UPDATE prepared_sets SET apply_nonce=NULL,updated_at=? WHERE parent_session_file=? AND apply_nonce IS NOT NULL AND apply_nonce NOT LIKE ?")
+    .run(now, parentSessionFile, currentPrefix);
 }
 
 export function reconcileWorkerDeliveries(registry: WorkerRegistry, parentSessionFile: string, deliveredIds: string[]): void {
@@ -640,7 +810,8 @@ export function reconcileWorkerDeliveries(registry: WorkerRegistry, parentSessio
     const mark = registry.database.prepare("UPDATE deliveries SET state='delivered',delivered_at=COALESCE(delivered_at,?) WHERE parent_session_file=? AND delivery_id=?");
     const now = new Date().toISOString();
     for (const deliveryId of deliveredIds) mark.run(now, parentSessionFile, deliveryId);
-    registry.database.prepare("UPDATE deliveries SET state='pending',runtime_generation=NULL WHERE parent_session_file=? AND state='claimed'").run(parentSessionFile);
+    // Unobserved sends are ambiguous: registration alone is not proof that the
+    // owning runtime died before attempting the send, so they are never replayed.
   });
 }
 
@@ -654,9 +825,12 @@ export function createWorkerRunBatch(registry: WorkerRegistry, input: {
   items: WorkerBatchCreateItem[];
   reviewLeases?: WorkerReviewLeaseClaim[];
   consumedPrepared?: Array<{ preparedId: string; parentSessionFile: string }>;
+  authority?: { parentSessionFile: string; runtimeGeneration: number };
   now: string;
 }): void {
   transaction(registry, () => {
+    if (input.authority && !parentRuntimeGenerationMatches(registry, input.authority.parentSessionFile, input.authority.runtimeGeneration))
+      throw new Error("Parent runtime was superseded; reload this session to regain worker lifecycle authority.");
     for (const lease of input.reviewLeases ?? []) {
       const result = registry.database.prepare(`UPDATE workers SET reviewed_by_worker_id=?,version=version+1,updated_at=?
         WHERE worker_id=? AND status='idle' AND (reviewed_by_worker_id IS NULL OR reviewed_by_worker_id=?) AND latest_run_id=? AND role IN ('work','integration')`)
@@ -681,10 +855,11 @@ export function createWorkerRunBatch(registry: WorkerRegistry, input: {
   });
 }
 
-export function claimWorkerRun(registry: WorkerRegistry, workerId: string, runId: string, kind: "launch" | "settlement" | "cancellation", nonce: string, allowed: WorkerRunStatus[]): boolean {
+export function claimWorkerRun(registry: WorkerRegistry, workerId: string, runId: string, kind: "launch" | "settlement" | "cancellation", nonce: string, allowed: WorkerRunStatus[], runtimeGeneration?: number): boolean {
   return transaction(registry, () => {
+    if (runtimeGeneration !== undefined && !workerRuntimeGenerationMatches(registry, workerId, runtimeGeneration)) return false;
     const placeholders = allowed.map(() => "?").join(",");
-    const result = registry.database.prepare(`UPDATE runs SET claim_kind=?,claim_nonce=? WHERE worker_id=? AND run_id=? AND claim_kind IS NULL AND status IN (${placeholders})`)
+    const result = registry.database.prepare(`UPDATE runs SET claim_kind=?,claim_nonce=? WHERE worker_id=? AND run_id=? AND claim_kind IS NULL AND terminal_intent IS NULL AND status IN (${placeholders})`)
       .run(kind, nonce, workerId, runId, ...allowed);
     return Number(result.changes) === 1;
   });
@@ -695,6 +870,98 @@ export function releaseWorkerRunClaim(registry: WorkerRegistry, workerId: string
     .run(workerId, runId, kind, nonce).changes) === 1);
 }
 
+/** Releases one exact claim only after the caller has proved its owner dead. */
+export function recoverProvablyDeadWorkerRunClaim(registry: WorkerRegistry, input: {
+  workerId: string; runId: string; claimKind: "launch" | "settlement" | "cancellation"; claimNonce: string; runtimeGeneration: number; now: string;
+}): boolean {
+  return transaction(registry, () => {
+    if (!workerRuntimeGenerationMatches(registry, input.workerId, input.runtimeGeneration)) return false;
+    const result = registry.database.prepare(`UPDATE runs SET claim_kind=NULL,claim_nonce=NULL,
+      terminal_intent=CASE WHEN claim_kind='cancellation' THEN COALESCE(terminal_intent,'cancellation') ELSE terminal_intent END,
+      terminal_error=CASE WHEN claim_kind='cancellation' AND terminal_intent IS NULL THEN NULL ELSE terminal_error END
+      WHERE worker_id=? AND run_id=? AND status IN ('queued','running') AND claim_kind=? AND claim_nonce=?`)
+      .run(input.workerId, input.runId, input.claimKind, input.claimNonce);
+    if (Number(result.changes) !== 1) return false;
+    if (input.claimKind === "cancellation") registry.database.prepare("UPDATE workers SET recovery_error=?,version=version+1,updated_at=? WHERE worker_id=? AND active_run_id=?")
+      .run("Interrupted cancellation claim is ready for exact containment recovery.", input.now, input.workerId, input.runId);
+    return true;
+  });
+}
+
+/** Claims a verified accepted result even if a later terminal request is pending. */
+export function claimWorkerAcceptedSettlement(registry: WorkerRegistry, workerId: string, runId: string, nonce: string, runtimeGeneration: number): boolean {
+  return transaction(registry, () => {
+    if (!workerRuntimeGenerationMatches(registry, workerId, runtimeGeneration)) return false;
+    return Number(registry.database.prepare("UPDATE runs SET claim_kind='settlement',claim_nonce=? WHERE worker_id=? AND run_id=? AND status='running' AND claim_kind IS NULL")
+      .run(nonce, workerId, runId).changes) === 1;
+  });
+}
+
+export function requestWorkerCancellation(registry: WorkerRegistry, workerId: string, runId: string, now: string): boolean {
+  return transaction(registry, () => {
+    const result = registry.database.prepare(`UPDATE runs SET terminal_intent=CASE WHEN terminal_intent='failure' THEN terminal_intent ELSE 'cancellation' END,
+      terminal_error=CASE WHEN terminal_intent='failure' THEN terminal_error ELSE NULL END
+      WHERE worker_id=? AND run_id=? AND status IN ('queued','running')`).run(workerId, runId);
+    if (Number(result.changes) === 1) registry.database.prepare("UPDATE workers SET updated_at=? WHERE worker_id=? AND active_run_id=?").run(now, workerId, runId);
+    return Number(result.changes) === 1;
+  });
+}
+
+export function requestWorkerFailure(registry: WorkerRegistry, workerId: string, runId: string, error: string, now: string, runtimeGeneration?: number): boolean {
+  return transaction(registry, () => {
+    if (runtimeGeneration !== undefined && !workerRuntimeGenerationMatches(registry, workerId, runtimeGeneration)) return false;
+    const result = registry.database.prepare(`UPDATE runs SET terminal_intent=COALESCE(terminal_intent,'failure'),
+      terminal_error=CASE WHEN terminal_intent IS NULL THEN ? ELSE terminal_error END
+      WHERE worker_id=? AND run_id=? AND status IN ('queued','running')`).run(error, workerId, runId);
+    if (Number(result.changes) === 1) registry.database.prepare("UPDATE workers SET recovery_error=?,updated_at=? WHERE worker_id=? AND active_run_id=?").run(error, now, workerId, runId);
+    return Number(result.changes) === 1;
+  });
+}
+
+export function setClaimedWorkerTerminalIntent(registry: WorkerRegistry, input: {
+  workerId: string; runId: string; claimKind: "launch" | "settlement" | "cancellation"; claimNonce: string;
+  terminalIntent: WorkerTerminalIntent; terminalError?: string; now: string;
+}): WorkerTerminalIntent {
+  return transaction(registry, () => {
+    const result = registry.database.prepare(`UPDATE runs SET
+      terminal_intent=COALESCE(terminal_intent,?),
+      terminal_error=CASE WHEN terminal_intent IS NULL THEN ? ELSE terminal_error END
+      WHERE worker_id=? AND run_id=? AND status IN ('queued','running') AND claim_kind=? AND claim_nonce=?`)
+      .run(input.terminalIntent, nullable(input.terminalError), input.workerId, input.runId, input.claimKind, input.claimNonce);
+    if (Number(result.changes) !== 1) throw staleRun(input.workerId, input.runId);
+    registry.database.prepare("UPDATE workers SET updated_at=? WHERE worker_id=? AND active_run_id=?").run(input.now, input.workerId, input.runId);
+    const row = registry.database.prepare("SELECT terminal_intent FROM runs WHERE worker_id=? AND run_id=?").get(input.workerId, input.runId) as { terminal_intent: WorkerTerminalIntent };
+    return row.terminal_intent;
+  });
+}
+
+export function claimWorkerTerminalIntent(registry: WorkerRegistry, input: {
+  workerId: string; runId: string; terminalIntent: WorkerTerminalIntent; claimKind: "settlement" | "cancellation";
+  claimNonce: string; now: string; runtimeGeneration?: number;
+}): boolean {
+  return transaction(registry, () => {
+    if (input.runtimeGeneration !== undefined && !workerRuntimeGenerationMatches(registry, input.workerId, input.runtimeGeneration)) return false;
+    const result = registry.database.prepare(`UPDATE runs SET claim_kind=?,claim_nonce=?
+      WHERE worker_id=? AND run_id=? AND status IN ('queued','running') AND terminal_intent=? AND claim_kind IS NULL`)
+      .run(input.claimKind, input.claimNonce, input.workerId, input.runId, input.terminalIntent);
+    if (Number(result.changes) === 1) registry.database.prepare("UPDATE workers SET updated_at=? WHERE worker_id=? AND active_run_id=?").run(input.now, input.workerId, input.runId);
+    return Number(result.changes) === 1;
+  });
+}
+
+function workerRuntimeGenerationMatches(registry: WorkerRegistry, workerId: string, runtimeGeneration: number): boolean {
+  const row = registry.database.prepare(`SELECT p.generation FROM workers w JOIN parent_runtimes p ON p.parent_session_file=w.parent_session_file WHERE w.worker_id=?`).get(workerId) as { generation: number } | undefined;
+  return row?.generation === runtimeGeneration;
+}
+
+export function updateClaimedWorkerRunRuntime(registry: WorkerRegistry, input: { workerId: string; runId: string; claimKind: "launch" | "settlement" | "cancellation"; claimNonce: string; runtime: Record<string, unknown> }): void {
+  transaction(registry, () => {
+    const result = registry.database.prepare("UPDATE runs SET runtime_json=? WHERE worker_id=? AND run_id=? AND status IN ('queued','running') AND claim_kind=? AND claim_nonce=?")
+      .run(json(input.runtime), input.workerId, input.runId, input.claimKind, input.claimNonce);
+    if (Number(result.changes) !== 1) throw staleRun(input.workerId, input.runId);
+  });
+}
+
 export function finalizeWorkerRunLaunch(registry: WorkerRegistry, input: {
   workerId: string; runId: string; claimNonce: string; modelSelection: string; sessionId: string; sessionFile: string;
   sessionStartLine: number; jobId: string; stdoutLog: string; stderrLog: string; runtime: Record<string, unknown>; startedAt: string;
@@ -703,7 +970,7 @@ export function finalizeWorkerRunLaunch(registry: WorkerRegistry, input: {
     const run = registry.database.prepare(`UPDATE runs SET status='running',model_selection=?,job_id=?,stdout_log=?,stderr_log=?,session_start_line=?,runtime_json=?,started_at=?,claim_kind=NULL,claim_nonce=NULL
       WHERE worker_id=? AND run_id=? AND status='queued' AND claim_kind='launch' AND claim_nonce=?`)
       .run(input.modelSelection, input.jobId, input.stdoutLog, input.stderrLog, input.sessionStartLine, json(input.runtime), input.startedAt, input.workerId, input.runId, input.claimNonce);
-    const worker = registry.database.prepare(`UPDATE workers SET status='running',model_selection=?,session_id=?,session_file=?,version=version+1,updated_at=?
+    const worker = registry.database.prepare(`UPDATE workers SET status='running',model_selection=?,session_id=?,session_file=?,recovery_error=NULL,version=version+1,updated_at=?
       WHERE worker_id=? AND active_run_id=? AND status='queued'`)
       .run(input.modelSelection, input.sessionId, input.sessionFile, input.startedAt, input.workerId, input.runId);
     if (Number(run.changes) !== 1 || Number(worker.changes) !== 1) throw staleRun(input.workerId, input.runId);
@@ -719,7 +986,7 @@ export function finalizeClaimedWorkerRun(registry: WorkerRegistry, input: {
     const current = readRunRow(registry, input.runId);
     if (current.worker_id !== input.workerId || current.status === "settled" || current.claim_kind !== input.claimKind || current.claim_nonce !== input.claimNonce) throw staleRun(input.workerId, input.runId);
     const deliveryId = `worker-run:${input.workerId}:${input.runId}`;
-    const run = registry.database.prepare(`UPDATE runs SET status='settled',outcome=?,outcome_source=?,summary=?,question=?,repositories_json=?,artifacts_json=?,errors_json=?,session_start_line=COALESCE(session_start_line,?),session_end_line=?,settled_at=?,claim_kind=NULL,claim_nonce=NULL
+    const run = registry.database.prepare(`UPDATE runs SET status='settled',outcome=?,outcome_source=?,summary=?,question=?,repositories_json=?,artifacts_json=?,errors_json=?,session_start_line=COALESCE(session_start_line,?),session_end_line=?,settled_at=?,claim_kind=NULL,claim_nonce=NULL,terminal_intent=NULL,terminal_error=NULL
       WHERE worker_id=? AND run_id=? AND status IN ('queued','running') AND claim_kind=? AND claim_nonce=?`)
       .run(input.outcome, input.outcomeSource, nullable(input.summary), nullable(input.question), json(input.repositories ?? []), json(input.artifacts ?? []), json(input.errors ?? []), nullable(input.sessionStartLine), nullable(input.sessionEndLine), input.settledAt, input.workerId, input.runId, input.claimKind, input.claimNonce);
     const worker = registry.database.prepare(`UPDATE workers SET status='idle',active_run_id=NULL,latest_run_id=?,recovery_error=NULL,version=version+1,updated_at=? WHERE worker_id=? AND active_run_id=?`)
@@ -793,13 +1060,15 @@ function insertWorker(registry: WorkerRegistry, worker: Omit<WorkerRegistryRecor
   );
 }
 
-export function claimWorkerCancellation(registry: WorkerRegistry, workerId: string, runId: string, nonce: string, now: string): boolean {
+export function claimWorkerCancellation(registry: WorkerRegistry, workerId: string, runId: string, nonce: string, now: string, runtimeGeneration?: number): boolean {
   return transaction(registry, () => {
-    const worker = registry.database.prepare("SELECT recovery_error FROM workers WHERE worker_id=? AND active_run_id=? AND status IN ('queued','running')").get(workerId, runId) as { recovery_error: string | null } | undefined;
+    const worker = registry.database.prepare("SELECT 1 AS present FROM workers WHERE worker_id=? AND active_run_id=? AND status IN ('queued','running')").get(workerId, runId) as { present: number } | undefined;
     if (!worker) return false;
-    const result = worker.recovery_error
-      ? registry.database.prepare("UPDATE runs SET claim_kind='cancellation',claim_nonce=? WHERE worker_id=? AND run_id=? AND status IN ('queued','running')").run(nonce, workerId, runId)
-      : registry.database.prepare("UPDATE runs SET claim_kind='cancellation',claim_nonce=? WHERE worker_id=? AND run_id=? AND status IN ('queued','running') AND (claim_kind IS NULL OR claim_kind='launch')").run(nonce, workerId, runId);
+    registry.database.prepare(`UPDATE runs SET terminal_intent=CASE WHEN terminal_intent='failure' THEN terminal_intent ELSE 'cancellation' END,
+      terminal_error=CASE WHEN terminal_intent='failure' THEN terminal_error ELSE NULL END WHERE worker_id=? AND run_id=? AND status IN ('queued','running')`).run(workerId, runId);
+    if (runtimeGeneration !== undefined && !workerRuntimeGenerationMatches(registry, workerId, runtimeGeneration)) return false;
+    const result = registry.database.prepare("UPDATE runs SET claim_kind='cancellation',claim_nonce=? WHERE worker_id=? AND run_id=? AND status IN ('queued','running') AND terminal_intent='cancellation' AND claim_kind IS NULL")
+      .run(nonce, workerId, runId);
     if (Number(result.changes) === 1) registry.database.prepare("UPDATE workers SET updated_at=? WHERE worker_id=?").run(now, workerId);
     return Number(result.changes) === 1;
   });

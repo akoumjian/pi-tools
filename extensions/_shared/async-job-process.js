@@ -1,22 +1,18 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
 
-export const PI_TOOLS_MODULE_FINGERPRINT = "cf0ffb8bd4c0d4c44099b22fe039fd64cc27fa3b1192a39c2eef95f328630c66";
+export const PI_TOOLS_MODULE_FINGERPRINT = "3ba95ef7bdb27b427d5c612c20565507096eec581a5793fe82ef05b6a6a45c65";
 
 export function asyncJobTokenProcessIds(token) {
   if (!token) return [];
   if (process.platform === "linux") {
     const marker = `PI_WORKER_JOB_TOKEN=${token}`;
     let entries;
-    try { entries = readdirSync("/proc", { withFileTypes: true }); }
+    // Read names only. Dirent mode may lstat DT_UNKNOWN procfs entries inside
+    // readdirSync and abort the whole scan when an unrelated process exits.
+    try { entries = readdirSync("/proc"); }
     catch (cause) { throw new Error(`Unable to enumerate async-job ownership tokens: ${cause instanceof Error ? cause.message : String(cause)}`); }
-    return entries.flatMap((entry) => {
-      if (!entry.isDirectory() || !/^[1-9][0-9]*$/.test(entry.name)) return [];
-      try {
-        const environment = readFileSync(`/proc/${entry.name}/environ`, "utf8").split("\0");
-        return environment.includes(marker) ? [Number(entry.name)] : [];
-      } catch { return []; }
-    });
+    return asyncJobTokenProcessIdsFromLinuxProc(token, entries, (pid) => readFileSync(`/proc/${pid}/environ`, "utf8"));
   }
   if (process.platform !== "darwin") return [];
   let output;
@@ -32,6 +28,16 @@ export function asyncJobTokenProcessIds(token) {
     if (!line.includes(marker)) return [];
     const pid = Number.parseInt(line.trimStart().split(/\s+/, 1)[0] ?? "", 10);
     return Number.isInteger(pid) && pid > 0 ? [pid] : [];
+  });
+}
+
+export function asyncJobTokenProcessIdsFromLinuxProc(token, entries, readEnvironment) {
+  if (!token) return [];
+  const marker = `PI_WORKER_JOB_TOKEN=${token}`;
+  return entries.flatMap((entry) => {
+    if (typeof entry !== "string" || !/^[1-9][0-9]*$/.test(entry)) return [];
+    try { return String(readEnvironment(entry)).split("\0").includes(marker) ? [Number(entry)] : []; }
+    catch { return []; }
   });
 }
 
@@ -62,11 +68,35 @@ export function captureAsyncJobProcessIdentity(pid, processToken) {
   return { pid, processToken, processStartToken };
 }
 
+export function probeAsyncJobProcessIdentity(identity, probes = {}) {
+  if (!identity || !Number.isInteger(identity.pid) || identity.pid <= 0 || typeof identity.processToken !== "string" || !identity.processToken || typeof identity.processStartToken !== "string" || !identity.processStartToken) return "dead";
+  const probePid = probes.probePid ?? probeAsyncJobPid;
+  const readStartToken = probes.readStartToken ?? asyncJobProcessStartToken;
+  const ownedProcessIds = probes.ownedProcessIds ?? asyncJobTokenProcessIds;
+  const before = probePid(identity.pid);
+  if (before === "dead") return "dead";
+  // Permission ambiguity is not identity ambiguity when the immutable start
+  // token is still observable. Compare it before deciding whether this exact
+  // process requires recovery so a reused cross-user PID cannot pin a job.
+  let processStartToken;
+  try { processStartToken = readStartToken(identity.pid); }
+  catch { return probePid(identity.pid) === "dead" ? "dead" : "unknown"; }
+  if (!processStartToken) return probePid(identity.pid) === "dead" ? "dead" : "unknown";
+  if (processStartToken !== identity.processStartToken) return "dead";
+  let processIds;
+  try { processIds = ownedProcessIds(identity.processToken); }
+  catch { return probePid(identity.pid) === "dead" ? "dead" : "unknown"; }
+  if (processIds.includes(identity.pid)) return "alive";
+  return "dead";
+}
+
 export function isAsyncJobProcessIdentityAlive(identity) {
-  if (!identity || !Number.isInteger(identity.pid) || typeof identity.processToken !== "string" || typeof identity.processStartToken !== "string") return false;
-  try {
-    return asyncJobProcessStartToken(identity.pid) === identity.processStartToken && asyncJobTokenProcessIds(identity.processToken).includes(identity.pid);
-  } catch { return false; }
+  return probeAsyncJobProcessIdentity(identity) === "alive";
+}
+
+function probeAsyncJobPid(pid) {
+  try { process.kill(pid, 0); return "alive"; }
+  catch (error) { return error && typeof error === "object" && error.code === "ESRCH" ? "dead" : "unknown"; }
 }
 
 export function isAsyncJobExecutionAlive(pid, token) {
