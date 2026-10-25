@@ -40,6 +40,7 @@ import { inspectInterruptedGitState, inventoryWorkerRepositories, snapshotWorker
 import { countSessionLines, openWorkerSessionViewer, sanitizeViewText, type WorkerSessionViewTarget } from "./view.js";
 import { canonicalPathWithin, canonicalRepository, trustedGit } from "./trusted-git.js";
 import { prepareWorkerCacheLineage, registerParentCacheLineageCapture, type WorkerCacheLineageRecord } from "./cache-lineage.js";
+import { adoptPreparedSetDiscard, adoptWorkers, buildCleanupInventory, buildCleanupPreview, claimPreparedSetDiscard, deleteCleanupLeftovers, deleteSettledWorkerHostLogs, finishPreparedSetDiscard, preflightCleanupLeftovers, preflightWorkerAdoption, preflightWorkerDiscard, preservationRecords, preserveWorkerArtifacts, recoverPreparedSetDiscards, validateCleanupConfirmation, type CleanupInventory } from "./cleanup.js";
 
 export { WorkerRunParamsV2 as WorkerRunParams, WorkerControlParamsV2 as WorkerControlParams, WorkerMergeTestParams, WorkerMergeApplyParams };
 export type WorkerRunInput = WorkerRunInputV2;
@@ -96,6 +97,7 @@ export type WorkerExtensionDependencies = {
   assertPackageGeneration?: () => void;
   probeHostIdentity?: (identity: ReturnType<typeof readWorkerHostProcess>) => AsyncJobProcessIdentityLiveness;
   beforeCreateRunBatch?: () => void | Promise<void>;
+  cleanupHostLogs?: typeof deleteSettledWorkerHostLogs;
   signalHostIdentity?: (identity: ReturnType<typeof readWorkerHostProcess>, signal: NodeJS.Signals) => boolean;
   hostTerminationGraceAttempts?: number; hostForcedTerminationAttempts?: number; hostProbeDelayMs?: number;
   readProcessStartToken?: (pid: number) => string | undefined; ownerProbeIntervalMs?: number; ownerWaitTimeoutMs?: number;
@@ -123,6 +125,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   const docker = () => configuredDockerPath ??= resolveDockerPath();
   const createContainer = overrides.createContainer ?? (testLaunch ? ((_docker, reference) => ({ ...reference, containerId: "f".repeat(64) })) : createWorkerContainerAsync);
   const removeContainer = overrides.removeContainer ?? (testLaunch ? (() => {}) : settleWorkerContainerAsync);
+  const cleanupHostLogs = overrides.cleanupHostLogs ?? (testLaunch ? (() => ({ deleted: [], leftovers: [] })) : deleteSettledWorkerHostLogs);
   const createOverlay = overrides.createOverlay ?? createReviewOverlayAsync;
   const verifyHostIdentity = overrides.waitForHostIdentity ?? waitForWorkerHostIdentity;
   const probeHostIdentity = overrides.probeHostIdentity ?? probeAsyncJobProcessIdentity;
@@ -144,6 +147,9 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   const deliveredRecovery = new Set<string>();
   let unconfirmedWarningGeneration = 0;
   const warnedUnconfirmedRuns = new Set<string>();
+  const cleanupInventoryByParent = new Map<string, CleanupInventory>();
+  const cleanupAnnounced = new Set<string>();
+  const cleanupInFlight = new Map<string, Promise<CleanupInventory>>();
   const lifecycleClaimProbeAt = new Map<string, number>();
   const getRegistry = () => registry ??= openWorkerRegistry(runtimeRoot);
   const operationSnapshots = new Map<string, WorkerOperationSnapshot>();
@@ -192,6 +198,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
           parentProcessStartToken ? { pid: process.pid, processStartToken: parentProcessStartToken } : undefined);
         parentRuntimeRegistrations.set(exactParent, { runtimeId, generation: runtimeGeneration });
         recoverInterruptedDiscardFiles(exactParent, runtimeGeneration);
+        recoverPreparedSetDiscards(getRegistry(), overrides.preparedRoot ?? defaultPreparedMergeRoot());
       } else runtimeGeneration = initialized.generation;
       reconcileWorkerDeliveries(getRegistry(), exactParent, sessionDeliveryIds(context));
       deliveredRecovery.clear();
@@ -200,6 +207,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       warnUnconfirmedCompletionSends(exactParent);
       deliverPendingCompletions(api, getRegistry(), exactParent, runtimeGeneration);
       void Promise.resolve().then(() => reconcileActiveRuns(launchInputs, exactParent)).catch(() => {});
+      void refreshCleanupInventory(exactParent, context.cwd).catch(() => {});
       if (deliveryTimer) clearInterval(deliveryTimer);
       deliveryTimer = setInterval(() => {
         try {
@@ -232,7 +240,9 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       const parentFile = context.sessionManager.getSessionFile(); if (!parentFile) return;
       // Exact same-session history is authoritative receipt evidence. This only
       // acknowledges observed delivery IDs; it never releases, retries, or sends.
-      reconcileWorkerDeliveries(getRegistry(), realpathOrResolve(parentFile), sessionDeliveryIds(context));
+      const exactParent = realpathOrResolve(parentFile);
+      reconcileWorkerDeliveries(getRegistry(), exactParent, sessionDeliveryIds(context));
+      void announceCleanupAfterAgentEnd(exactParent, context.cwd);
     } catch {}
   });
   api.on("message_end", (event, context) => {
@@ -263,6 +273,10 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const d = message.details as any; const recovery = d?.event === "worker_recovery_required"; const outcome = recovery ? "recovery required" : String(d?.outcome ?? "completed").replaceAll("_", " "); const role = d?.role ?? "work";
     const counts = recovery ? String(d?.status ?? "running") : `${Number(d?.repositoryCount ?? 0)} repos · ${Number(d?.artifactCount ?? 0)} artifacts`;
     return new Text(theme.fg(recovery || d?.outcome === "failed" ? "error" : d?.outcome === "cancelled" ? "warning" : "success", `${outcome} · ${role} · ${String(d?.workerId ?? "worker").slice(-8)} · ${counts}`), 0, 0);
+  });
+  api.registerMessageRenderer("worker-cleanup", (message, _options, theme) => {
+    const d = message.details as any; const workers = Array.isArray(d?.workers) ? d.workers.length : 0; const prepared = Array.isArray(d?.preparedIds) ? d.preparedIds.length : 0;
+    return new Text(theme.fg("warning", `cleanup due · ${workers} workers · ${prepared} prepared sets`), 0, 0);
   });
 
   const workerRunTool = defineTool({
@@ -326,10 +340,10 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
 
   const workerControlTool = defineTool({
     name: "worker_control", label: "Manage Workers",
-    description: "List and manage durable workers owned by the current parent session. Use `list` for compact worker discovery, `runs` to list one worker’s execution history, and `get` to inspect one exact active or settled run, including logs, session and workspace access, and submitted repository or artifact outputs. Use `cancel` to stop active work while preserving retained state. Use `discard` to permanently delete an idle worker and all retained state.",
-    promptSnippet: "List workers and their runs, inspect exact run outputs, cancel active work, or permanently discard idle workers.",
+    description: "List and manage durable workers. Use `list`, `runs`, and `get` for retained lifecycle evidence; `inventory` for bounded Beads-derived cleanup classes; `preserve` for explicit atomic non-Git artifact copies; `cancel` to stop active work; and exact batched `discard` for idle current-session workers or prepared sets after complete preflight.",
+    promptSnippet: "Inspect durable workers, derive cleanup inventory, preserve valuable artifacts, cancel active work, or explicitly discard exact idle state.",
     promptGuidelines: [
-      "Do not poll workers; rely on asynchronous completion notifications. Use `get` with the supplied `workerId` and `runId` when exact run evidence is needed for review, merge testing, a resume decision, or diagnosis. Use `list` to discover or recover workers and `runs` only to locate previous runs. Use `cancel` only to stop active work, and `discard` only when no further review, resume, merge, or recovery access is needed.",
+      "Do not poll workers; rely on asynchronous completion notifications. Use `get` with exact identities for evidence, `list` for discovery, and `runs` only to locate previous runs. Cleanup is never automatic: inspect `inventory`, preserve valuable non-Git artifacts, and use exact batched `discard` only when no review, resume, merge, recovery, or unacknowledged artifact access is needed. Cross-session deletion remains preview-bound through /worker:cleanup.",
       inputJsonSchemaGuideline("worker_control", WorkerControlParamsV2), outputJsonSchemaGuideline("worker_control", RetainedToolOutputSchemas.worker_control),
       "worker_control constraints: Only result content is provider-visible; details remain internal."
     ],
@@ -355,7 +369,8 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       throwIfAborted(signal); const parent = requireParentSession(context);
       const resolved = params.repositories.map((request) => ({ ...request, candidateRef: request.candidateRef ?? "HEAD" }));
       const set = prepareWorkerMerges(parent, resolved, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, sourceForCandidate: managedCandidateWarnings(parent) });
-      storePreparedSet(getRegistry(), { preparedId: set.preparedId, parentSessionFile: parent, status: set.status, order: set.order, repositories: set.repositories, createdAt: set.createdAt });
+      const taskIds = [...new Set(set.repositories.flatMap((repository) => repository.source ? (getWorker(getRegistry(), repository.source.workerId)?.taskIds ?? []) : []))];
+      storePreparedSet(getRegistry(), { preparedId: set.preparedId, parentSessionFile: parent, status: set.status, order: set.order, taskIds, repositories: set.repositories.map((repository) => ({ ...repository, taskIds: repository.source ? (getWorker(getRegistry(), repository.source.workerId)?.taskIds ?? []) : [] })), createdAt: set.createdAt });
       cleanupSupersededPreparedSets(set);
       const visible = publicPreparedSet(set);
       return resultText(`${set.status === "ready" ? "ready" : "resolution required"} · ${set.repositories.length} repositories`, visible);
@@ -405,6 +420,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         if (request.action === "resume") {
           if (resumed.has(request.workerId)) throw new Error(`Worker ${request.workerId} cannot be resumed twice in one batch.`); resumed.add(request.workerId);
           const worker = ownedWorker(request.workerId, parentSessionFile); if (worker.status !== "idle" || worker.operationKind) throw new Error(`Worker ${worker.workerId} is not idle.`);
+          if (worker.runtime && typeof worker.runtime.adoptedFromSession === "string") throw new Error(`Adopted worker ${worker.workerId} may be inspected, preserved, or discarded, but not resumed.`);
           if (worker.reviewedByWorkerId) throw new Error(`Worker ${worker.workerId} is leased to active reviewer ${worker.reviewedByWorkerId}.`);
           if (worker.role === "review" && request.additionalTaskIds?.length) throw new Error("Review workers cannot receive additional Beads tasks.");
           if (!worker.sessionId || !worker.sessionFile) {
@@ -1043,6 +1059,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       const irreversible = (!existsSync(paths.stateDir) && !existsSync(stateTrash)) || Boolean(separateWorkspace && !existsSync(row.workspace_root) && !existsSync(separateWorkspace));
       if (irreversible) { rmSync(paths.stateDir, { recursive: true, force: true }); rmSync(stateTrash, { recursive: true, force: true }); if (separateWorkspace) { rmSync(row.workspace_root, { recursive: true, force: true }); rmSync(separateWorkspace, { recursive: true, force: true }); } finalizeWorkerDiscard(getRegistry(), row.worker_id, row.operation_nonce); continue; }
       restoreDiscardPath(stateTrash, paths.stateDir); if (separateWorkspace) restoreDiscardPath(separateWorkspace, row.workspace_root);
+      abandonWorkerDiscard(getRegistry(), row.worker_id, row.operation_nonce, "Interrupted discard was rolled back and requires explicit retry.", now().toISOString());
     }
   }
   function restoreDiscardPath(trash: string, destination: string): void {
@@ -1051,13 +1068,17 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     renameSync(trash, destination);
   }
 
-  async function discardWorker(worker: WorkerRegistryRecord): Promise<void> {
+  async function discardWorker(worker: WorkerRegistryRecord, existingNonce?: string): Promise<{ hostLogs: string[] }> {
     assertCurrentPackageGeneration();
-    const nonce = claimNonce(); claimWorkerDiscard(getRegistry(), worker.workerId, worker.version, nonce, now().toISOString());
+    const nonce = existingNonce ?? claimNonce();
+    if (existingNonce === undefined) claimWorkerDiscard(getRegistry(), worker.workerId, worker.version, nonce, now().toISOString());
     const paths = workerPaths(roots, worker.workerId); const stateTrash = `${paths.stateDir}.discard-${nonce}`; const separateWorkspace = path.resolve(paths.workspaceRoot).startsWith(`${path.resolve(paths.stateDir)}${path.sep}`) ? undefined : `${paths.workspaceRoot}.discard-${nonce}`;
     try {
+      const logs = cleanupHostLogs(getRegistry(), worker);
+      if (logs.leftovers.length) throw new Error(`Worker host logs could not be deleted safely: ${logs.leftovers.map((item) => `${item.path}: ${item.reason}`).join("; ")}`);
       if (existsSync(paths.stateDir)) renameSync(paths.stateDir, stateTrash); if (separateWorkspace && existsSync(paths.workspaceRoot)) renameSync(paths.workspaceRoot, separateWorkspace);
       rmSync(stateTrash, { recursive: true, force: true }); if (separateWorkspace) rmSync(separateWorkspace, { recursive: true, force: true }); finalizeWorkerDiscard(getRegistry(), worker.workerId, nonce);
+      return { hostLogs: logs.deleted };
     } catch (error) {
       const irreversible = (!existsSync(paths.stateDir) && !existsSync(stateTrash)) || Boolean(separateWorkspace && !existsSync(paths.workspaceRoot) && !existsSync(separateWorkspace));
       if (!irreversible) { try { if (existsSync(stateTrash) && !existsSync(paths.stateDir)) renameSync(stateTrash, paths.stateDir); if (separateWorkspace && existsSync(separateWorkspace) && !existsSync(paths.workspaceRoot)) renameSync(separateWorkspace, paths.workspaceRoot); } catch {} abandonWorkerDiscard(getRegistry(), worker.workerId, nonce, sanitizeError(error), now().toISOString()); }
@@ -1065,18 +1086,84 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     }
   }
 
+  async function refreshCleanupInventory(parent: string, cwd: string): Promise<CleanupInventory> {
+    const existing = cleanupInFlight.get(parent); if (existing) return existing;
+    const work = buildCleanupInventory(getRegistry(), { parentSessionFile: parent, allSessions: false, cwd }).then((inventory) => { cleanupInventoryByParent.set(parent, inventory); return inventory; }).finally(() => cleanupInFlight.delete(parent));
+    cleanupInFlight.set(parent, work); return work;
+  }
+
+  async function announceCleanupAfterAgentEnd(parent: string, cwd: string): Promise<void> {
+    const generation = runtimeGeneration;
+    try {
+      const inventory = await refreshCleanupInventory(parent, cwd); if (inventory.workers.length === 0 && inventory.prepared.length === 0) return;
+      const all = await buildCleanupInventory(getRegistry(), { parentSessionFile: parent, allSessions: true, cwd });
+      const otherByOwner = new Map<string, { ownerSession: string; workerIds: string[]; preparedIds: string[]; attention: number }>();
+      for (const item of all.workers) if (item.ownerSession !== parent && ["due", "recovery", "unknown:task_missing"].includes(item.class)) { const value = otherByOwner.get(item.ownerSession) ?? { ownerSession: item.ownerSession, workerIds: [], preparedIds: [], attention: 0 }; if (item.class === "due") value.workerIds.push(item.workerId); else value.attention += 1; otherByOwner.set(item.ownerSession, value); }
+      for (const item of all.prepared) if (item.ownerSession !== parent && ["due", "explicit_decision", "partial"].includes(item.class)) { const value = otherByOwner.get(item.ownerSession) ?? { ownerSession: item.ownerSession, workerIds: [], preparedIds: [], attention: 0 }; if (item.class === "due") value.preparedIds.push(item.preparedId); else value.attention += 1; otherByOwner.set(item.ownerSession, value); }
+      const otherSessionsAll = [...otherByOwner.values()].sort((a, b) => a.ownerSession.localeCompare(b.ownerSession)); const otherSessions = otherSessionsAll.slice(0, 20).map((item) => ({ ...item, workerIds: item.workerIds.slice(0, 8), additionalWorkers: Math.max(0, item.workerIds.length - 8), preparedIds: item.preparedIds.slice(0, 8), additionalPrepared: Math.max(0, item.preparedIds.length - 8) }));
+      const announceable = [
+        ...inventory.workers.filter((item) => ["due", "recovery", "unknown:task_missing"].includes(item.class)).map((item) => ({ kind: "worker", id: item.workerId, class: item.class })),
+        ...inventory.prepared.filter((item) => ["due", "explicit_decision", "partial"].includes(item.class)).map((item) => ({ kind: "prepared", id: item.preparedId, class: item.class })),
+        ...otherSessions.map((item) => ({ kind: "other_session", id: item.ownerSession, class: item.attention > 0 ? "attention" : "due" }))
+      ];
+      const current = new Set(announceable.map((item) => `${runtimeGeneration}:${item.kind}:${item.id}:${item.class}`));
+      for (const key of [...cleanupAnnounced]) if (key.startsWith(`${runtimeGeneration}:`) && !current.has(key)) cleanupAnnounced.delete(key);
+      const fresh = announceable.filter((item) => !cleanupAnnounced.has(`${runtimeGeneration}:${item.kind}:${item.id}:${item.class}`));
+      if (fresh.length === 0 || generation !== runtimeGeneration || !currentContext?.sessionManager.getSessionFile() || realpathOrResolve(currentContext.sessionManager.getSessionFile()!) !== parent) return;
+      for (const item of announceable) cleanupAnnounced.add(`${runtimeGeneration}:${item.kind}:${item.id}:${item.class}`);
+      const dueWorkers = inventory.workers.filter((item) => item.class === "due"); const duePrepared = inventory.prepared.filter((item) => item.class === "due"); const recovery = inventory.workers.filter((item) => item.class === "recovery"); const unknown = inventory.workers.filter((item) => item.class === "unknown:task_missing"); const partial = inventory.prepared.filter((item) => item.class === "partial"); const explicitDecision = inventory.prepared.filter((item) => item.class === "explicit_decision");
+      const event = { event: "worker_cleanup_due", workers: dueWorkers.slice(0, 32).map((item) => ({ workerId: item.workerId, role: item.role, class: item.class, new: fresh.some((candidate) => candidate.kind === "worker" && candidate.id === item.workerId), unpreservedArtifacts: item.unpreservedArtifacts.slice(0, 4), additionalUnpreservedArtifacts: Math.max(0, item.unpreservedArtifacts.length - 4) })), additionalWorkers: Math.max(0, dueWorkers.length - 32), preparedIds: duePrepared.slice(0, 32).map((item) => item.preparedId), additionalPrepared: Math.max(0, duePrepared.length - 32), attention: { recovery: recovery.slice(0, 16).map((item) => ({ workerId: item.workerId, error: item.recoveryError ?? item.reason })), additionalRecovery: Math.max(0, recovery.length - 16), unknown: unknown.slice(0, 16).map((item) => ({ workerId: item.workerId, reason: item.reason })), additionalUnknown: Math.max(0, unknown.length - 16), partial: partial.slice(0, 16).map((item) => item.preparedId), additionalPartial: Math.max(0, partial.length - 16), explicitDecision: explicitDecision.slice(0, 16).map((item) => item.preparedId), additionalExplicitDecision: Math.max(0, explicitDecision.length - 16) }, beadsUnavailable: inventory.workers.filter((item) => item.class === "unknown:beads_unavailable").length, otherSessions, additionalOtherSessions: Math.max(0, otherSessionsAll.length - otherSessions.length) };
+      api.sendMessage({ customType: "worker-cleanup", content: JSON.stringify(event), display: true, details: event }, { triggerTurn: true, deliverAs: "followUp" });
+    } catch { /* Cleanup visibility is advisory and cannot mutate lifecycle state. */ }
+  }
+
   async function control(params: WorkerControlInputV2, context: ExtensionContext): Promise<AgentToolResult<any>> {
     const parent = requireParentSession(context); const db = getRegistry();
+    if (params.action === "inventory") {
+      const inventory = await buildCleanupInventory(db, { parentSessionFile: parent, allSessions: params.allSessions ?? false, cwd: context.cwd, roots, preparedRoot: overrides.preparedRoot ?? defaultPreparedMergeRoot() });
+      if (!params.allSessions) cleanupInventoryByParent.set(parent, inventory);
+      const offset = params.offset ?? 0; const limit = params.limit ?? 20;
+      const workers = inventory.workers.slice(offset, offset + limit).map(publicCleanupWorker); const prepared = inventory.prepared.slice(offset, offset + limit); const leftovers = inventory.leftovers.slice(offset, offset + limit);
+      const total = { workers: inventory.workers.length, prepared: inventory.prepared.length, leftovers: inventory.leftovers.length }; const maximum = Math.max(total.workers, total.prepared, total.leftovers);
+      return resultText(`${total.workers} workers · ${total.prepared} prepared sets · ${total.leftovers} leftovers`, { inventory: { workers, prepared, leftovers, total, scan: inventory.scan, generatedAt: inventory.generatedAt, ...(offset + limit < maximum ? { nextOffset: offset + limit } : {}) } });
+    }
     if (params.action === "list") {
       const page = listWorkers(db, { parentSessionFile: parent, status: params.status, role: params.role, limit: params.limit, offset: params.offset }); const counts = countWorkers(db, parent);
-      const workers = page.workers.map((worker) => { const latest = worker.latestRunId ? getWorkerRun(db, worker.workerId, worker.latestRunId) : undefined; const notification = latest ? publicDeliveryNotification(getWorkerDeliveryForRun(db, worker.workerId, latest.runId)) : undefined; return { workerId: worker.workerId, role: worker.role, status: worker.status, ...(worker.activeRunId ? { activeRunId: worker.activeRunId } : {}), ...(latest?.outcome ? { latestResult: { runId: latest.runId, outcome: latest.outcome, outcomeSource: latest.outcomeSource } } : {}), ...(notification ? { notification } : {}), taskIds: worker.taskIds, ...(worker.modelSelection ? { modelSelection: worker.modelSelection } : {}), ...(worker.recoveryError ? { recoveryRequired: true } : {}), lastActivityAt: worker.updatedAt }; });
+      const cached = new Map((cleanupInventoryByParent.get(parent)?.workers ?? []).map((item) => [item.workerId, item]));
+      const workers = page.workers.map((worker) => { const latest = worker.latestRunId ? getWorkerRun(db, worker.workerId, worker.latestRunId) : undefined; const notification = latest ? publicDeliveryNotification(getWorkerDeliveryForRun(db, worker.workerId, latest.runId)) : undefined; const cleanup = cached.get(worker.workerId); return { workerId: worker.workerId, role: worker.role, status: worker.status, ...(worker.activeRunId ? { activeRunId: worker.activeRunId } : {}), ...(latest?.outcome ? { latestResult: { runId: latest.runId, outcome: latest.outcome, outcomeSource: latest.outcomeSource } } : {}), ...(notification ? { notification } : {}), taskIds: worker.taskIds, ...(worker.modelSelection ? { modelSelection: worker.modelSelection } : {}), ...(worker.recoveryError ? { recoveryRequired: true } : {}), ...(cleanup ? { cleanup: { class: cleanup.class, reason: cleanup.reason, unpreservedArtifacts: cleanup.unpreservedArtifacts.slice(0, 4), additionalUnpreservedArtifacts: Math.max(0, cleanup.unpreservedArtifacts.length - 4), pendingPreservations: cleanup.preservations.filter((item) => item.status === "pending").slice(0, 64), additionalPendingPreservations: Math.max(0, cleanup.preservations.filter((item) => item.status === "pending").length - 64) } } : {}), lastActivityAt: worker.updatedAt }; });
+      void refreshCleanupInventory(parent, context.cwd).catch(() => {});
       return resultText(`${page.total} workers · ${counts.running} running, ${counts.queued} queued, ${counts.idle} idle`, { workers, total: page.total, counts, ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset }) });
+    }
+    if (params.action === "preserve") {
+      ownedWorker(params.workerId, parent);
+      const preserved = await preserveWorkerArtifacts(db, roots, runtimeRoot, { workerId: params.workerId, destination: params.destination, ...(params.paths ? { paths: params.paths } : {}), now: now() });
+      return resultText(`preserved · ${preserved.items.length} items · ${params.workerId.slice(-8)}`, { preservation: preserved });
+    }
+    if (params.action === "discard") {
+      const legacyDiscard = "workerId" in params && typeof params.workerId === "string";
+      const workerIds = "workerIds" in params && params.workerIds ? params.workerIds : legacyDiscard ? [params.workerId] : [];
+      const preparedIds = "preparedIds" in params ? params.preparedIds ?? [] : [];
+      if (workerIds.length === 0 && preparedIds.length === 0) throw new Error("Discard requires at least one exact workerId or preparedId.");
+      const planned = workerIds.length ? preflightWorkerDiscard(db, parent, { workerIds, ...("artifactLossAcknowledged" in params && params.artifactLossAcknowledged ? { artifactLossAcknowledged: params.artifactLossAcknowledged } : {}) }) : [];
+      const preparedProblems: string[] = [];
+      for (const preparedId of preparedIds) { const row = db.database.prepare("SELECT status,apply_nonce FROM prepared_sets WHERE prepared_id=? AND parent_session_file=?").get(preparedId, parent) as { status: string; apply_nonce: string | null } | undefined; if (!row) preparedProblems.push(`Unknown prepared set ${preparedId}.`); else if (row.apply_nonce || !["ready","resolution_required","failed","partial","discarding"].includes(row.status)) preparedProblems.push(`Prepared set ${preparedId} cannot be discarded from ${row.status}.`); }
+      if (preparedProblems.length) throw new Error(`Discard preflight failed:\n- ${preparedProblems.join("\n- ")}`);
+      const items: Array<Record<string, unknown>> = [];
+      for (const plan of planned) {
+        try { const current = getWorker(db, plan.worker.workerId); if (!current) throw new Error("worker disappeared after preflight"); const completed = await discardWorker(current); items.push({ kind: "worker", id: current.workerId, status: "discarded", erasedArtifacts: plan.erasedArtifacts, deletedHostLogs: completed.hostLogs }); }
+        catch (error) { items.push({ kind: "worker", id: plan.worker.workerId, status: "failed", reason: sanitizeError(error) }); }
+      }
+      for (const preparedId of preparedIds) {
+        try { const claimed = claimPreparedSetDiscard(db, parent, preparedId, now().toISOString()); finishPreparedSetDiscard(db, overrides.preparedRoot ?? defaultPreparedMergeRoot(), preparedId); items.push({ kind: "prepared", id: preparedId, status: "discarded", ...(claimed.partial ? { warning: "Discarded a partially applied prepared set." } : {}) }); }
+        catch (error) { items.push({ kind: "prepared", id: preparedId, status: "failed", reason: sanitizeError(error) }); }
+      }
+      if (legacyDiscard && items.length === 1 && items[0]?.status === "discarded") return resultText(`discarded · ${workerIds[0]!.slice(-8)}`, { workerId: workerIds[0]!, discarded: true });
+      return resultText(`${items.filter((item) => item.status === "discarded").length}/${items.length} discarded`, { discarded: items });
     }
     const worker = ownedWorker(params.workerId, parent);
     if (params.action === "runs") { const page = listWorkerRuns(db, worker.workerId, params.limit, params.offset); return resultText(`${page.runs.length} retained runs`, { workerId: worker.workerId, runs: page.runs.map(slimRun), total: page.total, ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset }) }); }
-    if (params.action === "get") { const run = getWorkerRun(db, worker.workerId, params.runId); if (!run) throw new Error(`Unknown run ${params.runId} for worker ${worker.workerId}.`); const details = exactRun(worker, run, getWorkerDeliveryForRun(db, worker.workerId, run.runId)); return resultText(`${run.outcome ?? run.status} · ${worker.role} · ${worker.workerId.slice(-8)}`, details); }
-    if (params.action === "cancel") { const cancellation = await cancelWorker(worker); const current = getWorker(db, worker.workerId) ?? worker; return resultText(`${cancellation.replaceAll("_", " ")} · ${worker.workerId.slice(-8)}`, { cancellation, worker: workerListItem(current) }); }
-    await discardWorker(worker); return resultText(`discarded · ${worker.role} · ${worker.workerId.slice(-8)}`, { workerId: worker.workerId, discarded: true });
+    if (params.action === "get") { const run = getWorkerRun(db, worker.workerId, params.runId); if (!run) throw new Error(`Unknown run ${params.runId} for worker ${worker.workerId}.`); const details = exactRun(worker, run, getWorkerDeliveryForRun(db, worker.workerId, run.runId), preservationRecords(db, worker.workerId)); return resultText(`${run.outcome ?? run.status} · ${worker.role} · ${worker.workerId.slice(-8)}`, details); }
+    const cancellation = await cancelWorker(worker); const current = getWorker(db, worker.workerId) ?? worker; return resultText(`${cancellation.replaceAll("_", " ")} · ${worker.workerId.slice(-8)}`, { cancellation, worker: workerListItem(current) });
   }
 
   function warnUnconfirmedCompletionSends(parentSessionFile: string): void {
@@ -1192,7 +1279,42 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     } });
     api.registerCommand("worker:logs", { description: "Open logs for an active/latest or exact retained worker run", handler: async (args, context) => { const [workerId, possibleRun, ...viewer] = args.trim().split(/\s+/).filter(Boolean); if (!workerId) return context.ui.notify("Usage: /worker:logs <workerId> [runId] [viewer options]", "info"); const worker = ownedWorker(workerId, requireParentSession(context)); const hasRun = possibleRun?.startsWith("run_"); const runId = (hasRun ? possibleRun : undefined) ?? worker.activeRunId ?? worker.latestRunId; const run = runId ? getWorkerRun(getRegistry(), workerId, runId) : undefined; if (!run?.jobId) return context.ui.notify("No retained run logs.", "info"); await handleAsyncShellViewerCommand(context, [run.jobId, ...(hasRun ? viewer : [possibleRun, ...viewer].filter(Boolean))].join(" ")); } });
     api.registerCommand("worker:cancel", { description: "Cancel active work while preserving retained state", handler: async (args, context) => { const workerId = args.trim(); if (!workerId) return context.ui.notify("Usage: /worker:cancel <workerId>", "info"); const result = await cancelWorker(ownedWorker(workerId, requireParentSession(context))); context.ui.notify(result === "cancelled" ? `Cancelled ${workerId}.` : result === "accepted_pending" ? `Cancellation accepted for ${workerId}; the current runtime will finish it.` : result === "superseded" ? `Cancellation for ${workerId} was superseded by a terminal result.` : "Worker is not active.", "info"); } });
-    api.registerCommand("worker:discard", { description: "Permanently discard one idle worker; requires --confirm", handler: async (args, context) => { const [workerId, confirm, ...extra] = args.trim().split(/\s+/).filter(Boolean); if (!workerId || confirm !== "--confirm" || extra.length) return context.ui.notify("Usage: /worker:discard <workerId> --confirm", "info"); await discardWorker(ownedWorker(workerId, requireParentSession(context))); context.ui.notify(`Discarded ${workerId}.`, "info"); } });
+    api.registerCommand("worker:discard", { description: "Permanently discard one idle worker; requires --confirm", handler: async (args, context) => { const [workerId, confirm, ...extra] = args.trim().split(/\s+/).filter(Boolean); if (!workerId || confirm !== "--confirm" || extra.length) return context.ui.notify("Usage: /worker:discard <workerId> --confirm", "info"); const parent = requireParentSession(context); const worker = ownedWorker(workerId, parent); preflightWorkerDiscard(getRegistry(), parent, { workerIds: [workerId] }); await discardWorker(worker); context.ui.notify(`Discarded ${workerId}.`, "info"); } });
+    api.registerCommand("worker:cleanup", { description: "Preview or confirm exact Beads-derived worker cleanup", handler: async (args, context) => {
+      const values = args.trim().split(/\s+/).filter(Boolean); const allSessions = values.includes("--all-sessions"); const confirmAt = values.indexOf("--confirm"); const token = confirmAt >= 0 ? values[confirmAt + 1] : undefined;
+      const recognized = new Set(["--all-sessions", "--confirm", ...(token ? [token] : [])]); if (values.some((value) => !recognized.has(value)) || (confirmAt >= 0 && (!token || confirmAt + 2 !== values.length))) return context.ui.notify("Usage: /worker:cleanup [--all-sessions] [--confirm <preview-token>]", "info");
+      const parent = requireParentSession(context); const preview = await buildCleanupPreview(getRegistry(), { parentSessionFile: parent, allSessions, cwd: context.cwd, roots, preparedRoot: overrides.preparedRoot ?? defaultPreparedMergeRoot() });
+      if (!token) return context.ui.notify(formatCleanupPreview(preview), "info");
+      validateCleanupConfirmation(preview, token); const dueWorkers = preview.workers.filter((item) => item.class === "due"); const duePrepared = preview.prepared.filter((item) => item.class === "due"); const eligibleLeftoverCount = preview.leftovers.filter((item) => item.eligible).length;
+      if (dueWorkers.length > 32 || duePrepared.length > 16 || eligibleLeftoverCount > 32) throw new Error("Cleanup snapshot exceeds one bounded batch; use paginated inventory and exact worker_control discard batches.");
+      if (dueWorkers.some((item) => item.unpreservedArtifacts.length > 4)) throw new Error("Cleanup snapshot contains workers with more than four unpreserved artifacts; preserve them or use exact worker_control acknowledgements.");
+      const currentWorkers = dueWorkers.filter((item) => item.ownerSession === parent); const crossWorkers = dueWorkers.filter((item) => item.ownerSession !== parent); const eligibleLeftovers = preview.leftovers.filter((item) => item.eligible);
+      for (const owner of new Set([...crossWorkers.map((item) => item.ownerSession), ...duePrepared.filter((item) => item.ownerSession !== parent).map((item) => item.ownerSession)])) assertOtherSessionInactive(owner, parent);
+      if (crossWorkers.length) preflightWorkerAdoption(getRegistry(), { workerIds: crossWorkers.map((item) => item.workerId), expectedOwners: Object.fromEntries(crossWorkers.map((item) => [item.workerId, item.ownerSession])), acknowledgePending: true });
+      for (const item of duePrepared) { const row = getRegistry().database.prepare("SELECT status,apply_nonce,parent_session_file FROM prepared_sets WHERE prepared_id=?").get(item.preparedId) as { status: string; apply_nonce: string | null; parent_session_file: string } | undefined; if (!row || row.parent_session_file !== item.ownerSession || row.apply_nonce !== null || !["ready","resolution_required","failed"].includes(row.status)) throw new Error(`Prepared set ${item.preparedId} changed after preview.`); }
+      preflightCleanupLeftovers(getRegistry(), eligibleLeftovers, { roots, preparedRoot: overrides.preparedRoot ?? defaultPreparedMergeRoot(), projectCwd: context.cwd });
+      const results: string[] = [];
+      if (currentWorkers.length) { const plans = preflightWorkerDiscard(getRegistry(), parent, { workerIds: currentWorkers.map((item) => item.workerId), artifactLossAcknowledged: currentWorkers.filter((item) => item.unpreservedArtifacts.length).map((item) => item.workerId) }); for (const plan of plans) { await discardWorker(getWorker(getRegistry(), plan.worker.workerId)!); results.push(plan.worker.workerId); } }
+      if (crossWorkers.length) {
+        const nonce = claimNonce(); adoptWorkers(getRegistry(), { workerIds: crossWorkers.map((item) => item.workerId), expectedOwners: Object.fromEntries(crossWorkers.map((item) => [item.workerId, item.ownerSession])), newParentSessionFile: parent, discardNonce: nonce, acknowledgePending: true, now: now().toISOString() });
+        const ordered = crossWorkers.slice().sort((a, b) => (a.role === "review" ? 0 : 1) - (b.role === "review" ? 0 : 1)); for (const item of ordered) { const worker = getWorker(getRegistry(), item.workerId); if (!worker) throw new Error(`Adopted worker ${item.workerId} disappeared.`); await discardWorker(worker, nonce); results.push(item.workerId); }
+      }
+      for (const item of duePrepared) { if (item.ownerSession === parent) claimPreparedSetDiscard(getRegistry(), parent, item.preparedId, now().toISOString()); else { adoptPreparedSetDiscard(getRegistry(), { preparedId: item.preparedId, expectedOwner: item.ownerSession, newParentSessionFile: parent, now: now().toISOString() }); } finishPreparedSetDiscard(getRegistry(), overrides.preparedRoot ?? defaultPreparedMergeRoot(), item.preparedId); results.push(item.preparedId); }
+      deleteCleanupLeftovers(getRegistry(), eligibleLeftovers, { roots, preparedRoot: overrides.preparedRoot ?? defaultPreparedMergeRoot(), projectCwd: context.cwd }); results.push(...eligibleLeftovers.map((item) => item.id));
+      context.ui.notify(`Cleanup discarded ${results.length} exact item${results.length === 1 ? "" : "s"}.`, "info");
+    } });
+    api.registerCommand("worker:adopt", { description: "Preview or confirm guarded adoption of one idle orphan", handler: async (args, context) => {
+      const [workerId, flag, token, abandonment, ...extra] = args.trim().split(/\s+/).filter(Boolean); if (!workerId || extra.length || (flag !== undefined && flag !== "--confirm")) return context.ui.notify("Usage: /worker:adopt <workerId> [--confirm <preview-token> [--abandon-open-tasks]]", "info");
+      const parent = requireParentSession(context); const preview = await buildCleanupPreview(getRegistry(), { parentSessionFile: parent, allSessions: true, cwd: context.cwd, roots, preparedRoot: overrides.preparedRoot ?? defaultPreparedMergeRoot() }); const item = preview.workers.find((candidate) => candidate.workerId === workerId); if (!item || item.ownerSession === parent) throw new Error(`Worker ${workerId} is not an orphan owned by another session.`);
+      if (!["due", "retained", "undelivered"].includes(item.class)) throw new Error(`Worker ${workerId} cannot be adopted while cleanup class is ${item.class}.`);
+      if (!flag) return context.ui.notify(`Adoption hands this session discard authority and may erase open-task work. ${JSON.stringify(item)}\nConfirm with /worker:adopt ${workerId} --confirm ${preview.token}${item.class === "retained" ? " --abandon-open-tasks" : ""}`, "warning");
+      if (!token) throw new Error("Adoption confirmation requires the exact preview token."); validateCleanupConfirmation(preview, token); if (item.class === "retained" && abandonment !== "--abandon-open-tasks") throw new Error("Open-task adoption requires exact --abandon-open-tasks consent."); if (item.class !== "retained" && abandonment !== undefined) throw new Error("Unexpected abandonment acknowledgement.");
+      assertOtherSessionInactive(item.ownerSession, parent); adoptWorkers(getRegistry(), { workerIds: [workerId], expectedOwners: { [workerId]: item.ownerSession }, newParentSessionFile: parent, acknowledgePending: true, now: now().toISOString() }); context.ui.notify(`Adopted ${workerId}. It may only be inspected, preserved, or discarded.`, "warning");
+    } });
+  }
+
+  function assertOtherSessionInactive(owner: string, current: string): void {
+    if (owner === current) return; const generation = currentParentRuntime(getRegistry(), owner); if (!generation) throw new Error(`Cannot prove owner session inactive: ${owner}`); const members = latestParentRuntimeMembers(getRegistry(), owner, 0, generation.generation); if (members.length === 0 || members.some((member) => !member.retired && parentRuntimeMemberLiveness(member) !== "dead")) throw new Error(`Owner session remains live or ambiguous: ${owner}`);
   }
 
   function workerViewTarget(workerId: string, requestedRunId: string | undefined, parent: string): WorkerSessionViewTarget {
@@ -1341,7 +1463,7 @@ function publicDeliveryNotification(delivery: WorkerDeliveryRecord | undefined) 
   if (delivery.sendStartedAt && delivery.state !== "delivered") return { state: "send_started_unconfirmed" as const, runId: delivery.runId, ...(delivery.runtimeGeneration === undefined ? {} : { runtimeGeneration: delivery.runtimeGeneration }), sendStartedAt: delivery.sendStartedAt };
   return { state: delivery.state, runId: delivery.runId, ...(delivery.runtimeGeneration === undefined ? {} : { runtimeGeneration: delivery.runtimeGeneration }), ...(delivery.deliveredAt ? { deliveredAt: delivery.deliveredAt } : {}) };
 }
-function exactRun(worker: WorkerRegistryRecord, run: WorkerRunRecord, delivery?: WorkerDeliveryRecord) { const notification = publicDeliveryNotification(delivery); return { workerId: worker.workerId, role: worker.role, runId: run.runId, status: run.status, taskIds: run.taskIds, ...(run.modelSelection ? { modelSelection: run.modelSelection } : {}), createdAt: run.createdAt, ...(run.startedAt ? { startedAt: run.startedAt } : {}), ...(run.settledAt ? { settledAt: run.settledAt } : {}), ...(run.jobId ? { jobId: run.jobId } : {}), ...(run.stdoutLog ? { stdoutLog: run.stdoutLog } : {}), ...(run.stderrLog ? { stderrLog: run.stderrLog } : {}), ...(worker.sessionId ? { sessionId: worker.sessionId } : {}), ...(worker.sessionFile ? { sessionFile: worker.sessionFile } : {}), sessionRange: { ...(run.sessionStartLine === undefined ? {} : { startLine: run.sessionStartLine }), ...(run.sessionEndLine === undefined ? {} : { endLine: run.sessionEndLine }) }, workspaceRoot: worker.workspaceRoot, ...(run.binding ? { binding: run.binding } : {}), ...(worker.recoveryError ? { recoveryError: worker.recoveryError } : {}), ...((run.runtime as RunRuntime | undefined)?.interruptionWarnings?.length ? { warnings: (run.runtime as RunRuntime).interruptionWarnings } : {}), ...(run.status === "settled" ? { outcome: run.outcome, outcomeSource: run.outcomeSource, ...(notification ? { notification } : {}), ...(run.summary ? { summary: run.summary } : {}), ...(run.question ? { question: run.question } : {}), repositories: run.repositories.map(({ path: relativePath, commit, source, reported, changed, dirty, eligible, issues }) => ({ repositoryPath: path.join(worker.workspaceRoot, relativePath), commit, ...(source ? { source } : {}), reported, changed, dirty, eligible, ...(issues ? { issues } : {}) })), artifacts: run.artifacts, errors: run.errors } : {}) }; }
+function exactRun(worker: WorkerRegistryRecord, run: WorkerRunRecord, delivery?: WorkerDeliveryRecord, preservations: ReturnType<typeof preservationRecords> = []) { const notification = publicDeliveryNotification(delivery); return { workerId: worker.workerId, role: worker.role, runId: run.runId, status: run.status, taskIds: run.taskIds, ...(run.modelSelection ? { modelSelection: run.modelSelection } : {}), createdAt: run.createdAt, ...(run.startedAt ? { startedAt: run.startedAt } : {}), ...(run.settledAt ? { settledAt: run.settledAt } : {}), ...(run.jobId ? { jobId: run.jobId } : {}), ...(run.stdoutLog ? { stdoutLog: run.stdoutLog } : {}), ...(run.stderrLog ? { stderrLog: run.stderrLog } : {}), ...(worker.sessionId ? { sessionId: worker.sessionId } : {}), ...(worker.sessionFile ? { sessionFile: worker.sessionFile } : {}), sessionRange: { ...(run.sessionStartLine === undefined ? {} : { startLine: run.sessionStartLine }), ...(run.sessionEndLine === undefined ? {} : { endLine: run.sessionEndLine }) }, workspaceRoot: worker.workspaceRoot, ...(run.binding ? { binding: run.binding } : {}), ...(worker.recoveryError ? { recoveryError: worker.recoveryError } : {}), ...(preservations.length ? { preservations } : {}), ...((run.runtime as RunRuntime | undefined)?.interruptionWarnings?.length ? { warnings: (run.runtime as RunRuntime).interruptionWarnings } : {}), ...(run.status === "settled" ? { outcome: run.outcome, outcomeSource: run.outcomeSource, ...(notification ? { notification } : {}), ...(run.summary ? { summary: run.summary } : {}), ...(run.question ? { question: run.question } : {}), repositories: run.repositories.map(({ path: relativePath, commit, source, reported, changed, dirty, eligible, issues }) => ({ repositoryPath: path.join(worker.workspaceRoot, relativePath), commit, ...(source ? { source } : {}), reported, changed, dirty, eligible, ...(issues ? { issues } : {}) })), artifacts: run.artifacts, errors: run.errors } : {}) }; }
 function compactWorkerList(value: any): string { const workers = Array.isArray(value?.workers) ? value.workers : []; return workers.length ? workers.map((worker: any) => `${worker.status} · ${worker.role} · ${worker.workerId}${worker.notification?.state === "send_started_unconfirmed" ? ` · send_started_unconfirmed · ${worker.notification.runId}` : ""}`).join("\n") : "No workers."; }
 function formatExactRun(value: any): string { return `${value.outcome ?? value.status} · ${value.role} · ${value.workerId}\nrun ${value.runId}\n${value.taskIds?.length ?? 0} tasks · ${value.repositories?.length ?? 0} repositories · ${value.artifacts?.length ?? 0} artifacts${value.notification?.state === "send_started_unconfirmed" ? "\nnotification: send_started_unconfirmed; it will not be replayed automatically" : ""}${value.recoveryError ? `\nrecovery: ${value.recoveryError}` : ""}`; }
 function boundedWorkerText(theme: any, text: string, color: string, bold: boolean, maximumWidth: number): Component {
@@ -1548,6 +1670,19 @@ function runCallLabel(input: unknown): string {
     return "Run Workers";
   } catch { return "Run Workers"; }
 }
+function publicCleanupWorker(item: import("./cleanup.js").CleanupWorkerItem) {
+  const pendingPreservations = item.preservations.filter((record) => record.status === "pending");
+  return { workerId: item.workerId, ownerSession: item.ownerSession, role: item.role, class: item.class, reason: item.reason, taskIds: item.taskIds, unpreservedArtifacts: item.unpreservedArtifacts.slice(0, 4), additionalUnpreservedArtifacts: Math.max(0, item.unpreservedArtifacts.length - 4), pendingResults: item.pendingResults.slice(0, 4), additionalPendingResults: Math.max(0, item.pendingResults.length - 4), pendingPreservations: pendingPreservations.slice(0, 4), additionalPendingPreservations: Math.max(0, pendingPreservations.length - 4), ...(item.after ? { after: item.after } : {}), ...(item.recoveryError ? { recoveryError: item.recoveryError } : {}) };
+}
+
+function formatCleanupPreview(preview: import("./cleanup.js").CleanupPreview): string {
+  const dueWorkers = preview.workers.filter((item) => item.class === "due"); const duePrepared = preview.prepared.filter((item) => item.class === "due");
+  const attention = preview.workers.filter((item) => ["recovery", "unknown:task_missing"].includes(item.class)).length + preview.prepared.filter((item) => ["partial", "explicit_decision"].includes(item.class)).length + preview.leftovers.length;
+  const workers = [...dueWorkers, ...preview.workers.filter((item) => item.class !== "due")].slice(0, 32).map(publicCleanupWorker); const prepared = [...duePrepared, ...preview.prepared.filter((item) => item.class !== "due")].slice(0, 16); const leftovers = preview.leftovers.slice(0, 32);
+  return `Cleanup preview ${preview.token}: ${dueWorkers.length} due workers, ${duePrepared.length} due prepared sets, ${attention} attention items. No deletion has occurred. Confirm this exact snapshot with /worker:cleanup${preview.allSessions ? " --all-sessions" : ""} --confirm ${preview.token}.
+${JSON.stringify({ workers, additionalWorkers: Math.max(0, preview.workers.length - workers.length), prepared, additionalPrepared: Math.max(0, preview.prepared.length - prepared.length), leftovers, additionalLeftovers: Math.max(0, preview.leftovers.length - leftovers.length), partial: preview.scan.partial })}`;
+}
+
 function workerControlCallLabel(input: unknown): string {
   try { return `worker ${recordValue(input) && typeof input.action === "string" ? sanitizeWorkerOperationText(input.action) || "control" : "control"}`; }
   catch { return "worker control"; }

@@ -7,3 +7,4 @@
 - Prioritize correctness, missed requirements, regressions, safety, portability, tests, and unnecessary complexity. Distinguish verified facts from gaps and avoid low-value nits.
 - Do not implement fixes, commit reviewed changes, push, publish, apply merges, mutate Beads tasks, or authorize acceptance or release.
 - Write the retained review report in the review worker’s own workspace, then return through `worker_result_submit` with a concise summary and the report’s artifact path.
+Before submitting a result, remove temporary clones, reproducible build/test environments, caches, and other disposable debris. Keep clean committed repositories, required reports, declared artifacts, and evidence needed for review or resume.

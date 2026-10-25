@@ -131,6 +131,11 @@ async function complete(f: Fixture, item: { workerId: string; runId: string }, r
   launch.resolve(job(launch.record.jobId, "exited", 0));
   await waitFor(() => { const side = f.registry(); const run = getWorkerRun(side, item.workerId, item.runId); side.close(); return run?.status === "settled"; });
 }
+async function acknowledgeWorkerDeliveries(f: Fixture, workerId: string): Promise<void> {
+  for (const attempted of f.messageAttempts.filter((message) => message.details?.workerId === workerId)) {
+    await f.event("message_end", { message: { role: "custom", customType: "worker-run", content: attempted.content, display: true, details: attempted.details, timestamp: Date.now() } });
+  }
+}
 
 test("worker_run returns complete provider-visible identities and defers Docker creation until turn_end", async () => {
   const f = await fixture(); try {
@@ -662,6 +667,7 @@ test("queued cancellation system-settles once, never launches, then discards wit
     assert.equal((cancelled.details as any).cancellation, "cancelled"); await f.event("turn_end"); assert.equal(f.launches.length, 0);
     const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; assert.equal(run.outcome, "cancelled"); assert.equal(run.outcomeSource, "system"); assert.equal(getWorker(db, started.workerId)!.status, "idle"); db.close();
     assert.equal(f.messages.filter((message) => message.details?.event === "worker_settled").length, 1);
+    await acknowledgeWorkerDeliveries(f, started.workerId);
     await f.call("worker_control", { action: "discard", workerId: started.workerId }); const after = f.registry(); assert.equal(getWorker(after, started.workerId), undefined); after.close(); assert.equal(existsSync(path.join(f.workersRoot, started.workerId)), false);
   } finally { await f.close(); }
 });
@@ -982,7 +988,7 @@ test("review starts fresh, mounts exact subject session range, cancellation rele
     assert.equal(f.cleaned[0]!.mergedVolume, runtime.overlay.mergedVolume, "cleanup must target the exact run overlay identity");
     assert.equal(f.cleanupLeaseOwners[0], review.workerId, "overlay cleanup must occur before finalization releases the exact review lease");
     const resumed = receipt(await f.call("worker_run", { runs: [{ action: "resume", workerId: review.workerId, instructions: "continue" }] })); await f.event("turn_end"); db = f.registry(); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, review.workerId); const resumedRuntime = getWorkerRun(db, review.workerId, resumed.runId)!.runtime as any; assert.notEqual(resumedRuntime.overlay.mergedVolume, runtime.overlay.mergedVolume); assert.equal((getWorker(db, review.workerId)!.runtime?.inputs as any[]).length, 1); db.close();
-    await f.call("worker_control", { action: "cancel", workerId: review.workerId }); await f.call("worker_control", { action: "discard", workerId: review.workerId }); db = f.registry(); assert.equal(getWorker(db, review.workerId), undefined); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, undefined); db.close();
+    await f.call("worker_control", { action: "cancel", workerId: review.workerId }); await acknowledgeWorkerDeliveries(f, review.workerId); await f.call("worker_control", { action: "discard", workerIds: [review.workerId], artifactLossAcknowledged: [review.workerId] }); db = f.registry(); assert.equal(getWorker(db, review.workerId), undefined); assert.equal(getWorker(db, subject.workerId)!.reviewedByWorkerId, undefined); db.close();
   } finally { await f.close(); }
 });
 
@@ -1050,7 +1056,7 @@ test("integration starts fresh, resumes with retained context, and exposes its c
     assert.equal(updated.additionalInputs.length, 2); assert.equal(existsSync(movedRepo), true); assert.equal(runtime.container.mounts.some((mount: any) => mount.target === "/integration/context.json"), true); assert.equal((worker.runtime?.inputs as any[]).length, 2); db.close();
     await f.event("turn_end"); await complete(f, resumed);
     const review = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "review", reviewedRunId: resumed.runId }] })); db = f.registry(); assert.equal(getWorker(db, review.workerId)!.modelSelection, "anthropic/claude-opus-5-5:xhigh"); assert.deepEqual(getWorkerRun(db, review.workerId, review.runId)!.binding, { reviewedWorkerId: resumed.workerId, reviewedRunId: resumed.runId }); db.close();
-    await f.call("worker_control", { action: "cancel", workerId: review.workerId }); await f.call("worker_control", { action: "discard", workerId: review.workerId }); await f.call("worker_control", { action: "discard", workerId: resumed.workerId }); db = f.registry(); assert.equal(getWorker(db, resumed.workerId), undefined); const retainedPrepared = db.database.prepare("SELECT prepared_id FROM prepared_sets WHERE prepared_id=?").get(prepared.preparedId); assert.equal(retainedPrepared, undefined); db.close();
+    await f.call("worker_control", { action: "cancel", workerId: review.workerId }); await acknowledgeWorkerDeliveries(f, review.workerId); await acknowledgeWorkerDeliveries(f, resumed.workerId); await f.call("worker_control", { action: "discard", workerIds: [review.workerId], artifactLossAcknowledged: [review.workerId] }); await f.call("worker_control", { action: "discard", workerIds: [resumed.workerId], artifactLossAcknowledged: [resumed.workerId] }); db = f.registry(); assert.equal(getWorker(db, resumed.workerId), undefined); const retainedPrepared = db.database.prepare("SELECT prepared_id FROM prepared_sets WHERE prepared_id=?").get(prepared.preparedId); assert.equal(retainedPrepared, undefined); db.close();
   } finally { await f.close(); }
 });
 
@@ -1137,7 +1143,7 @@ test("worker commands exercise compact list/show and exact cancel/discard lifecy
     const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "command probe" }] }));
     await f.commands.get("worker:list").handler("", f.context); assert.match(f.notifications.at(-1)!, /queued · work/); assert.doesNotMatch(f.notifications.at(-1)!, /send_started_unconfirmed|^\{/);
     await f.commands.get("worker:show").handler(`${started.workerId} ${started.runId}`, f.context); assert.match(f.notifications.at(-1)!, new RegExp(started.runId));
-    await f.commands.get("worker:cancel").handler(started.workerId, f.context); assert.match(f.notifications.at(-1)!, /Cancelled/);
+    await f.commands.get("worker:cancel").handler(started.workerId, f.context); assert.match(f.notifications.at(-1)!, /Cancelled/); await acknowledgeWorkerDeliveries(f, started.workerId);
     await f.commands.get("worker:discard").handler(`${started.workerId} --confirm`, f.context); assert.match(f.notifications.at(-1)!, /Discarded/);
   } finally { await f.close(); }
 });

@@ -600,7 +600,7 @@ function evaluateToolCall(event: ToolCallEvent, context: ExtensionContext): Safe
   }
 
   if (toolName === "worker_control") {
-    return evaluateWorkerControl(input);
+    return evaluateWorkerControl(input, context);
   }
 
   if (toolName === "worker_merge_test" || toolName === "worker_merge_apply") {
@@ -660,24 +660,32 @@ function evaluateToolCall(event: ToolCallEvent, context: ExtensionContext): Safe
   };
 }
 
-export function evaluateWorkerControl(input: unknown): SafetyDecision {
+export function evaluateWorkerControl(input: unknown, context?: ExtensionContext): SafetyDecision {
   if (!isRecord(input) || typeof input.action !== "string") return workerShapeReview("Malformed worker_control input requires review.");
-  const action = input.action;
-  const keys = new Set(Object.keys(input));
+  const action = input.action; const keys = new Set(Object.keys(input));
   const exactKeys = (allowed: string[]) => [...keys].every((key) => allowed.includes(key));
-  const page = (input.limit === undefined || (Number.isInteger(input.limit) && Number(input.limit) >= 1 && Number(input.limit) <= 100))
-    && (input.offset === undefined || (Number.isInteger(input.offset) && Number(input.offset) >= 0));
-  const valid = action === "list"
-    ? exactKeys(["action", "status", "role", "limit", "offset"]) && page
-      && (input.status === undefined || ["idle", "queued", "running"].includes(String(input.status)))
-      && (input.role === undefined || ["work", "review", "integration"].includes(String(input.role)))
-    : action === "runs"
-      ? exactKeys(["action", "workerId", "limit", "offset"]) && isWorkerId(input.workerId) && page
-      : action === "get"
-        ? exactKeys(["action", "workerId", "runId"]) && isWorkerId(input.workerId) && typeof input.runId === "string" && /^run_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(input.runId)
-        : action === "cancel" || action === "discard"
-          ? exactKeys(["action", "workerId"]) && isWorkerId(input.workerId)
-          : false;
+  const uniqueStrings = (value: unknown, minimum: number, maximum: number, valid: (item: string) => boolean) => Array.isArray(value) && value.length >= minimum && value.length <= maximum && new Set(value).size === value.length && value.every((item) => typeof item === "string" && valid(item));
+  const page = (input.limit === undefined || (Number.isInteger(input.limit) && Number(input.limit) >= 1 && Number(input.limit) <= 100)) && (input.offset === undefined || (Number.isInteger(input.offset) && Number(input.offset) >= 0));
+  let valid = false;
+  if (action === "list") valid = exactKeys(["action", "status", "role", "limit", "offset"]) && page && (input.status === undefined || ["idle", "queued", "running"].includes(String(input.status))) && (input.role === undefined || ["work", "review", "integration"].includes(String(input.role)));
+  else if (action === "runs") valid = exactKeys(["action", "workerId", "limit", "offset"]) && isWorkerId(input.workerId) && page;
+  else if (action === "get") valid = exactKeys(["action", "workerId", "runId"]) && isWorkerId(input.workerId) && typeof input.runId === "string" && /^run_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(input.runId);
+  else if (action === "cancel") valid = exactKeys(["action", "workerId"]) && isWorkerId(input.workerId);
+  else if (action === "inventory") valid = exactKeys(["action", "allSessions", "limit", "offset"]) && page && (input.allSessions === undefined || typeof input.allSessions === "boolean");
+  else if (action === "preserve") {
+    valid = exactKeys(["action", "workerId", "destination", "paths"]) && isWorkerId(input.workerId) && typeof input.destination === "string" && path.isAbsolute(input.destination) && Buffer.byteLength(input.destination) <= 4096 && (input.paths === undefined || uniqueStrings(input.paths, 1, 32, (item) => Buffer.byteLength(item) <= 4096));
+    if (!valid || !context) return workerShapeReview("Malformed worker_control preserve action or missing path context requires review.");
+    return classifyPath(input.destination as string, context);
+  } else if (action === "discard") {
+    const legacy = exactKeys(["action", "workerId"]) && isWorkerId(input.workerId);
+    const workerIds = input.workerIds === undefined || uniqueStrings(input.workerIds, 1, 32, isWorkerId);
+    const preparedIds = input.preparedIds === undefined || uniqueStrings(input.preparedIds, 1, 16, (item) => /^prepared_[0-9a-f]{24}$/.test(item));
+    const acknowledgements = input.artifactLossAcknowledged === undefined || uniqueStrings(input.artifactLossAcknowledged, 1, 32, isWorkerId);
+    const selectedWorkerIds = Array.isArray(input.workerIds) ? input.workerIds as unknown[] : undefined;
+    const acknowledgedWorkerIds = Array.isArray(input.artifactLossAcknowledged) ? input.artifactLossAcknowledged as unknown[] : undefined;
+    const exactBatch = exactKeys(["action", "workerIds", "preparedIds", "artifactLossAcknowledged"]) && workerIds && preparedIds && acknowledgements && (selectedWorkerIds !== undefined || Array.isArray(input.preparedIds)) && (acknowledgedWorkerIds === undefined || (selectedWorkerIds !== undefined && acknowledgedWorkerIds.every((item) => selectedWorkerIds.includes(item))));
+    valid = legacy || exactBatch;
+  }
   if (!valid) return workerShapeReview("Unsupported or malformed worker_control action requires review.");
   return { action: "allow", risk: action === "discard" ? "medium" : "low", reason: `Valid exact-session worker_control ${action} uses the trusted lifecycle implementation.`, ruleId: `worker-control-${action}`, tags: ["worker", "lifecycle"] };
 }

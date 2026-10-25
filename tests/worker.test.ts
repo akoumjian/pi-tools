@@ -40,8 +40,11 @@ test("worker_run schema exposes orthogonal action and role branches", () => {
 });
 
 test("worker_control and merge schemas use only v2 actions", () => {
-  for (const value of [{ action: "list" }, { action: "runs", workerId: "worker_20260101000000_aaaaaaaa" }, { action: "get", workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_aaaaaaaa" }, { action: "cancel", workerId: "worker_20260101000000_aaaaaaaa" }, { action: "discard", workerId: "worker_20260101000000_aaaaaaaa" }]) assert.equal(Check(WorkerControlParams, value), true);
+  for (const value of [{ action: "list" }, { action: "runs", workerId: "worker_20260101000000_aaaaaaaa" }, { action: "get", workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_aaaaaaaa" }, { action: "cancel", workerId: "worker_20260101000000_aaaaaaaa" }, { action: "discard", workerId: "worker_20260101000000_aaaaaaaa" }, { action: "discard", workerIds: ["worker_20260101000000_aaaaaaaa"], artifactLossAcknowledged: ["worker_20260101000000_aaaaaaaa"] }, { action: "preserve", workerId: "worker_20260101000000_aaaaaaaa", destination: "/tmp/archive", paths: ["artifacts/report.md"] }, { action: "inventory", allSessions: true }]) assert.equal(Check(WorkerControlParams, value), true);
   assert.equal(Check(WorkerControlParams, { action: "status" }), false);
+  assert.equal(Check(WorkerControlParams, { action: "discard", workerIds: ["worker_20260101000000_aaaaaaaa"], artifactLossAcknowledged: ["worker_20260101000000_bbbbbbbb"] }), true, "schema validates shape; runtime and tool-safety enforce acknowledgement subset");
+  assert.equal(Check(WorkerControlParams, { action: "discard" }), false);
+  assert.equal(Check(WorkerControlParams, { action: "preserve", workerId: "worker_20260101000000_aaaaaaaa", destination: "relative" }), false);
   assert.equal(Check(WorkerMergeTestParams, { repositories: [{ id: "repo", candidateRepo: "/candidate", candidateRef: "HEAD", targetRepo: "/target", targetRef: "refs/heads/main", method: "merge", commitMessage: "Merge" }] }), true);
   assert.equal(Check(WorkerMergeApplyParams, { preparedId: `prepared_${"b".repeat(24)}` }), true);
 });
@@ -67,7 +70,7 @@ test("parent extension exposes only the v2 worker tool and command surface", asy
   } as never;
   registerWorkerExtension(api);
   assert.deepEqual(tools.sort(), ["worker_control", "worker_merge_apply", "worker_merge_test", "worker_run"]);
-  assert.deepEqual(commands.sort(), ["worker:cancel", "worker:discard", "worker:list", "worker:logs", "worker:show", "worker:view"]);
+  assert.deepEqual(commands.sort(), ["worker:adopt", "worker:cancel", "worker:cleanup", "worker:discard", "worker:list", "worker:logs", "worker:show", "worker:view"]);
 });
 
 
@@ -103,7 +106,7 @@ test("parent tool labels and approved copy remain exact and schemas carry field 
   registerWorkerExtension({ registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, on() {}, sendMessage() {} } as unknown as ExtensionAPI);
   const run = tools.find((tool) => tool.name === "worker_run")!; const control = tools.find((tool) => tool.name === "worker_control")!; const apply = tools.find((tool) => tool.name === "worker_merge_apply")!;
   assert.equal(run.label, "Run Workers"); assert.equal(run.promptSnippet, "Start work, review, or integration workers, or resume previous workers."); assert.match(run.description, /Each new worker receives its role-specific inputs/);
-  assert.equal(control.label, "Manage Workers"); assert.equal(control.description, "List and manage durable workers owned by the current parent session. Use `list` for compact worker discovery, `runs` to list one worker’s execution history, and `get` to inspect one exact active or settled run, including logs, session and workspace access, and submitted repository or artifact outputs. Use `cancel` to stop active work while preserving retained state. Use `discard` to permanently delete an idle worker and all retained state.");
+  assert.equal(control.label, "Manage Workers"); assert.equal(control.description, "List and manage durable workers. Use `list`, `runs`, and `get` for retained lifecycle evidence; `inventory` for bounded Beads-derived cleanup classes; `preserve` for explicit atomic non-Git artifact copies; `cancel` to stop active work; and exact batched `discard` for idle current-session workers or prepared sets after complete preflight.");
   assert.equal(apply.label, "Apply Prepared Repository Merges"); assert.match(apply.description, /Applying multiple repositories is not atomic/);
   const schemaText = JSON.stringify(WorkerRunParams); for (const phrase of ["Continue a previous worker", "One or more Beads task IDs", "Additional files or directories", "When to deliver the asynchronous result"]) assert.match(schemaText, new RegExp(phrase));
   const controlGuidance = JSON.stringify(control.promptGuidelines); for (const phrase of ["notification", "send_started_unconfirmed", "delivered", "runtimeGeneration", "sendStartedAt"]) assert.match(controlGuidance, new RegExp(phrase), `provider-visible worker_control output guidance includes ${phrase}`);

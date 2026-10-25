@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import type { DatabaseSync as SQLiteDatabaseSync, SQLInputValue } from "node:sqlite";
 
-export const WORKER_REGISTRY_SCHEMA_VERSION = 5;
+export const WORKER_REGISTRY_SCHEMA_VERSION = 6;
 export const DEFAULT_WORKER_RUNTIME_ROOT = path.join(homedir(), ".local", "share", "agent", "worker-runtime");
 
 export type WorkerRole = "work" | "review" | "integration";
@@ -235,10 +235,25 @@ CREATE TABLE IF NOT EXISTS prepared_sets (
   status TEXT NOT NULL,
   order_json TEXT NOT NULL,
   warnings_json TEXT NOT NULL DEFAULT '[]',
+  task_ids_json TEXT NOT NULL DEFAULT '[]',
   apply_nonce TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 ) STRICT;
+CREATE TABLE IF NOT EXISTS preservation_records (
+  preservation_id TEXT PRIMARY KEY,
+  worker_id TEXT NOT NULL REFERENCES workers(worker_id) ON DELETE CASCADE,
+  status TEXT NOT NULL CHECK (status IN ('pending','published','failed')),
+  destination TEXT NOT NULL,
+  temp_path TEXT NOT NULL,
+  latest_run_id TEXT,
+  items_json TEXT NOT NULL,
+  manifest_json TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS preservation_records_worker ON preservation_records(worker_id, created_at DESC);
 CREATE TABLE IF NOT EXISTS prepared_repositories (
   prepared_id TEXT NOT NULL REFERENCES prepared_sets(prepared_id) ON DELETE CASCADE,
   repository_id TEXT NOT NULL,
@@ -318,6 +333,14 @@ function migrateWorkerRegistry(database: SQLiteDatabaseSync, fromVersion: number
       // may already have been attempted or accepted. Conservatively classify it
       // as unconfirmed rather than replaying a possible duplicate.
       database.exec("UPDATE deliveries SET send_started_at=COALESCE(delivered_at,created_at) WHERE state='claimed' AND send_started_at IS NULL");
+    },
+    5: () => {
+      addColumnIfMissing(database, "prepared_sets", "task_ids_json", "TEXT NOT NULL DEFAULT '[]'");
+      database.exec(`CREATE TABLE IF NOT EXISTS preservation_records (
+        preservation_id TEXT PRIMARY KEY, worker_id TEXT NOT NULL REFERENCES workers(worker_id) ON DELETE CASCADE,
+        status TEXT NOT NULL CHECK (status IN ('pending','published','failed')), destination TEXT NOT NULL, temp_path TEXT NOT NULL,
+        latest_run_id TEXT, items_json TEXT NOT NULL, manifest_json TEXT, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      ) STRICT; CREATE INDEX IF NOT EXISTS preservation_records_worker ON preservation_records(worker_id, created_at DESC)`);
     }
   };
   for (let version = fromVersion; version < WORKER_REGISTRY_SCHEMA_VERSION; version += 1) {
@@ -479,6 +502,14 @@ export function listWorkers(registry: WorkerRegistry, input: { parentSessionFile
   const where = predicates.join(" AND ");
   const total = Number((registry.database.prepare(`SELECT COUNT(*) AS count FROM workers WHERE ${where}`).get(...values) as { count: number }).count);
   const rows = registry.database.prepare(`SELECT * FROM workers WHERE ${where} ORDER BY updated_at DESC,worker_id DESC LIMIT ? OFFSET ?`).all(...values, limit, offset) as unknown as WorkerRow[];
+  return { workers: rows.map(decodeWorker), total, ...(offset + rows.length < total ? { nextOffset: offset + rows.length } : {}) };
+}
+
+export function listAllWorkers(registry: WorkerRegistry, limitInput = 100, offsetInput = 0): { workers: WorkerRegistryRecord[]; total: number; nextOffset?: number } {
+  const limit = Math.min(1000, Math.max(1, limitInput));
+  const offset = Math.max(0, offsetInput);
+  const total = Number((registry.database.prepare("SELECT COUNT(*) AS count FROM workers").get() as { count: number }).count);
+  const rows = registry.database.prepare("SELECT * FROM workers ORDER BY parent_session_file,updated_at DESC,worker_id LIMIT ? OFFSET ?").all(limit, offset) as unknown as WorkerRow[];
   return { workers: rows.map(decodeWorker), total, ...(offset + rows.length < total ? { nextOffset: offset + rows.length } : {}) };
 }
 
@@ -683,23 +714,23 @@ export function updateWorkerRunSessionRange(registry: WorkerRegistry, workerId: 
   });
 }
 
-export function storePreparedSet(registry: WorkerRegistry, input: { preparedId: string; parentSessionFile: string; status: string; order: string[]; warnings?: string[]; repositories: Array<{ id: string } & Record<string, unknown>>; createdAt: string }): void {
+export function storePreparedSet(registry: WorkerRegistry, input: { preparedId: string; parentSessionFile: string; status: string; order: string[]; warnings?: string[]; taskIds?: string[]; repositories: Array<{ id: string } & Record<string, unknown>>; createdAt: string }): void {
   transaction(registry, () => {
-    registry.database.prepare("INSERT INTO prepared_sets(prepared_id,parent_session_file,status,order_json,warnings_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
-      .run(input.preparedId, canonicalSessionFile(input.parentSessionFile), input.status, json(input.order), json(input.warnings ?? []), input.createdAt, input.createdAt);
+    registry.database.prepare("INSERT INTO prepared_sets(prepared_id,parent_session_file,status,order_json,warnings_json,task_ids_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+      .run(input.preparedId, canonicalSessionFile(input.parentSessionFile), input.status, json(input.order), json(input.warnings ?? []), json(input.taskIds ?? []), input.createdAt, input.createdAt);
     const insert = registry.database.prepare("INSERT INTO prepared_repositories(prepared_id,repository_id,record_json) VALUES(?,?,?)");
     for (const repository of input.repositories) insert.run(input.preparedId, repository.id, json(repository));
   });
 }
 
-export type TrustedPreparedSetRecord = { version: 1; preparedId: string; parentSessionFile: string; status: "ready" | "resolution_required" | "consumed" | "completed" | "partial" | "failed" | "superseded"; order: string[]; repositories: Array<{ id: string } & Record<string, any>>; createdAt: string };
+export type TrustedPreparedSetRecord = { version: 1; preparedId: string; parentSessionFile: string; status: "ready" | "resolution_required" | "consumed" | "completed" | "partial" | "failed" | "superseded" | "discarding"; order: string[]; repositories: Array<{ id: string } & Record<string, any>>; taskIds: string[]; createdAt: string };
 
 export function readPreparedSetRecord(registry: WorkerRegistry, parentSessionFile: string, preparedId: string): TrustedPreparedSetRecord {
   return transaction(registry, () => {
-    const set = registry.database.prepare("SELECT prepared_id,parent_session_file,status,order_json,created_at FROM prepared_sets WHERE prepared_id=? AND parent_session_file=?").get(preparedId, canonicalSessionFile(parentSessionFile)) as { prepared_id: string; parent_session_file: string; status: TrustedPreparedSetRecord["status"]; order_json: string; created_at: string } | undefined;
+    const set = registry.database.prepare("SELECT prepared_id,parent_session_file,status,order_json,task_ids_json,created_at FROM prepared_sets WHERE prepared_id=? AND parent_session_file=?").get(preparedId, canonicalSessionFile(parentSessionFile)) as { prepared_id: string; parent_session_file: string; status: TrustedPreparedSetRecord["status"]; order_json: string; task_ids_json: string; created_at: string } | undefined;
     if (!set) throw new Error(`Unknown prepared set ${preparedId}.`);
     const rows = registry.database.prepare("SELECT record_json FROM prepared_repositories WHERE prepared_id=? ORDER BY repository_id").all(preparedId) as Array<{ record_json: string }>;
-    return { version: 1, preparedId: set.prepared_id, parentSessionFile: set.parent_session_file, status: set.status, order: parseJson<string[]>(set.order_json), repositories: rows.map((row) => parseJson<any>(row.record_json)), createdAt: set.created_at };
+    return { version: 1, preparedId: set.prepared_id, parentSessionFile: set.parent_session_file, status: set.status, order: parseJson<string[]>(set.order_json), taskIds: parseJson<string[]>(set.task_ids_json), repositories: rows.map((row) => parseJson<any>(row.record_json)), createdAt: set.created_at };
   });
 }
 

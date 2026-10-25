@@ -394,3 +394,18 @@ test("conditional output variants preserve runtime-only boundaries", () => {
     }
   }), true, "document_parse accepts optional screenshot and warning handoffs");
 });
+
+test("worker_control cleanup inventory output is strict, bounded, and continuation-aware", () => {
+  const value = {
+    content: [{ type: "text", text: "1 workers · 1 prepared sets · 1 leftovers" }],
+    details: { inventory: {
+      workers: [{ workerId: "worker_20261025100002_aaaaaaaa", ownerSession: "/parent.jsonl", role: "work", class: "due", reason: "All assigned tasks are closed.", taskIds: ["personal-test"], unpreservedArtifacts: ["artifacts/report.md"], additionalUnpreservedArtifacts: 0, pendingResults: [], additionalPendingResults: 0, pendingPreservations: [], additionalPendingPreservations: 0 }],
+      prepared: [{ preparedId: "prepared_aaaaaaaaaaaaaaaaaaaaaaaa", ownerSession: "/parent.jsonl", status: "ready", class: "due", taskIds: ["personal-test"], reason: "All inherited tasks are closed." }],
+      leftovers: [{ kind: "worker_host_log", id: "job_20261023100002_aaaaaaaa", path: "/project/.pi/async-shell/jobs/job_20261023100002_aaaaaaaa", eligible: true, reason: "passed", device: 1, inode: 2 }],
+      total: { workers: 1, prepared: 1, leftovers: 1 }, scan: { partial: false, examinedWorkers: 1, totalWorkers: 1, examinedFilesystemEntries: 1 }, generatedAt: "2026-10-25T10:00:02.000Z", nextOffset: 20
+    } }
+  };
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, value), true);
+  const malformed = structuredClone(value) as any; malformed.details.inventory.workers[0].rawSummary = "untrusted";
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, malformed), false);
+});

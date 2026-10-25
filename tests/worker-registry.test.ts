@@ -311,7 +311,7 @@ test("registry applies an ordered idempotent v2 migration while mixed live opene
     migrated = openWorkerRegistry(root);
     const version = migrated.database.prepare("SELECT value FROM registry_meta WHERE key='schema_version'").get() as { value: string };
     const columns = migrated.database.prepare("PRAGMA table_info(prepared_sets)").all() as Array<{ name: string }>; const runColumns = migrated.database.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>; const deliveryColumns = migrated.database.prepare("PRAGMA table_info(deliveries)").all() as Array<{ name: string }>;
-    assert.equal(version.value, "5"); assert.equal(columns.some((column) => column.name === "apply_nonce"), true); assert.equal(runColumns.some((column) => column.name === "terminal_intent"), true); assert.equal(deliveryColumns.some((column) => column.name === "send_started_at"), true);
+    assert.equal(version.value, "6"); assert.equal(columns.some((column) => column.name === "apply_nonce"), true); assert.equal(runColumns.some((column) => column.name === "terminal_intent"), true); assert.equal(deliveryColumns.some((column) => column.name === "send_started_at"), true);
     const legacyHash = migrated.database.prepare("SELECT value FROM registry_meta WHERE key='schema_hash'").get() as { value: string };
     assert.equal(legacyHash.value, "old-live-build-fingerprint", "migration must not overwrite another live build's diagnostic hash");
     oldOpener.database.prepare("UPDATE registry_meta SET value='old-opener-still-live' WHERE key='schema_hash'").run();
@@ -319,4 +319,18 @@ test("registry applies an ordered idempotent v2 migration while mixed live opene
     assert.equal(registerParentRuntime(oldOpener, "/sessions/mixed.jsonl", "old", "2026-01-01T00:00:01.000Z"), 2);
     migrated.close(); migrated = openWorkerRegistry(root); assert.equal(registerParentRuntime(migrated, "/sessions/mixed.jsonl", "again", "2026-01-01T00:00:02.000Z"), 3);
   } finally { migrated?.close(); oldOpener?.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("v5 migration adds strict cleanup preservation records and prepared task lineage", () => {
+  const f = fixture(); let registry: ReturnType<typeof openWorkerRegistry> | undefined = f.registry;
+  try {
+    registry.database.exec("DROP TABLE preservation_records");
+    registry.database.exec("ALTER TABLE prepared_sets DROP COLUMN task_ids_json");
+    registry.database.prepare("UPDATE registry_meta SET value='5' WHERE key='schema_version'").run(); registry.database.exec("PRAGMA user_version = 5"); registry.close(); registry = undefined;
+    const migrated = openWorkerRegistry(f.root); registry = migrated;
+    const preparedColumns = migrated.database.prepare("PRAGMA table_info(prepared_sets)").all() as Array<{ name: string }>;
+    const preservation = migrated.database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='preservation_records'").get() as { sql: string } | undefined;
+    assert.equal(preparedColumns.some((column) => column.name === "task_ids_json"), true); assert.match(preservation?.sql ?? "", /STRICT/);
+    assert.equal((migrated.database.prepare("SELECT value FROM registry_meta WHERE key='schema_version'").get() as { value: string }).value, "6");
+  } finally { try { registry?.close(); } catch {} rmSync(f.root, { recursive: true, force: true }); }
 });

@@ -8,3 +8,4 @@
 - Return control through `worker_result_submit` with a concise summary and useful repository or artifact entry points.
 
 Repository candidates must live outside the workspace `cache/`, `tmp/`, and known HOME tool-cache subtrees; prefer `repos/`, which inventory always scans first. Treat inventory notices naming skipped broad artifact, runtime, or tool-cache subtrees as explicit discovery limitations, and report every intended repository directly.
+Before submitting a result, remove temporary clones, reproducible build/test environments, caches, and other disposable debris. Keep clean committed repositories, required reports, declared artifacts, and evidence needed for review or resume.

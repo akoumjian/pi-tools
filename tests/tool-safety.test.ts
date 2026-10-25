@@ -991,7 +991,10 @@ test("worker_control allows every valid exact-session lifecycle action without s
     { action: "runs", workerId },
     { action: "get", workerId, runId: "run_20260910193000_87654321" },
     { action: "cancel", workerId },
-    { action: "discard", workerId }
+    { action: "discard", workerId },
+    { action: "discard", workerIds: [workerId], preparedIds: [`prepared_${"a".repeat(24)}`], artifactLossAcknowledged: [workerId] },
+    { action: "inventory" },
+    { action: "inventory", allSessions: true }
   ];
 
   for (const input of validInputs) {
@@ -1006,6 +1009,10 @@ test("worker_control allows every valid exact-session lifecycle action without s
     }
   }
 
+  const preserve = evaluateWorkerControl({ action: "preserve", workerId, destination: path.join(process.cwd(), "preserved"), paths: ["artifacts/report.md"] }, { cwd: process.cwd() } as ExtensionContext);
+  assert.equal(preserve.action, "allow");
+  const sensitivePreserve = evaluateWorkerControl({ action: "preserve", workerId, destination: path.join(process.env.HOME!, ".ssh", "archive") }, { cwd: process.cwd() } as ExtensionContext);
+  assert.equal(sensitivePreserve.action, "review");
   const discard = evaluateWorkerControl({ action: "discard", workerId });
   assert.equal(discard.risk, "medium");
   assert.equal(discard.ruleId, "worker-control-discard");
@@ -1019,7 +1026,11 @@ test("worker_control allows every valid exact-session lifecycle action without s
     { action: "result", workerId, confirm: true },
     { action: "cancel" },
     { action: "discard", workerId, confirm: false },
-    { action: "discard", workerId: "wrong", confirm: true }
+    { action: "discard", workerId: "wrong", confirm: true },
+    { action: "discard", workerIds: [workerId, workerId] },
+    { action: "discard", preparedIds: ["wrong"] },
+    { action: "discard", preparedIds: [`prepared_${"a".repeat(24)}`], artifactLossAcknowledged: [workerId] },
+    { action: "preserve", workerId, destination: "relative" }
   ];
   for (const input of malformedInputs) {
     const decision = evaluateWorkerControl(input);

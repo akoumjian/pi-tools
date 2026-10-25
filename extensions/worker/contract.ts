@@ -61,13 +61,28 @@ const ListControl = Type.Object({
 const RunsControl = Type.Object({ action: Type.Literal("runs", { description: "List the execution runs belonging to one worker, newest first." }), workerId: WorkerId, limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, default: 20, description: "Maximum number of records to return. Defaults to 20 and cannot exceed 100." })), offset: Type.Optional(Type.Integer({ minimum: 0, default: 0, description: "Number of records to skip in the stable result order. Defaults to zero." })) }, { additionalProperties: false });
 const GetControl = Type.Object({ action: Type.Literal("get", { description: "Inspect one exact active or settled run, including operational access and any submitted result." }), workerId: WorkerId, runId: RunId }, { additionalProperties: false });
 const CancelControl = Type.Object({ action: Type.Literal("cancel", { description: "Stop a worker's active run while preserving its worker, workspace, session, and retained evidence." }), workerId: WorkerId }, { additionalProperties: false });
-const DiscardControl = Type.Object({ action: Type.Literal("discard", { description: "Permanently delete an idle worker and all of its retained workspace, session, run, and evidence data." }), workerId: WorkerId }, { additionalProperties: false });
-const WorkerControlStrict = Type.Union([ListControl, RunsControl, GetControl, CancelControl, DiscardControl]);
+const LegacyDiscardControl = Type.Object({ action: Type.Literal("discard", { description: "Permanently delete one idle worker. Retained for exact single-worker compatibility; batch discard is preferred." }), workerId: WorkerId }, { additionalProperties: false });
+const DiscardWorkerIds = Type.Array(WorkerId, { minItems: 1, maxItems: 32, uniqueItems: true });
+const DiscardPreparedIds = Type.Array(PreparedId, { minItems: 1, maxItems: 16, uniqueItems: true });
+const ArtifactLossAcknowledged = Type.Optional(Type.Array(WorkerId, { minItems: 1, maxItems: 32, uniqueItems: true, description: "Exact workers whose listed unpreserved reported artifacts may be erased." }));
+const BatchDiscardControl = Type.Union([
+  Type.Object({ action: Type.Literal("discard", { description: "Permanently discard exact idle workers and optional prepared sets after complete preflight." }), workerIds: DiscardWorkerIds, preparedIds: Type.Optional(DiscardPreparedIds), artifactLossAcknowledged: ArtifactLossAcknowledged }, { additionalProperties: false }),
+  Type.Object({ action: Type.Literal("discard", { description: "Permanently discard exact prepared sets and optional idle workers after complete preflight." }), preparedIds: DiscardPreparedIds, workerIds: Type.Optional(DiscardWorkerIds), artifactLossAcknowledged: ArtifactLossAcknowledged }, { additionalProperties: false })
+]);
+const PreserveControl = Type.Object({
+  action: Type.Literal("preserve", { description: "Atomically preserve selected ordinary non-Git worker artifacts outside managed worker storage." }), workerId: WorkerId,
+  destination: Type.String({ minLength: 1, maxLength: 4096, pattern: "^/" }),
+  paths: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), { minItems: 1, maxItems: 32, uniqueItems: true }))
+}, { additionalProperties: false });
+const InventoryControl = Type.Object({ action: Type.Literal("inventory", { description: "Derive cleanup and retention classes from current registry and central personal Beads facts." }), allSessions: Type.Optional(Type.Boolean({ default: false })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, default: 20 })), offset: Type.Optional(Type.Integer({ minimum: 0, default: 0 })) }, { additionalProperties: false });
+const WorkerControlStrict = Type.Union([ListControl, RunsControl, GetControl, CancelControl, LegacyDiscardControl, BatchDiscardControl, PreserveControl, InventoryControl]);
 export const WorkerControlParamsV2 = Type.Unsafe<Static<typeof WorkerControlStrict>>({
   ...WorkerControlStrict, type: "object", required: ["action"], additionalProperties: false,
   properties: {
-    action: Type.Union([Type.Literal("list"), Type.Literal("runs"), Type.Literal("get"), Type.Literal("cancel"), Type.Literal("discard")]),
+    action: Type.Union([Type.Literal("list"), Type.Literal("runs"), Type.Literal("get"), Type.Literal("cancel"), Type.Literal("discard"), Type.Literal("preserve"), Type.Literal("inventory")]),
     workerId: Type.Optional(WorkerId), runId: Type.Optional(RunId),
+    workerIds: Type.Optional(Type.Array(WorkerId, { minItems: 1, maxItems: 32, uniqueItems: true })), preparedIds: Type.Optional(Type.Array(PreparedId, { minItems: 1, maxItems: 16, uniqueItems: true })), artifactLossAcknowledged: Type.Optional(Type.Array(WorkerId, { minItems: 1, maxItems: 32, uniqueItems: true })),
+    destination: Type.Optional(Type.String({ minLength: 1, maxLength: 4096, pattern: "^/" })), paths: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), { minItems: 1, maxItems: 32, uniqueItems: true })), allSessions: Type.Optional(Type.Boolean()),
     status: Type.Optional(Type.Union([Type.Literal("idle"), Type.Literal("queued"), Type.Literal("running")], { description: "Optional current-worker filter for list." })),
     role: Type.Optional(Type.Union([Type.Literal("work"), Type.Literal("review"), Type.Literal("integration")], { description: "Optional worker-role filter for list." })),
     limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, default: 20, description: "Maximum number of records to return. Defaults to 20 and cannot exceed 100." })),
