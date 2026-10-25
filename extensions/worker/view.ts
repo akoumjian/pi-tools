@@ -259,8 +259,9 @@ function snapshotFromPage(target: WorkerSessionViewTarget, selected: ReadSession
     .map((item) => item.lineNumber)
     .filter((line) => sliceFromTail ? line >= pageStartLine : line <= pageEndLine));
   const unpositionedOversizedEntries = Math.max(0, selected.skippedOversizedEntries - new Set(selected.oversizedEntryPrefixes.map((item) => item.lineNumber)).size);
+  const containsFirstDisplayedBlock = !entryParsingTruncated && selected.previousVisibleEntries === 0 && blockStart === 0;
   const skippedOversizedEntries = unpositionedOversizedEntries + positionedOversizedLines.size
-    + (sliceFromTail && blockStart === 0 ? selected.leadingOversizedEntries : 0);
+    + (sliceFromTail && containsFirstDisplayedBlock ? selected.leadingOversizedEntries : 0);
   return {
     target,
     blocks,
@@ -607,6 +608,8 @@ function selectVisiblePage(fd: number, snapshotSize: number, index: SessionLineI
   const bounds = visiblePageBounds(request, runStartLine, selectableEndLine, visibility, includeCursorLine);
   const keepTail = request.mode === "tail" || request.mode === "before";
   let page = readVisiblePage(fd, snapshotSize, index, bounds, keepTail);
+  const indexedWindowStartLine = page.pageStartLine;
+  let backwardFallbackLine: number | undefined;
   if (visibility.incompleteLine !== undefined) {
     page.lines = page.lines.filter((item) => item.lineNumber !== visibility.incompleteLine);
     page.oversizedEntryPrefixes = page.oversizedEntryPrefixes.filter((item) => item.lineNumber !== visibility.incompleteLine);
@@ -621,6 +624,7 @@ function selectVisiblePage(fd: number, snapshotSize: number, index: SessionLineI
       ? previousVisibleRenderableLine(fd, snapshotSize, index, page.pageStartLine - 1, selectableEndLine, visibility, renderableCounts, false)
       : nextVisibleRenderableLine(fd, snapshotSize, index, page.pageEndLine + 1, selectableEndLine, visibility, renderableCounts);
     if (display?.line !== undefined) {
+      if (keepTail) backwardFallbackLine = display.line;
       const recoverBackwardGap = keepTail && indexedLineRangeWithinBytes(index, display.line, page.pageStartLine - 1, snapshotSize, SESSION_PAGE_READ_CHUNK);
       const backwardGapOversizedEntries = keepTail && !recoverBackwardGap ? indexedOversizedLineCount(index, display.line + 1, page.pageStartLine - 1) : 0;
       const skippedOversizedEntries = page.skippedOversizedEntries + (keepTail ? backwardGapOversizedEntries : display.skippedOversizedEntries);
@@ -640,8 +644,17 @@ function selectVisiblePage(fd: number, snapshotSize: number, index: SessionLineI
     }
   }
   const nextVisibleEntries = Math.max(0, totalVisibleEntries - throughEnd);
-  const leadingOversizedEntries = keepTail && previousVisibleEntries === 0 && page.pageStartLine > bounds.startLine
-    ? oversizedLineCount(fd, snapshotSize, index, visibility, bounds.startLine, page.pageStartLine - 1) : 0;
+  const leadingOversizedEntries = keepTail && previousVisibleEntries === 0 && indexedWindowStartLine > bounds.startLine
+    ? indexedOversizedLineCount(index, bounds.startLine, indexedWindowStartLine - 1) : 0;
+  if (leadingOversizedEntries > 0 && backwardFallbackLine !== undefined) {
+    const overlapStartLine = Math.max(bounds.startLine, backwardFallbackLine + 1);
+    const overlapEndLine = indexedWindowStartLine - 1;
+    const fallbackLeadingOversizedEntries = indexedOversizedLineCount(index, overlapStartLine, overlapEndLine);
+    if (fallbackLeadingOversizedEntries > 0) {
+      page.skippedOversizedEntries = Math.max(0, page.skippedOversizedEntries - fallbackLeadingOversizedEntries);
+      page.oversizedEntryPrefixes = page.oversizedEntryPrefixes.filter((item) => item.lineNumber < overlapStartLine || item.lineNumber > overlapEndLine);
+    }
+  }
   return { headerLine, ...page, leadingOversizedEntries, runStartLine, runEndLine, incompleteTrailingEntry: page.incompleteTrailingEntry || visibility.incompleteTrailingEntry, hasPreviousPage: previousVisibleEntries > 0, hasNextPage: nextVisibleEntries > 0, hiddenCompactedEntries: visibility.hiddenEntries, compactionCount: visibility.compactionCount, previousVisibleEntries, nextVisibleEntries, totalVisibleEntries };
 }
 
@@ -1195,7 +1208,7 @@ function extendSessionLineIndex(fd: number, file: string, index: SessionLineInde
       const newline = buffer.indexOf(0x0a, cursor);
       if (newline < 0 || newline >= count) break;
       const absoluteNewline = position + newline;
-      const oversized = absoluteNewline - index.lineStartOffset > MAX_SESSION_PAGE_BYTES;
+      const oversized = absoluteNewline - index.lineStartOffset >= MAX_SESSION_PAGE_BYTES;
       index.newlineCount += 1;
       const nextLine = index.newlineCount + 1;
       if ((nextLine - 1) % index.stride === 0 || oversized) {
@@ -1297,7 +1310,7 @@ function readPageLines(fd: number, snapshotSize: number, index: SessionLineIndex
 
   const append = (part: Buffer) => {
     if (lineNumber < desiredStart || lineNumber > desiredEnd || oversized || part.length === 0) return;
-    if (partBytes + part.length > MAX_SESSION_PAGE_BYTES) { oversized = true; parts = []; partBytes = 0; return; }
+    if (partBytes + part.length >= MAX_SESSION_PAGE_BYTES) { oversized = true; parts = []; partBytes = 0; return; }
     parts.push(Buffer.from(part));
     partBytes += part.length;
   };
@@ -1309,7 +1322,7 @@ function readPageLines(fd: number, snapshotSize: number, index: SessionLineIndex
         oversizedEntryPrefixes.push({ lineNumber, text: readOversizedEntryPrefix(fd, { startOffset: lineStartOffset, endOffset: lineEndOffset }, snapshotSize) });
       } else {
         const bytes = partBytes + 1;
-        if (!keepTail && totalBytes + bytes > maxPageBytes && lines.length > 0) { pageEndLine = lineNumber - 1; stoppedForPageBytes = true; return false; }
+        if (!keepTail && totalBytes + bytes > maxPageBytes && (lines.length > 0 || maxPageBytes < MAX_SESSION_PAGE_CONTENT_BYTES)) { pageEndLine = lineNumber - 1; stoppedForPageBytes = true; return false; }
         if (bytes > MAX_SESSION_PAGE_BYTES) { skippedOversizedEntries += 1; oversizedEntryPrefixes.push({ lineNumber, text: "" }); }
         else {
           lines.push({ lineNumber, text: decodeUtf8(Buffer.concat(parts, partBytes)), bytes });
