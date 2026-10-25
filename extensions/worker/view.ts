@@ -18,6 +18,7 @@ const MAX_SESSION_PAGE_CONTENT_BYTES = MAX_SESSION_PAGE_BYTES - SESSION_PAGE_MET
 const INITIAL_LINE_INDEX_STRIDE = 1;
 const MAX_LINE_INDEX_CHECKPOINTS = 65_536;
 const MAX_LINE_INDEX_FILES = 16;
+const SESSION_INDEX_PIN_BYTES = 256 * 1024;
 const MAX_BLOCK_TEXT = 16 * 1024;
 const MAX_DEFAULT_BLOCK_RENDER_LINES = 60;
 const MAX_THINKING_BLOCK_RENDER_LINES = 40;
@@ -540,7 +541,6 @@ function trustedSessionPath(target: WorkerSessionViewTarget): string {
 }
 
 class SessionChangedDuringReadError extends Error {}
-class SessionPageReadBudgetExceededError extends Error {}
 
 type CachedSessionRange = { start: number; data: Buffer };
 class SessionRangeReader {
@@ -549,12 +549,14 @@ class SessionRangeReader {
   private cachedBytes = 0;
   private pageBudgetActive = false;
   private pageReadBytes = 0;
+  private pageBudgetExhausted = false;
   actualReadBytes = 0;
 
   constructor(private readonly fd: number, snapshotSize: number) { this.snapshotSize = snapshotSize; }
 
   setSnapshotSize(snapshotSize: number): void { this.snapshotSize = snapshotSize; }
-  beginPageReads(): void { this.pageBudgetActive = true; this.pageReadBytes = 0; }
+  beginPageReads(): void { this.pageBudgetActive = true; this.pageReadBytes = Math.min(this.actualReadBytes, SESSION_PAGE_METADATA_RESERVE); this.pageBudgetExhausted = false; }
+  exhaustedPageBudget(): boolean { return this.pageBudgetExhausted; }
 
   readInto(buffer: Buffer, bufferOffset: number, length: number, position: number): number {
     const requestedEnd = Math.min(this.snapshotSize, position + Math.max(0, length));
@@ -569,7 +571,7 @@ class SessionRangeReader {
       }
       const next = this.ranges.filter((range) => range.start > current).reduce<number | undefined>((best, range) => best === undefined || range.start < best ? range.start : best, undefined);
       const gapLength = Math.min(requestedEnd - current, next === undefined ? requestedEnd - current : next - current);
-      if (this.pageBudgetActive && this.pageReadBytes + gapLength > MAX_SESSION_PAGE_BYTES) throw new SessionPageReadBudgetExceededError("Worker session page exceeded its read bound.");
+      if (this.pageBudgetActive && this.pageReadBytes + gapLength > MAX_SESSION_PAGE_BYTES) { this.pageBudgetExhausted = true; break; }
       const data = Buffer.allocUnsafe(gapLength);
       const count = readSync(this.fd, data, 0, gapLength, current);
       if (count === 0) break;
@@ -592,6 +594,7 @@ function readSessionRange(fd: number, buffer: Buffer, bufferOffset: number, leng
   return reader ? reader.readInto(buffer, bufferOffset, length, position) : readSync(fd, buffer, bufferOffset, length, position);
 }
 function closeSessionRangeReader(fd: number): void { sessionRangeReaders.delete(fd); }
+function sessionPageBudgetExhausted(fd: number): boolean { return sessionRangeReaders.get(fd)?.exhaustedPageBudget() === true; }
 
 type OpenSessionSnapshot = { fd: number; opened: Stats };
 function openSessionSnapshot(file: string, beforeOpen?: (file: string) => void): OpenSessionSnapshot {
@@ -674,7 +677,8 @@ function selectVisiblePage(fd: number, snapshotSize: number, index: SessionLineI
     page.oversizedEntryPrefixes = page.oversizedEntryPrefixes.filter((item) => item.lineNumber !== visibility.incompleteLine);
   }
   const renderableCounts = new Map<number, number>();
-  const totalVisibleEntries = visibleRenderableCountLessThan(fd, snapshotSize, index, runEndLine + 1, runEndLine, visibility, renderableCounts);
+  const preservedOpening = visibility.openingLine !== undefined && visibility.openingLine < visibility.keptLine && visibility.openingRenderable ? 1 : 0;
+  const totalVisibleEntries = preservedOpening + Math.max(0, visibility.renderedEntries - visibility.renderedBeforeKept);
   let previousVisibleEntries = visibleRenderableCountLessThan(fd, snapshotSize, index, page.pageStartLine, runEndLine, visibility, renderableCounts);
   let throughEnd = visibleRenderableCountLessThan(fd, snapshotSize, index, page.pageEndLine + 1, runEndLine, visibility, renderableCounts);
   const requestedWindowExists = bounds.endLine >= bounds.startLine || bounds.openingLine !== undefined;
@@ -752,20 +756,47 @@ function renderableBlockCountAtLine(fd: number, snapshotSize: number, index: Ses
   } catch { return 0; }
 }
 
-function renderableBlockCountFromIndexedPrefix(fd: number, snapshotSize: number, index: SessionLineIndex, line: number): number | undefined {
-  const start = index.checkpoints.find((checkpoint) => checkpoint.lineNumber === line)?.offset;
+function exactCheckpoint(index: SessionLineIndex, lineNumber: number): SessionLineCheckpoint | undefined {
+  let low = 0; let high = index.checkpoints.length - 1;
+  while (low <= high) {
+    const middle = (low + high) >>> 1; const checkpoint = index.checkpoints[middle]!;
+    if (checkpoint.lineNumber === lineNumber) return checkpoint;
+    if (checkpoint.lineNumber < lineNumber) low = middle + 1; else high = middle - 1;
+  }
+  return undefined;
+}
+
+type IndexedLineMetadata = { start: number; next?: number; completeLength?: number; prefix: string; suffix: string };
+function indexedLineMetadata(fd: number, snapshotSize: number, index: SessionLineIndex, line: number): IndexedLineMetadata | undefined {
+  const start = exactCheckpoint(index, line)?.offset;
   if (start === undefined) return undefined;
-  const nextCheckpoint = index.checkpoints.find((checkpoint) => checkpoint.lineNumber === line + 1);
-  if (nextCheckpoint?.oversizedStartOffset === start) return 0;
+  const nextCheckpoint = exactCheckpoint(index, line + 1);
   const next = nextCheckpoint?.offset;
   const completeLength = next === undefined ? undefined : Math.max(0, next - start - 1);
-  const length = Math.min(OVERSIZED_ENTRY_PREFIX_BYTES, completeLength ?? Math.max(0, snapshotSize - start));
-  if (length === 0) return 0;
-  const buffer = Buffer.allocUnsafe(length);
-  const count = readSessionRange(fd, buffer, 0, length, start);
-  if (count !== length) throw new SessionChangedDuringReadError();
-  const prefix = new TextDecoder("utf-8").decode(buffer);
-  if (completeLength !== undefined && completeLength <= OVERSIZED_ENTRY_PREFIX_BYTES) {
+  const prefixLength = Math.min(OVERSIZED_ENTRY_PREFIX_BYTES, completeLength ?? Math.max(0, snapshotSize - start));
+  if (prefixLength === 0) return { start, next, completeLength, prefix: "", suffix: "" };
+  const prefixBuffer = Buffer.allocUnsafe(prefixLength);
+  const prefixCount = readSessionRange(fd, prefixBuffer, 0, prefixLength, start);
+  if (prefixCount !== prefixLength) return undefined;
+  let suffix = "";
+  if (completeLength !== undefined && completeLength > prefixLength) {
+    const suffixLength = Math.min(OVERSIZED_ENTRY_PREFIX_BYTES, completeLength - prefixLength);
+    const suffixBuffer = Buffer.allocUnsafe(suffixLength);
+    const suffixCount = readSessionRange(fd, suffixBuffer, 0, suffixLength, start + completeLength - suffixLength);
+    if (suffixCount !== suffixLength) return undefined;
+    suffix = new TextDecoder("utf-8").decode(suffixBuffer);
+  }
+  return { start, next, completeLength, prefix: new TextDecoder("utf-8").decode(prefixBuffer), suffix };
+}
+
+function renderableBlockCountFromIndexedPrefix(fd: number, snapshotSize: number, index: SessionLineIndex, line: number): number | undefined {
+  const metadata = indexedLineMetadata(fd, snapshotSize, index, line);
+  if (!metadata) return undefined;
+  const { start, completeLength, prefix, suffix } = metadata;
+  const nextCheckpoint = exactCheckpoint(index, line + 1);
+  if (nextCheckpoint?.oversizedStartOffset === start) return 0;
+  if (prefix.length === 0) return 0;
+  if (completeLength !== undefined && completeLength <= Buffer.byteLength(prefix)) {
     try {
       const value: unknown = JSON.parse(prefix);
       return isSessionEntry(value) ? renderableBlockCount({ ...value, lineNumber: line }) : 0;
@@ -778,7 +809,13 @@ function renderableBlockCountFromIndexedPrefix(fd: number, snapshotSize: number,
     return undefined;
   }
   if (type === "compaction" || type === "branch_summary" || type === "model_change" || type === "thinking_level_change") return 1;
-  if (type === "custom_message") return /"display"\s*:\s*true/u.test(prefix) ? 1 : 0;
+  if (type === "custom_message") {
+    const metadataText = `${prefix}
+${suffix}`;
+    if (/"display"\s*:\s*true/u.test(metadataText)) return 1;
+    if (/"display"\s*:\s*false/u.test(metadataText)) return 0;
+    return undefined;
+  }
   if (type !== undefined) return 0;
   return undefined;
 }
@@ -1324,12 +1361,19 @@ function extendSessionLineIndex(fd: number, file: string, index: SessionLineInde
       const newline = buffer.indexOf(0x0a, cursor);
       if (newline < 0 || newline >= count) break;
       const absoluteNewline = position + newline;
-      const oversized = absoluteNewline - index.lineStartOffset >= MAX_SESSION_PAGE_BYTES;
+      const lineBytes = absoluteNewline - index.lineStartOffset;
+      const oversized = lineBytes >= MAX_SESSION_PAGE_BYTES;
+      const pinned = lineBytes >= SESSION_INDEX_PIN_BYTES;
       index.newlineCount += 1;
       const nextLine = index.newlineCount + 1;
-      if ((nextLine - 1) % index.stride === 0 || oversized) {
+      if (pinned) {
+        const currentLine = nextLine - 1; const previous = index.checkpoints.at(-1);
+        if (previous?.lineNumber === currentLine) index.checkpoints[index.checkpoints.length - 1] = { ...previous, pinned: true };
+        else index.checkpoints.push({ lineNumber: currentLine, offset: index.lineStartOffset, pinned: true });
+      }
+      if ((nextLine - 1) % index.stride === 0 || pinned) {
         const previous = index.checkpoints.at(-1);
-        const checkpoint = { lineNumber: nextLine, offset: absoluteNewline + 1, ...(oversized ? { pinned: true, oversizedStartOffset: index.lineStartOffset } : {}) };
+        const checkpoint = { lineNumber: nextLine, offset: absoluteNewline + 1, ...(pinned ? { pinned: true } : {}), ...(oversized ? { oversizedStartOffset: index.lineStartOffset } : {}) };
         if (previous?.lineNumber === nextLine) index.checkpoints[index.checkpoints.length - 1] = { ...previous, ...checkpoint, pinned: previous.pinned || checkpoint.pinned };
         else index.checkpoints.push(checkpoint);
       }
@@ -1348,7 +1392,7 @@ function extendSessionLineIndex(fd: number, file: string, index: SessionLineInde
   index.fingerprint = sessionPrefixFingerprint(fd, position);
   while (index.checkpoints.length > MAX_LINE_INDEX_CHECKPOINTS) {
     const last = index.checkpoints.length - 1;
-    const preferred = index.checkpoints.filter((value, position) => position === 0 || position === last || value.oversizedStartOffset !== undefined || position % 2 === 0);
+    const preferred = index.checkpoints.filter((value, position) => position === 0 || position === last || value.pinned === true || position % 2 === 0);
     index.checkpoints = preferred.length < index.checkpoints.length && preferred.length <= MAX_LINE_INDEX_CHECKPOINTS
       ? preferred : index.checkpoints.filter((_value, position) => position === 0 || position === last || position % 2 === 0);
     index.stride *= 2;
@@ -1403,18 +1447,11 @@ function readHeaderLine(fd: number, snapshotSize: number): string {
 }
 
 function indexedNondisplayLineEnd(fd: number, snapshotSize: number, index: SessionLineIndex, line: number, lineStartOffset: number): number | undefined {
-  const start = index.checkpoints.find((checkpoint) => checkpoint.lineNumber === line)?.offset;
-  const next = index.checkpoints.find((checkpoint) => checkpoint.lineNumber === line + 1)?.offset;
-  if (start !== lineStartOffset || next === undefined || next > snapshotSize) return undefined;
-  const length = Math.min(OVERSIZED_ENTRY_PREFIX_BYTES, Math.max(0, next - start - 1));
-  if (length === 0) return undefined;
-  const buffer = Buffer.allocUnsafe(length);
-  const count = readSessionRange(fd, buffer, 0, length, start);
-  if (count !== length) throw new SessionChangedDuringReadError();
-  const prefix = new TextDecoder("utf-8").decode(buffer);
-  const type = prefix.match(/^\s*\{\s*"type"\s*:\s*"([^"]+)"/u)?.[1];
-  if (type === "custom") return next;
-  if (type === "custom_message" && !/"display"\s*:\s*true/u.test(prefix)) return next;
+  const metadata = indexedLineMetadata(fd, snapshotSize, index, line);
+  if (!metadata || metadata.start !== lineStartOffset || metadata.next === undefined) return undefined;
+  const type = metadata.prefix.match(/^\s*\{\s*"type"\s*:\s*"([^"]+)"/u)?.[1];
+  const metadataText = `${metadata.prefix}\n${metadata.suffix}`;
+  if (type === "custom" && /"display"\s*:\s*false/u.test(metadataText)) return metadata.next;
   return undefined;
 }
 
@@ -1472,13 +1509,6 @@ function readPageLines(fd: number, snapshotSize: number, index: SessionLineIndex
   };
 
   scan: while (position < snapshotSize && lineNumber <= desiredEnd) {
-    if (skipKnownNondisplay && lineNumber >= desiredStart) {
-      const nondisplayEnd = indexedNondisplayLineEnd(fd, snapshotSize, index, lineNumber, position);
-      if (nondisplayEnd !== undefined) {
-        pageEndLine = lineNumber; position = nondisplayEnd; lineNumber += 1; lineStartOffset = position; parts = []; partBytes = 0; oversized = false;
-        continue;
-      }
-    }
     while (oversizedSpanIndex < oversizedSpans.length && oversizedSpans[oversizedSpanIndex]!.offset <= position) oversizedSpanIndex += 1;
     const span = oversizedSpans[oversizedSpanIndex];
     if (span?.oversizedStartOffset === position && span.lineNumber === lineNumber + 1) {
@@ -1490,9 +1520,19 @@ function readPageLines(fd: number, snapshotSize: number, index: SessionLineIndex
       position = span.offset; lineNumber += 1; lineStartOffset = position; parts = []; partBytes = 0; oversized = false; oversizedSpanIndex += 1;
       continue;
     }
+    if (skipKnownNondisplay && lineNumber >= desiredStart) {
+      const nondisplayEnd = indexedNondisplayLineEnd(fd, snapshotSize, index, lineNumber, position);
+      if (nondisplayEnd !== undefined) {
+        pageEndLine = lineNumber; position = nondisplayEnd; lineNumber += 1; lineStartOffset = position; parts = []; partBytes = 0; oversized = false;
+        continue;
+      }
+    }
     const beforePinnedSpan = span?.oversizedStartOffset !== undefined && span.oversizedStartOffset > position ? span.oversizedStartOffset - position : buffer.length;
     const count = readSessionRange(fd, buffer, 0, Math.min(buffer.length, snapshotSize - position, beforePinnedSpan), position);
-    if (count === 0) throw new SessionChangedDuringReadError();
+    if (count === 0) {
+      if (sessionPageBudgetExhausted(fd)) { stoppedForPageBytes = true; parts = []; partBytes = 0; break; }
+      throw new SessionChangedDuringReadError();
+    }
     let cursor = 0;
     while (cursor < count) {
       const newline = buffer.indexOf(0x0a, cursor);
@@ -1518,7 +1558,7 @@ function readOversizedEntryPrefix(fd: number, offsets: { startOffset: number; en
   if (length <= 0) return "";
   const buffer = Buffer.allocUnsafe(length);
   const count = readSessionRange(fd, buffer, 0, length, offsets.startOffset);
-  if (count !== length) throw new SessionChangedDuringReadError();
+  if (count !== length) { if (sessionPageBudgetExhausted(fd)) return ""; throw new SessionChangedDuringReadError(); }
   return new TextDecoder("utf-8").decode(buffer);
 }
 

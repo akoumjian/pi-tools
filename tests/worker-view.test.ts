@@ -817,11 +817,89 @@ test("reduced compaction pages stop before a kept entry that exceeds the opening
   } finally { f.close(); }
 });
 
+test("Pi-ordered large displayed custom messages remain reachable without paging cycles", async () => {
+  for (const prefixEntries of [0, 512]) {
+    const f = fixture();
+    try {
+      const prefix = Array.from({ length: prefixEntries }, (_, index) => line(message(`prefix-${index}`, index === 0 ? null : `prefix-${index - 1}`, `PREFIX-${index}`)));
+      const parentId = prefixEntries === 0 ? null : `prefix-${prefixEntries - 1}`;
+      const custom = { type: "custom_message", customType: "edge", content: `CUSTOM-${"c".repeat(20 * 1024)}`, display: true, details: {}, id: "custom", parentId, timestamp: "now" };
+      const after = message("after", "custom", "AFTER");
+      const entries = [...prefix, line(custom), line(after)]; writeFileSync(f.sessionFile, line(header(f.target)) + entries.join(""));
+      const target = { ...f.target, sessionStartLine: 2, sessionEndLine: entries.length + 1 };
+      const customText = `CUSTOM-${"c".repeat(20 * 1024)}`;
+      const expected = [...Array.from({ length: prefixEntries }, (_, index) => `PREFIX-${index}`), `${customText.slice(0, 16 * 1024)}\n[… block text truncated …]`, "AFTER"];
+      await assertExactBidirectionalBlocks(target, expected, prefixEntries + 2);
+    } finally { f.close(); }
+  }
+});
+
+test("sparse 70k prefix pages fit hidden 3 MiB plus user 5 MiB without throwing", async () => {
+  const f = fixture();
+  try {
+    const fd = openSync(f.sessionFile, "w");
+    try {
+      writeSync(fd, line(header(f.target))); let chunk = "";
+      for (let index = 0; index < 70_000; index += 1) { chunk += line(message(`prefix-${index}`, index === 0 ? null : `prefix-${index - 1}`, `PREFIX-${index}`)); if (index % 1_000 === 999) { writeSync(fd, chunk); chunk = ""; } }
+      if (chunk) writeSync(fd, chunk);
+      writeSync(fd, line(message("opening", "prefix-69999", "OPENING")));
+      writeSync(fd, line({ type: "custom", customType: "internal", content: "h".repeat(3 * 1024 * 1024), display: false, id: "hidden", parentId: "opening", timestamp: "now" }));
+      writeSync(fd, line(message("user", "hidden", `USER-${"u".repeat(5 * 1024 * 1024)}`)));
+      writeSync(fd, line({ type: "message", id: "assistant", parentId: "user", timestamp: "now", message: { role: "assistant", content: [{ type: "text", text: "ASSISTANT" }] } }));
+    } finally { closeSync(fd); }
+    const target = { ...f.target, sessionStartLine: 70_002, sessionEndLine: 70_005 };
+    for (const asyncMode of [false, true]) {
+      const request = { mode: "after" as const, line: 70_002 };
+      const page = asyncMode ? await loadWorkerSessionViewSnapshotAsync(target, request) : loadWorkerSessionViewSnapshot(target, {}, request);
+      assert.equal(page.blocks.length, 2); assert.match(page.blocks[0]?.text ?? "", /^USER-/); assert.equal(page.blocks[1]?.text, "ASSISTANT");
+      assert.equal(page.totalVisibleEntries, 3); assert.equal(page.previousVisibleEntries + page.totalActiveEntries + page.nextVisibleEntries, 3);
+    }
+    assertEdgePageReadCeiling(target, [{ mode: "after", line: 70_002 }], 8 * 1024 * 1024);
+  } finally { f.close(); }
+});
+
+test("thinned render checkpoints fit 1,100 entries around a 5.2 MiB assistant", async () => {
+  const f = fixture();
+  try {
+    const entries: string[] = []; let parentId: string | null = null;
+    for (let index = 0; index < 1_100; index += 1) {
+      if (index === 300) {
+        entries.push(line({ type: "message", id: "assistant-large", parentId, timestamp: "now", message: { role: "assistant", content: [{ type: "text", text: `ASSISTANT-${"a".repeat(5_200 * 1024)}` }] } })); parentId = "assistant-large";
+      } else if (index === 301) {
+        entries.push(line({ type: "custom", customType: "internal", content: "h".repeat(2_300 * 1024), display: false, id: "hidden-large", parentId, timestamp: "now" })); parentId = "hidden-large";
+      } else {
+        const id = `entry-${index}`; entries.push(line(message(id, parentId, `ENTRY-${index}-${"x".repeat(1024)}`))); parentId = id;
+      }
+    }
+    writeFileSync(f.sessionFile, line(header(f.target)) + entries.join(""));
+    const target = { ...f.target, sessionStartLine: 2, sessionEndLine: 1_101 };
+    for (const asyncMode of [false, true]) {
+      const request = { mode: "before" as const, line: 590 };
+      const page = asyncMode ? await loadWorkerSessionViewSnapshotAsync(target, request) : loadWorkerSessionViewSnapshot(target, {}, request);
+      assert.ok(page.blocks.length > 0); assert.equal(page.totalVisibleEntries, 1_099); assert.equal(page.previousVisibleEntries + page.totalActiveEntries + page.nextVisibleEntries, 1_099);
+    }
+    assertEdgePageReadCeiling(target, [{ mode: "before", line: 590 }], 8 * 1024 * 1024);
+  } finally { f.close(); }
+});
+
+test("oversized Pi-ordered hidden custom entries report exact notices in both directions", async () => {
+  for (const withUser of [false, true]) {
+    const f = fixture();
+    try {
+      const custom = { type: "custom", customType: "internal", content: "h".repeat(9 * 1024 * 1024), display: false, id: "hidden", parentId: null, timestamp: "now" };
+      const entries = [line(custom), ...(withUser ? [line(message("shown", "hidden", "SHOWN"))] : [])]; writeFileSync(f.sessionFile, line(header(f.target)) + entries.join(""));
+      const target = { ...f.target, sessionStartLine: 2, sessionEndLine: entries.length + 1 };
+      if (withUser) await assertExactBidirectionalBlocks(target, ["SHOWN"], 1, 0, 1);
+      else for (const page of [loadWorkerSessionViewSnapshot(target), await loadWorkerSessionViewSnapshotAsync(target), loadWorkerSessionViewSnapshot(target, {}, { mode: "first" }), await loadWorkerSessionViewSnapshotAsync(target, { mode: "first" })]) { assert.equal(page.blocks.length, 0); assert.equal(page.skippedOversizedEntries, 1); }
+    } finally { f.close(); }
+  }
+});
+
 test("multi-MiB skipped, compaction, and opening edge pages stay within the total 8 MiB read ceiling", () => {
   const f = fixture();
   try {
     const opening = message("opening", null, `OPENING-${"o".repeat(2 * 1024 * 1024)}`);
-    const hidden = { type: "custom", id: "hidden", parentId: "opening", timestamp: "now", customType: "internal", data: { hidden: true, padding: "h".repeat(3 * 1024 * 1024) } };
+    const hidden = { type: "custom", customType: "internal", content: "h".repeat(3 * 1024 * 1024), display: false, id: "hidden", parentId: "opening", timestamp: "now" };
     const kept = message("kept", "hidden", `KEPT-${"k".repeat(5 * 1024 * 1024)}`);
     const compact = { type: "compaction", id: "compact", parentId: "kept", timestamp: "now", summary: "EDGE-COMPACTION", firstKeptEntryId: "kept", tokensBefore: 10 };
     const oversized = message("oversized", "compact", `OVERSIZED-${"z".repeat(9 * 1024 * 1024)}`);
@@ -838,18 +916,21 @@ test("multi-MiB skipped, compaction, and opening edge pages stay within the tota
 test("160 deterministic multi-MiB layouts preserve exact sync/async paging within the hard read ceiling", async () => {
   const f = fixture();
   try {
+    let inherited = "";
+    for (let index = 0; index < 70_000; index += 1) inherited += line(message(`matrix-prefix-${index}`, index === 0 ? null : `matrix-prefix-${index - 1}`, `P-${index}`));
+    const retainedStartLine = 70_002;
     for (let layout = 0; layout < 160; layout += 1) {
       const opening = message(`opening-${layout}`, null, `OPEN-${layout}`);
       const before = { type: "message", id: `before-${layout}`, parentId: opening.id, timestamp: "now", message: { role: "toolResult", toolCallId: "before", toolName: "edge", content: `BEFORE-${"b".repeat(8_500 * 1024)}`, isError: false } };
-      const hiddenBefore = { type: "custom", id: `hidden-before-${layout}`, parentId: layout & 8 ? before.id : opening.id, timestamp: "now", customType: "internal", data: { padding: "h".repeat(3 * 1024 * 1024) } };
+      const hiddenBefore = { type: "custom", customType: "internal", content: "h".repeat(3 * 1024 * 1024), display: false, id: `hidden-before-${layout}`, parentId: layout & 8 ? before.id : opening.id, timestamp: "now" };
       const userParent = layout & 1 ? hiddenBefore.id : layout & 8 ? before.id : opening.id;
       const user = message(`user-${layout}`, userParent, `USER-${layout}-${"u".repeat(layout & 2 ? 5 * 1024 * 1024 : 64 * 1024)}`);
       const compact = { type: "compaction", id: `compact-${layout}`, parentId: user.id, timestamp: "now", summary: `COMPACT-${layout}`, firstKeptEntryId: user.id, tokensBefore: 10 };
       const assistantParent = layout & 16 ? compact.id : user.id;
       const assistant = { type: "message", id: `assistant-${layout}`, parentId: assistantParent, timestamp: "now", message: { role: "assistant", content: Array.from({ length: layout & 4 ? 4_096 : 3 }, (_, index) => ({ type: "text", text: `PART-${layout}-${index}` })) } };
-      const hiddenAfter = { type: "custom", id: `hidden-after-${layout}`, parentId: assistant.id, timestamp: "now", customType: "internal", data: { padding: "z".repeat(3 * 1024 * 1024) } };
+      const hiddenAfter = { type: "custom", customType: "internal", content: "z".repeat(3 * 1024 * 1024), display: false, id: `hidden-after-${layout}`, parentId: assistant.id, timestamp: "now" };
       const customParent = layout & 32 ? hiddenAfter.id : assistant.id;
-      const custom = { type: "custom_message", id: `custom-${layout}`, parentId: customParent, timestamp: "now", customType: "shown", display: true, content: `CUSTOM-${layout}` };
+      const custom = { type: "custom_message", customType: "shown", content: `CUSTOM-${layout}`, display: true, details: {}, id: `custom-${layout}`, parentId: customParent, timestamp: "now" };
       const finalParent = layout & 64 ? custom.id : customParent;
       const finalTool = { type: "message", id: `final-${layout}`, parentId: finalParent, timestamp: "now", message: { role: "toolResult", toolCallId: "final", toolName: "edge", content: `FINAL-${"f".repeat(8_500 * 1024)}`, isError: false } };
       const entries: unknown[] = [opening];
@@ -861,8 +942,8 @@ test("160 deterministic multi-MiB layouts preserve exact sync/async paging withi
       if (layout & 32) entries.push(hiddenAfter);
       if (layout & 128) entries.push(custom);
       if (layout & 64) entries.push(finalTool);
-      writeFileSync(f.sessionFile, line(header(f.target)) + entries.map(line).join(""));
-      const target = { ...f.target, sessionStartLine: 2, sessionEndLine: entries.length + 1 };
+      writeFileSync(f.sessionFile, line(header(f.target)) + inherited + entries.map(line).join(""));
+      const target = { ...f.target, sessionStartLine: retainedStartLine, sessionEndLine: retainedStartLine + entries.length - 1 };
       const collect = async (asyncMode: boolean, direction: "forward" | "backward") => {
         const pages: WorkerSessionViewSnapshot[] = []; let request: WorkerSessionPageRequest = direction === "forward" ? { mode: "first" } : { mode: "tail" };
         for (let step = 0; step < 32; step += 1) {
@@ -893,6 +974,40 @@ test("160 deterministic multi-MiB layouts preserve exact sync/async paging withi
       for (const value of [forward, backward, asyncForward, asyncBackward]) { assert.equal(value.notices, expectedNotices, `layout ${layout} notices`); assert.ok(value.visible > 0); }
     }
   } finally { f.close(); }
+});
+
+test("40 seeded sparse and dense multi-MiB layouts remain exact and bounded", async () => {
+  let random = 0x5eedf10;
+  const next = () => { random = (Math.imul(random, 1_664_525) + 1_013_904_223) >>> 0; return random; };
+  const expectedText = (text: string) => text.length <= 16 * 1024 ? text : `${text.slice(0, 16 * 1024)}\n[… block text truncated …]`;
+  for (let seed = 0; seed < 40; seed += 1) {
+    const f = fixture();
+    try {
+      const count = 70 + next() % 1_531; const multiCount = 1 + next() % 5;
+      const special = new Map<number, number>();
+      while (special.size < multiCount) special.set(next() % count, next() % 4);
+      const entries: string[] = []; const expected: string[] = []; let parentId: string | null = null; let oversized = 0;
+      for (let index = 0; index < count; index += 1) {
+        const id = `seed-${seed}-${index}`; const kind = special.get(index);
+        if (kind === 0) {
+          entries.push(line({ type: "custom", customType: "internal", content: "h".repeat((2_100 + next() % 900) * 1024), display: false, id, parentId, timestamp: "now" }));
+        } else if (kind === 1) {
+          entries.push(line({ type: "custom", customType: "internal", content: "z".repeat(9 * 1024 * 1024), display: false, id, parentId, timestamp: "now" })); oversized += 1;
+        } else if (kind === 2) {
+          const text = `USER-${seed}-${index}-${"u".repeat((4_000 + next() % 1_200) * 1024)}`; entries.push(line(message(id, parentId, text))); expected.push(expectedText(text));
+        } else if (kind === 3) {
+          const text = `ASSISTANT-${seed}-${index}-${"a".repeat((4_500 + next() % 800) * 1024)}`; entries.push(line({ type: "message", id, parentId, timestamp: "now", message: { role: "assistant", content: [{ type: "text", text }] } })); expected.push(expectedText(text));
+        } else {
+          const text = `ENTRY-${seed}-${index}`; entries.push(line(message(id, parentId, text))); expected.push(text);
+        }
+        parentId = id;
+      }
+      writeFileSync(f.sessionFile, line(header(f.target)) + entries.join(""));
+      const target = { ...f.target, sessionStartLine: 2, sessionEndLine: entries.length + 1 };
+      await assertExactBidirectionalBlocks(target, expected, expected.length, 0, oversized);
+      assertEdgePageReadCeiling(target, [{ mode: "first" }, { mode: "tail" }], 8 * 1024 * 1024);
+    } finally { f.close(); }
+  }
 });
 
 test("forward terminal and all-undisplayable tail pages retain indexed oversized notices", async () => {
