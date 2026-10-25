@@ -11,7 +11,8 @@ const MAX_SESSION_PAGE_BLOCKS = 2_048;
 const OVERSIZED_ENTRY_PREFIX_BYTES = 16 * 1024;
 const MAX_SESSION_HEADER_BYTES = 64 * 1024;
 const SESSION_READ_CHUNK = 1024 * 1024;
-const SESSION_PAGE_READ_CHUNK = 512 * 1024;
+const SESSION_PAGE_READ_CHUNK = 256 * 1024;
+const SESSION_FALLBACK_RECOVERY_BYTES = 512 * 1024;
 const SESSION_PAGE_METADATA_RESERVE = SESSION_READ_CHUNK;
 const MAX_SESSION_PAGE_CONTENT_BYTES = MAX_SESSION_PAGE_BYTES - SESSION_PAGE_METADATA_RESERVE;
 const INITIAL_LINE_INDEX_STRIDE = 1;
@@ -608,8 +609,6 @@ function selectVisiblePage(fd: number, snapshotSize: number, index: SessionLineI
   const bounds = visiblePageBounds(request, runStartLine, selectableEndLine, visibility, includeCursorLine);
   const keepTail = request.mode === "tail" || request.mode === "before";
   let page = readVisiblePage(fd, snapshotSize, index, bounds, keepTail);
-  const indexedWindowStartLine = page.pageStartLine;
-  let backwardFallbackLine: number | undefined;
   if (visibility.incompleteLine !== undefined) {
     page.lines = page.lines.filter((item) => item.lineNumber !== visibility.incompleteLine);
     page.oversizedEntryPrefixes = page.oversizedEntryPrefixes.filter((item) => item.lineNumber !== visibility.incompleteLine);
@@ -624,8 +623,7 @@ function selectVisiblePage(fd: number, snapshotSize: number, index: SessionLineI
       ? previousVisibleRenderableLine(fd, snapshotSize, index, page.pageStartLine - 1, selectableEndLine, visibility, renderableCounts, false)
       : nextVisibleRenderableLine(fd, snapshotSize, index, page.pageEndLine + 1, selectableEndLine, visibility, renderableCounts);
     if (display?.line !== undefined) {
-      if (keepTail) backwardFallbackLine = display.line;
-      const recoverBackwardGap = keepTail && indexedLineRangeWithinBytes(index, display.line, page.pageStartLine - 1, snapshotSize, SESSION_PAGE_READ_CHUNK);
+      const recoverBackwardGap = keepTail && indexedLineRangeWithinBytes(index, display.line, page.pageStartLine - 1, snapshotSize, SESSION_FALLBACK_RECOVERY_BYTES);
       const backwardGapOversizedEntries = keepTail && !recoverBackwardGap ? indexedOversizedLineCount(index, display.line + 1, page.pageStartLine - 1) : 0;
       const skippedOversizedEntries = page.skippedOversizedEntries + (keepTail ? backwardGapOversizedEntries : display.skippedOversizedEntries);
       const oversizedEntryPrefixes = page.oversizedEntryPrefixes;
@@ -644,16 +642,12 @@ function selectVisiblePage(fd: number, snapshotSize: number, index: SessionLineI
     }
   }
   const nextVisibleEntries = Math.max(0, totalVisibleEntries - throughEnd);
-  const leadingOversizedEntries = keepTail && previousVisibleEntries === 0 && indexedWindowStartLine > bounds.startLine
-    ? indexedOversizedLineCount(index, bounds.startLine, indexedWindowStartLine - 1) : 0;
-  if (leadingOversizedEntries > 0 && backwardFallbackLine !== undefined) {
-    const overlapStartLine = Math.max(bounds.startLine, backwardFallbackLine + 1);
-    const overlapEndLine = indexedWindowStartLine - 1;
-    const fallbackLeadingOversizedEntries = indexedOversizedLineCount(index, overlapStartLine, overlapEndLine);
-    if (fallbackLeadingOversizedEntries > 0) {
-      page.skippedOversizedEntries = Math.max(0, page.skippedOversizedEntries - fallbackLeadingOversizedEntries);
-      page.oversizedEntryPrefixes = page.oversizedEntryPrefixes.filter((item) => item.lineNumber < overlapStartLine || item.lineNumber > overlapEndLine);
-    }
+  const firstDisplayedLine = firstRenderableLineInLoadedPage(page.lines);
+  let leadingOversizedEntries = 0;
+  if (keepTail && previousVisibleEntries === 0 && firstDisplayedLine !== undefined && firstDisplayedLine > bounds.startLine) {
+    const indexedLeading = indexedOversizedLineCount(index, bounds.startLine, firstDisplayedLine - 1);
+    const loadedLeadingLines = new Set(page.oversizedEntryPrefixes.filter((item) => item.lineNumber >= bounds.startLine && item.lineNumber < firstDisplayedLine).map((item) => item.lineNumber));
+    leadingOversizedEntries = Math.max(0, indexedLeading - loadedLeadingLines.size);
   }
   return { headerLine, ...page, leadingOversizedEntries, runStartLine, runEndLine, incompleteTrailingEntry: page.incompleteTrailingEntry || visibility.incompleteTrailingEntry, hasPreviousPage: previousVisibleEntries > 0, hasNextPage: nextVisibleEntries > 0, hiddenCompactedEntries: visibility.hiddenEntries, compactionCount: visibility.compactionCount, previousVisibleEntries, nextVisibleEntries, totalVisibleEntries };
 }
@@ -824,15 +818,24 @@ function previousVisibleRenderableLine(fd: number, snapshotSize: number, index: 
 }
 
 function readVisiblePage(fd: number, snapshotSize: number, index: SessionLineIndex, bounds: VisiblePageBounds, keepTail: boolean): ReadPageLines {
-  let byteBoundedStart = keepTail ? byteBoundedTailStart(index, bounds.startLine, bounds.endLine, snapshotSize) : bounds.startLine;
-  let main = readPageLines(fd, snapshotSize, index, byteBoundedStart, bounds.endLine, keepTail, MAX_SESSION_PAGE_CONTENT_BYTES);
-  if (byteBoundedStart > bounds.startLine) { main.droppedLeadingEntries += byteBoundedStart - bounds.startLine; main.pageStartLine = byteBoundedStart; }
-  if (bounds.openingLine === undefined || bounds.openingLine >= bounds.startLine || main.droppedLeadingEntries > 0) return main;
-  const opening = readPageLines(fd, snapshotSize, index, bounds.openingLine, bounds.openingLine, false);
-  if (opening.decodedBytes + main.decodedBytes > MAX_SESSION_PAGE_CONTENT_BYTES) {
-    if (keepTail) return main;
-    main = readPageLines(fd, snapshotSize, index, bounds.startLine, bounds.endLine, false, Math.max(1, MAX_SESSION_PAGE_CONTENT_BYTES - opening.decodedBytes));
+  const separateOpening = bounds.openingLine !== undefined && bounds.openingLine < bounds.startLine;
+  if (separateOpening && !keepTail) {
+    const opening = readPageLines(fd, snapshotSize, index, bounds.openingLine!, bounds.openingLine!, false, MAX_SESSION_PAGE_CONTENT_BYTES);
+    const remainingBytes = Math.max(1, MAX_SESSION_PAGE_CONTENT_BYTES - opening.decodedBytes);
+    const main = readPageLines(fd, snapshotSize, index, bounds.startLine, bounds.endLine, false, remainingBytes);
+    return combineOpeningAndMainPages(opening, main);
   }
+  const byteBoundedStart = keepTail ? byteBoundedTailStart(index, bounds.startLine, bounds.endLine, snapshotSize) : bounds.startLine;
+  const main = readPageLines(fd, snapshotSize, index, byteBoundedStart, bounds.endLine, keepTail, MAX_SESSION_PAGE_CONTENT_BYTES);
+  if (byteBoundedStart > bounds.startLine) { main.droppedLeadingEntries += byteBoundedStart - bounds.startLine; main.pageStartLine = byteBoundedStart; }
+  if (!separateOpening || main.droppedLeadingEntries > 0) return main;
+  const remainingBytes = Math.max(1, MAX_SESSION_PAGE_CONTENT_BYTES - main.decodedBytes);
+  const opening = readPageLines(fd, snapshotSize, index, bounds.openingLine!, bounds.openingLine!, false, remainingBytes);
+  if (opening.lines.length === 0 && opening.oversizedEntryPrefixes.length === 0) return main;
+  return combineOpeningAndMainPages(opening, main);
+}
+
+function combineOpeningAndMainPages(opening: ReadPageLines, main: ReadPageLines): ReadPageLines {
   return {
     lines: [...opening.lines, ...main.lines],
     oversizedEntryPrefixes: [...opening.oversizedEntryPrefixes, ...main.oversizedEntryPrefixes],
@@ -843,6 +846,17 @@ function readVisiblePage(fd: number, snapshotSize: number, index: SessionLineInd
     droppedLeadingEntries: 0,
     decodedBytes: opening.decodedBytes + main.decodedBytes
   };
+}
+
+function firstRenderableLineInLoadedPage(lines: Array<{ lineNumber: number; text: string }>): number | undefined {
+  for (const line of lines) {
+    if (!line.text.trim()) continue;
+    try {
+      const value: unknown = JSON.parse(line.text);
+      if (isSessionEntry(value) && isRenderableSessionEntry({ ...value, lineNumber: line.lineNumber })) return line.lineNumber;
+    } catch { /* Malformed records do not render. */ }
+  }
+  return undefined;
 }
 
 function indexedOversizedLineCount(index: SessionLineIndex, startLine: number, endLine: number): number {
@@ -1308,11 +1322,15 @@ function readPageLines(fd: number, snapshotSize: number, index: SessionLineIndex
   let stoppedForPageBytes = false;
   let droppedLeadingEntries = 0;
 
-  const append = (part: Buffer) => {
-    if (lineNumber < desiredStart || lineNumber > desiredEnd || oversized || part.length === 0) return;
-    if (partBytes + part.length >= MAX_SESSION_PAGE_BYTES) { oversized = true; parts = []; partBytes = 0; return; }
+  const append = (part: Buffer): boolean => {
+    if (lineNumber < desiredStart || lineNumber > desiredEnd || oversized || part.length === 0) return true;
+    if (!keepTail && totalBytes + partBytes + part.length + 1 > maxPageBytes && (lines.length > 0 || maxPageBytes < MAX_SESSION_PAGE_CONTENT_BYTES)) {
+      pageEndLine = lineNumber - 1; stoppedForPageBytes = true; return false;
+    }
+    if (partBytes + part.length >= MAX_SESSION_PAGE_BYTES) { oversized = true; parts = []; partBytes = 0; return true; }
     parts.push(Buffer.from(part));
     partBytes += part.length;
+    return true;
   };
   const finish = (lineEndOffset: number): boolean => {
     if (lineNumber >= desiredStart && lineNumber <= desiredEnd) {
@@ -1354,7 +1372,7 @@ function readPageLines(fd: number, snapshotSize: number, index: SessionLineIndex
     while (cursor < count) {
       const newline = buffer.indexOf(0x0a, cursor);
       const end = newline >= 0 && newline < count ? newline : count;
-      if (end > cursor) append(buffer.subarray(cursor, end));
+      if (end > cursor && !append(buffer.subarray(cursor, end))) break scan;
       if (newline < 0 || newline >= count) break;
       if (!finish(position + newline)) break scan;
       cursor = newline + 1;

@@ -81,6 +81,12 @@ function assertNondisplayedGapReadBound(target: WorkerSessionViewTarget, maximum
   execFileSync(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(target), String(maximumBytes)], { timeout: 20_000, stdio: "pipe" });
 }
 
+function assertEdgePageReadCeiling(target: WorkerSessionViewTarget, requests: WorkerSessionPageRequest[], maximumBytes: number): void {
+  const moduleUrl = new URL("../extensions/worker/view.js", import.meta.url).href;
+  const script = `import fs from "node:fs"; import { syncBuiltinESMExports } from "node:module"; const original = fs.readSync; let bytes = 0; let calls = []; fs.readSync = function(...args) { const count = original.apply(this, args); bytes += count; calls.push([args[4], args[3], count]); return count; }; syncBuiltinESMExports(); const view = await import(${JSON.stringify(moduleUrl)}); const target = JSON.parse(process.argv[1]); const requests = JSON.parse(process.argv[2]); const maximum = Number(process.argv[3]); await view.loadWorkerSessionViewSnapshotAsync(target); for (const asyncMode of [false, true]) for (const request of requests) { bytes = 0; calls = []; const page = asyncMode ? await view.loadWorkerSessionViewSnapshotAsync(target, request) : view.loadWorkerSessionViewSnapshot(target, {}, request); if (page.blocks.length === 0) throw new Error("edge page was empty " + JSON.stringify(request)); if (bytes > maximum) throw new Error("edge page reread " + bytes + " bytes request=" + JSON.stringify(request) + " calls=" + JSON.stringify(calls)); }`;
+  execFileSync(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(target), JSON.stringify(requests), String(maximumBytes)], { timeout: 30_000, stdio: "pipe" });
+}
+
 function assertCountSessionLinesReadFailure(target: WorkerSessionViewTarget, mode: "retry" | "fail" | "replace"): void {
   const moduleUrl = new URL("../extensions/worker/view.js", import.meta.url).href;
   const script = `import fs from "node:fs"; import { syncBuiltinESMExports } from "node:module"; const original = fs.readSync; let injected = 0; const mode = process.argv[2]; const target = JSON.parse(process.argv[1]); fs.readSync = function(fd, buffer, offset, length, position) { if (typeof position === "number" && position > 0 && (mode === "fail" || injected === 0)) { injected += 1; if (mode === "replace") { fs.renameSync(target.sessionFile, target.sessionFile + ".original"); fs.writeFileSync(target.sessionFile, "replacement\\n"); } return 0; } return original.call(this, fd, buffer, offset, length, position); }; syncBuiltinESMExports(); const view = await import(${JSON.stringify(moduleUrl)}); try { const count = view.countSessionLines(target.sessionFile); if (mode !== "retry") throw new Error("count unexpectedly succeeded"); if (count !== target.sessionEndLine) throw new Error("retry count mismatch " + count); } catch (error) { if (mode === "retry") throw error; if (error?.message !== "Worker session changed while counting lines; retry.") throw new Error("unstable count error: " + String(error?.message)); }`;
@@ -811,6 +817,24 @@ test("reduced compaction pages stop before a kept entry that exceeds the opening
   } finally { f.close(); }
 });
 
+test("multi-MiB skipped, compaction, and opening edge pages stay within the total 8 MiB read ceiling", () => {
+  const f = fixture();
+  try {
+    const opening = message("opening", null, `OPENING-${"o".repeat(2 * 1024 * 1024)}`);
+    const hidden = { type: "custom", id: "hidden", parentId: "opening", timestamp: "now", customType: "internal", data: { hidden: true } };
+    const kept = message("kept", "hidden", `KEPT-${"k".repeat(3_500 * 1024)}`);
+    const compact = { type: "compaction", id: "compact", parentId: "kept", timestamp: "now", summary: "EDGE-COMPACTION", firstKeptEntryId: "kept", tokensBefore: 10 };
+    const oversized = message("oversized", "compact", `OVERSIZED-${"z".repeat(9 * 1024 * 1024)}`);
+    const edgeOne = message("edge-1", "oversized", `EDGE-1-${"a".repeat(2_500 * 1024)}`);
+    const edgeTwo = message("edge-2", "edge-1", `EDGE-2-${"b".repeat(3_500 * 1024)}`);
+    const last = message("last", "edge-2", "LAST");
+    const entries = [opening, hidden, kept, compact, oversized, edgeOne, edgeTwo, last];
+    writeFileSync(f.sessionFile, line(header(f.target)) + entries.map(line).join(""));
+    const target = { ...f.target, sessionStartLine: 2, sessionEndLine: entries.length + 1 };
+    assertEdgePageReadCeiling(target, [{ mode: "first" }, { mode: "tail" }, { mode: "after", line: 2 }, { mode: "before", line: 9 }], 8 * 1024 * 1024);
+  } finally { f.close(); }
+});
+
 test("exactly 8 MiB entry content is indexed and displayed consistently as oversized", async () => {
   const f = fixture();
   try {
@@ -829,22 +853,20 @@ test("exactly 8 MiB entry content is indexed and displayed consistently as overs
   } finally { f.close(); }
 });
 
-test("truncated backward entry parsing defers the leading oversized notice", async () => {
+test("exact 2,048-block backward parsing defers the leading oversized notice when an earlier display remains", async () => {
   const f = fixture();
   try {
-    const entries: string[] = [line(message("huge", null, `HUGE-${"h".repeat(9 * 1024 * 1024)}`)), line(message("first", "huge", "FIRST"))];
-    let parentId = "first";
-    for (let index = 0; index < 2_048; index += 1) { const id = `later-${index}`; entries.push(line(message(id, parentId, `LATER-${index}`))); parentId = id; }
-    writeFileSync(f.sessionFile, line(header(f.target)) + entries.join(""));
-    const target = { ...f.target, sessionStartLine: 2, sessionEndLine: entries.length + 1 };
+    const huge = message("huge", null, `HUGE-${"h".repeat(9 * 1024 * 1024)}`);
+    const first = message("first", "huge", "FIRST");
+    const assistant = { type: "message", id: "assistant", parentId: "first", timestamp: "now", message: { role: "assistant", content: Array.from({ length: 2_048 }, (_, index) => ({ type: "text", text: `PART-${index}` })) } };
+    writeFileSync(f.sessionFile, line(header(f.target)) + line(huge) + line(first) + line(assistant));
+    const target = { ...f.target, sessionStartLine: 2, sessionEndLine: 4 };
     for (const asyncMode of [false, true]) {
-      let page = asyncMode ? await loadWorkerSessionViewSnapshotAsync(target) : loadWorkerSessionViewSnapshot(target);
-      assert.equal(page.blocks.length, 512); assert.equal(page.skippedOversizedEntries, 0); assert.equal(page.hasPreviousPage, true);
-      while (page.hasPreviousPage) {
-        page = asyncMode ? await loadWorkerSessionViewSnapshotAsync(target, { mode: "before", line: page.pageStartLine }) : loadWorkerSessionViewSnapshot(target, {}, { mode: "before", line: page.pageStartLine });
-        if (page.hasPreviousPage) assert.equal(page.skippedOversizedEntries, 0);
-      }
-      assert.equal(page.blocks[0]?.text, "FIRST"); assert.equal(page.skippedOversizedEntries, 1);
+      const tail = asyncMode ? await loadWorkerSessionViewSnapshotAsync(target) : loadWorkerSessionViewSnapshot(target);
+      assert.equal(tail.blocks.length, 2_048); assert.equal(tail.blocks[0]?.text, "PART-0"); assert.equal(tail.blocks.at(-1)?.text, "PART-2047");
+      assert.equal(tail.skippedOversizedEntries, 0); assert.equal(tail.hasPreviousPage, true);
+      const opening = asyncMode ? await loadWorkerSessionViewSnapshotAsync(target, { mode: "before", line: tail.pageStartLine }) : loadWorkerSessionViewSnapshot(target, {}, { mode: "before", line: tail.pageStartLine });
+      assert.deepEqual(opening.blocks.map((block) => block.text), ["FIRST"]); assert.equal(opening.skippedOversizedEntries, 1); assert.equal(opening.hasPreviousPage, false);
     }
   } finally { f.close(); }
 });
@@ -852,37 +874,37 @@ test("truncated backward entry parsing defers the leading oversized notice", asy
 test("backward block paging reports a leading oversized entry only with the first displayed block", async () => {
   const f = fixture();
   try {
-    const hiddenBefore = { type: "custom", id: "hidden-before", parentId: null, timestamp: "now", customType: "internal", data: { hidden: true } };
-    const huge = message("huge", "hidden-before", `HUGE-${"h".repeat(9 * 1024 * 1024)}`);
-    const hiddenAfter = { type: "custom", id: "hidden-after", parentId: "huge", timestamp: "now", customType: "internal", data: { hidden: true } };
-    const assistant = { type: "message", id: "assistant", parentId: "hidden-after", timestamp: "now", message: { role: "assistant", content: Array.from({ length: 4_096 }, (_, index) => ({ type: "text", text: `PART-${index}` })) } };
-    writeFileSync(f.sessionFile, line(header(f.target)) + line(hiddenBefore) + line(huge) + line(hiddenAfter) + line(assistant));
-    const target = { ...f.target, sessionStartLine: 2, sessionEndLine: 5 };
+    const firstHuge = message("huge-1", null, `HUGE-1-${"h".repeat(9 * 1024 * 1024)}`);
+    const secondHuge = message("huge-2", "huge-1", `HUGE-2-${"h".repeat(9 * 1024 * 1024)}`);
+    const assistant = { type: "message", id: "assistant", parentId: "huge-2", timestamp: "now", message: { role: "assistant", content: Array.from({ length: 4_096 }, (_, index) => ({ type: "text", text: `PART-${index}` })) } };
+    writeFileSync(f.sessionFile, line(header(f.target)) + line(firstHuge) + line(secondHuge) + line(assistant));
+    const target = { ...f.target, sessionStartLine: 2, sessionEndLine: 4 };
     for (const asyncMode of [false, true]) {
       const tail = asyncMode ? await loadWorkerSessionViewSnapshotAsync(target) : loadWorkerSessionViewSnapshot(target);
       assert.equal(tail.blocks.length, 2_048); assert.equal(tail.blocks[0]?.text, "PART-2048"); assert.equal(tail.blocks.at(-1)?.text, "PART-4095");
-      assert.equal(tail.skippedOversizedEntries, 0); assert.equal(tail.totalVisibleEntries, 1); assert.equal(tail.pageStartLine, 5); assert.equal(tail.pageStartBlock, 2_048); assert.equal(tail.hasPreviousBlocksInEntry, true);
+      assert.equal(tail.skippedOversizedEntries, 0); assert.equal(tail.totalVisibleEntries, 1); assert.equal(tail.pageStartLine, 4); assert.equal(tail.pageStartBlock, 2_048); assert.equal(tail.hasPreviousBlocksInEntry, true);
       const first = asyncMode ? await loadWorkerSessionViewSnapshotAsync(target, { mode: "before", line: tail.pageStartLine, block: tail.pageStartBlock }) : loadWorkerSessionViewSnapshot(target, {}, { mode: "before", line: tail.pageStartLine, block: tail.pageStartBlock });
       assert.equal(first.blocks.length, 2_048); assert.equal(first.blocks[0]?.text, "PART-0"); assert.equal(first.blocks.at(-1)?.text, "PART-2047");
-      assert.equal(first.skippedOversizedEntries, 1); assert.equal(first.totalVisibleEntries, 1); assert.equal(first.previousVisibleEntries + first.totalActiveEntries + first.nextVisibleEntries, 1);
-      assert.equal(first.pageStartLine, 4); assert.equal(first.pageEndLine, 5); assert.equal(first.pageStartBlock, 0); assert.equal(first.pageEndBlock, 2_048); assert.equal(first.hasPreviousPage, false);
+      assert.equal(first.skippedOversizedEntries, 2); assert.equal(first.totalVisibleEntries, 1); assert.equal(first.previousVisibleEntries + first.totalActiveEntries + first.nextVisibleEntries, 1);
+      assert.equal(first.pageStartLine, 4); assert.equal(first.pageEndLine, 4); assert.equal(first.pageStartBlock, 0); assert.equal(first.pageEndBlock, 2_048); assert.equal(first.hasPreviousPage, false);
     }
   } finally { f.close(); }
 });
 
-test("backward fallback before the indexed window keeps its oversized notice on the first block page", async () => {
+test("backward fallback counts indexed oversized records before but not after its first display as leading", async () => {
   const f = fixture();
   try {
-    const oversized = message("oversized", null, `OVERSIZED-${"o".repeat(9 * 1024 * 1024)}`);
-    const assistant = { type: "message", id: "assistant", parentId: "oversized", timestamp: "now", message: { role: "assistant", content: Array.from({ length: 4_096 }, (_, index) => ({ type: "text", text: `PART-${index}` })) } };
-    const entries = [line(oversized), line(assistant)];
-    let parentId = "assistant";
+    const before = message("before", null, `BEFORE-${"b".repeat(9 * 1024 * 1024)}`);
+    const assistant = { type: "message", id: "assistant", parentId: "before", timestamp: "now", message: { role: "assistant", content: Array.from({ length: 4_096 }, (_, index) => ({ type: "text", text: `PART-${index}` })) } };
+    const after = message("after", "assistant", `AFTER-${"a".repeat(9 * 1024 * 1024)}`);
+    const entries = [line(before), line(assistant), line(after)];
+    let parentId = "after";
     for (let index = 0; index < 10; index += 1) { const id = `hidden-${index}`; entries.push(line({ type: "custom", id, parentId, timestamp: "now", customType: "internal", data: { padding: "h".repeat(900 * 1024) } })); parentId = id; }
     writeFileSync(f.sessionFile, line(header(f.target)) + entries.join(""));
     const target = { ...f.target, sessionStartLine: 2, sessionEndLine: entries.length + 1 };
     for (const asyncMode of [false, true]) {
       const tail = asyncMode ? await loadWorkerSessionViewSnapshotAsync(target) : loadWorkerSessionViewSnapshot(target);
-      assert.equal(tail.blocks.length, 2_048); assert.equal(tail.blocks[0]?.text, "PART-2048"); assert.equal(tail.skippedOversizedEntries, 0); assert.equal(tail.hasPreviousBlocksInEntry, true);
+      assert.equal(tail.blocks.length, 2_048); assert.equal(tail.blocks[0]?.text, "PART-2048"); assert.equal(tail.skippedOversizedEntries, 1); assert.equal(tail.hasPreviousBlocksInEntry, true);
       const first = asyncMode ? await loadWorkerSessionViewSnapshotAsync(target, { mode: "before", line: tail.pageStartLine, block: tail.pageStartBlock }) : loadWorkerSessionViewSnapshot(target, {}, { mode: "before", line: tail.pageStartLine, block: tail.pageStartBlock });
       assert.equal(first.blocks.length, 2_048); assert.equal(first.blocks[0]?.text, "PART-0"); assert.equal(first.skippedOversizedEntries, 1); assert.equal(first.hasPreviousPage, false);
     }
