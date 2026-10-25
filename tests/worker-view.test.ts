@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { SessionManager, type ExtensionCommandContext, type Theme } from "@earendil-works/pi-coding-agent";
-import { buildWorkerSessionViewerFrame, countSessionLines, createWorkerSessionViewerComponent, loadWorkerSessionViewSnapshot, loadWorkerSessionViewSnapshotAsync, openWorkerSessionViewer, sanitizeViewText, type WorkerSessionPageRequest, type WorkerSessionViewSnapshot, type WorkerSessionViewTarget, type WorkerSessionViewerState } from "../extensions/worker/view.js";
+import { buildWorkerSessionViewerFrame, countSessionLines, createWorkerSessionViewerComponent, loadWorkerSessionViewSnapshot, loadWorkerSessionViewSnapshotAsync, openWorkerSessionViewer, sanitizeViewText, simulateWorkerSessionVisibilityRankIndex, type WorkerSessionPageRequest, type WorkerSessionViewSnapshot, type WorkerSessionViewTarget, type WorkerSessionViewerState } from "../extensions/worker/view.js";
 import { forkWorkerSession } from "../extensions/worker/session.js";
 
 function fixture(options: { root?: string; splitRoots?: boolean } = {}) {
@@ -81,6 +81,12 @@ function assertNondisplayedGapReadBound(target: WorkerSessionViewTarget, maximum
   execFileSync(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(target), String(maximumBytes)], { timeout: 20_000, stdio: "pipe" });
 }
 
+function assertRankTraversalReadCeiling(target: WorkerSessionViewTarget, expected: number): void {
+  const moduleUrl = new URL("../extensions/worker/view.js", import.meta.url).href;
+  const script = `import fs from "node:fs"; import { syncBuiltinESMExports } from "node:module"; const original = fs.readSync; let bytes = 0; fs.readSync = function(...args) { const count = original.apply(this, args); bytes += count; return count; }; syncBuiltinESMExports(); const view = await import(${JSON.stringify(moduleUrl)}); const target = JSON.parse(process.argv[1]); const expected = Number(process.argv[2]); await view.loadWorkerSessionViewSnapshotAsync(target); for (const asyncMode of [false, true]) for (const direction of ["forward", "backward"]) { let request = direction === "forward" ? { mode: "first" } : { mode: "tail" }; let seen = 0; let previousCursor; const cursors = new Set(); for (let step = 0; step < expected + 16; step += 1) { bytes = 0; const page = asyncMode ? await view.loadWorkerSessionViewSnapshotAsync(target, request) : view.loadWorkerSessionViewSnapshot(target, {}, request); if (bytes > 8 * 1024 * 1024) throw new Error("rank page read " + bytes); if (page.blocks.length === 0 || page.totalVisibleEntries !== expected || page.previousVisibleEntries + page.totalActiveEntries + page.nextVisibleEntries !== expected) throw new Error("inexact rank page"); const cursor = direction === "forward" ? page.pageEndLine + ":" + (page.pageEndBlock ?? 0) : page.pageStartLine + ":" + (page.pageStartBlock ?? 0); if (cursors.has(cursor)) throw new Error("rank cursor cycle " + cursor); cursors.add(cursor); if (previousCursor !== undefined && (direction === "forward" ? page.pageEndLine <= previousCursor : page.pageStartLine >= previousCursor)) throw new Error("rank cursor did not advance"); previousCursor = direction === "forward" ? page.pageEndLine : page.pageStartLine; seen += page.blocks.length; if (direction === "forward" ? !page.hasNextPage : !page.hasPreviousPage) break; request = direction === "forward" ? { mode: "after", line: page.pageEndLine, ...(page.hasNextBlocksInEntry ? { block: page.pageEndBlock } : {}) } : { mode: "before", line: page.pageStartLine, ...(page.hasPreviousBlocksInEntry ? { block: page.pageStartBlock } : {}) }; } if (seen !== expected) throw new Error("rank traversal lost entries " + seen); }`;
+  execFileSync(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(target), String(expected)], { timeout: 60_000, stdio: "pipe" });
+}
+
 function assertEdgePageReadCeiling(target: WorkerSessionViewTarget, requests: WorkerSessionPageRequest[], maximumBytes: number): void {
   const moduleUrl = new URL("../extensions/worker/view.js", import.meta.url).href;
   const script = `import fs from "node:fs"; import { syncBuiltinESMExports } from "node:module"; const original = fs.readSync; let bytes = 0; let calls = []; fs.readSync = function(...args) { const count = original.apply(this, args); bytes += count; calls.push([args[4], args[3], count]); return count; }; syncBuiltinESMExports(); const view = await import(${JSON.stringify(moduleUrl)}); const target = JSON.parse(process.argv[1]); const requests = JSON.parse(process.argv[2]); const maximum = Number(process.argv[3]); await view.loadWorkerSessionViewSnapshotAsync(target); for (const asyncMode of [false, true]) for (const request of requests) { bytes = 0; calls = []; const page = asyncMode ? await view.loadWorkerSessionViewSnapshotAsync(target, request) : view.loadWorkerSessionViewSnapshot(target, {}, request); if (page.blocks.length === 0) throw new Error("edge page was empty " + JSON.stringify(request)); if (bytes > maximum) throw new Error("edge page reread " + bytes + " bytes request=" + JSON.stringify(request) + " calls=" + JSON.stringify(calls)); }`;
@@ -117,7 +123,40 @@ async function assertExactBidirectionalBlocks(target: WorkerSessionViewTarget, e
   }
 }
 
+function expectedBlockText(text: string): string { return text.length <= 16 * 1024 ? text : `${text.slice(0, 16 * 1024)}\n[… block text truncated …]`; }
+
+async function assertExactOneBlockRanks(target: WorkerSessionViewTarget, expected: string[], expectedOversized = 0): Promise<void> {
+  const positions = new Map(expected.map((text, index) => [text, index]));
+  for (const asyncMode of [false, true]) for (const direction of ["forward", "backward"] as const) {
+    const pages: WorkerSessionViewSnapshot[] = []; const cursors = new Set<string>();
+    let request: WorkerSessionPageRequest = direction === "forward" ? { mode: "first" } : { mode: "tail" };
+    for (let step = 0; step < expected.length + 16; step += 1) {
+      const page: WorkerSessionViewSnapshot = asyncMode ? await loadWorkerSessionViewSnapshotAsync(target, request) : loadWorkerSessionViewSnapshot(target, {}, request);
+      assert.ok(page.blocks.length > 0, `${direction} ${asyncMode} empty page`);
+      const texts: string[] = page.blocks.map((block) => block.text); const first = positions.get(texts[0]!);
+      assert.notEqual(first, undefined); assert.deepEqual(texts, expected.slice(first!, first! + texts.length));
+      assert.equal(page.previousVisibleEntries, first); assert.equal(page.totalActiveEntries, texts.length);
+      assert.equal(page.nextVisibleEntries, expected.length - first! - texts.length); assert.equal(page.totalVisibleEntries, expected.length);
+      const cursor = direction === "forward" ? `${page.pageEndLine}:${page.pageEndBlock ?? 0}` : `${page.pageStartLine}:${page.pageStartBlock ?? 0}`;
+      assert.equal(cursors.has(cursor), false); cursors.add(cursor); pages.push(page);
+      if (direction === "forward" ? !page.hasNextPage : !page.hasPreviousPage) break;
+      request = direction === "forward" ? { mode: "after", line: page.pageEndLine, ...(page.hasNextBlocksInEntry ? { block: page.pageEndBlock } : {}) } : { mode: "before", line: page.pageStartLine, ...(page.hasPreviousBlocksInEntry ? { block: page.pageStartBlock } : {}) };
+    }
+    if (direction === "backward") pages.reverse();
+    assert.deepEqual(pages.flatMap((page) => page.blocks.map((block) => block.text)), expected);
+    assert.equal(pages.reduce((total, page) => total + page.skippedOversizedEntries, 0), expectedOversized);
+  }
+}
+
 const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as Theme;
+
+test("10M-entry visibility rank/select simulation stays compact and exact", () => {
+  const value = simulateWorkerSessionVisibilityRankIndex(10_000_000);
+  assert.equal(value.displays, Math.ceil(10_000_000 / 17));
+  assert.equal(value.oversized, Math.ceil(10_000_000 / 1_009));
+  assert.equal(value.lastDisplay, 1 + (value.displays - 1) * 17);
+  assert.ok(value.bytes < 4 * 1024 * 1024, `rank index used ${value.bytes} bytes`);
+});
 
 test("worker conversation view preserves the opening assignment and renders compaction chronologically without raw JSONL", () => {
   const f = fixture();
@@ -817,6 +856,78 @@ test("reduced compaction pages stop before a kept entry that exceeds the opening
   } finally { f.close(); }
 });
 
+test("rank/select paging stays exact around adjacent multi-MiB entries beyond 1,024 displays", async () => {
+  for (const [position, sizes] of [[520, [5_000, 5_000]], [600, [5_000, 5_000]], [1_080, [4_000, 4_000, 4_000, 4_000]]] as const) {
+    const f = fixture();
+    try {
+      const entries: string[] = []; const expected: string[] = []; let parentId: string | null = null;
+      for (let index = 0; index < 1_100; index += 1) {
+        if (index === position) for (let special = 0; special < sizes.length; special += 1) {
+          const id = `large-${position}-${special}`; const text = `LARGE-${position}-${special}-${"L".repeat(sizes[special]! * 1024)}`;
+          entries.push(line(message(id, parentId, text))); expected.push(expectedBlockText(text)); parentId = id;
+        }
+        const id = `small-${position}-${index}`; const text = `SMALL-${position}-${index}`;
+        entries.push(line(message(id, parentId, text))); expected.push(text); parentId = id;
+      }
+      writeFileSync(f.sessionFile, line(header(f.target)) + entries.join(""));
+      const target = { ...f.target, sessionStartLine: 2, sessionEndLine: entries.length + 1 };
+      await assertExactOneBlockRanks(target, expected);
+      if (position === 600) { assertEdgePageReadCeiling(target, [{ mode: "after", line: 602 }, { mode: "tail" }, { mode: "before", line: 607 }], 8 * 1024 * 1024); assertRankTraversalReadCeiling(target, expected.length); }
+      const terminal = loadWorkerSessionViewSnapshot(target, {}, { mode: "after", line: entries.length + 1 });
+      assert.equal(terminal.blocks.length, 0); assert.equal(terminal.hasNextPage, false); assert.equal(terminal.previousVisibleEntries, expected.length);
+    } finally { f.close(); }
+  }
+});
+
+test("5,000-entry backward clusters retain every adjacent large display and exact ranks", async () => {
+  const f = fixture();
+  try {
+    const entries: string[] = []; const expected: string[] = []; let parentId: string | null = null;
+    const pushUser = (id: string, text: string) => { entries.push(line(message(id, parentId, text))); expected.push(expectedBlockText(text)); parentId = id; };
+    for (let index = 0; index < 5_000; index += 1) {
+      if (index === 1_000) {
+        const assistantText = `ASSISTANT-5-${"a".repeat(5_000 * 1024)}`; const assistantId = "cluster-assistant-1";
+        entries.push(line({ type: "message", id: assistantId, parentId, timestamp: "now", message: { role: "assistant", content: [{ type: "text", text: assistantText }] } })); expected.push(expectedBlockText(assistantText)); parentId = assistantId;
+        pushUser("cluster-user-near", `USER-NEAR-${"u".repeat(6_850 * 1024)}`);
+        pushUser("cluster-user-5", `USER-5-${"v".repeat(5_000 * 1024)}`);
+        entries.push(line({ type: "custom", customType: "internal", data: { padding: "h".repeat(3 * 1024 * 1024) }, id: "cluster-hidden", parentId, timestamp: "now" })); parentId = "cluster-hidden";
+        const toolText = `TOOL-NEAR-${"t".repeat(6_850 * 1024)}`; const toolId = "cluster-tool";
+        entries.push(line({ type: "message", id: toolId, parentId, timestamp: "now", message: { role: "toolResult", toolCallId: "cluster", toolName: "edge", content: toolText, isError: false } })); expected.push(expectedBlockText(toolText)); parentId = toolId;
+        const lastText = `ASSISTANT-LAST-${"q".repeat(5_000 * 1024)}`; const lastId = "cluster-assistant-2";
+        entries.push(line({ type: "message", id: lastId, parentId, timestamp: "now", message: { role: "assistant", content: [{ type: "text", text: lastText }] } })); expected.push(expectedBlockText(lastText)); parentId = lastId;
+      }
+      pushUser(`dense-${index}`, `DENSE-${index}`);
+    }
+    writeFileSync(f.sessionFile, line(header(f.target)) + entries.join(""));
+    const target = { ...f.target, sessionStartLine: 2, sessionEndLine: entries.length + 1 };
+    await assertExactOneBlockRanks(target, expected);
+    assertEdgePageReadCeiling(target, [{ mode: "before", line: 1_008 }, { mode: "after", line: 1_002 }, { mode: "tail" }], 8 * 1024 * 1024);
+    assertRankTraversalReadCeiling(target, expected.length);
+  } finally { f.close(); }
+});
+
+test("compaction-filtered oversized ranks and Pi-ordered first-kept metadata agree", async () => {
+  for (const keptType of ["custom", "custom_message"] as const) {
+    const f = fixture();
+    try {
+      const opening = message("opening", null, `OPENING-${"o".repeat(9 * 1024 * 1024)}`);
+      const hiddenOversized = message("old-oversized", "opening", `OLD-${"x".repeat(9 * 1024 * 1024)}`);
+      const kept = keptType === "custom"
+        ? { type: "custom", customType: "state", data: { padding: "k".repeat(9 * 1024 * 1024) }, id: "kept-custom", parentId: "old-oversized", timestamp: "now" }
+        : { type: "custom_message", customType: "state", content: `K-${"k".repeat(9 * 1024 * 1024)}`, display: true, details: {}, id: "kept-custom", parentId: "old-oversized", timestamp: "now" };
+      const after = message("after", "kept-custom", "AFTER");
+      const compact = { type: "compaction", id: "compact", parentId: "after", timestamp: "now", summary: "SUMMARY", firstKeptEntryId: "kept-custom", tokensBefore: 10 };
+      const entries = [opening, hiddenOversized, kept, after, compact];
+      writeFileSync(f.sessionFile, line(header(f.target)) + entries.map(line).join(""));
+      const target = { ...f.target, sessionStartLine: 2, sessionEndLine: entries.length + 1 };
+      await assertExactBidirectionalBlocks(target, ["AFTER", "SUMMARY"], 2, 0, 2);
+      for (const request of [{ mode: "first" as const }, { mode: "tail" as const }]) for (const page of [loadWorkerSessionViewSnapshot(target, {}, request), await loadWorkerSessionViewSnapshotAsync(target, request)]) {
+        assert.equal(page.hiddenCompactedEntries, 1); assert.equal(page.skippedOversizedEntries, 2);
+      }
+    } finally { f.close(); }
+  }
+});
+
 test("Pi-ordered large displayed custom messages remain reachable without paging cycles", async () => {
   for (const prefixEntries of [0, 512]) {
     const f = fixture();
@@ -934,7 +1045,7 @@ test("near-bound entry advances before a 400 KiB follower without empty pages or
   } finally { f.close(); }
 });
 
-test("160 deterministic multi-MiB layouts preserve exact sync/async paging within the hard read ceiling", async () => {
+test("160 deterministic multi-MiB layouts preserve exact sync/async paging on fresh fixtures", async () => {
   let inherited = "";
     for (let index = 0; index < 70_000; index += 1) inherited += line(message(`matrix-prefix-${index}`, index === 0 ? null : `matrix-prefix-${index - 1}`, `P-${index}`));
     const retainedStartLine = 70_002;
@@ -997,15 +1108,16 @@ test("160 deterministic multi-MiB layouts preserve exact sync/async paging withi
   }
 });
 
-test("64 seeded sparse and dense multi-MiB layouts remain exact and bounded", async () => {
+test("64 seeded dense layouts above 1,024 entries remain exact with adjacent multi-MiB records", async () => {
   let random = 0x5eedf10;
   const next = () => { random = (Math.imul(random, 1_664_525) + 1_013_904_223) >>> 0; return random; };
   const expectedText = (text: string) => text.length <= 16 * 1024 ? text : `${text.slice(0, 16 * 1024)}\n[… block text truncated …]`;
   for (let seed = 0; seed < 64; seed += 1) {
     const f = fixture();
     try {
-      const count = 70 + next() % 1_531; const multiCount = 1 + next() % 5;
-      const special = new Map<number, number>();
+      const count = 1_025 + next() % 576; const multiCount = 2 + next() % 4;
+      const special = new Map<number, number>(); const cluster = 1 + next() % (count - 2);
+      special.set(cluster, 2); special.set(cluster + 1, 3);
       while (special.size < multiCount) special.set(next() % count, next() % 4);
       const entries: string[] = []; const expected: string[] = []; let parentId: string | null = null; let oversized = 0;
       for (let index = 0; index < count; index += 1) {
