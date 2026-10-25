@@ -11,7 +11,18 @@ import { assertWorkerSandboxReference, createWorkerSandboxAsync, planWorkerSandb
 
 const revisions = { pi: "1".repeat(40), profile: "2".repeat(40), piTools: "3".repeat(40), piDocparser: "4".repeat(40) };
 const extensionPaths = ["/opt/profile/extensions", "/opt/pi-tools/extensions/worker/runtime.ts"];
-const knownUpdateBanner="\n\n"+["╭──────────────────────────────────────────────────────────────────────────────────╮","│ Docker Sandboxes Update Available                                                │","├──────────────────────────────────────────────────────────────────────────────────┤","│ v0.49.1  →  v0.49.2                                                              │","├──────────────────────────────────────────────────────────────────────────────────┤","│ Release notes  https://github.com/docker/sbx-releases/releases/tag/v0.49.2       │","├──────────────────────────────────────────────────────────────────────────────────┤","│ To upgrade     brew upgrade docker/tap/sbx                                       │","╰──────────────────────────────────────────────────────────────────────────────────╯"].join("\n")+"\n";
+const recordedUpdateTrailer=`
+╭──────────────────────────────────────────────────────────────────────────────────╮
+│ Docker Sandboxes Update Available                                                │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│ v0.49.1  →  v0.49.2                                                              │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│ Release notes  https://github.com/docker/sbx-releases/releases/tag/v0.49.2       │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│ To upgrade     brew upgrade docker/tap/sbx                                       │
+╰──────────────────────────────────────────────────────────────────────────────────╯
+
+`;
 const runtimeJson = JSON.stringify({ protocolVersion: 1, stagedLockSha256: "e".repeat(64), piRevision: revisions.pi, profileRevision: revisions.profile, piToolsRevision: revisions.piTools, piDocparserRevision: revisions.piDocparser, resourceManifestSha256: "c".repeat(64), extensionPaths });
 const release: WorkerSandboxRelease = { schemaVersion: 1, protocolVersion: 1, releaseOrdinal: 1, status: "approved", kit: { reference: "/immutable/pi-kit", sha256: "a".repeat(64) }, image: { reference: `example.invalid/pi@sha256:${"b".repeat(64)}`, digest: "b".repeat(64) }, sandbox: { version: "v0.49.1", buildCommit: "c5b19951af121b439800029695f88bf1139a0b0b", template: { id: "template-id-1234", repository: "docker.io/akoumjian/pi-worker-r1-deadbeef", tag: "loaded", flavor: "pi-managed-worker" } }, revisions, guest: { stagedLockSha256: "e".repeat(64), piCli: "/usr/local/bin/pi", rpcLauncher: "/opt/pi-worker/launch.mjs", codingAgentDir: "/run/pi-worker/agent", resourceManifestSha256: "c".repeat(64), runtimeProvenanceSha256: createHash("sha256").update(runtimeJson).digest("hex"), extensionPaths, searxngUrl: "http://host.docker.internal:18888" } };
 
@@ -41,11 +52,11 @@ printf '%s\n' "$*" >> ${JSON.stringify(log)}
 if [ "$1" = version ]; then printf 'sbx version v0.49.1 c5b19951af121b439800029695f88bf1139a0b0b\n'
 elif [ "$1 $2 $3" = "template ls --json" ]; then printf '%s\n' '[{"id":"${release.sandbox.template.id}","repository":"${release.sandbox.template.repository}","tag":"${release.sandbox.template.tag}","flavor":"${release.sandbox.template.flavor}","created_at":"2026-10-25T00:00:00Z","size":123}]'
 elif [ "$1" = create ]; then printf 'ID: sandbox-id-1234\nName: %s\n' "$3"; printf '%s\n' "$3" > ${JSON.stringify(state)}
-elif [ "$1" = inspect ] && [ "$3" = --json ]; then printf '{"name":"%s","id":"sandbox-id-1234","status":"running","agent":"shell","workspace":"%s"}' "$2" ${JSON.stringify(workerRoot)}; printf '%s' '${knownUpdateBanner}'
+elif [ "$1" = inspect ] && [ "$3" = --json ]; then printf '{"name":"%s","id":"sandbox-id-1234","status":"running","agent":"shell","workspace":"%s"}\n' "$2" ${JSON.stringify(workerRoot)}; printf '%s' '${recordedUpdateTrailer}'
 elif [ "$1" = exec ]; then printf 'cpu=8\nmemoryBytes=17179869184\nruntime=%s\nresource=%s\n' '${runtimeJson}' '${release.guest.resourceManifestSha256}'
 elif [ "$1" = stop ]; then :
 elif [ "$1" = rm ]; then rm -f ${JSON.stringify(state)}
-elif [ "$1 $2" = "ls --json" ]; then if test -e ${JSON.stringify(state)}; then n=$(cat ${JSON.stringify(state)}); printf '[{"id":"sandbox-id-1234","name":"%s","status":"running","agent":"shell","workspace":"${workerRoot}"}]' "$n"; printf '%s' '${knownUpdateBanner}'; else printf '%s' '[]${knownUpdateBanner}'; fi
+elif [ "$1 $2" = "ls --json" ]; then if test -e ${JSON.stringify(state)}; then n=$(cat ${JSON.stringify(state)}); printf '[{"id":"sandbox-id-1234","name":"%s","status":"running","agent":"shell","workspace":"${workerRoot}"}]\n' "$n"; printf '%s' '${recordedUpdateTrailer}'; else printf '[]\n'; printf '%s' '${recordedUpdateTrailer}'; fi
 elif [ "$1" = ls ]; then test -e ${JSON.stringify(state)} && cat ${JSON.stringify(state)} || :
 else exit 64
 fi
@@ -54,6 +65,7 @@ fi
   const bareVersion=path.join(root,"sbx-bare-version");await writeFile(bareVersion,"#!/bin/sh\nprintf 'v0.49.1\\n'\n");await chmod(bareVersion,0o755);await assert.rejects(createWorkerSandboxAsync(bareVersion,planned),/recorded v0\.49\.1 contract/);
   const created = await createWorkerSandboxAsync(fake, planned); assert.match(created.createEvidenceSha256 ?? "", /^[a-f0-9]{64}$/); assert.equal(created.observedCpu, 8); assert.equal(created.observedMemoryBytes, 17_179_869_184); await settleWorkerSandboxAsync(fake, created);
   const commands = await readFile(log, "utf8"); assert.match(commands, new RegExp(`create --name ${planned.sandboxName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`)); assert.match(commands, new RegExp(`stop ${planned.sandboxName}`)); assert.match(commands, new RegExp(`rm --force ${planned.sandboxName}`));
+  const exactFake=await readFile(fake,"utf8");await writeFile(fake,exactFake.replace("Docker Sandboxes Update Available","unexpected banner"));await assert.rejects(createWorkerSandboxAsync(fake,planned),/Sandbox inspect JSON was malformed/);
 }));
 
 test("RPC arguments retain immutable explicit extensions and complete built-in tools", () => {
