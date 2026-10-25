@@ -125,7 +125,7 @@ async function assertExactBidirectionalBlocks(target: WorkerSessionViewTarget, e
 
 function expectedBlockText(text: string): string { return text.length <= 16 * 1024 ? text : `${text.slice(0, 16 * 1024)}\n[… block text truncated …]`; }
 
-async function assertExactOneBlockRanks(target: WorkerSessionViewTarget, expected: string[], expectedOversized = 0): Promise<void> {
+async function assertExactOneBlockRanks(target: WorkerSessionViewTarget, expected: string[], expectedOversized = 0, expectedMalformed = 0): Promise<void> {
   const positions = new Map(expected.map((text, index) => [text, index]));
   for (const asyncMode of [false, true]) for (const direction of ["forward", "backward"] as const) {
     const pages: WorkerSessionViewSnapshot[] = []; const cursors = new Set<string>();
@@ -145,6 +145,7 @@ async function assertExactOneBlockRanks(target: WorkerSessionViewTarget, expecte
     if (direction === "backward") pages.reverse();
     assert.deepEqual(pages.flatMap((page) => page.blocks.map((block) => block.text)), expected);
     assert.equal(pages.reduce((total, page) => total + page.skippedOversizedEntries, 0), expectedOversized);
+    assert.equal(pages.reduce((total, page) => total + page.malformedEntries, 0), expectedMalformed);
   }
 }
 
@@ -154,8 +155,9 @@ test("10M-entry visibility rank/select simulation stays compact and exact", () =
   const value = simulateWorkerSessionVisibilityRankIndex(10_000_000);
   assert.equal(value.displays, Math.ceil(10_000_000 / 17));
   assert.equal(value.oversized, Math.ceil(10_000_000 / 1_009));
+  assert.equal(value.malformed, Math.ceil(10_000_000 / 997));
   assert.equal(value.lastDisplay, 1 + (value.displays - 1) * 17);
-  assert.ok(value.bytes < 4 * 1024 * 1024, `rank index used ${value.bytes} bytes`);
+  assert.ok(value.bytes < 5 * 1024 * 1024, `rank index used ${value.bytes} bytes`);
 });
 
 test("worker conversation view preserves the opening assignment and renders compaction chronologically without raw JSONL", () => {
@@ -167,10 +169,14 @@ test("worker conversation view preserves the opening assignment and renders comp
     const assistant = { type: "message", id: "a1", parentId: "c1", timestamp: "2026-01-01T00:00:04.000Z", message: { role: "assistant", provider: "openai-codex", model: "gpt-5.6-sol", content: [{ type: "thinking", thinking: "check carefully" }, { type: "toolCall", name: "search_many", arguments: { pattern: "x" } }, { type: "text", text: "done" }] } };
     const result = { type: "message", id: "t1", parentId: "a1", timestamp: "2026-01-01T00:00:05.000Z", message: { role: "toolResult", toolName: "search_many", isError: false, content: [{ type: "text", text: "match" }] } };
     writeFileSync(f.sessionFile, line(header(f.target)) + line(user) + line(kept) + line(compaction) + "{bad json}\n" + line(assistant) + line(result));
-    const value = loadWorkerSessionViewSnapshot({ ...f.target, sessionStartLine: 2, sessionEndLine: 7 });
+    const target = { ...f.target, sessionStartLine: 2, sessionEndLine: 7 };
+    const first = loadWorkerSessionViewSnapshot(target, {}, { mode: "first" });
+    assert.deepEqual(first.blocks.map((block) => block.kind), ["user"]); assert.equal(first.blocks[0]?.text, "old question"); assert.equal(first.hasNextPage, true);
+    const value = loadWorkerSessionViewSnapshot(target, {}, { mode: "after", line: first.pageEndLine });
     assert.equal(value.malformedEntries, 1);
-    assert.deepEqual(value.blocks.map((block) => block.kind), ["user", "user", "compaction", "thinking", "tool", "assistant", "toolResult"]);
-    assert.equal(value.blocks.some((block) => block.text.includes("old question")), true);
+    assert.deepEqual(value.blocks.map((block) => block.kind), ["user", "compaction", "thinking", "tool", "assistant", "toolResult"]);
+    assert.equal(value.blocks.some((block) => block.text.includes("old question")), false);
+    assert.deepEqual([...first.blocks, ...value.blocks].map((block) => block.kind), ["user", "user", "compaction", "thinking", "tool", "assistant", "toolResult"]);
     const rendered = buildWorkerSessionViewerFrame(theme, { snapshot: value, topLine: 0, pinnedToEnd: false }, 100, 40).lines.join("\n");
     assert.match(rendered, /Earlier work summary|Tool call · search_many/); assert.doesNotMatch(rendered, /"type":"message"/);
   } finally { f.close(); }
@@ -856,6 +862,74 @@ test("reduced compaction pages stop before a kept entry that exceeds the opening
   } finally { f.close(); }
 });
 
+test("rank-selected anchors skip adjacent Pi display:false and malformed payloads without entry loss", async () => {
+  const scenarios = [
+    { count: 8, position: 2, hidden: "custom_message" as const, sparse: false },
+    { count: 1_100, position: 600, hidden: "custom_message" as const, sparse: false },
+    { count: 5_000, position: 1_000, hidden: "custom_message" as const, sparse: false },
+    { count: 1_100, position: 600, hidden: "custom_message" as const, sparse: true },
+    { count: 1_100, position: 512, hidden: "malformed" as const, sparse: false },
+    { count: 1_100, position: 1_024, hidden: "malformed" as const, sparse: true }
+  ];
+  for (const scenario of scenarios) {
+    const f = fixture();
+    try {
+      const fd = openSync(f.sessionFile, "w"); const expected: string[] = []; let parentId: string | null = null; let retainedStart = 2;
+      try {
+        writeSync(fd, line(header(f.target)));
+        if (scenario.sparse) {
+          let chunk = "";
+          for (let index = 0; index < 70_000; index += 1) { chunk += line(message(`inherited-${index}`, index === 0 ? null : `inherited-${index - 1}`, `INHERITED-${index}`)); if (index % 1_000 === 999) { writeSync(fd, chunk); chunk = ""; } }
+          if (chunk) writeSync(fd, chunk); retainedStart = 70_002; parentId = "inherited-69999";
+        }
+        for (let index = 0; index < scenario.count; index += 1) {
+          if (index === scenario.position) {
+            const toolText = `READ-TOOL-${"r".repeat(3 * 1024 * 1024)}`; const toolId = `tool-${scenario.count}-${scenario.hidden}`;
+            writeSync(fd, line({ type: "message", id: toolId, parentId, timestamp: "now", message: { role: "toolResult", toolCallId: "read", toolName: "read", content: toolText, isError: false } })); expected.push(expectedBlockText(toolText)); parentId = toolId;
+            if (scenario.hidden === "custom_message") {
+              const hiddenId = `hidden-${scenario.count}`;
+              writeSync(fd, line({ type: "custom_message", customType: "fixture", content: `HIDDEN-${"h".repeat(5 * 1024 * 1024)}`, display: false, details: {}, id: hiddenId, parentId, timestamp: "now" })); parentId = hiddenId;
+            } else writeSync(fd, `{${"!".repeat(5 * 1024 * 1024 - 2)}\n`);
+            const assistantText = `ASSISTANT-AFTER-${"a".repeat(3 * 1024 * 1024)}`; const assistantId = `assistant-${scenario.count}-${scenario.hidden}`;
+            writeSync(fd, line({ type: "message", id: assistantId, parentId, timestamp: "now", message: { role: "assistant", content: [{ type: "text", text: assistantText }] } })); expected.push(expectedBlockText(assistantText)); parentId = assistantId;
+          }
+          const id = `r1-${scenario.count}-${scenario.hidden}-${index}`; const text = `R1-${scenario.count}-${index}`;
+          writeSync(fd, line(message(id, parentId, text))); expected.push(text); parentId = id;
+        }
+      } finally { closeSync(fd); }
+      const target = { ...f.target, sessionStartLine: retainedStart, sessionEndLine: retainedStart + scenario.count + 2 };
+      await assertExactOneBlockRanks(target, expected, 0, scenario.hidden === "malformed" ? 1 : 0);
+      if (scenario.count === 5_000 || scenario.hidden === "malformed" && !scenario.sparse) assertRankTraversalReadCeiling(target, expected.length);
+    } finally { f.close(); }
+  }
+});
+
+test("all-hidden pinned malformed pages report one ranked notice without duplication", async () => {
+  const f = fixture();
+  try {
+    writeFileSync(f.sessionFile, line(header(f.target)) + `{${"!".repeat(5 * 1024 * 1024)}\n`);
+    const target = { ...f.target, sessionStartLine: 2, sessionEndLine: 2 };
+    for (const request of [{ mode: "first" as const }, { mode: "tail" as const }]) for (const page of [loadWorkerSessionViewSnapshot(target, {}, request), await loadWorkerSessionViewSnapshotAsync(target, request)]) {
+      assert.equal(page.blocks.length, 0); assert.equal(page.totalVisibleEntries, 0); assert.equal(page.malformedEntries, 1); assert.equal(page.hasPreviousPage, false); assert.equal(page.hasNextPage, false);
+    }
+  } finally { f.close(); }
+});
+
+test("preserved opening never gap-recovers compacted entries before a hidden first-kept boundary", async () => {
+  const f = fixture();
+  try {
+    const entries: unknown[] = [message("opening", null, "OPENING")]; let parentId = "opening";
+    for (let index = 0; index < 300; index += 1) { const id = `old-${index}`; entries.push(message(id, parentId, `OLD-${index}`)); parentId = id; }
+    entries.push({ type: "custom", customType: "state", data: { kept: true }, id: "hidden-kept", parentId, timestamp: "now" }); parentId = "hidden-kept";
+    entries.push(message("oversized", parentId, `OVERSIZED-${"z".repeat(9 * 1024 * 1024)}`)); parentId = "oversized";
+    entries.push(message("after", parentId, "AFTER"));
+    entries.push({ type: "compaction", id: "compact", parentId: "after", timestamp: "now", summary: "SUMMARY", firstKeptEntryId: "hidden-kept", tokensBefore: 10 });
+    writeFileSync(f.sessionFile, line(header(f.target)) + entries.map(line).join(""));
+    const target = { ...f.target, sessionStartLine: 2, sessionEndLine: entries.length + 1 };
+    await assertExactBidirectionalBlocks(target, ["OPENING", "AFTER", "SUMMARY"], 3, 0, 1);
+  } finally { f.close(); }
+});
+
 test("rank/select paging stays exact around adjacent multi-MiB entries beyond 1,024 displays", async () => {
   for (const [position, sizes] of [[520, [5_000, 5_000]], [600, [5_000, 5_000]], [1_080, [4_000, 4_000, 4_000, 4_000]]] as const) {
     const f = fixture();
@@ -1115,29 +1189,33 @@ test("64 seeded dense layouts above 1,024 entries remain exact with adjacent mul
   for (let seed = 0; seed < 64; seed += 1) {
     const f = fixture();
     try {
-      const count = 1_025 + next() % 576; const multiCount = 2 + next() % 4;
-      const special = new Map<number, number>(); const cluster = 1 + next() % (count - 2);
-      special.set(cluster, 2); special.set(cluster + 1, 3);
-      while (special.size < multiCount) special.set(next() % count, next() % 4);
-      const entries: string[] = []; const expected: string[] = []; let parentId: string | null = null; let oversized = 0;
+      const count = 1_025 + next() % 576; const multiCount = 3 + next() % 4;
+      const special = new Map<number, number>(); const cluster = 1 + next() % (count - 3);
+      special.set(cluster, 2); special.set(cluster + 1, seed % 2 === 0 ? 0 : 1); special.set(cluster + 2, 3);
+      while (special.size < multiCount) special.set(next() % count, next() % 6);
+      const entries: string[] = []; const expected: string[] = []; let parentId: string | null = null; let oversized = 0; let malformed = 0;
       for (let index = 0; index < count; index += 1) {
         const id = `seed-${seed}-${index}`; const kind = special.get(index);
         if (kind === 0) {
-          entries.push(line({ type: "custom", customType: "internal", data: { padding: "h".repeat((2_100 + next() % 900) * 1024) }, id, parentId, timestamp: "now" }));
+          entries.push(line({ type: "custom_message", customType: "hidden", content: "h".repeat((4_500 + next() % 700) * 1024), display: false, details: {}, id, parentId, timestamp: "now" }));
         } else if (kind === 1) {
-          entries.push(line({ type: "custom", customType: "internal", data: { padding: "z".repeat(9 * 1024 * 1024) }, id, parentId, timestamp: "now" })); oversized += 1;
+          entries.push(`{${"!".repeat((4_500 + next() % 700) * 1024)}\n`); malformed += 1;
         } else if (kind === 2) {
           const text = `USER-${seed}-${index}-${"u".repeat((4_000 + next() % 1_200) * 1024)}`; entries.push(line(message(id, parentId, text))); expected.push(expectedText(text));
         } else if (kind === 3) {
           const text = `ASSISTANT-${seed}-${index}-${"a".repeat((4_500 + next() % 800) * 1024)}`; entries.push(line({ type: "message", id, parentId, timestamp: "now", message: { role: "assistant", content: [{ type: "text", text }] } })); expected.push(expectedText(text));
+        } else if (kind === 4) {
+          entries.push(line({ type: "custom", customType: "internal", data: { padding: "z".repeat(9 * 1024 * 1024) }, id, parentId, timestamp: "now" })); oversized += 1;
+        } else if (kind === 5) {
+          entries.push(line({ type: "custom", customType: "internal", data: { padding: "h".repeat((2_100 + next() % 900) * 1024) }, id, parentId, timestamp: "now" }));
         } else {
           const text = `ENTRY-${seed}-${index}`; entries.push(line(message(id, parentId, text))); expected.push(text);
         }
-        parentId = id;
+        if (kind !== 1) parentId = id;
       }
       writeFileSync(f.sessionFile, line(header(f.target)) + entries.join(""));
       const target = { ...f.target, sessionStartLine: 2, sessionEndLine: entries.length + 1 };
-      await assertExactBidirectionalBlocks(target, expected, expected.length, 0, oversized);
+      await assertExactBidirectionalBlocks(target, expected, expected.length, malformed, oversized);
       assertEdgePageReadCeiling(target, [{ mode: "first" }, { mode: "tail" }], 8 * 1024 * 1024);
     } finally { f.close(); }
   }
@@ -1239,7 +1317,7 @@ test("backward block paging reports a leading oversized entry only with the firs
   } finally { f.close(); }
 });
 
-test("backward fallback counts indexed oversized records before but not after its first display as leading", async () => {
+test("backward block cursors rank oversized records before but not after their first display", async () => {
   const f = fixture();
   try {
     const before = message("before", null, `BEFORE-${"b".repeat(9 * 1024 * 1024)}`);
@@ -1259,7 +1337,7 @@ test("backward fallback counts indexed oversized records before but not after it
   } finally { f.close(); }
 });
 
-test("backward notices include indexed oversized records before the 512-line fallback window", async () => {
+test("backward notices include ranked oversized records before the 512-line raw window", async () => {
   const f = fixture();
   try {
     const first = message("huge-1", null, `HUGE-1-${"x".repeat(9 * 1024 * 1024)}`);
@@ -1274,7 +1352,7 @@ test("backward notices include indexed oversized records before the 512-line fal
   } finally { f.close(); }
 });
 
-test("async fallback parses exactly 512 KiB but not a byte-skipped region one byte larger", async () => {
+test("async malformed ranks remain exact across the former 512 KiB boundary", async () => {
   for (const delta of [0, 1]) {
     const f = fixture();
     try {
@@ -1287,13 +1365,13 @@ test("async fallback parses exactly 512 KiB but not a byte-skipped region one by
       const target = { ...f.target, sessionStartLine: 2, sessionEndLine: hidden.length + 3 };
       const page = await loadWorkerSessionViewSnapshotAsync(target);
       assert.deepEqual(page.blocks.map((block) => block.text), ["FIRST"]);
-      assert.equal(page.malformedEntries, delta === 0 ? 1 : 0);
+      assert.equal(page.malformedEntries, 1);
       assert.equal(page.hasPreviousPage, false); assert.equal(page.hasNextPage, false);
     } finally { f.close(); }
   }
 });
 
-test("backward fallback derives oversized notices across an over-8-MiB nondisplayed gap", () => {
+test("backward ranks derive oversized notices across an over-8-MiB nondisplayed gap", () => {
   const f = fixture();
   try {
     const entries = [line(message("display", null, "FIRST")), line(message("oversized", "display", `OVERSIZED-${"o".repeat(9 * 1024 * 1024)}`))];
