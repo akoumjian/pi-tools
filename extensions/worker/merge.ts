@@ -167,7 +167,7 @@ export function applyPreparedWorkerMerges(parentSessionFile: string, preparedId:
       if (current !== repository.desiredCommit) {
         git(repository.targetRepo, ["fetch", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", repository.preparedPath, repository.desiredCommit!]);
         const checkout = targetCheckoutPath(repository.targetRepo, repository.targetRef);
-        if (checkout) git(checkout, ["-c", `branch.${repository.targetRef.slice("refs/heads/".length)}.mergeOptions=`, "merge", "--ff-only", repository.desiredCommit!]);
+        if (checkout) git(checkout, ["-c", `branch.${repository.targetRef.slice("refs/heads/".length)}.mergeOptions=`, "merge", "--ff-only", "--no-overwrite-ignore", repository.desiredCommit!]);
         else git(repository.targetRepo, ["update-ref", "--no-deref", repository.targetRef, repository.desiredCommit!, repository.expectedCommit]);
       }
       output.status = "applied";

@@ -32,11 +32,12 @@ import { readWorkerRuntimeResult } from "./runtime.js";
 import { cleanupReviewOverlayAsync, createReviewOverlayAsync, type ReviewOverlayRecord } from "./review-workspace.js";
 import { preferredWorkerModel } from "./settings.js";
 import { createWorkerId, createWorkerRunId, defaultWorkerRoots, provisionWorkerPaths, workerPaths, type WorkerPaths, type WorkerRoots } from "./identity.js";
-import { createWorkerSession, forkWorkerSession, verifyWorkerSession } from "./session.js";
+import { createWorkerSession, forkWorkerSession, readWorkerSessionHeader, verifyWorkerSession } from "./session.js";
 import { launchWorkerHost, readWorkerHostProcess, readWorkerHostSettlement, type WorkerLaunchRecord } from "./runner.js";
 import { renderWorkerRuntimePrompt } from "./prompts.js";
 import { contextInputs, inputMounts, validateAdditionalInputs, type RetainedInput } from "./inputs.js";
 import { inspectInterruptedGitState, inventoryWorkerRepositories, snapshotWorkerRepositories, type RepositorySnapshot } from "./inventory.js";
+import { countSessionLines, openWorkerSessionViewer, sanitizeViewText, type WorkerSessionViewTarget } from "./view.js";
 import { canonicalPathWithin, canonicalRepository, trustedGit } from "./trusted-git.js";
 import { prepareWorkerCacheLineage, registerParentCacheLineageCapture, type WorkerCacheLineageRecord } from "./cache-lineage.js";
 
@@ -80,7 +81,7 @@ class WorkerLifecycleOwnerBusyError extends Error {}
 type PlannedRun = {
   request: WorkerRunInputV2["runs"][number]; role: WorkerRole; workerId: string; runId: string; jobId: string; paths: WorkerPaths;
   taskIds: string[]; modelSelection: string; binding?: WorkerRunRecord["binding"]; workerRuntime: WorkerRuntime; runRuntime: RunRuntime;
-  newWorker: boolean; expectedVersion?: number; reviewedRunId?: string; preparedId?: string; consumedPrepared?: boolean; operationRepositories?: Array<Record<string, unknown>>;
+  newWorker: boolean; sessionStartLine?: number; expectedVersion?: number; reviewedRunId?: string; preparedId?: string; consumedPrepared?: boolean; operationRepositories?: Array<Record<string, unknown>>;
 };
 type WorkerOperationSnapshot =
   | { scope: "worker_run"; runId: string; operation: WorkerOperation }
@@ -293,9 +294,11 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         for (const plan of planned) if (plan.role === "integration" && plan.consumedPrepared && plan.preparedId) assertIntegrationTargetsCurrent(trustedPreparedSet(getRegistry(), parentSessionFile, plan.preparedId));
         const items: WorkerBatchCreateItem[] = planned.map((plan) => {
           const session = plan.runRuntime.pendingWorkSessionId ? undefined : sessionIdentity(plan.paths);
+          const sessionStartLine = session ? plan.sessionStartLine ?? (plan.newWorker ? 2 : undefined) : undefined;
+          if (session && sessionStartLine === undefined) throw new Error(`Worker ${plan.workerId} has no retained session boundary for resume.`);
           const run: WorkerRunRecord = { runId: plan.runId, workerId: plan.workerId, status: "queued", taskIds: plan.taskIds, modelSelection: plan.modelSelection,
             completionDelivery: plan.request.completionDelivery ?? "steer", ...(plan.binding ? { binding: plan.binding } : {}), jobId: plan.jobId,
-            stdoutLog: path.join(plan.runRuntime.runDir, "launch-stdout.log"), stderrLog: path.join(plan.runRuntime.runDir, "launch-stderr.log"), ...(session ? { sessionStartLine: countLines(session.sessionFile) + 1 } : {}),
+            stdoutLog: path.join(plan.runRuntime.runDir, "launch-stdout.log"), stderrLog: path.join(plan.runRuntime.runDir, "launch-stderr.log"), ...(sessionStartLine === undefined ? {} : { sessionStartLine }),
             repositories: [], artifacts: [], errors: [], runtime: plan.runRuntime, createdAt: timestamp };
           if (plan.newWorker) return { kind: "new", worker: { workerId: plan.workerId, parentSessionFile, role: plan.role, status: "queued", activeRunId: plan.runId,
             taskIds: plan.taskIds, modelSelection: plan.modelSelection, ...(session ? { sessionId: session.sessionId, sessionFile: session.sessionFile } : {}),
@@ -408,6 +411,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
             if (worker.role !== "work") throw new Error(`Worker ${worker.workerId} has no retained session.`);
           } else verifyRetainedSession(worker);
           const latest = worker.latestRunId ? getWorkerRun(getRegistry(), worker.workerId, worker.latestRunId) : undefined;
+          const sessionStartLine = worker.sessionFile ? nextRetainedRunStart(worker, latest) : undefined;
           const binding = latest?.binding; const paths = workerPaths(roots, worker.workerId); provisionWorkerPaths(paths);
           const role = worker.role; const inputs = validateAdditionalInputs({ values: request.additionalInputs, existing: runtimeInputs(worker), role, workspaceRoot: paths.workspaceRoot, runtimeRoot });
           let reviewOverlayPlan: ReviewOverlayPlan | undefined; let contextFile: string | undefined; let reviewedRunId: string | undefined; let preparedId: string | undefined; let operationRepositories: Array<Record<string, unknown>> | undefined; const pendingWorkSessionId = !worker.sessionId && role === "work" ? randomUUID() : undefined; const reservedRunId = role === "review" ? createWorkerRunId(now(), random()) : undefined;
@@ -427,7 +431,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
           }
           const retained = retainedWorkerRuntime(worker);
           if (pendingWorkSessionId) retained.cacheLineage = prepareWorkerCacheLineage({ stateRoot: roots.stateRoot, workerStateDir: paths.stateDir, parentSessionFile, parentSessionId: context.sessionManager.getSessionId(), route: parseWorkerModelSelection(worker.modelSelection!), now: now() });
-          const plan = finishPlanSafely({ request, role, workerId: worker.workerId, ...(reservedRunId ? { runId: reservedRunId } : {}), paths, taskIds: unique([...worker.taskIds, ...(request.additionalTaskIds ?? [])]), modelSelection, binding, workerRuntime: { version: 2, inputs, ...retained }, newWorker: false, expectedVersion: worker.version, reviewOverlayPlan, contextFile, reviewedRunId, preparedId, operationRepositories, pendingWorkSessionId, mounts, parentSessionFile, context });
+          const plan = finishPlanSafely({ request, role, workerId: worker.workerId, ...(reservedRunId ? { runId: reservedRunId } : {}), paths, taskIds: unique([...worker.taskIds, ...(request.additionalTaskIds ?? [])]), modelSelection, binding, workerRuntime: { version: 2, inputs, ...retained }, newWorker: false, ...(sessionStartLine === undefined ? {} : { sessionStartLine }), expectedVersion: worker.version, reviewOverlayPlan, contextFile, reviewedRunId, preparedId, operationRepositories, pendingWorkSessionId, mounts, parentSessionFile, context });
           plans.push(plan); continue;
         }
         const role = request.role;
@@ -506,7 +510,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       repositoryBefore: snapshotWorkerRepositories(input.paths.workspaceRoot), launchProjectCwd: path.resolve(input.context.cwd), parentSessionId: input.context.sessionManager.getSessionId(),
       ...(input.pendingWorkSessionId ? { pendingWorkSessionId: input.pendingWorkSessionId } : {}), ...(interruptionWarnings.length ? { interruptionWarnings } : {}) };
     return { request, role: input.role, workerId: input.workerId, runId, jobId, paths: input.paths, taskIds: input.taskIds, modelSelection: input.modelSelection, ...(input.binding ? { binding: input.binding } : {}), workerRuntime: input.workerRuntime, runRuntime,
-      newWorker: input.newWorker, ...(input.expectedVersion === undefined ? {} : { expectedVersion: input.expectedVersion }), ...(input.reviewedRunId ? { reviewedRunId: input.reviewedRunId } : {}), ...(input.preparedId ? { preparedId: input.preparedId } : {}), ...(input.consumedPrepared ? { consumedPrepared: true } : {}), ...(input.operationRepositories ? { operationRepositories: input.operationRepositories } : {}) };
+      newWorker: input.newWorker, ...(input.sessionStartLine === undefined ? {} : { sessionStartLine: input.sessionStartLine }), ...(input.expectedVersion === undefined ? {} : { expectedVersion: input.expectedVersion }), ...(input.reviewedRunId ? { reviewedRunId: input.reviewedRunId } : {}), ...(input.preparedId ? { preparedId: input.preparedId } : {}), ...(input.consumedPrepared ? { consumedPrepared: true } : {}), ...(input.operationRepositories ? { operationRepositories: input.operationRepositories } : {}) };
   }
 
   function rollbackPlans(plans: PlannedRun[], parentSessionFile: string): void {
@@ -600,7 +604,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       const sessionId = worker.sessionId; const sessionFile = worker.sessionFile;
       if (!sessionId || !sessionFile) throw new Error(`Worker ${worker.workerId} session provisioning failed.`);
       if (worker.role === "work") verifyWorkerSession({ sessionFile, sessionId, workspaceRoot: worker.workspaceRoot, parentSessionFile: worker.parentSessionFile });
-      const sessionStartLine = countLines(sessionFile) + 1;
+      const sessionStartLine = requiredRunStartLine(run, item.runtime, sessionFile);
       const record: WorkerLaunchRecord = { workerId: worker.workerId, runId: run.runId, jobId: run.jobId!, sessionId, sessionFile, workspaceRoot: worker.workspaceRoot, taskIds: run.taskIds, role: worker.role, modelSelection: worker.modelSelection!, ...(worker.runtime?.cacheLineage ? { cacheLineage: worker.runtime.cacheLineage as WorkerCacheLineageRecord } : {}) };
       if (item.runtime.reviewOverlayPlan && !item.runtime.overlay) {
         item.runtime.overlay = await launchSideEffect(item.workerId, item.runId, nonce, () => createOverlaySafely({ dockerPath: docker(), ...item.runtime.reviewOverlayPlan! }));
@@ -797,7 +801,8 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       if (evidenceError) throw evidenceError;
       const inventory = inventoryWorkerRepositories({ workspaceRoot: worker.workspaceRoot, workerId, runId, reported, before: runtime.repositoryBefore });
       errors.push(...inventory.errors.map((message) => ({ scope: "repositories" as const, message: sanitizeError(message) })));
-      finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind: "settlement", claimNonce: nonce, outcome, outcomeSource, summary: summary.slice(0, 2048), ...(question ? { question } : {}), repositories: inventory.repositories, artifacts, errors, sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile) : undefined, settledAt: now().toISOString() });
+      const sessionEndLine = bestEffortSessionEndLine(worker.sessionFile, errors, run.sessionStartLine);
+      finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind: "settlement", claimNonce: nonce, outcome, outcomeSource, summary: summary.slice(0, 2048), ...(question ? { question } : {}), repositories: inventory.repositories, artifacts, errors, sessionEndLine, settledAt: now().toISOString() });
       if (currentContext?.sessionManager.getSessionFile() && realpathOrResolve(currentContext.sessionManager.getSessionFile()!) === worker.parentSessionFile) deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration);
     } catch (error) {
       const message = sanitizeError(error);
@@ -810,11 +815,13 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       try { if (existsSync(runtime.resultFile)) accepted = readWorkerRuntimeResult(runtime.resultFile); } catch {}
       if (attempts >= 3) {
         const retained = accepted ? ` Accepted result ${accepted.result.outcome} remains retained at ${runtime.resultFile}.` : ` Settlement evidence remains retained beneath ${runtime.runDir}.`;
+        const fallbackErrors: Array<{ scope: "run" | "repositories" | "artifacts"; message: string }> = [{ scope: "run", message: `${message}${retained}` }];
+        const sessionEndLine = bestEffortSessionEndLine(worker.sessionFile, fallbackErrors, accepted ? run.sessionStartLine : run.sessionStartLine === undefined ? undefined : run.sessionStartLine - 1);
         finalizeClaimedWorkerRun(getRegistry(), {
           parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind: "settlement", claimNonce: nonce,
           outcome: "failed", outcomeSource: "system", summary: `Worker result settlement failed after ${attempts} deterministic attempts.`,
-          artifacts: accepted?.result.artifacts ?? [], errors: [{ scope: "run", message: `${message}${retained}` }],
-          sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile) : undefined, settledAt: now().toISOString()
+          artifacts: accepted?.result.artifacts ?? [], errors: fallbackErrors,
+          sessionEndLine, settledAt: now().toISOString()
         });
         if (currentContext?.sessionManager.getSessionFile() && realpathOrResolve(currentContext.sessionManager.getSessionFile()!) === worker.parentSessionFile) deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration);
       } else {
@@ -833,9 +840,11 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       operationAdmission = beginLifecycleAdmission(runtime, workerId, runId, claimKind, claimNonce);
       await containWorkerRun(runtime, workerId, runId, "failed-run cleanup", { signalAttached: true });
       const cancelled = terminalIntent === "cancellation";
+      const errors: Array<{ scope: "run" | "repositories" | "artifacts"; message: string }> = cancelled ? [] : [{ scope: "run", message: sanitizeError(error) }];
+      const sessionEndLine = bestEffortSessionEndLine(worker.sessionFile, errors, run.sessionStartLine === undefined ? undefined : run.sessionStartLine - 1);
       finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind, claimNonce,
         outcome: cancelled ? "cancelled" : "failed", outcomeSource: "system", summary: cancelled ? "Worker run was cancelled by its parent." : "Worker run failed before accepting a result.",
-        errors: cancelled ? [] : [{ scope: "run", message: sanitizeError(error) }], sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile) : undefined, settledAt: now().toISOString() });
+        errors, sessionEndLine, settledAt: now().toISOString() });
     } catch (cleanupError) {
       if (operationAdmission) { endLifecycleAdmission(operationAdmission, claimNonce); operationAdmission = undefined; }
       if (terminalIntentPersisted) releaseWorkerRunClaim(getRegistry(), workerId, runId, claimKind, claimNonce);
@@ -890,7 +899,9 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         await settleCompletedRun(workerId, runId, { status: "exited", exitCode: 0 });
         return "not_active";
       }
-      finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind: "cancellation", claimNonce: nonce, outcome: "cancelled", outcomeSource: "system", summary: "Worker run was cancelled by its parent.", sessionEndLine: worker.sessionFile ? countLines(worker.sessionFile) : undefined, settledAt: now().toISOString() });
+      const errors: Array<{ scope: "run" | "repositories" | "artifacts"; message: string }> = [];
+      const sessionEndLine = bestEffortSessionEndLine(worker.sessionFile, errors, run.sessionStartLine === undefined ? undefined : run.sessionStartLine - 1);
+      finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId, runId, claimKind: "cancellation", claimNonce: nonce, outcome: "cancelled", outcomeSource: "system", summary: "Worker run was cancelled by its parent.", ...(errors.length ? { errors } : {}), sessionEndLine, settledAt: now().toISOString() });
       active.delete(workerId); deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration); return "cancelled";
     } catch (error) {
       if (operationAdmission) { endLifecycleAdmission(operationAdmission, nonce); operationAdmission = undefined; }
@@ -1136,7 +1147,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
             if (liveness === "alive") {
               const nonce = lifecycleClaimNonce();
               if (claimWorkerRun(getRegistry(), worker.workerId, run.runId, "launch", nonce, ["queued"], runtimeGeneration)) {
-                try { finalizeWorkerRunLaunch(getRegistry(), { workerId: worker.workerId, runId: run.runId, claimNonce: nonce, modelSelection: worker.modelSelection!, sessionId: worker.sessionId!, sessionFile: worker.sessionFile!, sessionStartLine: run.sessionStartLine ?? countLines(worker.sessionFile!) + 1, jobId: run.jobId!, stdoutLog: run.stdoutLog!, stderrLog: run.stderrLog!, runtime, startedAt: run.startedAt ?? now().toISOString() }); }
+                try { finalizeWorkerRunLaunch(getRegistry(), { workerId: worker.workerId, runId: run.runId, claimNonce: nonce, modelSelection: worker.modelSelection!, sessionId: worker.sessionId!, sessionFile: worker.sessionFile!, sessionStartLine: requiredRunStartLine(run, runtime, worker.sessionFile!), jobId: run.jobId!, stdoutLog: run.stdoutLog!, stderrLog: run.stderrLog!, runtime, startedAt: run.startedAt ?? now().toISOString() }); }
                 catch (error) { releaseWorkerRunClaim(getRegistry(), worker.workerId, run.runId, "launch", nonce); throw error; }
               }
               continue;
@@ -1170,11 +1181,29 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   function registerCommands(): void {
     api.registerCommand("worker:list", { description: "List retained workers; optional status and role filters", handler: async (args, context) => { const [status, role] = args.trim().split(/\s+/).filter(Boolean); const result = await control({ action: "list", ...(status ? { status: status as any } : {}), ...(role ? { role: role as any } : {}) }, context); context.ui.notify(compactWorkerList((result as any).details), "info"); } });
     api.registerCommand("worker:show", { description: "Show an active/latest or exact retained worker run", handler: async (args, context) => { const [workerId, runId] = args.trim().split(/\s+/); if (!workerId) return context.ui.notify("Usage: /worker:show <workerId> [runId]", "info"); const worker = ownedWorker(workerId, requireParentSession(context)); const exact = runId ?? worker.activeRunId ?? worker.latestRunId; if (!exact) return context.ui.notify(`Worker ${workerId} has no runs.`, "info"); const result = await control({ action: "get", workerId, runId: exact }, context); context.ui.notify(formatExactRun((result as any).details), "info"); } });
+    api.registerCommand("worker:view", { description: "Open a bounded read-only conversation view for an active/latest or exact worker run", handler: async (args, context) => {
+      const values = args.trim().split(/\s+/).filter(Boolean); const [workerId, runId, ...extra] = values;
+      if (!workerId || extra.length || (runId !== undefined && !runId.startsWith("run_"))) return context.ui.notify("Usage: /worker:view <workerId> [runId]", "info");
+      try {
+        const parent = requireParentSession(context);
+        const target = workerViewTarget(workerId, runId, parent);
+        await openWorkerSessionViewer(context, target, () => workerViewTarget(workerId, target.runId, parent));
+      } catch (error) { context.ui.notify(sanitizeViewText(error instanceof Error ? error.message : String(error)), "error"); }
+    } });
     api.registerCommand("worker:logs", { description: "Open logs for an active/latest or exact retained worker run", handler: async (args, context) => { const [workerId, possibleRun, ...viewer] = args.trim().split(/\s+/).filter(Boolean); if (!workerId) return context.ui.notify("Usage: /worker:logs <workerId> [runId] [viewer options]", "info"); const worker = ownedWorker(workerId, requireParentSession(context)); const hasRun = possibleRun?.startsWith("run_"); const runId = (hasRun ? possibleRun : undefined) ?? worker.activeRunId ?? worker.latestRunId; const run = runId ? getWorkerRun(getRegistry(), workerId, runId) : undefined; if (!run?.jobId) return context.ui.notify("No retained run logs.", "info"); await handleAsyncShellViewerCommand(context, [run.jobId, ...(hasRun ? viewer : [possibleRun, ...viewer].filter(Boolean))].join(" ")); } });
     api.registerCommand("worker:cancel", { description: "Cancel active work while preserving retained state", handler: async (args, context) => { const workerId = args.trim(); if (!workerId) return context.ui.notify("Usage: /worker:cancel <workerId>", "info"); const result = await cancelWorker(ownedWorker(workerId, requireParentSession(context))); context.ui.notify(result === "cancelled" ? `Cancelled ${workerId}.` : result === "accepted_pending" ? `Cancellation accepted for ${workerId}; the current runtime will finish it.` : result === "superseded" ? `Cancellation for ${workerId} was superseded by a terminal result.` : "Worker is not active.", "info"); } });
     api.registerCommand("worker:discard", { description: "Permanently discard one idle worker; requires --confirm", handler: async (args, context) => { const [workerId, confirm, ...extra] = args.trim().split(/\s+/).filter(Boolean); if (!workerId || confirm !== "--confirm" || extra.length) return context.ui.notify("Usage: /worker:discard <workerId> --confirm", "info"); await discardWorker(ownedWorker(workerId, requireParentSession(context))); context.ui.notify(`Discarded ${workerId}.`, "info"); } });
   }
 
+  function workerViewTarget(workerId: string, requestedRunId: string | undefined, parent: string): WorkerSessionViewTarget {
+    const worker = ownedWorker(workerId, parent);
+    const runId = requestedRunId ?? worker.activeRunId ?? worker.latestRunId;
+    if (!runId) throw new Error("Worker has no retained runs.");
+    const run = getWorkerRun(getRegistry(), worker.workerId, runId);
+    if (!run) throw new Error("Worker has no matching retained run.");
+    if (!worker.sessionId || !worker.sessionFile) throw new Error("Worker has no retained Pi session.");
+    return { workerId: worker.workerId, role: worker.role, workerStatus: worker.status, runId: run.runId, runStatus: run.status, ...(run.outcome ? { outcome: run.outcome } : {}), ...(run.modelSelection ?? worker.modelSelection ? { modelSelection: run.modelSelection ?? worker.modelSelection } : {}), sessionId: worker.sessionId, sessionFile: worker.sessionFile, sessionRoot: workerPaths(roots, worker.workerId).sessionDir, workspaceRoot: worker.workspaceRoot, parentSessionFile: worker.parentSessionFile, ...(run.sessionStartLine === undefined ? {} : { sessionStartLine: run.sessionStartLine }), ...(run.sessionEndLine === undefined ? {} : { sessionEndLine: run.sessionEndLine }) };
+  }
   function ownedWorker(workerId: string, parent: string): WorkerRegistryRecord { const worker = getWorker(getRegistry(), workerId); if (!worker || worker.parentSessionFile !== parent) throw new Error(`Unknown worker ${workerId} for this parent session.`); return worker; }
   function reviewSubject(runId: string, parent: string, reviewerWorkerId?: string) {
     const found = findWorkerRunById(getRegistry(), runId); if (!found || found.worker.parentSessionFile !== parent) throw new Error(`Unknown reviewed run ${runId}.`);
@@ -1228,8 +1257,20 @@ function writeIntegrationContext(paths: WorkerPaths, set: ReturnType<typeof read
   writeReadonlyJson(file, value); return file;
 }
 function writeReadonlyJson(file: string, value: unknown): void { if (existsSync(file)) chmodSync(file, 0o600); writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 }); chmodSync(file, 0o400); }
-function sessionIdentity(paths: WorkerPaths): { sessionId: string; sessionFile: string } { const files = existsSync(paths.sessionDir) ? readdirSync(paths.sessionDir).filter((name) => name.endsWith(".jsonl")) : []; if (files.length !== 1) throw new Error(`Expected one fresh worker session in ${paths.sessionDir}.`); const sessionFile = realpathSync(path.join(paths.sessionDir, files[0]!)); const first = JSON.parse(readFileSync(sessionFile, "utf8").split("\n")[0]!); return { sessionId: first.id, sessionFile }; }
-function verifyRetainedSession(worker: WorkerRegistryRecord): void { if (worker.role === "work") verifyWorkerSession({ sessionFile: worker.sessionFile!, sessionId: worker.sessionId!, workspaceRoot: worker.workspaceRoot, parentSessionFile: worker.parentSessionFile }); else { const first = JSON.parse(readFileSync(worker.sessionFile!, "utf8").split("\n")[0]!); if (first.id !== worker.sessionId || realpathOrResolve(first.cwd) !== realpathOrResolve(worker.workspaceRoot) || first.parentSession) throw new Error(`Worker ${worker.workerId} retained independent session is invalid.`); } }
+function sessionIdentity(paths: WorkerPaths): { sessionId: string; sessionFile: string } {
+  const files = existsSync(paths.sessionDir) ? readdirSync(paths.sessionDir).filter((name) => name.endsWith(".jsonl")) : [];
+  if (files.length !== 1) throw new Error(`Expected one fresh worker session in ${paths.sessionDir}.`);
+  const { sessionFile, header } = readWorkerSessionHeader(path.join(paths.sessionDir, files[0]!));
+  return { sessionId: header.id, sessionFile };
+}
+function verifyRetainedSession(worker: WorkerRegistryRecord): void {
+  if (worker.role === "work") {
+    verifyWorkerSession({ sessionFile: worker.sessionFile!, sessionId: worker.sessionId!, workspaceRoot: worker.workspaceRoot, parentSessionFile: worker.parentSessionFile });
+    return;
+  }
+  const { header } = readWorkerSessionHeader(worker.sessionFile!);
+  if (header.id !== worker.sessionId || realpathOrResolve(header.cwd) !== realpathOrResolve(worker.workspaceRoot) || header.parentSession) throw new Error(`Worker ${worker.workerId} retained independent session is invalid.`);
+}
 function runtimeInputs(worker: WorkerRegistryRecord): RetainedInput[] { const value = worker.runtime?.inputs; return Array.isArray(value) ? value as RetainedInput[] : []; }
 function retainedWorkerRuntime(worker: WorkerRegistryRecord): Partial<WorkerRuntime> { const baselines = worker.runtime?.repositoryBaselines; const cacheLineage = worker.runtime?.cacheLineage; return { ...(Array.isArray(baselines) ? { repositoryBaselines: baselines as any } : {}), ...(cacheLineage && typeof cacheLineage === "object" ? { cacheLineage: cacheLineage as WorkerCacheLineageRecord } : {}) }; }
 function parseWorkerModelSelection(value: string): { provider: string; model: string; thinkingLevel: string } { const slash = value.indexOf("/"); const colon = value.lastIndexOf(":"); if (slash < 1 || colon <= slash + 1) throw new Error(`Invalid worker model selection: ${value}.`); return { provider: value.slice(0, slash), model: value.slice(slash + 1, colon), thinkingLevel: value.slice(colon + 1) }; }
@@ -1253,7 +1294,31 @@ function resolveModel(role: WorkerRole, explicit: string | undefined, context: E
 
 function requireParentSession(context: ExtensionContext): string { const file = context.sessionManager.getSessionFile(); if (!file) throw new Error("Managed workers require a persisted parent session."); return realpathOrResolve(file); }
 function realpathOrResolve(value: string): string { try { return realpathSync(value); } catch { return path.resolve(value); } }
-function countLines(file: string): number { try { const text = readFileSync(file, "utf8"); return text === "" ? 0 : text.split("\n").length - (text.endsWith("\n") ? 1 : 0); } catch { return 0; } }
+function bestEffortSessionEndLine(file: string | undefined, errors: Array<{ scope: "run" | "repositories" | "artifacts"; message: string }>, minimum?: number): number | undefined {
+  if (!file) return undefined;
+  try {
+    const count = countLines(file);
+    if (minimum !== undefined && count < minimum) throw new Error(`Worker session was truncated below retained line ${minimum}.`);
+    return count;
+  } catch (error) {
+    errors.push({ scope: "run", message: `Worker session end line could not be recorded safely: ${sanitizeError(error)}`.slice(0, 768) });
+    return undefined;
+  }
+}
+
+function requiredRunStartLine(run: WorkerRunRecord, runtime: RunRuntime, sessionFile: string): number {
+  if (run.sessionStartLine !== undefined) return run.sessionStartLine;
+  if (runtime.pendingWorkSessionId) return countLines(sessionFile) + 1;
+  throw new Error(`Worker run ${run.runId} has no retained session start boundary.`);
+}
+
+function nextRetainedRunStart(worker: WorkerRegistryRecord, latest: WorkerRunRecord | undefined): number {
+  if (!latest || latest.status !== "settled" || latest.sessionEndLine === undefined) throw new Error(`Worker ${worker.workerId} has no complete retained session boundary for resume.`);
+  if (!Number.isSafeInteger(latest.sessionEndLine) || latest.sessionEndLine < 0) throw new Error(`Worker ${worker.workerId} has an invalid retained session boundary.`);
+  return latest.sessionEndLine + 1;
+}
+
+function countLines(file: string): number { return countSessionLines(file); }
 function validateRunRequestBounds(request: WorkerRunInputV2["runs"][number]): void {
   if (Buffer.byteLength(request.instructions ?? "") > 12 * 1024) throw new Error("instructions must be at most 12 KiB UTF-8.");
   for (const value of ("additionalInputs" in request ? request.additionalInputs : undefined) ?? []) if (Buffer.byteLength(value) > 4096) throw new Error("additionalInputs paths must be at most 4 KiB UTF-8.");

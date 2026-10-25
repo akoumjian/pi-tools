@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, ftruncateSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -144,6 +144,30 @@ test("worker_run returns complete provider-visible identities and defers Docker 
   } finally { await f.close(); }
 });
 
+
+test("worker:view handler enforces parent and worker/run ownership without mutation or delivery", async () => {
+  const f = await fixture(); try {
+    const first = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-first"], instructions: "first" }] }));
+    const second = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-second"], instructions: "second" }] }));
+    await f.event("turn_end");
+    const command = f.commands.get("worker:view")!;
+    const beforeMessages = f.messages.length;
+    const before = (() => { const db = f.registry(); const rows = db.database.prepare("SELECT worker_id,status,active_run_id,latest_run_id,version FROM workers ORDER BY worker_id").all(); db.close(); return JSON.stringify(rows); })();
+
+    await command.handler(`${first.workerId} ${second.runId}`, f.context);
+    assert.match(f.notifications.at(-1) ?? "", /no matching retained run/i);
+    await command.handler(first.workerId, f.context);
+    assert.match(f.notifications.at(-1) ?? "", /requires interactive Pi TUI mode/);
+
+    const foreignSession = path.join(f.root, "foreign-parent.jsonl"); writeFileSync(foreignSession, "\n");
+    const foreign = { ...f.context, sessionManager: { getSessionFile: () => foreignSession, getSessionId: () => "foreign" } } as unknown as ExtensionContext;
+    await command.handler(first.workerId, foreign);
+    assert.match(f.notifications.at(-1) ?? "", /Unknown worker.*parent session/);
+    assert.equal(f.messages.length, beforeMessages, "view must not emit or acknowledge delivery messages");
+    const after = (() => { const db = f.registry(); const rows = db.database.prepare("SELECT worker_id,status,active_run_id,latest_run_id,version FROM workers ORDER BY worker_id").all(); db.close(); return JSON.stringify(rows); })();
+    assert.equal(after, before, "view must not mutate worker lifecycle state");
+  } finally { await f.close(); }
+});
 
 test("turn_end returns without awaiting deferred container readiness", async () => {
   const f = await fixture({ deferContainer: true }); try {
@@ -653,6 +677,24 @@ test("cancelling an initial queued work run defers its exact fork until a resume
   } finally { await f.close(); }
 });
 
+test("work resume uses bounded session identity for a sparse session beyond 512 MiB", async () => {
+  const f = await fixture();
+  try {
+    const first = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "create retained session" }] }));
+    await f.event("turn_end"); await complete(f, first);
+    const before = f.registry(); const sessionFile = getWorker(before, first.workerId)!.sessionFile!; const previousEnd = getWorkerRun(before, first.workerId, first.runId)!.sessionEndLine!; before.close();
+    const fd = openSync(sessionFile, "r+"); try { ftruncateSync(fd, 600 * 1024 * 1024); } finally { closeSync(fd); }
+    const rssBefore = process.memoryUsage().rss; const started = performance.now();
+    const resumed = receipt(await f.call("worker_run", { runs: [{ action: "resume", workerId: first.workerId, instructions: "resume a very large retained session" }] }));
+    const elapsed = performance.now() - started; const rssGrowth = process.memoryUsage().rss - rssBefore;
+    assert.equal(resumed.workerId, first.workerId); assert.ok(elapsed < 1_000, `large resume should not scan the retained session; took ${elapsed}ms`); assert.ok(rssGrowth < 32 * 1024 * 1024, `large resume grew RSS by ${rssGrowth} bytes`);
+    let db = f.registry(); assert.equal(getWorkerRun(db, resumed.workerId, resumed.runId)!.sessionStartLine, previousEnd + 1); db.close();
+    await f.event("turn_end"); assert.equal(f.launches.some((launch) => launch.record.runId === resumed.runId), true);
+    db = f.registry(); assert.equal(getWorkerRun(db, resumed.workerId, resumed.runId)!.sessionStartLine, previousEnd + 1); db.close();
+    await f.call("worker_control", { action: "cancel", workerId: resumed.workerId });
+  } finally { await f.close(); }
+});
+
 test("later batch validation failure rolls back earlier containers, workspaces, and registry visibility", async () => {
   const f = await fixture(); try {
     await assert.rejects(() => f.call("worker_run", { runs: [
@@ -817,6 +859,60 @@ test("managed completion accepted while active is not ambiguously retried at age
     assert.ok(delivery.runtime_generation > 0);
     db.close();
   } finally { await f.close(); }
+});
+
+test("truncated and non-regular sessions become bounded settlement evidence", async () => {
+  for (const damage of ["truncated", "non-regular"] as const) {
+    const f = await fixture();
+    try {
+      const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: `settle with ${damage} session` }] }));
+      await f.event("turn_end");
+      const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: `${damage} retained result` });
+      const db = f.registry(); const sessionFile = getWorker(db, started.workerId)!.sessionFile!; db.close();
+      if (damage === "truncated") writeFileSync(sessionFile, "");
+      else { rmSync(sessionFile); mkdirSync(sessionFile); }
+      launch.resolve(job(launch.record.jobId, "exited", 0));
+      await waitFor(() => { const side = f.registry(); const run = getWorkerRun(side, started.workerId, started.runId); side.close(); return run?.status === "settled"; });
+      const after = f.registry(); const run = getWorkerRun(after, started.workerId, started.runId)!; after.close();
+      assert.equal(run.outcome, "completed"); assert.equal(run.outcomeSource, "worker"); assert.equal(run.sessionEndLine, undefined);
+      assert.match(run.errors.map((error) => error.message).join(" "), damage === "truncated" ? /truncated below retained line/i : /not a regular file/i);
+    } finally { await f.close(); }
+  }
+});
+
+test("missing session settlement is best-effort and repeated reconciliation never leaks an async rejection", async () => {
+  const f = await fixture();
+  const runtimes: Array<{ handlers: Map<string, Function[]> }> = [];
+  try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "settle after session damage" }] }));
+    await f.event("turn_end"); await f.event("session_shutdown");
+    const detached = writeCompletionEvidence(f, started, { outcome: "completed", summary: "retained despite missing session" });
+    const before = f.registry(); const sessionFile = getWorker(before, started.workerId)!.sessionFile!; before.close(); rmSync(sessionFile);
+
+    for (let restart = 0; restart < 3; restart += 1) {
+      const handlers = new Map<string, Function[]>(); const api = {
+        registerTool() {}, registerCommand() {}, registerMessageRenderer() {}, sendMessage() {},
+        on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }
+      } as unknown as ExtensionAPI;
+      registerWorkerExtension(api, {
+        runtimeRoot: f.runtimeRoot, roots: { stateRoot: f.workersRoot, workspaceRoot: f.workersRoot }, codeRoot: f.root,
+        preparedRoot: path.join(f.runtimeRoot, "prepared"), targetRoot: f.root, dockerPath: "/fake/docker",
+        createContainer: async () => { throw new Error("settled run must not relaunch"); }, removeContainer: async () => {},
+        createOverlay: async () => { throw new Error("settled run must not create an overlay"); }, cleanupOverlay: async () => {},
+        waitForHostIdentity: async () => {}, launch: () => { throw new Error("settled run must not relaunch"); }
+      });
+      runtimes.push({ handlers });
+      for (const handler of handlers.get("session_start") ?? []) assert.equal(handler({}, f.context), undefined);
+      await waitFor(() => { const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId); db.close(); return run?.status === "settled"; });
+    }
+    const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; db.close();
+    assert.equal(run.outcome, "completed"); assert.equal(run.outcomeSource, "worker"); assert.equal(run.sessionEndLine, undefined);
+    assert.match(run.errors.map((error) => error.message).join(" "), /session end line could not be recorded safely.*unavailable/i);
+    detached.resolve(job(detached.record.jobId, "exited", 0));
+  } finally {
+    for (const runtime of runtimes) for (const handler of runtime.handlers.get("session_shutdown") ?? []) await handler({}, f.context);
+    await f.close();
+  }
 });
 
 test("failed deferred review overlay setup system-settles and releases the subject lease", async () => {

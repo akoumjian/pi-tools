@@ -173,6 +173,26 @@ test("apply checks only the exact checked-out target worktree and treats untrack
   } finally { f.close(); }
 });
 
+
+test("checked-out apply refuses an ignored file collision without changing the file or ref", () => {
+  const f = fixture();
+  try {
+    commit(f.candidate, "generated.txt", "tracked candidate\n", "track generated file");
+    const set = prepareWorkerMerges("/parent.jsonl", [{ id: "source", candidateRepo: f.candidate, targetRepo: f.target, targetRef: "refs/heads/main", method: "merge", commitMessage: "candidate" }], { preparedRoot: f.preparedRoot, targetRoot: f.targets, randomHex: () => "c3".repeat(12) });
+    const expected = git(f.target, ["rev-parse", "HEAD"]);
+    writeFileSync(path.join(f.target, ".git", "info", "exclude"), "generated.txt\n");
+    writeFileSync(path.join(f.target, "generated.txt"), "local ignored value\n");
+
+    const result = applyPreparedWorkerMerges("/parent.jsonl", set.preparedId, { preparedRoot: f.preparedRoot, targetRoot: f.targets });
+
+    assert.equal(result.status, "failed");
+    assert.match(result.error ?? "", /untracked working tree files would be overwritten|would be overwritten by merge/i);
+    assert.equal(readFileSync(path.join(f.target, "generated.txt"), "utf8"), "local ignored value\n");
+    assert.equal(git(f.target, ["rev-parse", "HEAD"]), expected);
+    assert.equal(git(f.target, ["rev-parse", "refs/heads/main"]), expected);
+  } finally { f.close(); }
+});
+
 test("apply does not reject an unrelated dirty worktree when the target ref is not checked out", () => {
   const f = fixture();
   try {

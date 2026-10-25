@@ -73,7 +73,7 @@ Commands:
 - `/scrollback:status`, `/tmux-scrollback:status`
 - `/safety:setup`, `/safety:status`, `/safety:model`, `/safety:toggle`
 - `/async:status`, `/async:view [job-id] [--stream both|stdout|stderr] [--tail 1..500] [--follow]`
-- `/worker:list [status] [role]`, `/worker:show <worker-id> [run-id]`, `/worker:logs <worker-id> [run-id] [...]`, `/worker:cancel <worker-id>`, `/worker:discard <worker-id> --confirm`
+- `/worker:list [status] [role]`, `/worker:show <worker-id> [run-id]`, `/worker:view <worker-id> [run-id]`, `/worker:logs <worker-id> [run-id] [...]`, `/worker:cancel <worker-id>`, `/worker:discard <worker-id> --confirm`
 - `/notify [on|off|status|test]`
 - `/native:status`
 - `/retry`
@@ -142,7 +142,7 @@ Each extension below documents what it does, what it provides, and how to set it
 
 **Purpose.** Run durable sandboxed work, independent review, and conflict integration while the parent retains grounding, acceptance, validation, authoritative mutation, publication, and task closure.
 
-**Provides.** `worker_run`, `worker_control`, `worker_merge_test`, `worker_merge_apply`; worker-only `worker_result_submit` and `worker_beads_tasks` (including digest-fenced canonical Beads design continuation); trusted width-bounded operation hints plus compact exact-session `wN` worker activity beside direct-shell `shN`; `/worker:list`, `/worker:show`, `/worker:logs`, `/worker:cancel`, and `/worker:discard`.
+**Provides.** `worker_run`, `worker_control`, `worker_merge_test`, `worker_merge_apply`; worker-only `worker_result_submit` and `worker_beads_tasks` (including digest-fenced canonical Beads design continuation); trusted width-bounded operation hints plus compact exact-session `wN` worker activity beside direct-shell `shN`; `/worker:list`, `/worker:show`, `/worker:view`, `/worker:logs`, `/worker:cancel`, and `/worker:discard`.
 
 **Setup.** Node 22.19+, Pi, Docker Desktop or a rootful Docker Engine, the pinned worker image, central `bd`, and role model preferences in `config/worker-settings.json`.
 

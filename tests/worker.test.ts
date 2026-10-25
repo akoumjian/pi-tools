@@ -67,7 +67,7 @@ test("parent extension exposes only the v2 worker tool and command surface", asy
   } as never;
   registerWorkerExtension(api);
   assert.deepEqual(tools.sort(), ["worker_control", "worker_merge_apply", "worker_merge_test", "worker_run"]);
-  assert.deepEqual(commands.sort(), ["worker:cancel", "worker:discard", "worker:list", "worker:logs", "worker:show"]);
+  assert.deepEqual(commands.sort(), ["worker:cancel", "worker:discard", "worker:list", "worker:logs", "worker:show", "worker:view"]);
 });
 
 
