@@ -347,7 +347,7 @@ export function continueWorkerCacheLineage(record: WorkerCacheLineageRecord, wor
   if (record.mode === "fresh") return undefined;
   if (!validateWorkerCacheLineageRecord(record)) throw new Error("Retained cache-lineage metadata is corrupt or unsupported.");
   let status: WorkerCacheLineageSummary; try { status = readLineageSummary(record); } catch (error) { throw new Error(`Retained cache-lineage summary is missing or corrupt: ${error instanceof Error ? error.message : String(error)}`); }
-  if (status.mode !== "eligible" && status.mode !== "adopted") return undefined;
+  if (status.mode !== "eligible" && status.mode !== "adopted") throw new Error(`Retained cache-lineage summary mode ${status.mode} cannot authorize a fresh fallback.`);
   let snapshot: string; try { snapshot = readNoFollowBounded(record.snapshotFile, WORKER_CACHE_LINEAGE_MAX_BYTES); } catch (error) { throw new Error(`Retained cache-lineage snapshot is missing or unreadable: ${error instanceof Error ? error.message : String(error)}`); }
   if (sha256(snapshot) !== record.snapshotSha256) throw new Error("Retained cache-lineage snapshot integrity mismatch.");
   mkdirSync(workerStateDir, { recursive: true, mode: 0o700 });

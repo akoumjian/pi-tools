@@ -155,10 +155,10 @@ async function drainAdmittedMutations() {
 }
 function validateHello(value) {
   const expected = config.runtimeProvenance;
-  const keys = ["version","workerId","runId","role","sessionId","protocolVersion","sandboxName","creationNonce","piRevision","profileRevision","piToolsRevision","piDocparserRevision","resourceManifestSha256","imageDigest","kitSha256","extensionPaths","observedSandboxId","observedRuntimeSha256"];
+  const keys = ["version","workerId","runId","role","sessionId","protocolVersion","sandboxName","creationNonce","piRevision","profileRevision","piToolsRevision","piDocparserRevision","resourceManifestSha256","runtimeProvenanceSha256","imageDigest","kitSha256","sbxVersion","templateId","templateRepository","templateTag","templateFlavor","inspectEvidenceSha256","sbxVersionEvidenceSha256","extensionPaths",...(expected.observedSandboxId ? ["observedSandboxId"] : []),"observedRuntimeSha256"];
   assertExactObject(value, keys, "Worker runtime hello");
   if (value.version !== 1 || value.workerId !== config.workerId || value.runId !== config.runId || value.role !== config.role || value.sessionId !== config.sessionId || value.protocolVersion !== 1 || value.sandboxName !== config.sandbox.sandboxName || value.creationNonce !== config.sandbox.creationNonce) throw new Error("Worker runtime hello identity mismatch.");
-  for (const key of ["piRevision", "profileRevision", "piToolsRevision", "piDocparserRevision", "resourceManifestSha256", "imageDigest", "kitSha256", "observedSandboxId", "observedRuntimeSha256"]) if (value[key] !== expected[key]) throw new Error(`Worker runtime hello ${key} mismatch.`);
+  for (const key of ["piRevision", "profileRevision", "piToolsRevision", "piDocparserRevision", "resourceManifestSha256", "runtimeProvenanceSha256", "imageDigest", "kitSha256", "sbxVersion", "templateId", "templateRepository", "templateTag", "templateFlavor", "inspectEvidenceSha256", "sbxVersionEvidenceSha256", ...(expected.observedSandboxId ? ["observedSandboxId"] : []), "observedRuntimeSha256"]) if (value[key] !== expected[key]) throw new Error(`Worker runtime hello ${key} mismatch.`);
   if (!Array.isArray(value.extensionPaths) || value.extensionPaths.length > 64 || value.extensionPaths.some((item) => typeof item !== "string" || item.length < 1 || item.length > 4096) || JSON.stringify(value.extensionPaths) !== JSON.stringify(expected.extensionPaths)) throw new Error("Worker runtime hello extensionPaths mismatch.");
   return value;
 }

@@ -155,6 +155,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       runtimeGeneration = registerParentRuntime(getRegistry(), exactParent, randomUUID(), now().toISOString());
       recoverInterruptedDiscardFiles(exactParent, runtimeGeneration);
       recoverInterruptedClaimsForParent(getRegistry(), exactParent, runtimeGeneration, now().toISOString());
+      recoverAbandonedDiscardTrash(exactParent);
       reconcileWorkerDeliveries(getRegistry(), exactParent, sessionDeliveryIds(context));
       deliveredRecovery.clear();
       observedDataVersion = workerRegistryDataVersion(getRegistry());
@@ -328,7 +329,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   }
 
   function preflightBatch(params: WorkerRunInputV2, context: ExtensionContext, parentSessionFile: string): PlannedRun[] {
-    const plans: PlannedRun[] = []; const resumed = new Set<string>();
+    const plans: PlannedRun[] = []; const resumed = new Set<string>(); let pendingReservation: { paths: WorkerPaths; runId: string } | undefined;
     try {
       for (const request of params.runs) {
         validateRunRequestBounds(request);
@@ -344,6 +345,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
           const binding = latest?.binding; provisionWorkerPaths(paths);
           const role = worker.role; const retainedInputs = validateAdditionalInputs({ values: request.additionalInputs, existing: runtimeInputs(worker), role, workspaceRoot: paths.workspaceRoot, runtimeRoot });
           let contextFile: string | undefined; let reviewedRunId: string | undefined; let preparedId: string | undefined; let operationRepositories: Array<Record<string, unknown>> | undefined; const pendingWorkSessionId = !worker.sessionId && role === "work" ? randomUUID() : undefined; const reservedRunId = createWorkerRunId(now(), random());
+          pendingReservation = { paths, runId: reservedRunId };
           const inputs = snapshotAdditionalInputs(runEvidenceDirectory(paths, reservedRunId), retainedInputs);
           const mounts: WorkerSandboxMount[] = inputMounts(inputs);
           if (role === "review") {
@@ -365,7 +367,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
             if (retained.cacheLineage.mode === "eligible" && priorFingerprint) retained.cacheLineage.runtimeFingerprint = priorFingerprint;
           }
           const plan = finishPlanSafely({ request, role, workerId: worker.workerId, ...(reservedRunId ? { runId: reservedRunId } : {}), paths, promptInputs: inputs, taskIds: unique([...worker.taskIds, ...(request.additionalTaskIds ?? [])]), modelSelection: worker.modelSelection!, binding, workerRuntime: { version: 2, inputs: retainedInputs, ...retained }, newWorker: false, expectedVersion: worker.version, contextFile, reviewedRunId, preparedId, operationRepositories, pendingWorkSessionId, mounts, parentSessionFile, context });
-          plans.push(plan); continue;
+          plans.push(plan); pendingReservation = undefined; continue;
         }
         const role = request.role;
         const modelSelection = resolveModel(role, role === "work" ? request.modelSelection : undefined, context);
@@ -409,14 +411,20 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         }
       }
       return plans;
-    } catch (error) { rollbackPlans(plans, parentSessionFile); throw error; }
+    } catch (error) { if (pendingReservation) cleanupReservedRun(pendingReservation.paths, pendingReservation.runId); rollbackPlans(plans, parentSessionFile); throw error; }
+  }
+
+  function cleanupReservedRun(paths: WorkerPaths, runId: string): void {
+    removeOwnerTree(path.join(paths.supervisionDir, "runs", runId));
+    removeOwnerTree(path.join(paths.evidenceDir, "runs", runId));
+    removeOwnerTree(path.join(paths.stateDir, "cache-lineage", runId));
   }
 
   function finishPlanSafely(input: Omit<PlannedRun, "runId" | "jobId" | "runRuntime"> & { runId?: string; contextFile?: string; pendingWorkSessionId?: string; promptInputs: RetainedInput[]; mounts: WorkerSandboxMount[]; parentSessionFile: string; context: ExtensionContext }): PlannedRun {
     try { return finishPlan(input); } catch (error) {
       if (input.consumedPrepared && input.preparedId) { try { restoreConsumedPreparedMergeSet(input.parentSessionFile, input.preparedId, input.paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, trustedSet: trustedPreparedSet(getRegistry(), input.parentSessionFile, input.preparedId) }); } catch {} }
       if (input.newWorker) { removeOwnerTree(input.paths.stateDir); removeOwnerTree(input.paths.supervisionDir); removeOwnerTree(input.paths.evidenceDir); }
-      else if (input.runId) { removeOwnerTree(path.join(input.paths.supervisionDir, "runs", input.runId)); removeOwnerTree(path.join(input.paths.evidenceDir, "runs", input.runId)); removeOwnerTree(path.join(input.paths.stateDir, "cache-lineage", input.runId)); }
+      else if (input.runId) cleanupReservedRun(input.paths, input.runId);
       throw error;
     }
   }
@@ -428,7 +436,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const nonce = randomUUID();
     const codeRoot = overrides.codeRoot ?? (testLaunch ? input.context.cwd : path.join(homedir(), "Code"));
     const sandbox = planWorkerSandbox({ workerId: input.workerId, runId, creationNonce: nonce, workerRoot: input.paths.stateDir, workingDirectory: input.paths.workspaceRoot, codeRoot, mounts: input.mounts.map((mount) => ({ source: mount.source, ...(mount.readOnly ? { readOnly: true } : {}) })), ...(sandboxRelease ? { release: sandboxRelease } : {}) });
-    const runtimeFingerprint = createHash("sha256").update(JSON.stringify({ imageDigest: sandbox.imageDigest, kitSha256: sandbox.kitSha256, resourceManifestSha256: sandbox.resourceManifestSha256, revisions: sandbox.revisions })).digest("hex");
+    const runtimeFingerprint = createHash("sha256").update(JSON.stringify({ imageDigest: sandbox.imageDigest, kitSha256: sandbox.kitSha256, sbxVersion: sandbox.sbxVersion, templateId: sandbox.templateId, templateRepository: sandbox.templateRepository, templateTag: sandbox.templateTag, templateFlavor: sandbox.templateFlavor, resourceManifestSha256: sandbox.resourceManifestSha256, runtimeProvenanceSha256: sandbox.runtimeProvenanceSha256, revisions: sandbox.revisions })).digest("hex");
     const roleInstructions = roleInstructionsFor(input.role);
     const cacheBoundaryFingerprint = createHash("sha256").update(JSON.stringify({ runtimeFingerprint, role: input.role, modelSelection: input.modelSelection, roleInstructions, taskIds: [...input.taskIds].sort(), repositoryBaselines: input.workerRuntime.repositoryBaselines ?? [] })).digest("hex");
     if (input.workerRuntime.cacheLineage?.mode === "eligible") input.workerRuntime.cacheLineage = input.workerRuntime.cacheLineage.runtimeFingerprint && input.workerRuntime.cacheLineage.runtimeFingerprint !== cacheBoundaryFingerprint ? { version: 1, mode: "fresh", reason: "Trusted runtime, tool, role, model, assignment, or fork boundary changed; prior cache generation was retired.", hostGeneration: runId } : { ...input.workerRuntime.cacheLineage, runtimeFingerprint: cacheBoundaryFingerprint };
@@ -490,7 +498,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       const record: WorkerLaunchRecord = { workerId: worker.workerId, runId: run.runId, jobId: run.jobId!, sessionId, sessionFile, workerRoot: paths.stateDir, workspaceRoot: worker.workspaceRoot, taskIds: run.taskIds, role: worker.role, modelSelection: worker.modelSelection!, ...(worker.runtime?.cacheLineage ? { cacheLineage: worker.runtime.cacheLineage as WorkerCacheLineageRecord } : {}) };
       assertRunClaim(item.workerId, item.runId, "launch", nonce);
       item.runtime.sandbox = await createSandbox(sbx(), item.runtime.sandbox);
-      writeReadonlyJson(path.join(item.runtime.runDir, "sandbox-created.json"), { version: 1, workerId: item.workerId, runId: item.runId, creationNonce: item.runtime.sandbox.creationNonce, sandboxName: item.runtime.sandbox.sandboxName, sandboxId: item.runtime.sandbox.observedSandboxId, imageReference: item.runtime.sandbox.imageReference, imageDigest: item.runtime.sandbox.imageDigest, kitReference: item.runtime.sandbox.kitReference, kitSha256: item.runtime.sandbox.kitSha256, createEvidenceSha256: item.runtime.sandbox.createEvidenceSha256, observedRuntimeSha256: item.runtime.sandbox.observedRuntimeSha256, observedCpu: item.runtime.sandbox.observedCpu, observedMemoryBytes: item.runtime.sandbox.observedMemoryBytes, observedAt: now().toISOString() });
+      writeReadonlyJson(path.join(item.runtime.runDir, "sandbox-created.json"), { version: 1, workerId: item.workerId, runId: item.runId, creationNonce: item.runtime.sandbox.creationNonce, sandboxName: item.runtime.sandbox.sandboxName, sandboxId: item.runtime.sandbox.observedSandboxId, imageReference: item.runtime.sandbox.imageReference, imageDigest: item.runtime.sandbox.imageDigest, kitReference: item.runtime.sandbox.kitReference, kitSha256: item.runtime.sandbox.kitSha256, sbxVersion: item.runtime.sandbox.sbxVersion, templateId: item.runtime.sandbox.templateId, templateRepository: item.runtime.sandbox.templateRepository, templateTag: item.runtime.sandbox.templateTag, templateFlavor: item.runtime.sandbox.templateFlavor, createEvidenceSha256: item.runtime.sandbox.createEvidenceSha256, inspectEvidenceSha256: item.runtime.sandbox.inspectEvidenceSha256, sbxVersionEvidenceSha256: item.runtime.sandbox.sbxVersionEvidenceSha256, runtimeProvenanceSha256: item.runtime.sandbox.runtimeProvenanceSha256, observedRuntimeSha256: item.runtime.sandbox.observedRuntimeSha256, observedCpu: item.runtime.sandbox.observedCpu, observedMemoryBytes: item.runtime.sandbox.observedMemoryBytes, observedAt: now().toISOString() });
       launchAdmission = path.join(item.runtime.runDir, "launch-admitting.json"); writeFileSync(launchAdmission, `${JSON.stringify({ version: 2, workerId: item.workerId, runId: item.runId, pid: process.pid, processStartToken: asyncJobProcessStartToken(process.pid), startedAt: now().toISOString() })}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
       assertRunClaim(item.workerId, item.runId, "launch", nonce);
       handle = launch(context, record, item.runtime); await verifyHostIdentity(item.runtime, item.workerId, item.runId); assertRunClaim(item.workerId, item.runId, "launch", nonce); const snapshot = handle.snapshot();
@@ -589,9 +597,11 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         const deadline = Date.now() + cancellationResultGraceMs;
         while (!existsSync(runtime.settledFile) && Date.now() < deadline) await delay(Math.min(50, Math.max(1, deadline - Date.now())));
         if (!existsSync(runtime.settledFile)) {
-          requestWorkerCancellation(runtime, worker.workerId, runId);
+          let supervised: ReturnType<typeof readWorkerHostProcess> | undefined;
+          try { supervised = requestWorkerCancellation(runtime, worker.workerId, runId); } catch {}
           if (attached?.runId === runId) await Promise.race([attached.handle.completion, delay(cancellationEofGraceMs)]);
-          await removeSandbox(sbx(), runtime.sandbox); await proveWorkerHostExited(runtime, worker.workerId, runId);
+          else if (supervised) await waitForSupervisedExit(supervised, cancellationEofGraceMs);
+          await removeSandbox(sbx(), runtime.sandbox); if (supervised || !existsSync(runtime.processFile)) await proveWorkerHostExited(runtime, worker.workerId, runId);
           finalizeAcceptedCancellation(worker, run, runtime, nonce, accepted);
           active.delete(worker.workerId); deliverPendingCompletions(api, getRegistry(), worker.parentSessionFile, runtimeGeneration); return "not_active";
         }
@@ -612,19 +622,22 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     } catch (error) { recordRecovery(worker.workerId, runId, error); throw new Error(`Worker ${worker.workerId}/${runId} cancellation requires recovery: ${sanitizeError(error)}`); }
   }
 
-  function requestWorkerCancellation(runtime: RunRuntime, workerId: string, runId: string): void {
-    if (!existsSync(runtime.processFile)) return;
+  function requestWorkerCancellation(runtime: RunRuntime, workerId: string, runId: string): ReturnType<typeof readWorkerHostProcess> | undefined {
+    if (!existsSync(runtime.processFile)) return undefined;
     const supervised = readWorkerHostProcess(runtime.processFile);
     if (supervised.workerId !== workerId || supervised.runId !== runId || supervised.nonce !== runtime.processNonce) throw new Error("Worker host process identity mismatch during cancellation.");
     if (isAsyncJobProcessIdentityAlive(supervised)) writeCancellationRequest(runtime, workerId, runId);
+    return supervised;
   }
 
   function writeCancellationRequest(runtime: RunRuntime, workerId: string, runId: string): void {
     const file = path.join(runtime.runDir, "cancel-request.json");
     if (existsSync(file)) {
-      const retained = JSON.parse(readBoundedNoFollowFile(file, runtime.runDir, 4096, "worker cancellation request").toString("utf8")) as { version?: unknown; workerId?: unknown; runId?: unknown };
-      if (retained.version === 1 && retained.workerId === workerId && retained.runId === runId) return;
-      throw new Error("Retained worker cancellation request identity mismatch.");
+      try {
+        const retained = JSON.parse(readBoundedNoFollowFile(file, runtime.runDir, 4096, "worker cancellation request").toString("utf8")) as { version?: unknown; workerId?: unknown; runId?: unknown };
+        if (retained.version === 1 && retained.workerId === workerId && retained.runId === runId) return;
+      } catch {}
+      rmSync(file, { force: true });
     }
     try { writeFileSync(file, `${JSON.stringify({ version: 1, workerId, runId, requestedAt: now().toISOString() })}\n`, { flag: "wx", mode: 0o600 }); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") return writeCancellationRequest(runtime, workerId, runId); throw error; }
@@ -639,6 +652,11 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       errors.push(...inventory.errors.map((message) => ({ scope: "repositories" as const, message: sanitizeError(message) })));
     } catch (storageError) { errors.push({ scope: "run", message: `Accepted worker result was retained, but post-containment storage inventory was unavailable: ${sanitizeError(storageError)}` }); }
     finalizeClaimedWorkerRun(getRegistry(), { parentSessionFile: worker.parentSessionFile, workerId: worker.workerId, runId: run.runId, claimKind: "cancellation", claimNonce: nonce, outcome: accepted.result.outcome, outcomeSource: "worker", summary: accepted.result.summary.slice(0, 2048), ...(accepted.result.question ? { question: accepted.result.question } : {}), repositories, artifacts, errors, sessionEndLine: worker.sessionFile ? safeCountLines(worker.sessionFile, workerPaths(roots, worker.workerId).sessionDir) : undefined, settledAt: now().toISOString() });
+  }
+
+  async function waitForSupervisedExit(processRecord: ReturnType<typeof readWorkerHostProcess>, timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (isAsyncJobProcessIdentityAlive(processRecord) && Date.now() < deadline) await delay(Math.min(50, Math.max(1, deadline - Date.now())));
   }
 
   async function waitForRuntimeAdmissions(runtime: RunRuntime, authorizationFile: string): Promise<void> {
@@ -664,15 +682,34 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     for (const row of rows) {
       if (row.operation_nonce.startsWith(`${generation}-`)) continue;
       const paths = workerPaths(roots, row.worker_id); const stateTrash = `${paths.stateDir}.discard-${row.operation_nonce}`;
-      const separateWorkspace = path.resolve(row.workspace_root).startsWith(`${path.resolve(paths.stateDir)}${path.sep}`) ? undefined : `${row.workspace_root}.discard-${row.operation_nonce}`;
+      const workspaceIsSeparate = !path.resolve(row.workspace_root).startsWith(`${path.resolve(paths.stateDir)}${path.sep}`);
+      const separateWorkspace = workspaceIsSeparate ? `${row.workspace_root}.discard-${row.operation_nonce}` : undefined;
       try {
-        for (const candidate of [paths.stateDir, stateTrash, paths.supervisionDir, paths.evidenceDir, row.workspace_root, separateWorkspace].filter((item): item is string => Boolean(item))) prepareOwnerRemovalTree(candidate);
-        if (existsSync(paths.stateDir)) { if (existsSync(stateTrash)) throw new Error("Interrupted discard retained both state and trash directories."); renameSync(paths.stateDir, stateTrash); }
-        if (separateWorkspace && existsSync(row.workspace_root)) { if (existsSync(separateWorkspace)) throw new Error("Interrupted discard retained both workspace and trash directories."); renameSync(row.workspace_root, separateWorkspace); }
-        removeOwnerTree(paths.supervisionDir); removeOwnerTree(paths.evidenceDir); removeOwnerTree(stateTrash); if (separateWorkspace) removeOwnerTree(separateWorkspace);
+        const staleStateTrash = discardTrashPaths(paths.stateDir); const staleWorkspaceTrash = workspaceIsSeparate ? discardTrashPaths(row.workspace_root) : [];
+        for (const candidate of [paths.stateDir, ...staleStateTrash, paths.supervisionDir, paths.evidenceDir, row.workspace_root, ...staleWorkspaceTrash].filter((item): item is string => Boolean(item))) prepareOwnerRemovalTree(candidate);
+        if (existsSync(paths.stateDir)) { if (existsSync(stateTrash)) throw new Error("Interrupted discard retained both state and current trash directories."); renameSync(paths.stateDir, stateTrash); }
+        if (separateWorkspace && existsSync(row.workspace_root)) { if (existsSync(separateWorkspace)) throw new Error("Interrupted discard retained both workspace and current trash directories."); renameSync(row.workspace_root, separateWorkspace); }
+        removeOwnerTree(paths.supervisionDir); removeOwnerTree(paths.evidenceDir);
+        for (const trash of new Set([...staleStateTrash, stateTrash, ...staleWorkspaceTrash, ...(separateWorkspace ? [separateWorkspace] : [])])) removeOwnerTree(trash);
         finalizeWorkerDiscard(getRegistry(), row.worker_id, row.operation_nonce);
       } catch (error) {
+        try { if (existsSync(stateTrash) && !existsSync(paths.stateDir)) renameSync(stateTrash, paths.stateDir); if (separateWorkspace && existsSync(separateWorkspace) && !existsSync(row.workspace_root)) renameSync(separateWorkspace, row.workspace_root); } catch {}
         abandonWorkerDiscard(getRegistry(), row.worker_id, row.operation_nonce, `Interrupted discard cleanup failed: ${sanitizeError(error)}`, now().toISOString());
+      }
+    }
+  }
+
+  function recoverAbandonedDiscardTrash(parentSessionFile: string): void {
+    const rows = getRegistry().database.prepare("SELECT worker_id,workspace_root FROM workers WHERE parent_session_file=? AND operation_kind IS NULL").all(parentSessionFile) as Array<{ worker_id: string; workspace_root: string }>;
+    for (const row of rows) {
+      const paths = workerPaths(roots, row.worker_id); const workspaceIsSeparate = !path.resolve(row.workspace_root).startsWith(`${path.resolve(paths.stateDir)}${path.sep}`);
+      for (const original of [paths.stateDir, ...(workspaceIsSeparate ? [row.workspace_root] : [])]) {
+        const trash = discardTrashPaths(original); if (!trash.length) continue;
+        try {
+          for (const candidate of trash) prepareOwnerRemovalTree(candidate);
+          if (!existsSync(original)) { if (trash.length !== 1) continue; renameSync(trash[0]!, original); }
+          for (const candidate of discardTrashPaths(original)) removeOwnerTree(candidate);
+        } catch {}
       }
     }
   }
@@ -681,7 +718,9 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const nonce = claimNonce(); claimWorkerDiscard(getRegistry(), worker.workerId, worker.version, nonce, now().toISOString());
     const paths = workerPaths(roots, worker.workerId); const stateTrash = `${paths.stateDir}.discard-${nonce}`; const separateWorkspace = path.resolve(paths.workspaceRoot).startsWith(`${path.resolve(paths.stateDir)}${path.sep}`) ? undefined : `${paths.workspaceRoot}.discard-${nonce}`;
     try {
-      for (const candidate of [paths.stateDir, paths.supervisionDir, paths.evidenceDir, separateWorkspace ? paths.workspaceRoot : undefined].filter((item): item is string => Boolean(item))) prepareOwnerRemovalTree(candidate);
+      const staleStateTrash = discardTrashPaths(paths.stateDir); const staleWorkspaceTrash = separateWorkspace ? discardTrashPaths(paths.workspaceRoot) : [];
+      for (const candidate of [paths.stateDir, paths.supervisionDir, paths.evidenceDir, separateWorkspace ? paths.workspaceRoot : undefined, ...staleStateTrash, ...staleWorkspaceTrash].filter((item): item is string => Boolean(item))) prepareOwnerRemovalTree(candidate);
+      for (const trash of [...staleStateTrash, ...staleWorkspaceTrash]) removeOwnerTree(trash);
       if (existsSync(stateTrash) || (separateWorkspace && existsSync(separateWorkspace))) throw new Error("Discard trash destination already exists.");
       if (existsSync(paths.stateDir)) renameSync(paths.stateDir, stateTrash); if (separateWorkspace && existsSync(paths.workspaceRoot)) renameSync(paths.workspaceRoot, separateWorkspace);
       removeOwnerTree(paths.supervisionDir); removeOwnerTree(paths.evidenceDir); removeOwnerTree(stateTrash); if (separateWorkspace) removeOwnerTree(separateWorkspace); finalizeWorkerDiscard(getRegistry(), worker.workerId, nonce);
@@ -749,6 +788,12 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const { worker, run } = found; if (!(["work", "integration"] as WorkerRole[]).includes(worker.role) || run.status !== "settled" || run.outcome !== "completed" || worker.latestRunId !== runId || worker.status !== "idle" || !worker.sessionFile || run.sessionStartLine === undefined || run.sessionEndLine === undefined) throw new Error(`Review requires the latest completed run of an idle work or integration worker; ${runId} is not eligible.`);
     if (worker.reviewedByWorkerId && worker.reviewedByWorkerId !== reviewerWorkerId) throw new Error(`Worker ${worker.workerId} is leased to reviewer ${worker.reviewedByWorkerId}.`); return found;
   }
+  function discardTrashPaths(original: string): string[] {
+    const parent = path.dirname(original); if (!existsSync(parent)) return [];
+    const prefix = `${path.basename(original)}.discard-`;
+    return readdirSync(parent).filter((name) => name.startsWith(prefix) && /^\d+-[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(name.slice(prefix.length))).sort().map((name) => path.join(parent, name));
+  }
+
   function claimNonce(): string { return `${runtimeGeneration}-${randomUUID()}`; }
   function managedCandidateWarnings(parentSessionFile: string) { return (candidateRepo: string, candidateCommit: string) => {
     const rows = getRegistry().database.prepare("SELECT r.run_id,r.repositories_json,w.worker_id,w.latest_run_id,w.status,w.workspace_root FROM runs r JOIN workers w ON w.worker_id=r.worker_id WHERE r.status='settled' AND w.parent_session_file=?").all(parentSessionFile) as Array<any>;
@@ -845,17 +890,11 @@ function writeReviewContext(directory: string, subjectPaths: WorkerPaths, review
     const source = path.join(subjectWorker.workspaceRoot, repository.path); assertContainedOrdinaryDirectory(subjectWorker.workspaceRoot, source, "review candidate repository");
     if (trustedGit(source, ["rev-parse", `${repository.commit}^{commit}`]).trim() !== repository.commit) throw new Error("Review candidate commit is unavailable from its reported repository.");
     const target = path.join(subjectWorkspace, `${String(index + 1).padStart(3, "0")}-${repository.candidateId}`);
-    const branch = `pi-worker-review-${createHash("sha256").update(`${reviewerWorkerId}\0${contextId}\0${repository.candidateId}`).digest("hex").slice(0, 24)}`;
-    const sourceRef = `refs/heads/${branch}`;
-    trustedGit(source, ["update-ref", sourceRef, repository.commit, "0".repeat(40)]);
-    try {
-      execFileSync("git", trustedGitArgs(["clone", "--no-local", "--no-checkout", "--single-branch", "--branch", branch, "--no-tags", "--", source, target]), { env: trustedGitEnvironment(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 16 * 1024 * 1024 });
-    } finally {
-      trustedGit(source, ["update-ref", "-d", sourceRef, repository.commit]);
-    }
+    execFileSync("git", trustedGitArgs(["clone", "--no-local", "--no-hardlinks", "--no-checkout", "--no-tags", "--", source, target]), { env: trustedGitEnvironment(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 16 * 1024 * 1024 });
+    if (trustedGit(target, ["rev-parse", `${repository.commit}^{commit}`]).trim() !== repository.commit) throw new Error("Cloned review candidate does not contain its accepted exact commit.");
     trustedGit(target, ["checkout", "--detach", repository.commit]);
     try { trustedGit(target, ["remote", "remove", "origin"]); } catch {}
-    try { trustedGit(target, ["branch", "-D", branch]); } catch {}
+    for (const ref of trustedGit(target, ["for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes", "refs/tags"]).split("\n").filter(Boolean)) trustedGit(target, ["update-ref", "-d", ref]);
     if (trustedGit(target, ["rev-parse", "HEAD"]).trim() !== repository.commit) throw new Error("Materialized review candidate commit mismatch.");
     makeReadonlyTree(target, { nodes: 0, bytes: 0 }); materializedRepositories.push({ ...repository, path: path.relative(subjectWorkspace, target) });
   }
@@ -933,7 +972,7 @@ function validateRunRequestBounds(request: WorkerRunInputV2["runs"][number]): vo
 function unique(values: string[]): string[] { const result = [...new Set(values.map((value) => value.trim()).filter(Boolean))]; if (result.length !== values.length) throw new Error("Worker task IDs and batch identities must be unique."); return result; }
 function sanitizeError(error: unknown): string { return String(error instanceof Error ? error.message : error).replaceAll(/[\r\n\t]+/g, " ").slice(0, 2048); }
 function testWorkerSandboxRelease(): WorkerSandboxRelease {
-  return { schemaVersion: 1, protocolVersion: 1, releaseOrdinal: 1, status: "approved", kit: { reference: "/test/pi-worker-kit", sha256: "a".repeat(64) }, image: { reference: `example.invalid/pi-worker@sha256:${"b".repeat(64)}`, digest: "b".repeat(64) }, revisions: { pi: "1".repeat(40), profile: "2".repeat(40), piTools: "3".repeat(40), piDocparser: "4".repeat(40) }, guest: { piCli: "/usr/local/bin/pi", rpcLauncher: "/opt/pi-worker/launch.mjs", codingAgentDir: "/run/pi-worker/agent", resourceManifestSha256: "c".repeat(64), extensionPaths: ["/opt/pi-tools/extensions/worker/runtime.ts"], searxngUrl: "http://host.docker.internal:18888" } };
+  return { schemaVersion: 1, protocolVersion: 1, releaseOrdinal: 1, status: "approved", kit: { reference: "/test/pi-worker-kit", sha256: "a".repeat(64) }, image: { reference: `example.invalid/pi-worker@sha256:${"b".repeat(64)}`, digest: "b".repeat(64) }, sandbox: { version: "v0.49.1", template: { id: "template-test-1234", repository: "pi-worker-test", tag: "loaded", flavor: "pi-managed-worker" } }, revisions: { pi: "1".repeat(40), profile: "2".repeat(40), piTools: "3".repeat(40), piDocparser: "4".repeat(40) }, guest: { piCli: "/usr/local/bin/pi", rpcLauncher: "/opt/pi-worker/launch.mjs", codingAgentDir: "/run/pi-worker/agent", resourceManifestSha256: "c".repeat(64), runtimeProvenanceSha256: "d".repeat(64), extensionPaths: ["/opt/pi-tools/extensions/worker/runtime.ts"], searxngUrl: "http://host.docker.internal:18888" } };
 }
 
 function delay(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)); }
