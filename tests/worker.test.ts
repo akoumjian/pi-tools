@@ -106,6 +106,7 @@ test("parent tool labels and approved copy remain exact and schemas carry field 
   assert.equal(control.label, "Manage Workers"); assert.equal(control.description, "List and manage durable workers owned by the current parent session. Use `list` for compact worker discovery, `runs` to list one worker’s execution history, and `get` to inspect one exact active or settled run, including logs, session and workspace access, and submitted repository or artifact outputs. Use `cancel` to stop active work while preserving retained state. Use `discard` to permanently delete an idle worker and all retained state.");
   assert.equal(apply.label, "Apply Prepared Repository Merges"); assert.match(apply.description, /Applying multiple repositories is not atomic/);
   const schemaText = JSON.stringify(WorkerRunParams); for (const phrase of ["Continue a previous worker", "One or more Beads task IDs", "Additional files or directories", "When to deliver the asynchronous result"]) assert.match(schemaText, new RegExp(phrase));
+  const controlGuidance = JSON.stringify(control.promptGuidelines); for (const phrase of ["notification", "send_started_unconfirmed", "delivered", "runtimeGeneration", "sendStartedAt"]) assert.match(controlGuidance, new RegExp(phrase), `provider-visible worker_control output guidance includes ${phrase}`);
 });
 
 test("worker package-generation mismatch registers no launchable tools", () => {

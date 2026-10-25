@@ -226,6 +226,14 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     for (const item of launches) pending.delete(item.runId);
     for (const item of launches) beginPreparedRun(item);
   });
+  api.on("agent_end", (_event, context) => {
+    try {
+      const parentFile = context.sessionManager.getSessionFile(); if (!parentFile) return;
+      // Exact same-session history is authoritative receipt evidence. This only
+      // acknowledges observed delivery IDs; it never releases, retries, or sends.
+      reconcileWorkerDeliveries(getRegistry(), realpathOrResolve(parentFile), sessionDeliveryIds(context));
+    } catch {}
+  });
   api.on("message_end", (event, context) => {
     const deliveryId = (event.message as any)?.details?.deliveryId;
     if (typeof deliveryId !== "string" || !deliveryId.startsWith("worker-run:")) return;

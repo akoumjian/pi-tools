@@ -410,7 +410,8 @@ test("a started completion send is surfaced as unconfirmed and never replayed", 
     await new Promise((resolve) => setTimeout(resolve, 1_200));
     assert.equal(f.messageAttempts.filter((message) => message.details?.runId === started.runId).length, 1, "an attempted send cannot be replayed after acceptance becomes ambiguous");
     const shown = await f.call("worker_control", { action: "get", workerId: started.workerId, runId: started.runId });
-    assert.equal((shown.details as any).notification.state, "send_started_unconfirmed"); assert.ok((shown.details as any).notification.sendStartedAt);
+    const shownVisible = JSON.parse((shown.content[0] as any).text);
+    assert.equal((shown.details as any).notification.state, "send_started_unconfirmed"); assert.ok((shown.details as any).notification.sendStartedAt); assert.deepEqual(shownVisible.notification, (shown.details as any).notification);
     const db = f.registry(); const delivery = db.database.prepare("SELECT state,send_started_at FROM deliveries WHERE run_id=?").get(started.runId) as any; db.close(); assert.equal(delivery.state, "claimed"); assert.ok(delivery.send_started_at);
   } finally { await f.close(); }
 });
@@ -419,7 +420,7 @@ test("Escape-like lost completion remains visible across reload without replay o
   const f = await fixture({ tui: true }); try {
     const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "queued completion visibility" }] })); await f.event("turn_end"); await complete(f, started);
     assert.equal(f.messageAttempts.filter((message) => message.details?.runId === started.runId).length, 1, "the original completion send starts once");
-    const listed = await f.call("worker_control", { action: "list" }); assert.equal((listed.details as any).workers[0].notification.state, "send_started_unconfirmed"); assert.equal((listed.details as any).workers[0].notification.runId, started.runId); assert.deepEqual((listed.details as any).counts, { queued: 0, running: 0, idle: 1 }); assert.equal((listed.details as any).total, 1);
+    const listed = await f.call("worker_control", { action: "list" }); const listedVisible = JSON.parse((listed.content[0] as any).text); assert.equal((listed.details as any).workers[0].notification.state, "send_started_unconfirmed"); assert.equal((listed.details as any).workers[0].notification.runId, started.runId); assert.deepEqual(listedVisible.workers[0].notification, (listed.details as any).workers[0].notification); assert.deepEqual((listed.details as any).counts, { queued: 0, running: 0, idle: 1 }); assert.equal((listed.details as any).total, 1);
     await f.commands.get("worker:list").handler("", f.context); assert.match(f.notifications.at(-1)!, /send_started_unconfirmed/); assert.match(f.notifications.at(-1)!, new RegExp(started.runId));
     await f.commands.get("worker:show").handler(`${started.workerId} ${started.runId}`, f.context); assert.match(f.notifications.at(-1)!, /send_started_unconfirmed/);
     const beforeWarnings = f.notifications.filter((message) => /completed, but its notification is send_started_unconfirmed/.test(message)).length; assert.equal(beforeWarnings, 0);
@@ -729,6 +730,33 @@ test("unreceipted idle-origin managed completion is not replayed after its send 
     assert.ok(delivery.runtime_generation > 0);
     assert.ok(delivery.send_started_at, "the durable send boundary prevents an automatic duplicate");
     db.close();
+  } finally { await f.close(); }
+});
+
+test("agent_end acknowledges exact same-session completion history without replay or model steering", async () => {
+  const f = await fixture();
+  try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "reconcile exact receipt" }] }));
+    await f.event("turn_end");
+    await complete(f, started);
+    await waitFor(() => f.messages.filter((message) => message.details?.event === "worker_settled").length === 1);
+    const deliveryId = `worker-run:${started.workerId}:${started.runId}`;
+    let db = f.registry();
+    const before = db.database.prepare("SELECT state,send_started_at FROM deliveries WHERE run_id=?").get(started.runId) as { state: string; send_started_at: string | null };
+    assert.equal(before.state, "claimed"); assert.ok(before.send_started_at); db.close();
+
+    f.session.appendCustomMessageEntry("worker-run", JSON.stringify({ event: "worker_settled", workerId: started.workerId, runId: started.runId }), true, { deliveryId });
+    const sendAttempts = f.messageAttempts.length;
+    await f.event("agent_end");
+
+    db = f.registry();
+    const after = db.database.prepare("SELECT state,delivered_at FROM deliveries WHERE run_id=?").get(started.runId) as { state: string; delivered_at: string | null };
+    assert.equal(after.state, "delivered"); assert.ok(after.delivered_at); db.close();
+    assert.equal(f.messageAttempts.length, sendAttempts, "history reconciliation never invokes sendMessage or starts a model turn");
+    assert.equal(f.messages.filter((message) => message.details?.event === "worker_settled").length, 1, "history reconciliation never replays the managed completion");
+    const shown = await f.call("worker_control", { action: "get", workerId: started.workerId, runId: started.runId });
+    const visible = JSON.parse((shown.content[0] as any).text);
+    assert.equal(visible.notification.state, "delivered"); assert.equal(visible.notification.runId, started.runId);
   } finally { await f.close(); }
 });
 
