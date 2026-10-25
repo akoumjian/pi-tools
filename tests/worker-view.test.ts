@@ -75,6 +75,12 @@ function assertDeepCheckpointSamples(target: WorkerSessionViewTarget, expectedEn
   execFileSync(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(target), String(expectedEntries), String(payloadBytes)], { timeout: 180_000, stdio: "pipe" });
 }
 
+function assertNondisplayedGapReadBound(target: WorkerSessionViewTarget, maximumBytes: number): void {
+  const moduleUrl = new URL("../extensions/worker/view.js", import.meta.url).href;
+  const script = `import fs from "node:fs"; import { syncBuiltinESMExports } from "node:module"; const original = fs.readSync; let bytes = 0; fs.readSync = function(...args) { const count = original.apply(this, args); bytes += count; return count; }; syncBuiltinESMExports(); const view = await import(${JSON.stringify(moduleUrl)}); const target = JSON.parse(process.argv[1]); const verify = (page) => { if (page.blocks.length !== 1 || page.blocks[0]?.text !== "FIRST" || page.skippedOversizedEntries !== 1 || page.totalVisibleEntries !== 1 || page.previousVisibleEntries !== 0 || page.nextVisibleEntries !== 0 || page.hasPreviousPage || page.hasNextPage) throw new Error("nondisplayed-gap page changed"); }; verify(await view.loadWorkerSessionViewSnapshotAsync(target)); for (const asyncMode of [false, true]) { bytes = 0; const page = asyncMode ? await view.loadWorkerSessionViewSnapshotAsync(target) : view.loadWorkerSessionViewSnapshot(target); verify(page); if (bytes > Number(process.argv[2])) throw new Error("nondisplayed-gap page reread " + bytes + " bytes"); }`;
+  execFileSync(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(target), String(maximumBytes)], { timeout: 20_000, stdio: "pipe" });
+}
+
 function assertCountSessionLinesReadFailure(target: WorkerSessionViewTarget, mode: "retry" | "fail" | "replace"): void {
   const moduleUrl = new URL("../extensions/worker/view.js", import.meta.url).href;
   const script = `import fs from "node:fs"; import { syncBuiltinESMExports } from "node:module"; const original = fs.readSync; let injected = 0; const mode = process.argv[2]; const target = JSON.parse(process.argv[1]); fs.readSync = function(fd, buffer, offset, length, position) { if (typeof position === "number" && position > 0 && (mode === "fail" || injected === 0)) { injected += 1; if (mode === "replace") { fs.renameSync(target.sessionFile, target.sessionFile + ".original"); fs.writeFileSync(target.sessionFile, "replacement\\n"); } return 0; } return original.call(this, fd, buffer, offset, length, position); }; syncBuiltinESMExports(); const view = await import(${JSON.stringify(moduleUrl)}); try { const count = view.countSessionLines(target.sessionFile); if (mode !== "retry") throw new Error("count unexpectedly succeeded"); if (count !== target.sessionEndLine) throw new Error("retry count mismatch " + count); } catch (error) { if (mode === "retry") throw error; if (error?.message !== "Worker session changed while counting lines; retry.") throw new Error("unstable count error: " + String(error?.message)); }`;
@@ -785,25 +791,38 @@ test("exact-budget end pages include trailing oversized notices without inventin
   } finally { f.close(); }
 });
 
-test("backward paging reports one oversized entry before the first displayed entry without moving cursors", async () => {
+test("backward block paging reports a leading oversized entry only with the first displayed block", async () => {
   const f = fixture();
   try {
     const hiddenBefore = { type: "custom", id: "hidden-before", parentId: null, timestamp: "now", customType: "internal", data: { hidden: true } };
     const huge = message("huge", "hidden-before", `HUGE-${"h".repeat(9 * 1024 * 1024)}`);
     const hiddenAfter = { type: "custom", id: "hidden-after", parentId: "huge", timestamp: "now", customType: "internal", data: { hidden: true } };
-    const assistant = { type: "message", id: "assistant", parentId: "hidden-after", timestamp: "now", message: { role: "assistant", content: Array.from({ length: 2_048 }, (_, index) => ({ type: "text", text: `PART-${index}` })) } };
+    const assistant = { type: "message", id: "assistant", parentId: "hidden-after", timestamp: "now", message: { role: "assistant", content: Array.from({ length: 4_096 }, (_, index) => ({ type: "text", text: `PART-${index}` })) } };
     writeFileSync(f.sessionFile, line(header(f.target)) + line(hiddenBefore) + line(huge) + line(hiddenAfter) + line(assistant));
     const target = { ...f.target, sessionStartLine: 2, sessionEndLine: 5 };
-    for (const page of [loadWorkerSessionViewSnapshot(target), await loadWorkerSessionViewSnapshotAsync(target)]) {
-      assert.equal(page.blocks.length, 2_048);
-      assert.equal(page.blocks[0]?.text, "PART-0"); assert.equal(page.blocks.at(-1)?.text, "PART-2047");
-      assert.equal(page.skippedOversizedEntries, 1);
-      assert.equal(page.totalVisibleEntries, 1);
-      assert.equal(page.previousVisibleEntries + page.totalActiveEntries + page.nextVisibleEntries, 1);
-      assert.equal(page.pageStartLine, 4); assert.equal(page.pageEndLine, 5);
-      assert.equal(page.pageStartBlock, 0); assert.equal(page.pageEndBlock, 2_048);
-      assert.equal(page.hasPreviousPage, false); assert.equal(page.hasNextPage, false);
+    for (const asyncMode of [false, true]) {
+      const tail = asyncMode ? await loadWorkerSessionViewSnapshotAsync(target) : loadWorkerSessionViewSnapshot(target);
+      assert.equal(tail.blocks.length, 2_048); assert.equal(tail.blocks[0]?.text, "PART-2048"); assert.equal(tail.blocks.at(-1)?.text, "PART-4095");
+      assert.equal(tail.skippedOversizedEntries, 0); assert.equal(tail.totalVisibleEntries, 1); assert.equal(tail.pageStartLine, 5); assert.equal(tail.pageStartBlock, 2_048); assert.equal(tail.hasPreviousBlocksInEntry, true);
+      const first = asyncMode ? await loadWorkerSessionViewSnapshotAsync(target, { mode: "before", line: tail.pageStartLine, block: tail.pageStartBlock }) : loadWorkerSessionViewSnapshot(target, {}, { mode: "before", line: tail.pageStartLine, block: tail.pageStartBlock });
+      assert.equal(first.blocks.length, 2_048); assert.equal(first.blocks[0]?.text, "PART-0"); assert.equal(first.blocks.at(-1)?.text, "PART-2047");
+      assert.equal(first.skippedOversizedEntries, 1); assert.equal(first.totalVisibleEntries, 1); assert.equal(first.previousVisibleEntries + first.totalActiveEntries + first.nextVisibleEntries, 1);
+      assert.equal(first.pageStartLine, 4); assert.equal(first.pageEndLine, 5); assert.equal(first.pageStartBlock, 0); assert.equal(first.pageEndBlock, 2_048); assert.equal(first.hasPreviousPage, false);
     }
+  } finally { f.close(); }
+});
+
+test("backward fallback derives oversized notices across an over-8-MiB nondisplayed gap", () => {
+  const f = fixture();
+  try {
+    const entries = [line(message("display", null, "FIRST")), line(message("oversized", "display", `OVERSIZED-${"o".repeat(9 * 1024 * 1024)}`))];
+    let parentId = "oversized";
+    for (let index = 0; index < 10; index += 1) {
+      const id = `hidden-${index}`;
+      entries.push(line({ type: "custom", id, parentId, timestamp: "now", customType: "internal", data: { padding: "h".repeat(900 * 1024) } })); parentId = id;
+    }
+    writeFileSync(f.sessionFile, line(header(f.target)) + entries.join(""));
+    assertNondisplayedGapReadBound({ ...f.target, sessionStartLine: 2, sessionEndLine: entries.length + 1 }, 8 * 1024 * 1024);
   } finally { f.close(); }
 });
 
