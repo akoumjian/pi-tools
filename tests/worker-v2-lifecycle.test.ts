@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync, spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -103,6 +103,16 @@ test("a malformed or mismatched retained cancellation request is replaced and ca
   } finally { if(child?.pid) try{child.kill("SIGKILL");}catch{} await f.close(); }
 });
 
+test("resume pre-plan snapshot failure removes reserved supervision, evidence, and cache-lineage debris", async () => {
+  const f=await fixture(); let unreadable=""; try {
+    const started=receipt(await f.call("worker_run",{runs:[{action:"start",role:"work",taskIds:["personal-test"],instructions:"pre-plan cleanup baseline"}]})); await f.call("worker_control",{action:"cancel",workerId:started.workerId});
+    const db=f.registry(),worker=getWorker(db,started.workerId)!; db.close(); const supervision=path.join(f.runtimeRoot,"supervision",started.workerId),state=path.join(f.workersRoot,started.workerId); const before={supervision:relativeTree(supervision),lineage:relativeTree(path.join(state,"cache-lineage"))};
+    const readable=path.join(f.root,"input-readable.txt");unreadable=path.join(f.root,"input-unreadable.txt");writeFileSync(readable,"first\n");writeFileSync(unreadable,"second\n");chmodSync(unreadable,0o000);
+    await assert.rejects(f.call("worker_run",{runs:[{action:"resume",workerId:started.workerId,instructions:"snapshot both",additionalInputs:[readable,unreadable]}]}));
+    chmodSync(unreadable,0o600);assert.deepEqual(relativeTree(supervision),before.supervision);assert.deepEqual(relativeTree(path.join(state,"cache-lineage")),before.lineage);const after=f.registry();assert.equal(getWorker(after,started.workerId)!.activeRunId,undefined);after.close();
+  } finally {if(unreadable&&existsSync(unreadable))chmodSync(unreadable,0o600);await f.close();}
+});
+
 test("accepted result survives missing guest settlement through EOF and exact Sandbox removal", async () => {
   const f = await fixture(); try {
     const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "accepted result" }] })); await f.event("turn_end");
@@ -111,6 +121,16 @@ test("accepted result survives missing guest settlement through EOF and exact Sa
     const cancelled = await f.call("worker_control", { action: "cancel", workerId: started.workerId }); assert.equal((cancelled.details as any).cancellation, "not_active");
     const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; assert.equal(run.outcome, "completed"); assert.equal(run.outcomeSource, "worker"); assert.equal(run.summary, "accepted before guest settlement"); assert.equal(getWorker(db, started.workerId)!.status, "idle"); db.close(); assert.deepEqual(f.removed, [started.runId]);
   } finally { await f.close(); }
+});
+
+test("a restarted runtime preserves an accepted outcome while detached-supervisor EOF precedes exact removal", async () => {
+  const f=await fixture(); const secondHandlers=new Map<string,Function[]>(),secondTools:ToolDefinition[]=[];let child:ReturnType<typeof spawn>|undefined;const removalStates:boolean[]=[];try{
+    const started=receipt(await f.call("worker_run",{runs:[{action:"start",role:"work",taskIds:["personal-test"],instructions:"restart accepted result"}]}));await f.event("turn_end");const launch=f.launches[0]!;await f.event("session_shutdown");
+    writeFileSync(launch.runtime.resultFile,`${JSON.stringify({version:2,workerId:started.workerId,runId:started.runId,acceptedAt:new Date().toISOString(),result:{outcome:"blocked",summary:"accepted before parent restart"}},null,2)}\n`);
+    const cancellation=path.join(launch.runtime.runDir,"cancel-request.json"),seen=path.join(f.root,"detached-cancel-seen");const token=`restart-accepted-${Date.now()}`;child=spawn(process.execPath,["-e",`const fs=require("fs"),cancel=process.argv[1],seen=process.argv[2];const timer=setInterval(()=>{if(fs.existsSync(cancel)){fs.writeFileSync(seen,"seen\\n");clearInterval(timer);process.exit(0)}},10)`,cancellation,seen],{env:{...process.env,PI_WORKER_JOB_TOKEN:token},stdio:"ignore"});await waitFor(()=>Boolean(child?.pid&&asyncJobProcessStartToken(child.pid)));const startToken=asyncJobProcessStartToken(child.pid!);writeFileSync(launch.runtime.processFile,`${JSON.stringify({version:2,workerId:started.workerId,runId:started.runId,pid:child.pid,processToken:token,processStartToken:startToken,nonce:launch.runtime.processNonce,hostConfigFile:path.join(launch.runtime.runDir,"host.json"),startedAt:new Date().toISOString()})}\n`);
+    const secondApi={registerTool(tool:ToolDefinition){secondTools.push(tool)},registerCommand(){},registerMessageRenderer(){},sendMessage(){},on(name:string,handler:Function){secondHandlers.set(name,[...(secondHandlers.get(name)??[]),handler]);}} as unknown as ExtensionAPI;registerWorkerExtension(secondApi,{runtimeRoot:f.runtimeRoot,roots:{stateRoot:f.workersRoot,workspaceRoot:f.workersRoot},codeRoot:f.root,preparedRoot:path.join(f.runtimeRoot,"prepared"),targetRoot:f.root,sbxPath:"/fake/sbx",waitForHostIdentity:async()=>{},createSandbox:async()=>{throw new Error("accepted restart must not create")},removeSandbox:async()=>{removalStates.push(Boolean(child?.pid&&asyncJobProcessStartToken(child.pid)));},launch:()=>{throw new Error("accepted restart must not relaunch")},cancellationResultGraceMs:20,cancellationEofGraceMs:500});for(const handler of secondHandlers.get("session_start")??[])await handler({},f.context);
+    const control=secondTools.find((tool)=>tool.name==="worker_control")!;const result=await control.execute!("restart-cancel",{action:"cancel",workerId:started.workerId},new AbortController().signal,undefined,f.context);assert.equal((result.details as any).cancellation,"not_active");await waitFor(()=>existsSync(seen));const db=f.registry(),run=getWorkerRun(db,started.workerId,started.runId)!;assert.equal(run.outcome,"blocked");assert.equal(run.outcomeSource,"worker");assert.equal(run.summary,"accepted before parent restart");db.close();assert.deepEqual(removalStates,[false]);
+  }finally{if(child?.pid)try{child.kill("SIGKILL")}catch{}for(const handler of secondHandlers.get("session_shutdown")??[])await handler({},f.context);await f.close();}
 });
 
 test("cancellation waits for a deferred launch boundary before proving termination", async () => {
@@ -122,6 +142,10 @@ test("cancellation waits for a deferred launch boundary before proving terminati
     const db = f.registry(); const worker = getWorker(db, started.workerId)!; const run = getWorkerRun(db, started.workerId, started.runId)!; db.close();
     assert.equal(worker.status, "idle"); assert.equal(run.outcome, "cancelled"); assert.equal(f.launches.length, 0);
   } finally { f.releaseSandbox(); await f.close(); }
+});
+
+test("abandoned partial old-nonce trash is removed without restoring a deleted live tree", async () => {
+  const f=await fixture();const handlers=new Map<string,Function[]>();try{const started=receipt(await f.call("worker_run",{runs:[{action:"start",role:"work",taskIds:["personal-test"],instructions:"partial trash"}]}));await f.call("worker_control",{action:"cancel",workerId:started.workerId});await f.event("session_shutdown");const original=path.join(f.workersRoot,started.workerId),trash=`${original}.discard-0-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee`;renameSync(original,trash);rmSync(path.join(trash,"workspace"),{recursive:true,force:true});const api={registerTool(){},registerCommand(){},registerMessageRenderer(){},sendMessage(){},on(name:string,handler:Function){handlers.set(name,[...(handlers.get(name)??[]),handler]);}} as unknown as ExtensionAPI;registerWorkerExtension(api,{runtimeRoot:f.runtimeRoot,roots:{stateRoot:f.workersRoot,workspaceRoot:f.workersRoot},codeRoot:f.root,preparedRoot:path.join(f.runtimeRoot,"prepared"),targetRoot:f.root,sbxPath:"/fake/sbx",waitForHostIdentity:async()=>{},createSandbox:async()=>{throw new Error("must not create")},removeSandbox:async()=>{},launch:()=>{throw new Error("must not launch")}});for(const handler of handlers.get("session_start")??[])await handler({},f.context);assert.equal(existsSync(original),false);assert.equal(existsSync(trash),false);}finally{for(const handler of handlers.get("session_shutdown")??[])await handler({},f.context);await f.close();}
 });
 
 test("stale interrupted discard restores owner removal and deletes evidence before registry authority", async () => {
@@ -366,7 +390,7 @@ test("first version-4 resume after retained legacy metadata is explicitly disclo
 });
 
 test("resume rejects runtime downgrade and discloses an approved monotonic runtime upgrade", async () => {
-  const release: any = { schemaVersion: 1, protocolVersion: 1, releaseOrdinal: 2, status: "approved", kit: { reference: "/kit", sha256: "a".repeat(64) }, image: { reference: `example.invalid/worker@sha256:${"b".repeat(64)}`, digest: "b".repeat(64) }, sandbox: { version: "v0.49.1", template: { id: "template-id-1234", repository: "pi-worker-r2-deadbeef", tag: "loaded", flavor: "pi-managed-worker" } }, revisions: { pi: "1".repeat(40), profile: "2".repeat(40), piTools: "3".repeat(40), piDocparser: "4".repeat(40) }, guest: { piCli: "/usr/bin/pi", rpcLauncher: "/opt/pi-worker/launch.mjs", codingAgentDir: "/run/pi-worker/agent", resourceManifestSha256: "c".repeat(64), runtimeProvenanceSha256: "d".repeat(64), extensionPaths: ["/opt/pi-tools/extensions/worker/runtime.ts"], searxngUrl: "http://host.docker.internal:18888" } };
+  const release: any = { schemaVersion: 1, protocolVersion: 1, releaseOrdinal: 2, status: "approved", kit: { reference: "/kit", sha256: "a".repeat(64) }, image: { reference: `example.invalid/worker@sha256:${"b".repeat(64)}`, digest: "b".repeat(64) }, sandbox: { version: "v0.49.1", buildCommit: "c5b19951af121b439800029695f88bf1139a0b0b", template: { id: "template-id-1234", repository: "docker.io/akoumjian/pi-worker-r2-deadbeef", tag: "loaded", flavor: "pi-managed-worker" } }, revisions: { pi: "1".repeat(40), profile: "2".repeat(40), piTools: "3".repeat(40), piDocparser: "4".repeat(40) }, guest: { stagedLockSha256: "e".repeat(64), piCli: "/usr/bin/pi", rpcLauncher: "/opt/pi-worker/launch.mjs", codingAgentDir: "/run/pi-worker/agent", resourceManifestSha256: "c".repeat(64), runtimeProvenanceSha256: "d".repeat(64), extensionPaths: ["/opt/pi-tools/extensions/worker/runtime.ts"], searxngUrl: "http://host.docker.internal:18888" } };
   const f = await fixture({ sandboxRelease: release }); try {
     const started=receipt(await f.call("worker_run",{runs:[{action:"start",role:"work",taskIds:["personal-test"],instructions:"release two"}]})); await f.event("turn_end"); await complete(f,started);
     release.releaseOrdinal=1; await assert.rejects(()=>f.call("worker_run",{runs:[{action:"resume",workerId:started.workerId,instructions:"must reject downgrade"}]}),/downgrade refused/);
@@ -397,6 +421,7 @@ test("worker commands exercise compact list/show and exact cancel/discard lifecy
 function gitInit(repo: string): void { mkdirSync(repo, { recursive: true }); execFileSync("git", ["init", "-q", "-b", "main", repo]); git(repo, "config", "user.name", "Test"); git(repo, "config", "user.email", "test@example.invalid"); }
 function git(repo: string, ...args: string[]): string { return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } }).trim(); }
 function readDirs(root: string): string[] { return readdirSync(root).filter((name) => !name.startsWith(".")); }
+function relativeTree(root: string): string[] { const result: string[]=[]; if(!existsSync(root))return result; const visit=(directory:string,relative="")=>{for(const name of readdirSync(directory).sort()){const item=path.join(directory,name),next=relative?`${relative}/${name}`:name,stat=lstatSync(item);result.push(`${next}:${stat.isDirectory()?"d":stat.isFile()?"f":stat.isSymbolicLink()?"l":"o"}`);if(stat.isDirectory())visit(item,next);}};visit(root);return result; }
 
 test("resume rejects a worker-planted symlink in a fixed writable storage directory", async () => {
   const f = await fixture(); try {
