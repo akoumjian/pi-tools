@@ -74,7 +74,7 @@ const PreserveControl = Type.Object({
   destination: Type.String({ minLength: 1, maxLength: 4096, pattern: "^/" }),
   paths: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), { minItems: 1, maxItems: 32, uniqueItems: true }))
 }, { additionalProperties: false });
-const CleanupInventoryControl = Type.Object({ action: Type.Literal("cleanup_inventory", { description: "Read a bounded page of current- or all-session cleanup classes without granting mutation authority." }), allSessions: Type.Optional(Type.Boolean({ default: false })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, default: 20 })), offset: Type.Optional(Type.Integer({ minimum: 0, default: 0 })) }, { additionalProperties: false });
+const CleanupInventoryControl=Type.Object({action:Type.Literal("cleanup_inventory",{description:"Read a bounded page of current- or all-session cleanup classes without granting mutation authority. All-session filesystem scans return a persisted one-use cursor for resumable per-root accounting."}),allSessions:Type.Optional(Type.Boolean({default:false})),limit:Type.Optional(Type.Integer({minimum:1,maximum:100,default:20})),offset:Type.Optional(Type.Integer({minimum:0,default:0})),cursor:Type.Optional(Type.String({pattern:"^cleanup_scan_[a-f0-9]{48}$"}))},{additionalProperties:false});
 const CleanupPreviewControl = Type.Object({
   action: Type.Literal("cleanup_preview", { description: "Persist a one-use host-only cleanup snapshot for exact bounded targets selected from cleanup_inventory." }),
   workerIds: Type.Optional(DiscardWorkerIds), preparedIds: Type.Optional(DiscardPreparedIds),
@@ -87,7 +87,8 @@ const CleanupApplyControl = Type.Object({
   openTaskAbandonmentAcknowledged: CleanupAcknowledgements,
   artifactLossAcknowledged: CleanupAcknowledgements,
   pendingDeliveryTakeoverAcknowledged: CleanupAcknowledgements,
-  claimedDeliveryTakeoverAcknowledged: CleanupAcknowledgements
+  claimedDeliveryTakeoverAcknowledged: CleanupAcknowledgements,
+  recoveryAcknowledged: CleanupAcknowledgements
 }, { additionalProperties: false });
 const WorkerControlStrict = Type.Union([ListControl, RunsControl, GetControl, CancelControl, LegacyDiscardControl, BatchDiscardControl, PreserveControl, CleanupInventoryControl, CleanupPreviewControl, CleanupApplyControl]);
 export const WorkerControlParamsV2 = Type.Unsafe<Static<typeof WorkerControlStrict>>({
@@ -98,9 +99,11 @@ export const WorkerControlParamsV2 = Type.Unsafe<Static<typeof WorkerControlStri
     workerIds: Type.Optional(DiscardWorkerIds), preparedIds: Type.Optional(DiscardPreparedIds), artifactLossAcknowledged: Type.Optional(Type.Array(WorkerId, { minItems: 1, maxItems: 32, uniqueItems: true })),
     leftoverIds: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 96, pattern: "^leftover_[a-f0-9]{24}$" }), { minItems: 1, maxItems: 32, uniqueItems: true })),
     token: Type.Optional(Type.String({ minLength: 32, maxLength: 96, pattern: "^cleanup_[a-f0-9]{48}$" })),
+    cursor: Type.Optional(Type.String({ minLength: 32, maxLength: 96, pattern: "^cleanup_scan_[a-f0-9]{48}$" })),
     openTaskAbandonmentAcknowledged: Type.Optional(Type.Array(WorkerId, { minItems: 1, maxItems: 32, uniqueItems: true })),
     pendingDeliveryTakeoverAcknowledged: Type.Optional(Type.Array(WorkerId, { minItems: 1, maxItems: 32, uniqueItems: true })),
     claimedDeliveryTakeoverAcknowledged: Type.Optional(Type.Array(WorkerId, { minItems: 1, maxItems: 32, uniqueItems: true })),
+    recoveryAcknowledged: Type.Optional(Type.Array(WorkerId, { minItems: 1, maxItems: 32, uniqueItems: true })),
     destination: Type.Optional(Type.String({ minLength: 1, maxLength: 4096, pattern: "^/" })), paths: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), { minItems: 1, maxItems: 32, uniqueItems: true })), allSessions: Type.Optional(Type.Boolean()),
     status: Type.Optional(Type.Union([Type.Literal("idle"), Type.Literal("queued"), Type.Literal("running")], { description: "Optional current-worker filter for list." })),
     role: Type.Optional(Type.Union([Type.Literal("work"), Type.Literal("review"), Type.Literal("integration")], { description: "Optional worker-role filter for list." })),
@@ -126,7 +129,7 @@ export const WorkerMergeApplyParams = Type.Object({ preparedId: PreparedId }, { 
 
 const ResultSummary = Type.String({ minLength: 1, maxLength: 2048, description: "Concise account of the result, useful progress, remaining risk, or reason the work could not continue." });
 const ResultQuestion = Type.Optional(Type.String({ minLength: 1, maxLength: 2048, description: "Specific question the parent must answer before work can continue. Required for needs_input and not allowed for other outcomes." }));
-const ResultArtifacts = Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), { maxItems: 32, description: "Files or directories that are useful result entry points. Paths may be absolute within the worker workspace or relative to the workspace; the tool stores normalized relative paths." }));
+const ResultArtifacts = Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), { maxItems: 32, description: "Ordinary non-repository files or directories that are useful result entry points. An artifact path cannot itself be a standalone, worktree, shallow, nested, or bare Git repository root; report repositories separately. Review approve/request_changes results require a non-empty regular report file. Paths may be absolute within the worker workspace or relative to the workspace; the tool stores normalized relative paths." }));
 export const WorkerWorkResultSubmitParams = Type.Object({
   outcome: Type.Union([Type.Literal("completed"), Type.Literal("needs_input"), Type.Literal("blocked")], { description: "Why this work or integration run is ending." }),
   summary: ResultSummary,
@@ -195,7 +198,7 @@ export function validateWorkerResultInput(role: WorkerRole, input: WorkerResultS
   return { outcome: input.outcome, summary, ...(question ? { question } : {}) };
 }
 
-export function normalizeWorkspaceResultPaths(workspaceRoot: string, values: string[], kind: "repository" | "artifact", stat: (value: string) => { exists: boolean; directory: boolean; file: boolean; repository: boolean }): string[] {
+export function normalizeWorkspaceResultPaths(workspaceRoot: string, values: string[], kind: "repository" | "artifact", stat: (value: string) => { exists: boolean; directory: boolean; file: boolean; repository: boolean; bytes?:number }): string[] {
   if (Buffer.byteLength(values.join("\0")) > 32 * 1024) throw new WorkerResultValidationError("unsupported_path_type", kind === "repository" ? "repositories" : "artifacts", "Combined result paths exceed 32768 UTF-8 bytes.");
   const root = realpathSync(path.resolve(workspaceRoot));
   const seen = new Set<string>();
@@ -217,7 +220,8 @@ export function normalizeWorkspaceResultPaths(workspaceRoot: string, values: str
     const metadata = stat(exact);
     if (!metadata.exists) throw new WorkerResultValidationError("path_not_found", fieldPath, `Result path does not exist: ${value}.`);
     if (kind === "repository" && (!metadata.directory || !metadata.repository)) throw new WorkerResultValidationError("not_repository", fieldPath, `Repository result is not a Git repository directory: ${value}.`);
-    if (kind === "artifact" && !metadata.directory && !metadata.file) throw new WorkerResultValidationError("unsupported_path_type", fieldPath, `Artifact result must be a regular file or directory: ${value}.`);
+    if(kind==="artifact"&&metadata.repository)throw new WorkerResultValidationError("unsupported_path_type",fieldPath,`Artifact result cannot itself be a Git repository root; report it in repositories instead: ${value}.`);
+    if (kind === "artifact" && !metadata.directory && !metadata.file) throw new WorkerResultValidationError("unsupported_path_type", fieldPath, `Artifact result must be an ordinary regular file or directory: ${value}.`);
     return normalized;
   });
 }

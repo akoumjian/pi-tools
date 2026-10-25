@@ -996,7 +996,7 @@ test("worker_control allows every valid exact-session lifecycle action without s
     { action: "cleanup_inventory" },
     { action: "cleanup_inventory", allSessions: true },
     { action: "cleanup_preview", workerIds: [workerId] },
-    { action: "cleanup_apply", token: `cleanup_${"a".repeat(48)}` }
+    { action: "cleanup_inventory", allSessions: true, cursor: `cleanup_scan_${"b".repeat(48)}` }
   ];
 
   for (const input of validInputs) {
@@ -1018,7 +1018,7 @@ test("worker_control allows every valid exact-session lifecycle action without s
   const discard = evaluateWorkerControl({ action: "discard", workerId });
   assert.equal(discard.risk, "medium");
   assert.equal(discard.ruleId, "worker-control-discard");
-  assert.equal(evaluateWorkerControl({ action: "cleanup_apply", token: `cleanup_${"a".repeat(48)}` }).risk, "medium");
+  const cleanupApply=evaluateWorkerControl({action:"cleanup_apply",token:`cleanup_${"a".repeat(48)}`,recoveryAcknowledged:[workerId]});assert.equal(cleanupApply.action,"review");assert.equal(cleanupApply.risk,"high");assert.equal(cleanupApply.ruleId,"worker-control-cleanup-apply");
 
   const malformedInputs: unknown[] = [
     null,

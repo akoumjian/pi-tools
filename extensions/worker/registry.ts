@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import type { DatabaseSync as SQLiteDatabaseSync, SQLInputValue } from "node:sqlite";
 
-export const WORKER_REGISTRY_SCHEMA_VERSION = 7;
+export const WORKER_REGISTRY_SCHEMA_VERSION = 8;
 export const DEFAULT_WORKER_RUNTIME_ROOT = path.join(homedir(), ".local", "share", "agent", "worker-runtime");
 
 export type WorkerRole = "work" | "review" | "integration";
@@ -263,6 +263,19 @@ CREATE TABLE IF NOT EXISTS cleanup_snapshots (
   consumed_at TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS cleanup_snapshots_parent ON cleanup_snapshots(parent_session_file, created_at DESC);
+CREATE TABLE IF NOT EXISTS cleanup_scan_cursors (
+  token TEXT PRIMARY KEY,
+  parent_session_file TEXT NOT NULL,
+  state_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  consumed_at TEXT
+) STRICT;
+CREATE INDEX IF NOT EXISTS cleanup_scan_cursors_parent ON cleanup_scan_cursors(parent_session_file, created_at DESC);
+CREATE TABLE IF NOT EXISTS cleanup_leftover_observations (
+  leftover_id TEXT PRIMARY KEY,
+  record_json TEXT NOT NULL,
+  observed_at TEXT NOT NULL
+) STRICT;
 CREATE TABLE IF NOT EXISTS prepared_repositories (
   prepared_id TEXT NOT NULL REFERENCES prepared_sets(prepared_id) ON DELETE CASCADE,
   repository_id TEXT NOT NULL,
@@ -356,6 +369,12 @@ function migrateWorkerRegistry(database: SQLiteDatabaseSync, fromVersion: number
         token TEXT PRIMARY KEY, parent_session_file TEXT NOT NULL, snapshot_json TEXT NOT NULL, snapshot_hash TEXT NOT NULL,
         created_at TEXT NOT NULL, consumed_at TEXT
       ) STRICT; CREATE INDEX IF NOT EXISTS cleanup_snapshots_parent ON cleanup_snapshots(parent_session_file, created_at DESC)`);
+    },
+    7: () => {
+      database.exec(`CREATE TABLE IF NOT EXISTS cleanup_scan_cursors (
+        token TEXT PRIMARY KEY, parent_session_file TEXT NOT NULL, state_json TEXT NOT NULL, created_at TEXT NOT NULL, consumed_at TEXT
+      ) STRICT; CREATE INDEX IF NOT EXISTS cleanup_scan_cursors_parent ON cleanup_scan_cursors(parent_session_file, created_at DESC);
+      CREATE TABLE IF NOT EXISTS cleanup_leftover_observations (leftover_id TEXT PRIMARY KEY, record_json TEXT NOT NULL, observed_at TEXT NOT NULL) STRICT`);
     }
   };
   for (let version = fromVersion; version < WORKER_REGISTRY_SCHEMA_VERSION; version += 1) {
@@ -1069,6 +1088,8 @@ export function claimWorkerDiscard(registry: WorkerRegistry, workerId: string, e
     return worker.latestRunId ? getWorkerRun(registry, workerId, worker.latestRunId) : undefined;
   });
 }
+
+export function claimWorkerRecoveryDiscard(registry:WorkerRegistry,workerId:string,expectedVersion:number,expectedRecoveryError:string,nonce:string,now:string):void{transaction(registry,()=>{const changed=registry.database.prepare("UPDATE workers SET operation_kind='discard',operation_nonce=?,recovery_error=NULL,version=version+1,updated_at=? WHERE worker_id=? AND version=? AND status='idle' AND reviewed_by_worker_id IS NULL AND operation_kind IS NULL AND recovery_error=?").run(nonce,now,workerId,expectedVersion,expectedRecoveryError);if(Number(changed.changes)!==1)throw staleWorker(workerId);});}
 
 export function finalizeWorkerDiscard(registry: WorkerRegistry, workerId: string, nonce: string): void {
   transaction(registry, () => {

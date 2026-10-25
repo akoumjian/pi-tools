@@ -9,7 +9,6 @@ import { createWorkerCacheLineageRuntime, registerWorkerCacheLineageRuntimeHooks
 import { WorkerBeadsTasksParams, WorkerBeadsTasksReadParams, WorkerResultSubmitParams, WorkerReviewResultSubmitParams, WorkerWorkResultSubmitParams, WorkerResultValidationError, normalizeWorkspaceResultPaths, validateWorkerResultInput, type WorkerResultSubmitInput } from "./contract.js";
 import type { WorkerRole } from "./registry.js";
 import { inputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
-import { trustedGit } from "./trusted-git.js";
 import { MAX_WORKER_TASK_IDS, workerMutationAdmissionPath, workerResultAdmissionPath } from "../_shared/worker-contract.js";
 import { asyncJobProcessStartToken } from "../_shared/async-job.js";
 import { writeAtomicJson } from "../_shared/atomic-json.js";
@@ -66,12 +65,12 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
   }));
   api.registerTool(defineTool({
     name: "worker_result_submit", label: "Submit Worker Result",
-    description: "End the current worker run by submitting a structured result. Use it for completed work, requests for guidance, blockers, and review verdicts. The tool records the outcome, summary, optional question, and reported repository and artifact paths, then seals the run and returns control to the parent. It does not approve work, apply repositories, close tasks, or discard the worker.",
+    description: "End the current worker run by submitting a structured result. Use it for completed work, requests for guidance, blockers, and review verdicts. The tool records the outcome, summary, optional question, repository roots, and ordinary non-repository artifact entry points, then seals the run and returns control to the parent. Completed reviewers must report a non-empty ordinary report file. It does not approve work, apply repositories, close tasks, or discard the worker.",
     promptSnippet: "Submit the current run’s completed work, request for guidance, blocker, or review verdict.",
     promptGuidelines: [
       "Use `worker_result_submit` when the current run should return control to the parent. Use `completed` only when the assigned work is finished, `needs_input` for parent-answerable questions required to continue, and `blocked` when an unavailable prerequisite or required intervention prevents progress. Review workers use `approve` or `request_changes` for completed reviews. Summarize the result and report useful repository and artifact entry points.",
       inputJsonSchemaGuideline("worker_result_submit", workerRuntimeRole() === "review" ? WorkerReviewResultSubmitParams : WorkerWorkResultSubmitParams),
-      "worker_result_submit constraints: Rejected semantic results return stable coded field errors and do not seal the run. The runtime canonicalizes every reported path and internally reconciles owned work before acceptance."
+      "worker_result_submit constraints: Rejected semantic results return stable coded field errors and do not seal the run. The runtime canonicalizes every reported path, rejects Git roots in artifacts, requires completed reviewers to report a non-empty ordinary report file, and internally reconciles owned work before acceptance."
     ],
     parameters: workerRuntimeRole() === "review" ? WorkerReviewResultSubmitParams : WorkerWorkResultSubmitParams, executionMode: "sequential",
     async execute(_id, params): Promise<AgentToolResult<WorkerResultDetails>> {
@@ -84,6 +83,7 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
         validateWorkerResultInput(workerRuntimeRole(), params);
         repositories = normalizeWorkspaceResultPaths(identity.workspaceRoot, ("repositories" in params ? params.repositories : undefined) ?? [], "repository", resultPathMetadata);
         artifacts = normalizeWorkspaceResultPaths(identity.workspaceRoot, params.artifacts ?? [], "artifact", resultPathMetadata);
+        if(workerRuntimeRole()==="review"&&(params.outcome==="approve"||params.outcome==="request_changes")&&!artifacts.some((artifact)=>{const metadata=resultPathMetadata(path.join(identity.workspaceRoot,artifact));return metadata.file&&metadata.bytes>0;}))throw new WorkerResultValidationError("artifact_required","artifacts","Completed review results require at least one non-empty ordinary report file artifact.");
       } catch (error) {
         const semantic = error instanceof WorkerResultValidationError ? error : undefined;
         errors.push({ code: semantic?.code ?? "unsupported_path_type", path: semantic?.fieldPath ?? "result", message: error instanceof Error ? error.message : String(error) });
@@ -136,12 +136,16 @@ function validateBeadsAction(params: any): void {
 
 function assertRuntimeOpen(tool: string): void { const identity = workerRuntimeIdentity(); assertRuntimeAuthorization(identity, tool); if (existsSync(identity.resultFile)) throw new Error(`${tool} is sealed after worker_result_submit acceptance.`); }
 function workerRuntimeRole(): WorkerRole { const value = requiredEnvironment("PI_WORKER_ROLE"); if (value !== "work" && value !== "review" && value !== "integration") throw new Error(`Invalid PI_WORKER_ROLE: ${value}.`); return value; }
-function resultPathMetadata(value: string): { exists: boolean; directory: boolean; file: boolean; repository: boolean } {
-  if (!existsSync(value)) return { exists: false, directory: false, file: false, repository: false };
-  const metadata = lstatSync(value);
-  let repository = false;
-  if (metadata.isDirectory()) { try { trustedGit(value, ["rev-parse", "--git-dir"]); repository = true; } catch {} }
-  return { exists: true, directory: metadata.isDirectory(), file: metadata.isFile(), repository };
+export function resultPathMetadata(value:string):{exists:boolean;directory:boolean;file:boolean;repository:boolean;bytes:number}{
+  if(!existsSync(value))return{exists:false,directory:false,file:false,repository:false,bytes:0};
+  const metadata=lstatSync(value);let repository=false;
+  if(metadata.isDirectory()){
+    const dotGit=path.join(value,".git"),head=path.join(value,"HEAD"),objects=path.join(value,"objects"),refs=path.join(value,"refs");let rootShape=false;
+    try{const gitMarker=lstatSync(dotGit);rootShape=!gitMarker.isSymbolicLink()&&(gitMarker.isDirectory()||gitMarker.isFile());}catch{}
+    if(!rootShape)try{rootShape=lstatSync(head).isFile()&&lstatSync(objects).isDirectory()&&lstatSync(refs).isDirectory();}catch{}
+    repository=rootShape;
+  }
+  return{exists:true,directory:metadata.isDirectory(),file:metadata.isFile(),repository,bytes:Number(metadata.size)};
 }
 
 async function executeTaskRead(params: WorkerTaskRead): Promise<AgentToolResult<WorkerTaskReadDetails>> {

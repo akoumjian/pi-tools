@@ -313,7 +313,7 @@ test("registry applies an ordered idempotent v2 migration while mixed live opene
     migrated = openWorkerRegistry(root);
     const version = migrated.database.prepare("SELECT value FROM registry_meta WHERE key='schema_version'").get() as { value: string };
     const columns = migrated.database.prepare("PRAGMA table_info(prepared_sets)").all() as Array<{ name: string }>; const runColumns = migrated.database.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>; const deliveryColumns = migrated.database.prepare("PRAGMA table_info(deliveries)").all() as Array<{ name: string }>;
-    assert.equal(version.value, "7"); assert.equal(columns.some((column) => column.name === "apply_nonce"), true); assert.equal(runColumns.some((column) => column.name === "terminal_intent"), true); assert.equal(deliveryColumns.some((column) => column.name === "send_started_at"), true);
+    assert.equal(version.value, "8"); assert.equal(columns.some((column) => column.name === "apply_nonce"), true); assert.equal(runColumns.some((column) => column.name === "terminal_intent"), true); assert.equal(deliveryColumns.some((column) => column.name === "send_started_at"), true);
     const legacyHash = migrated.database.prepare("SELECT value FROM registry_meta WHERE key='schema_hash'").get() as { value: string };
     assert.equal(legacyHash.value, "old-live-build-fingerprint", "migration must not overwrite another live build's diagnostic hash");
     oldOpener.database.prepare("UPDATE registry_meta SET value='old-opener-still-live' WHERE key='schema_hash'").run();
@@ -323,7 +323,7 @@ test("registry applies an ordered idempotent v2 migration while mixed live opene
   } finally { migrated?.close(); oldOpener?.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
-test("v5 migration adds preservation, prepared lineage, and host-only cleanup snapshots through v7", () => {
+test("v5 migration adds preservation, prepared lineage, and host-only cleanup snapshots through v8", () => {
   const f = fixture(); let registry: ReturnType<typeof openWorkerRegistry> | undefined = f.registry;
   try {
     registry.database.exec("DROP TABLE preservation_records");
@@ -331,8 +331,8 @@ test("v5 migration adds preservation, prepared lineage, and host-only cleanup sn
     registry.database.prepare("UPDATE registry_meta SET value='5' WHERE key='schema_version'").run(); registry.database.exec("PRAGMA user_version = 5"); registry.close(); registry = undefined;
     const migrated = openWorkerRegistry(f.root); registry = migrated;
     const preparedColumns = migrated.database.prepare("PRAGMA table_info(prepared_sets)").all() as Array<{ name: string }>;
-    const preservation = migrated.database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='preservation_records'").get() as { sql: string } | undefined;const snapshots=migrated.database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='cleanup_snapshots'").get() as {sql:string}|undefined;
-    assert.equal(preparedColumns.some((column) => column.name === "task_ids_json"), true); assert.match(preservation?.sql ?? "", /STRICT/);assert.match(snapshots?.sql??"",/STRICT/);
-    assert.equal((migrated.database.prepare("SELECT value FROM registry_meta WHERE key='schema_version'").get() as { value: string }).value, "7");
+    const preservation = migrated.database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='preservation_records'").get() as { sql: string } | undefined;const snapshots=migrated.database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='cleanup_snapshots'").get() as {sql:string}|undefined;const cursors=migrated.database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='cleanup_scan_cursors'").get() as {sql:string}|undefined;const observations=migrated.database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='cleanup_leftover_observations'").get() as {sql:string}|undefined;
+    assert.equal(preparedColumns.some((column) => column.name === "task_ids_json"), true); assert.match(preservation?.sql ?? "", /STRICT/);assert.match(snapshots?.sql??"",/STRICT/);assert.match(cursors?.sql??"",/STRICT/);assert.match(observations?.sql??"",/STRICT/);
+    assert.equal((migrated.database.prepare("SELECT value FROM registry_meta WHERE key='schema_version'").get() as { value: string }).value, "8");
   } finally { try { registry?.close(); } catch {} rmSync(f.root, { recursive: true, force: true }); }
 });

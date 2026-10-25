@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, realpathSync } from "node:fs";
 import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -12,7 +12,8 @@ import { Check } from "typebox/value";
 import { WORKER_ACTIVITY_STATUS_KEY, WorkerControlParams, WorkerMergeApplyParams, WorkerMergeTestParams, WorkerRunParams, activeWorkerCountForContext, registerWorkerExtension, renderWorkerActivityStatus, renderWorkerOperationHint, sanitizeWorkerOperationText, workerRunCallOperationHint, workerRunResultOperationHint } from "../extensions/worker/index.js";
 import { RetainedToolOutputSchemas } from "../extensions/_shared/tool-output.js";
 import { normalizeWorkerSettings } from "../extensions/worker/settings.js";
-import { validateWorkerResultInput, WorkerResultValidationError } from "../extensions/worker/contract.js";
+import { normalizeWorkspaceResultPaths, validateWorkerResultInput, WorkerResultValidationError } from "../extensions/worker/contract.js";
+import { resultPathMetadata } from "../extensions/worker/runtime.js";
 import { ASYNC_SHELL_ACTIVITY_STATUS_KEY, renderAsyncShellActivityStatus } from "../extensions/async-shell/index.js";
 import { createWorkerAndRun, getWorker, getWorkerRun, openWorkerRegistry, setWorkerRecoveryError, settleWorkerRun, type WorkerRegistry, type WorkerRunRecord } from "../extensions/worker/registry.js";
 
@@ -55,6 +56,11 @@ test("result outcomes are role-specific and reviews require artifacts", () => {
   assert.throws(() => validateWorkerResultInput("review", { outcome: "approve", summary: "Approved." }), /artifact/);
   assert.equal(validateWorkerResultInput("review", { outcome: "request_changes", summary: "Fix.", artifacts: ["review.md"] }).outcome, "request_changes");
   assert.throws(() => validateWorkerResultInput("integration", { outcome: "needs_input", summary: "Question." }), /question/);
+});
+
+
+test("artifact paths reject exact standalone, shallow, nested, worktree, and bare Git roots while allowing ordinary subdirectories",async()=>{
+ const temporary=await mkdtemp(path.join(tmpdir(),"pi-worker-artifact-git-")),root=realpathSync(temporary);try{const repository=path.join(root,"repo");execFileSync("git",["init",repository]);execFileSync("git",["-C",repository,"config","user.name","Test"]);execFileSync("git",["-C",repository,"config","user.email","test@example.invalid"]);await writeFile(path.join(repository,"tracked.txt"),"tracked");execFileSync("git",["-C",repository,"add","tracked.txt"]);execFileSync("git",["-C",repository,"commit","-m","initial"]);await writeFile(path.join(repository,".git","shallow"),`${execFileSync("git",["-C",repository,"rev-parse","HEAD"],{encoding:"utf8"}).trim()}\n`);const ordinary=path.join(repository,"reports");await mkdir(ordinary);await writeFile(path.join(ordinary,"review.md"),"detailed report");const nested=path.join(repository,"nested");execFileSync("git",["init",nested]);const worktree=path.join(root,"worktree");execFileSync("git",["-C",repository,"worktree","add","--detach",worktree]);const bare=path.join(root,"bare.git");execFileSync("git",["init","--bare",bare]);for(const artifact of [repository,nested,worktree,bare])assert.throws(()=>normalizeWorkspaceResultPaths(root,[artifact],"artifact",resultPathMetadata),/Git repository root/);assert.deepEqual(normalizeWorkspaceResultPaths(root,[ordinary],"artifact",resultPathMetadata),["repo/reports"]);assert.deepEqual(normalizeWorkspaceResultPaths(root,[repository],"repository",resultPathMetadata),["repo"]);}finally{await rm(root,{recursive:true,force:true});}
 });
 
 test("parent extension exposes only the v2 worker tool and command surface", async () => {

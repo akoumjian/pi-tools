@@ -70,6 +70,7 @@ test("work result submission validates and persists normalized repository and ar
     const repository = path.join(root, "repos", "project"); await mkdir(repository, { recursive: true }); execFileSync("git", ["init", "-q", repository]);
     await mkdir(path.join(root, "artifacts")); await writeFile(path.join(root, "artifacts", "report.txt"), "ok\n");
     const tool = api.tools.find((candidate) => candidate.name === "worker_result_submit")!;
+    const repositoryAsArtifact=await tool.execute!("call",{outcome:"completed",summary:"Invalid artifact.",artifacts:["repos/project"]},undefined,undefined,undefined as never);assert.equal((repositoryAsArtifact.details as {status:string}).status,"rejected");
     const result = await tool.execute!("call", { outcome: "completed", summary: "Done.", repositories: ["repos/project"], artifacts: ["artifacts/report.txt"] }, undefined, undefined, undefined as never);
     assert.equal((result.details as { status: string }).status, "accepted");
     const accepted = readWorkerRuntimeResult(path.join(root, "state", "result.json"));
@@ -94,7 +95,7 @@ test("review decisions require a retained report and cannot report repositories"
     const tool = api.tools.find((candidate) => candidate.name === "worker_result_submit")!;
     const rejected = await tool.execute!("call", { outcome: "approve", summary: "Approved." }, undefined, undefined, undefined as never);
     assert.equal((rejected.details as { status: string }).status, "rejected");
-    await mkdir(path.join(root, "reports")); await writeFile(path.join(root, "reports", "review.md"), "# Review\n");
+    await mkdir(path.join(root, "reports"));const directoryOnly=await tool.execute!("call",{outcome:"approve",summary:"Approved.",artifacts:["reports"]},undefined,undefined,undefined as never);assert.equal((directoryOnly.details as {status:string}).status,"rejected");await writeFile(path.join(root,"reports","empty.md"),"");const empty=await tool.execute!("call",{outcome:"approve",summary:"Approved.",artifacts:["reports/empty.md"]},undefined,undefined,undefined as never);assert.equal((empty.details as {status:string}).status,"rejected");await writeFile(path.join(root, "reports", "review.md"), "# Review\n");
     const result = await tool.execute!("call", { outcome: "approve", summary: "Approved.", artifacts: ["/workspace/reports/review.md"] }, undefined, undefined, undefined as never);
     assert.equal((result.details as { status: string }).status, "accepted");
   });
@@ -168,7 +169,7 @@ test("review runtime exposes only read-only Beads branches with four-item bounds
 test("worker_result_submit returns the approved accepted/rejected semantic union", async () => {
   await fixture("work", async (_root, api) => {
     const tool = api.tools.find((candidate) => candidate.name === "worker_result_submit")!;
-    assert.equal(tool.description, "End the current worker run by submitting a structured result. Use it for completed work, requests for guidance, blockers, and review verdicts. The tool records the outcome, summary, optional question, and reported repository and artifact paths, then seals the run and returns control to the parent. It does not approve work, apply repositories, close tasks, or discard the worker.");
+    assert.equal(tool.description, "End the current worker run by submitting a structured result. Use it for completed work, requests for guidance, blockers, and review verdicts. The tool records the outcome, summary, optional question, repository roots, and ordinary non-repository artifact entry points, then seals the run and returns control to the parent. Completed reviewers must report a non-empty ordinary report file. It does not approve work, apply repositories, close tasks, or discard the worker.");
     const rejected = await tool.execute!("call", { outcome: "needs_input", summary: "question missing" }, undefined, undefined, undefined as never);
     assert.deepEqual((rejected.details as any).errors.map((item: any) => ({ code: item.code, path: item.path })), [{ code: "question_required", path: "question" }]);
     const accepted = await tool.execute!("call", { outcome: "completed", summary: "done" }, undefined, undefined, undefined as never);
