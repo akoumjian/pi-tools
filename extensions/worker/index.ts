@@ -192,7 +192,6 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         runtimeGeneration = registerParentRuntimeAndRecoverClaims(getRegistry(), exactParent, runtimeId, now().toISOString(), lifecycleClaimIsLive,
           parentProcessStartToken ? { pid: process.pid, processStartToken: parentProcessStartToken } : undefined);
         parentRuntimeRegistrations.set(exactParent, { runtimeId, generation: runtimeGeneration });
-        recoverInterruptedDiscardFiles(exactParent, runtimeGeneration);
       } else runtimeGeneration = initialized.generation;
         recoverAbandonedDiscardTrash(exactParent);
       reconcileWorkerDeliveries(getRegistry(), exactParent, sessionDeliveryIds(context));
@@ -1123,28 +1122,6 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     return processRecord;
   }
 
-  function recoverInterruptedDiscardFiles(parentSessionFile: string, generation: number): void {
-    const rows = getRegistry().database.prepare("SELECT worker_id,workspace_root,operation_nonce FROM workers WHERE parent_session_file=? AND operation_kind='discard' AND operation_nonce IS NOT NULL").all(parentSessionFile) as Array<{ worker_id: string; workspace_root: string; operation_nonce: string }>;
-    for (const row of rows) {
-      if (row.operation_nonce.startsWith(`${generation}-`)) continue;
-      const paths = workerPaths(roots, row.worker_id); const stateTrash = `${paths.stateDir}.discard-${row.operation_nonce}`;
-      const workspaceIsSeparate = !path.resolve(row.workspace_root).startsWith(`${path.resolve(paths.stateDir)}${path.sep}`);
-      const separateWorkspace = workspaceIsSeparate ? `${row.workspace_root}.discard-${row.operation_nonce}` : undefined;
-      try {
-        const staleStateTrash = discardTrashPaths(paths.stateDir); const staleWorkspaceTrash = workspaceIsSeparate ? discardTrashPaths(row.workspace_root) : [];
-        for (const candidate of [paths.stateDir, ...staleStateTrash, paths.supervisionDir, paths.evidenceDir, row.workspace_root, ...staleWorkspaceTrash].filter((item): item is string => Boolean(item))) prepareOwnerRemovalTree(candidate);
-        if (existsSync(paths.stateDir)) { if (existsSync(stateTrash)) throw new Error("Interrupted discard retained both state and current trash directories."); renameSync(paths.stateDir, stateTrash); }
-        if (separateWorkspace && existsSync(row.workspace_root)) { if (existsSync(separateWorkspace)) throw new Error("Interrupted discard retained both workspace and current trash directories."); renameSync(row.workspace_root, separateWorkspace); }
-        removeOwnerTree(paths.supervisionDir); removeOwnerTree(paths.evidenceDir);
-        for (const trash of new Set([...staleStateTrash, stateTrash, ...staleWorkspaceTrash, ...(separateWorkspace ? [separateWorkspace] : [])])) removeOwnerTree(trash);
-        finalizeWorkerDiscard(getRegistry(), row.worker_id, row.operation_nonce);
-      } catch (error) {
-        try { if (existsSync(stateTrash) && !existsSync(paths.stateDir)) renameSync(stateTrash, paths.stateDir); if (separateWorkspace && existsSync(separateWorkspace) && !existsSync(row.workspace_root)) renameSync(separateWorkspace, row.workspace_root); } catch {}
-        abandonWorkerDiscard(getRegistry(), row.worker_id, row.operation_nonce, `Interrupted discard cleanup failed: ${sanitizeError(error)}`, now().toISOString());
-      }
-    }
-  }
-
   function recoverAbandonedDiscardTrash(parentSessionFile: string): void {
     const rows = getRegistry().database.prepare("SELECT worker_id,workspace_root FROM workers WHERE parent_session_file=? AND operation_kind IS NULL").all(parentSessionFile) as Array<{ worker_id: string; workspace_root: string }>;
     for (const row of rows) {
@@ -1232,7 +1209,13 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const observedClaims = new Set<string>();
     for (const activeRun of activeRuns) {
       let worker = activeRun.worker; let run = activeRun.run; const runtime = run.runtime as RunRuntime;
-      if (!runtime || runtime.version !== 4) { if (worker.recoveryError) deliverRecovery(worker, run, worker.recoveryError); continue; }
+      if (!runtime || runtime.version !== 4) {
+        const schema = runtime && typeof runtime === "object" ? (runtime as { version?: unknown }).version ?? "unknown" : "missing";
+        const message = `Unsupported retained worker runtime schema ${schema}; exact manual containment/migration is required and no downgrade will be attempted.`;
+        setWorkerRecoveryError(getRegistry(), worker.workerId, run.runId, message, now().toISOString());
+        deliverRecovery(worker, run, message);
+        continue;
+      }
       if (run.claimNonce) observedClaims.add(run.claimNonce);
       if (run.status === "running" && active.get(worker.workerId)?.runId !== run.runId && validAcceptedResultEvidence(worker, run)) {
         if (run.claimKind && !recoverDeadLifecycleClaim(worker.workerId, run)) continue;

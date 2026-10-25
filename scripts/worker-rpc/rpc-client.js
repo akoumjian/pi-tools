@@ -709,7 +709,7 @@ export class RpcClient {
             this.pendingRequests.set(id, {
                 resolve: (response) => {
                     clearTimeout(timeout);
-                    resolve({ ...response, command: response.command ?? command.type });
+                    resolve(response);
                 },
                 reject: (error) => {
                     clearTimeout(timeout);

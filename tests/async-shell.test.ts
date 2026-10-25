@@ -704,7 +704,7 @@ test("concurrent child session runtime cannot deactivate or receive parent compl
       notifyOnExit: true
     });
     await waitWithRefTimeout(handle.completion);
-    await delay(200);
+    await delay(700);
     assert.equal(parentApi.sentMessages.length, 1);
     assert.equal(childApi.sentMessages.length, 0);
     const delivered = parentApi.sentMessages[0]!.message as { details?: { originSessionId?: string } };
@@ -743,7 +743,7 @@ test("ordinary async-shell completion rebinds to the fresh extension runtime aft
     } as unknown as ExtensionContext;
     await freshApi.emit("session_start", { reason: "reload" }, freshContext);
     await waitWithRefTimeout(handle.completion);
-    await delay(200);
+    await delay(700);
     await freshApi.emit("agent_end", {}, freshContext);
     assert.equal(originalApi.sentMessages.length, 0, "the detached runtime never delivers completion");
     assert.equal(freshApi.sentMessages.length, 1, "the latest same-session runtime delivers completion");
@@ -772,7 +772,7 @@ test("reload never replays an accepted async-shell batch absent from the session
       notifyOnExit: true
     });
     const completed = await waitWithRefTimeout(handle.completion);
-    await delay(200);
+    await delay(700);
     assert.equal(originalApi.sentMessages.length, 1);
     const acceptedMessage = originalApi.sentMessages[0]!.message;
     await originalApi.emit("session_shutdown", { reason: "reload" }, originalContext);
@@ -815,7 +815,7 @@ test("reload acknowledges an accepted async-shell delivery already present in th
       notifyOnExit: true
     });
     const completed = await waitWithRefTimeout(handle.completion);
-    await delay(200);
+    await delay(700);
     assert.equal(originalApi.sentMessages.length, 1);
     const recordedMessage = originalApi.sentMessages[0]!.message;
     await originalApi.emit("session_shutdown", { reason: "reload" }, originalContext);
