@@ -6,6 +6,7 @@ import type { ExtensionCommandContext, Theme, ThemeColor } from "@earendil-works
 import { Key, matchesKey, truncateToWidth, wrapTextWithAnsi, type Component, type TUI } from "@earendil-works/pi-tui";
 
 const MAX_SESSION_PAGE_BYTES = 8 * 1024 * 1024;
+const MAX_SESSION_ENTRY_DISPLAY_BYTES = 7 * 1024 * 1024;
 const MAX_SESSION_PAGE_LINES = 512;
 const MAX_SESSION_PAGE_BLOCKS = 2_048;
 const OVERSIZED_ENTRY_PREFIX_BYTES = 16 * 1024;
@@ -412,7 +413,7 @@ export function buildWorkerSessionViewerFrame(theme: Theme, state: WorkerSession
     state.snapshot.hasNextPage && state.snapshot.nextVisibleEntries > 0 ? `${state.snapshot.nextVisibleEntries} later visible run entr${state.snapshot.nextVisibleEntries === 1 ? "y is" : "ies are"} available with ] or PgDn at the bottom (G opens the latest page).` : undefined,
     state.snapshot.hasNextBlocksInEntry ? "Later rendered blocks from this run entry are available with ] or PgDn at the bottom (G opens the latest page)." : undefined,
     body.truncatedBlocks > 0 ? `${body.truncatedBlocks} long block${body.truncatedBlocks === 1 ? " was" : "s were"} explicitly truncated within this page.` : undefined,
-    state.snapshot.skippedOversizedEntries > 0 ? `${state.snapshot.skippedOversizedEntries} session entr${state.snapshot.skippedOversizedEntries === 1 ? "y exceeds" : "ies exceed"} the ${MAX_SESSION_PAGE_BYTES}-byte per-entry display bound and ${state.snapshot.skippedOversizedEntries === 1 ? "was" : "were"} skipped.` : undefined,
+    state.snapshot.skippedOversizedEntries > 0 ? `${state.snapshot.skippedOversizedEntries} session entr${state.snapshot.skippedOversizedEntries === 1 ? "y reaches or exceeds" : "ies reach or exceed"} the ${MAX_SESSION_ENTRY_DISPLAY_BYTES}-byte per-entry display bound and ${state.snapshot.skippedOversizedEntries === 1 ? "was" : "were"} skipped.` : undefined,
     state.snapshot.malformedEntries > 0 ? `${state.snapshot.malformedEntries} malformed session entr${state.snapshot.malformedEntries === 1 ? "y was" : "ies were"} skipped.` : undefined,
     state.snapshot.hiddenCompactedEntries > 0 ? `${state.snapshot.hiddenCompactedEntries} earlier run entr${state.snapshot.hiddenCompactedEntries === 1 ? "y is" : "ies are"} superseded by ${state.snapshot.compactionCount} compaction${state.snapshot.compactionCount === 1 ? "" : "s"}; the opening assignment remains on the first page.` : undefined,
     state.snapshot.incompleteTrailingEntry ? "The final unterminated session entry was still being written and was skipped." : undefined,
@@ -1362,7 +1363,7 @@ function extendSessionLineIndex(fd: number, file: string, index: SessionLineInde
       if (newline < 0 || newline >= count) break;
       const absoluteNewline = position + newline;
       const lineBytes = absoluteNewline - index.lineStartOffset;
-      const oversized = lineBytes >= MAX_SESSION_PAGE_BYTES;
+      const oversized = lineBytes >= MAX_SESSION_ENTRY_DISPLAY_BYTES;
       const pinned = lineBytes >= SESSION_INDEX_PIN_BYTES;
       index.newlineCount += 1;
       const nextLine = index.newlineCount + 1;
@@ -1451,7 +1452,7 @@ function indexedNondisplayLineEnd(fd: number, snapshotSize: number, index: Sessi
   if (!metadata || metadata.start !== lineStartOffset || metadata.next === undefined) return undefined;
   const type = metadata.prefix.match(/^\s*\{\s*"type"\s*:\s*"([^"]+)"/u)?.[1];
   const metadataText = `${metadata.prefix}\n${metadata.suffix}`;
-  if (type === "custom" && /"display"\s*:\s*false/u.test(metadataText)) return metadata.next;
+  if (type === "custom") return metadata.next;
   return undefined;
 }
 
@@ -1482,7 +1483,7 @@ function readPageLines(fd: number, snapshotSize: number, index: SessionLineIndex
     if (!keepTail && totalBytes + partBytes + part.length + 1 > maxPageBytes && (lines.length > 0 || maxPageBytes < MAX_SESSION_PAGE_CONTENT_BYTES)) {
       pageEndLine = lineNumber - 1; stoppedForPageBytes = true; return false;
     }
-    if (partBytes + part.length >= MAX_SESSION_PAGE_BYTES) { oversized = true; parts = []; partBytes = 0; return true; }
+    if (partBytes + part.length >= MAX_SESSION_ENTRY_DISPLAY_BYTES) { oversized = true; parts = []; partBytes = 0; return true; }
     parts.push(Buffer.from(part));
     partBytes += part.length;
     return true;
@@ -1496,7 +1497,7 @@ function readPageLines(fd: number, snapshotSize: number, index: SessionLineIndex
       } else {
         const bytes = partBytes + 1;
         if (!keepTail && totalBytes + bytes > maxPageBytes && (lines.length > 0 || maxPageBytes < MAX_SESSION_PAGE_CONTENT_BYTES)) { pageEndLine = lineNumber - 1; stoppedForPageBytes = true; return false; }
-        if (bytes > MAX_SESSION_PAGE_BYTES) { skippedOversizedEntries += 1; oversizedEntryPrefixes.push({ lineNumber, text: "" }); }
+        if (partBytes >= MAX_SESSION_ENTRY_DISPLAY_BYTES) { skippedOversizedEntries += 1; oversizedEntryPrefixes.push({ lineNumber, text: "" }); }
         else {
           lines.push({ lineNumber, text: decodeUtf8(Buffer.concat(parts, partBytes)), bytes });
           totalBytes += bytes;
