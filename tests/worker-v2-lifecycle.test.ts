@@ -58,7 +58,7 @@ async function fixture(options: { tui?: boolean; staleWarningContext?: boolean; 
       if (revokeOnLaunch) { revokeOnLaunch = false; const db = openWorkerRegistry(runtimeRoot); db.database.prepare("UPDATE runs SET claim_kind=NULL,claim_nonce=NULL WHERE worker_id=? AND run_id=?").run(input.record.workerId, input.record.runId); db.close(); }
       return handle; }
   };
-  const instances: Array<{ tools: ToolDefinition[]; handlers: Map<string, Function[]>; commands: Map<string, any>; renderers: Map<string, Function>; call(name: string, params: any): Promise<any>; event(name: string): Promise<void>; invalidate(): void }> = [];
+  const instances: Array<{ tools: ToolDefinition[]; handlers: Map<string, Function[]>; commands: Map<string, any>; renderers: Map<string, Function>; call(name: string, params: any): Promise<any>; event(name: string, event?: any): Promise<void>; invalidate(): void }> = [];
   const createInstance = async () => {
     let invalidated = false;
     const context = Object.create(baseContext) as ExtensionContext;
@@ -69,7 +69,7 @@ async function fixture(options: { tui?: boolean; staleWarningContext?: boolean; 
     const api = { registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand(name: string, command: any) { commands.set(name, command); }, registerMessageRenderer(name: string, renderer: Function) { renderers.set(name, renderer); }, on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, sendMessage(message: any) { messageAttempts.push(message); if (options.sendMessageThrows) throw new Error("send acceptance unavailable"); messages.push(message); } } as unknown as ExtensionAPI;
     registerWorkerExtension(api, dependencies);
     const call = async (name: string, params: any) => { const tool = tools.find((candidate) => candidate.name === name)!; return tool.execute!("test", params, new AbortController().signal, undefined, context); };
-    const event = async (name: string) => { for (const handler of handlers.get(name) ?? []) await handler({}, context); if (name === "turn_end") await waitFor(() => { const db = openWorkerRegistry(runtimeRoot); const queued = Number((db.database.prepare("SELECT COUNT(*) AS count FROM runs WHERE status='queued'").get() as any).count); db.close(); return queued === 0; }); };
+    const event = async (name: string, event: any = {}) => { for (const handler of handlers.get(name) ?? []) await handler(event, context); if (name === "turn_end") await waitFor(() => { const db = openWorkerRegistry(runtimeRoot); const queued = Number((db.database.prepare("SELECT COUNT(*) AS count FROM runs WHERE status='queued'").get() as any).count); db.close(); return queued === 0; }); };
     const instance = { tools, handlers, commands, renderers, call, event, invalidate: () => { invalidated = true; } }; instances.push(instance); await event("session_start"); return instance;
   };
   let current = await createInstance(); const first = current;
@@ -765,6 +765,39 @@ test("agent_end acknowledges exact same-session completion history without repla
     const shown = await f.call("worker_control", { action: "get", workerId: started.workerId, runId: started.runId });
     const visible = JSON.parse((shown.content[0] as any).text);
     assert.equal(visible.notification.state, "delivered"); assert.equal(visible.notification.runId, started.runId);
+  } finally { await f.close(); }
+});
+
+test("message_end acknowledges only the exact managed completion message without replay or steering", async () => {
+  const f = await fixture();
+  try {
+    const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "acknowledge exact message receipt" }] }));
+    await f.event("turn_end");
+    await complete(f, started);
+    await waitFor(() => f.messageAttempts.filter((message) => message.details?.runId === started.runId).length === 1);
+    const attempted = f.messageAttempts.find((message) => message.details?.runId === started.runId)!;
+    const deliveryId = `worker-run:${started.workerId}:${started.runId}`;
+    const exactDetails = { ...attempted.details, event: "worker_settled", workerId: started.workerId, runId: started.runId, deliveryId };
+    const lookalikes = [
+      { role: "toolResult", customType: "worker-run", details: exactDetails },
+      { role: "assistant", customType: "worker-run", details: exactDetails },
+      { role: "custom", customType: "third-party", details: exactDetails },
+      { role: "custom", customType: "worker-run", details: { ...exactDetails, event: "tool_result" } },
+      { role: "custom", customType: "worker-run", details: { ...exactDetails, deliveryId: `${deliveryId}-other` } },
+      { role: "toolResult", details: { result: { customType: "worker-run", details: exactDetails } } },
+      { type: "custom_message", customType: "worker-run", details: exactDetails }
+    ];
+    const sendAttempts = f.messageAttempts.length; const acceptedMessages = f.messages.length;
+    for (const message of lookalikes) await f.event("message_end", { message });
+    let db = f.registry();
+    assert.equal((db.database.prepare("SELECT state FROM deliveries WHERE run_id=?").get(started.runId) as { state: string }).state, "claimed", "tool results, wrong roles/custom types, malformed events, mismatched IDs, and session-entry lookalikes are not message receipts"); db.close();
+    assert.equal(f.messageAttempts.length, sendAttempts); assert.equal(f.messages.length, acceptedMessages, "rejected message receipts never send, replay, or steer");
+
+    await f.event("message_end", { message: { role: "custom", customType: "worker-run", content: attempted.content, display: true, details: exactDetails, timestamp: Date.now() } });
+    db = f.registry();
+    const delivered = db.database.prepare("SELECT state,delivered_at FROM deliveries WHERE run_id=?").get(started.runId) as { state: string; delivered_at: string | null };
+    assert.equal(delivered.state, "delivered"); assert.ok(delivered.delivered_at); db.close();
+    assert.equal(f.messageAttempts.length, sendAttempts); assert.equal(f.messages.length, acceptedMessages, "exact acknowledgement is receipt-only and never sends, replays, or steers");
   } finally { await f.close(); }
 });
 

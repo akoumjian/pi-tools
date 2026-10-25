@@ -235,12 +235,12 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     } catch {}
   });
   api.on("message_end", (event, context) => {
-    const deliveryId = (event.message as any)?.details?.deliveryId;
-    if (typeof deliveryId !== "string" || !deliveryId.startsWith("worker-run:")) return;
+    const receipt = managedWorkerCompletionReceipt(event.message);
+    if (receipt?.source !== "message") return;
     const parent = context.sessionManager.getSessionFile(); if (!parent) return;
     try {
-      const delivery = pendingWorkerDeliveries(getRegistry(), realpathOrResolve(parent)).find((item) => item.deliveryId === deliveryId);
-      if (delivery?.runtimeGeneration !== undefined) markWorkerDeliveryDelivered(getRegistry(), deliveryId, delivery.runtimeGeneration, now().toISOString());
+      const delivery = pendingWorkerDeliveries(getRegistry(), realpathOrResolve(parent)).find((item) => item.deliveryId === receipt.deliveryId);
+      if (delivery?.runtimeGeneration !== undefined) markWorkerDeliveryDelivered(getRegistry(), receipt.deliveryId, delivery.runtimeGeneration, now().toISOString());
     } catch {}
   });
   api.on("session_shutdown", (_event, context) => {
@@ -1488,17 +1488,29 @@ function workerControlCallLabel(input: unknown): string {
   catch { return "worker control"; }
 }
 function publicPreparedSet(set: any) { return { preparedId: set.preparedId, status: set.status, order: set.order, repositories: set.repositories.map((item: any) => ({ id: item.id, candidateRepo: item.candidateRepo, candidateCommit: item.candidateCommit, targetRepo: item.targetRepo, targetRef: item.targetRef, method: item.method, status: item.status, expectedCommit: item.expectedCommit, ...(item.desiredCommit ? { desiredCommit: item.desiredCommit } : {}), preparedPath: item.preparedPath, overlapCount: item.overlapCount, dependsOn: item.dependsOn, ...(item.source ? { source: item.source } : {}), ...(item.warnings ? { warnings: item.warnings } : {}) })), ...(set.resolutionCases ? { resolutionCases: set.resolutionCases } : {}) }; }
+type ManagedWorkerCompletionReceipt = { source: "message" | "session"; deliveryId: string };
+function managedWorkerCompletionReceipt(value: unknown): ManagedWorkerCompletionReceipt | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const message = value as Record<string, unknown>;
+  const source = message.role === "custom" && !("type" in message)
+    ? "message"
+    : message.type === "custom_message" && !("role" in message)
+      ? "session"
+      : undefined;
+  if (!source || message.customType !== "worker-run") return undefined;
+  const details = message.details;
+  if (!details || typeof details !== "object" || Array.isArray(details)) return undefined;
+  const record = details as Record<string, unknown>;
+  if (record.event !== "worker_settled" || typeof record.workerId !== "string" || !record.workerId || typeof record.runId !== "string" || !record.runId || typeof record.deliveryId !== "string") return undefined;
+  const deliveryId = `worker-run:${record.workerId}:${record.runId}`;
+  return record.deliveryId === deliveryId ? { source, deliveryId } : undefined;
+}
 function sessionDeliveryIds(context: ExtensionContext): string[] {
   const ids = new Set<string>();
   try {
     for (const entry of context.sessionManager.getEntries()) {
-      if (entry.type !== "custom_message" || entry.customType !== "worker-run") continue;
-      const details = entry.details;
-      if (!details || typeof details !== "object") continue;
-      const record = details as Record<string, unknown>;
-      if (record.event !== "worker_settled" || typeof record.workerId !== "string" || typeof record.runId !== "string" || typeof record.deliveryId !== "string") continue;
-      const exactDeliveryId = `worker-run:${record.workerId}:${record.runId}`;
-      if (record.deliveryId === exactDeliveryId) ids.add(exactDeliveryId);
+      const receipt = managedWorkerCompletionReceipt(entry);
+      if (receipt?.source === "session") ids.add(receipt.deliveryId);
     }
   } catch {}
   return [...ids];
