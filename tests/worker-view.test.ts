@@ -62,6 +62,18 @@ function assertAlternatingOversizedReadBound(target: WorkerSessionViewTarget, ma
   execFileSync(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(target), String(maximumBytes)], { timeout: 8_000, stdio: "pipe" });
 }
 
+function assertLargeCheckpointTraversal(target: WorkerSessionViewTarget, expectedEntries: number): void {
+  const moduleUrl = new URL("../extensions/worker/view.js", import.meta.url).href;
+  const script = `import fs from "node:fs"; import { syncBuiltinESMExports } from "node:module"; import { performance } from "node:perf_hooks"; const original = fs.readSync; let bytes = 0; fs.readSync = function(...args) { const count = original.apply(this, args); bytes += count; return count; }; syncBuiltinESMExports(); const view = await import(${JSON.stringify(moduleUrl)}); const target = JSON.parse(process.argv[1]); const expected = Number(process.argv[2]); await view.loadWorkerSessionViewSnapshotAsync(target); let maximumBytes = 0; let maximumMilliseconds = 0; const observe = (started) => { maximumBytes = Math.max(maximumBytes, bytes); maximumMilliseconds = Math.max(maximumMilliseconds, performance.now() - started); }; const traverseSync = (direction) => { let request = direction === "forward" ? { mode: "first" } : { mode: "tail" }; let total = 0; let prior; for (let step = 0; step < expected / 400 + 20; step += 1) { bytes = 0; const started = performance.now(); const page = view.loadWorkerSessionViewSnapshot(target, {}, request); observe(started); if (page.blocks.length === 0 || page.totalVisibleEntries !== expected || page.previousVisibleEntries + page.totalActiveEntries + page.nextVisibleEntries !== expected) throw new Error("invalid sync page"); const cursor = direction === "forward" ? page.pageEndLine : page.pageStartLine; if (prior !== undefined && (direction === "forward" ? cursor <= prior : cursor >= prior)) throw new Error("non-monotonic sync cursor"); prior = cursor; total += page.blocks.length; if (direction === "forward" ? !page.hasNextPage : !page.hasPreviousPage) break; request = direction === "forward" ? { mode: "after", line: page.pageEndLine, ...(page.hasNextBlocksInEntry ? { block: page.pageEndBlock } : {}) } : { mode: "before", line: page.pageStartLine, ...(page.hasPreviousBlocksInEntry ? { block: page.pageStartBlock } : {}) }; } if (total !== expected) throw new Error("sync traversal count " + total); }; traverseSync("forward"); let ticks = 0; let maximumStall = 0; let lastTick = performance.now(); const timer = setInterval(() => { const now = performance.now(); maximumStall = Math.max(maximumStall, now - lastTick); lastTick = now; ticks += 1; }, 1); const traverseAsync = async (direction) => { let request = direction === "forward" ? { mode: "first" } : { mode: "tail" }; let total = 0; let prior; for (let step = 0; step < expected / 400 + 20; step += 1) { bytes = 0; const started = performance.now(); const page = await view.loadWorkerSessionViewSnapshotAsync(target, request); observe(started); if (page.blocks.length === 0 || page.totalVisibleEntries !== expected || page.previousVisibleEntries + page.totalActiveEntries + page.nextVisibleEntries !== expected) throw new Error("invalid async page"); const cursor = direction === "forward" ? page.pageEndLine : page.pageStartLine; if (prior !== undefined && (direction === "forward" ? cursor <= prior : cursor >= prior)) throw new Error("non-monotonic async cursor"); prior = cursor; total += page.blocks.length; if (direction === "forward" ? !page.hasNextPage : !page.hasPreviousPage) break; request = direction === "forward" ? { mode: "after", line: page.pageEndLine, ...(page.hasNextBlocksInEntry ? { block: page.pageEndBlock } : {}) } : { mode: "before", line: page.pageStartLine, ...(page.hasPreviousBlocksInEntry ? { block: page.pageStartBlock } : {}) }; } if (total !== expected) throw new Error("async traversal count " + total); }; await traverseAsync("backward"); clearInterval(timer); if (maximumBytes > 8 * 1024 * 1024) throw new Error("deep page reread " + maximumBytes + " bytes"); if (maximumMilliseconds > 2000) throw new Error("deep page took " + maximumMilliseconds + "ms"); if (ticks < 2 || maximumStall > 1000) throw new Error("event loop stall " + maximumStall + "ms ticks=" + ticks);`;
+  execFileSync(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(target), String(expectedEntries)], { timeout: 45_000, stdio: "pipe" });
+}
+
+function assertCountSessionLinesReadFailure(target: WorkerSessionViewTarget, mode: "retry" | "fail"): void {
+  const moduleUrl = new URL("../extensions/worker/view.js", import.meta.url).href;
+  const script = `import fs from "node:fs"; import { syncBuiltinESMExports } from "node:module"; const original = fs.readSync; let injected = 0; const mode = process.argv[2]; fs.readSync = function(fd, buffer, offset, length, position) { if (typeof position === "number" && position > 0 && (mode === "fail" || injected === 0)) { injected += 1; return 0; } return original.call(this, fd, buffer, offset, length, position); }; syncBuiltinESMExports(); const view = await import(${JSON.stringify(moduleUrl)}); const target = JSON.parse(process.argv[1]); try { const count = view.countSessionLines(target.sessionFile); if (mode === "fail") throw new Error("count unexpectedly succeeded"); if (count !== target.sessionEndLine) throw new Error("retry count mismatch " + count); } catch (error) { if (mode !== "fail") throw error; if (error?.message !== "Worker session changed while counting lines; retry.") throw new Error("unstable count error: " + String(error?.message)); }`;
+  execFileSync(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(target), mode], { timeout: 8_000, stdio: "pipe" });
+}
+
 const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as Theme;
 
 test("worker conversation view preserves the opening assignment and renders compaction chronologically without raw JSONL", () => {
@@ -542,14 +554,56 @@ test("byte-bounded cursor pages make monotonic progress across adjacent multi-Mi
           }
           if (step === 31) assert.fail(`${sizes} ${direction} traversal did not terminate`);
         }
+        const skippedOversizedEntries = pages.reduce((total, value) => total + value.skippedOversizedEntries, 0);
         if (direction === "backward") pages.reverse();
-        return pages.flatMap((value) => value.blocks.map((block) => block.text));
+        return { blocks: pages.flatMap((value) => value.blocks.map((block) => block.text)), skippedOversizedEntries };
       };
       const expected = [`OPENING-${shapeIndex}`, ...sizes!.flatMap((size, index) => size > 8 ? [] : [`BIG-${index}-`]), `LAST-${shapeIndex}`];
+      const expectedSkipped = sizes!.filter((size) => size > 8).length;
       const normalize = (values: string[]) => values.map((value) => value.startsWith("BIG-") ? value.slice(0, 6) : value);
-      assert.deepEqual(normalize(traverse("forward")), expected); assert.deepEqual(normalize(traverse("backward")), expected);
+      const forward = traverse("forward"); const backward = traverse("backward");
+      assert.deepEqual(normalize(forward.blocks), expected); assert.deepEqual(normalize(backward.blocks), expected);
+      assert.equal(forward.skippedOversizedEntries, expectedSkipped); assert.equal(backward.skippedOversizedEntries, expectedSkipped);
     } finally { f.close(); }
   }
+});
+
+test("leveled checkpoints bound 60k, 100k, and 140k entry traversal reads and event-loop stalls", () => {
+  for (const count of [60_000, 100_000, 140_000]) {
+    const f = fixture();
+    try {
+      const entries = Array.from({ length: count }, (_, index) => line(message(`entry-${index}`, index === 0 ? null : `entry-${index - 1}`, `ENTRY-${index}-${"x".repeat(96)}`)));
+      writeFileSync(f.sessionFile, line(header(f.target)) + entries.join(""));
+      const target = { ...f.target, sessionStartLine: 2, sessionEndLine: count + 1 };
+      assertLargeCheckpointTraversal(target, count);
+    } finally { f.close(); }
+  }
+});
+
+test("countSessionLines retries transient zero reads and translates persistent snapshot failures", () => {
+  const f = fixture();
+  try {
+    const entries = Array.from({ length: 400 }, (_, index) => line(message(`count-${index}`, index === 0 ? null : `count-${index - 1}`, `COUNT-${index}-${"x".repeat(7000)}`)));
+    writeFileSync(f.sessionFile, line(header(f.target)) + entries.join(""));
+    const target = { ...f.target, sessionStartLine: 2, sessionEndLine: 401 };
+    assertCountSessionLinesReadFailure(target, "retry"); assertCountSessionLinesReadFailure(target, "fail");
+  } finally { f.close(); }
+});
+
+test("forward oversized notices are counted once across rendered-block cursors", () => {
+  const f = fixture();
+  try {
+    const assistant = { type: "message", id: "assistant", parentId: null, timestamp: "now", message: { role: "assistant", content: Array.from({ length: 3_000 }, (_, index) => ({ type: "text", text: `PART-${index}` })) } };
+    const huge = message("huge", "assistant", `HUGE-${"h".repeat(9 * 1024 * 1024)}`);
+    const last = message("last", "huge", "LAST");
+    writeFileSync(f.sessionFile, line(header(f.target)) + line(assistant) + line(huge) + line(last));
+    const target = { ...f.target, sessionStartLine: 2, sessionEndLine: 4 };
+    const first = loadWorkerSessionViewSnapshot(target, {}, { mode: "first" });
+    assert.equal(first.blocks.length, 2_048); assert.equal(first.skippedOversizedEntries, 0); assert.equal(first.hasNextBlocksInEntry, true);
+    const second = loadWorkerSessionViewSnapshot(target, {}, { mode: "after", line: first.pageEndLine, block: first.pageEndBlock });
+    assert.equal(second.skippedOversizedEntries, 1); assert.equal(second.blocks.length, 953); assert.equal(second.blocks.at(-1)?.text, "LAST");
+    assert.equal(first.skippedOversizedEntries + second.skippedOversizedEntries, 1);
+  } finally { f.close(); }
 });
 
 test("alternating oversized backward traversal uses cached offsets within a linear read bound", () => {
