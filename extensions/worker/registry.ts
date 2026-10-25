@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import type { DatabaseSync as SQLiteDatabaseSync, SQLInputValue } from "node:sqlite";
 
-export const WORKER_REGISTRY_SCHEMA_VERSION = 8;
+export const WORKER_REGISTRY_SCHEMA_VERSION = 9;
 export const DEFAULT_WORKER_RUNTIME_ROOT = path.join(homedir(), ".local", "share", "agent", "worker-runtime");
 
 export type WorkerRole = "work" | "review" | "integration";
@@ -276,6 +276,23 @@ CREATE TABLE IF NOT EXISTS cleanup_leftover_observations (
   record_json TEXT NOT NULL,
   observed_at TEXT NOT NULL
 ) STRICT;
+CREATE TABLE IF NOT EXISTS cleanup_leftover_claims (
+  claim_id TEXT PRIMARY KEY,
+  source_leftover_id TEXT NOT NULL UNIQUE,
+  source_kind TEXT NOT NULL CHECK (source_kind IN ('worker_root','worker_trash','prepared_root','worker_host_log')),
+  original_id TEXT NOT NULL,
+  entry_name TEXT NOT NULL,
+  source_path TEXT NOT NULL UNIQUE,
+  trash_path TEXT NOT NULL UNIQUE,
+  root_path TEXT NOT NULL,
+  device INTEGER NOT NULL,
+  inode INTEGER NOT NULL,
+  nonce TEXT NOT NULL,
+  owner_pid INTEGER NOT NULL,
+  owner_start_token TEXT NOT NULL,
+  created_at TEXT NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS cleanup_leftover_claims_root ON cleanup_leftover_claims(root_path, trash_path);
 CREATE TABLE IF NOT EXISTS prepared_repositories (
   prepared_id TEXT NOT NULL REFERENCES prepared_sets(prepared_id) ON DELETE CASCADE,
   repository_id TEXT NOT NULL,
@@ -375,6 +392,15 @@ function migrateWorkerRegistry(database: SQLiteDatabaseSync, fromVersion: number
         token TEXT PRIMARY KEY, parent_session_file TEXT NOT NULL, state_json TEXT NOT NULL, created_at TEXT NOT NULL, consumed_at TEXT
       ) STRICT; CREATE INDEX IF NOT EXISTS cleanup_scan_cursors_parent ON cleanup_scan_cursors(parent_session_file, created_at DESC);
       CREATE TABLE IF NOT EXISTS cleanup_leftover_observations (leftover_id TEXT PRIMARY KEY, record_json TEXT NOT NULL, observed_at TEXT NOT NULL) STRICT`);
+    },
+    8: () => {
+      database.exec(`CREATE TABLE IF NOT EXISTS cleanup_leftover_claims (
+        claim_id TEXT PRIMARY KEY, source_leftover_id TEXT NOT NULL UNIQUE,
+        source_kind TEXT NOT NULL CHECK (source_kind IN ('worker_root','worker_trash','prepared_root','worker_host_log')),
+        original_id TEXT NOT NULL, entry_name TEXT NOT NULL, source_path TEXT NOT NULL UNIQUE, trash_path TEXT NOT NULL UNIQUE,
+        root_path TEXT NOT NULL, device INTEGER NOT NULL, inode INTEGER NOT NULL, nonce TEXT NOT NULL,
+        owner_pid INTEGER NOT NULL, owner_start_token TEXT NOT NULL, created_at TEXT NOT NULL
+      ) STRICT; CREATE INDEX IF NOT EXISTS cleanup_leftover_claims_root ON cleanup_leftover_claims(root_path, trash_path)`);
     }
   };
   for (let version = fromVersion; version < WORKER_REGISTRY_SCHEMA_VERSION; version += 1) {
@@ -1089,7 +1115,7 @@ export function claimWorkerDiscard(registry: WorkerRegistry, workerId: string, e
   });
 }
 
-export function claimWorkerRecoveryDiscard(registry:WorkerRegistry,workerId:string,expectedVersion:number,expectedRecoveryError:string,nonce:string,now:string):void{transaction(registry,()=>{const changed=registry.database.prepare("UPDATE workers SET operation_kind='discard',operation_nonce=?,recovery_error=NULL,version=version+1,updated_at=? WHERE worker_id=? AND version=? AND status='idle' AND reviewed_by_worker_id IS NULL AND operation_kind IS NULL AND recovery_error=?").run(nonce,now,workerId,expectedVersion,expectedRecoveryError);if(Number(changed.changes)!==1)throw staleWorker(workerId);});}
+export function claimWorkerRecoveryDiscard(registry:WorkerRegistry,workerId:string,expectedVersion:number,expectedRecoveryError:string,nonce:string,now:string):void{transaction(registry,()=>{const worker=getWorker(registry,workerId),recovery=worker?.runtime?.cleanupRecovery as Record<string,unknown>|undefined;if(!worker||recovery?.phase!=="precommit"||recovery.error!==expectedRecoveryError)throw staleWorker(workerId);const changed=registry.database.prepare("UPDATE workers SET operation_kind='discard',operation_nonce=?,recovery_error=NULL,version=version+1,updated_at=? WHERE worker_id=? AND version=? AND status='idle' AND reviewed_by_worker_id IS NULL AND operation_kind IS NULL AND recovery_error=?").run(nonce,now,workerId,expectedVersion,expectedRecoveryError);if(Number(changed.changes)!==1)throw staleWorker(workerId);});}
 
 export function finalizeWorkerDiscard(registry: WorkerRegistry, workerId: string, nonce: string): void {
   transaction(registry, () => {
@@ -1108,10 +1134,11 @@ export function finalizeWorkerDiscard(registry: WorkerRegistry, workerId: string
   });
 }
 
+function runtimeWithCleanupRecovery(runtimeJson:string,error:string,now:string):string{const runtime=parseJson<Record<string,unknown>>(runtimeJson);if(runtime.cleanupConsent&&typeof runtime.cleanupConsent==="object")runtime.cleanupRecovery={phase:"precommit",error:error.slice(0,2048),recordedAt:now};return JSON.stringify(runtime);}
 export function abandonWorkerDiscard(registry: WorkerRegistry, workerId: string, nonce: string, error: string, now: string): void {
-  transaction(registry, () => registry.database.prepare("UPDATE workers SET operation_kind=NULL,operation_nonce=NULL,recovery_error=?,version=version+1,updated_at=? WHERE worker_id=? AND operation_kind='discard' AND operation_nonce=?")
-    .run(error.slice(0, 2048), now, workerId, nonce));
+  transaction(registry, () => {const row=registry.database.prepare("SELECT runtime_json FROM workers WHERE worker_id=? AND operation_kind='discard' AND operation_nonce=?").get(workerId,nonce) as {runtime_json:string}|undefined;if(!row)return;registry.database.prepare("UPDATE workers SET operation_kind=NULL,operation_nonce=NULL,recovery_error=?,runtime_json=?,version=version+1,updated_at=? WHERE worker_id=? AND operation_kind='discard' AND operation_nonce=?").run(error.slice(0, 2048),runtimeWithCleanupRecovery(row.runtime_json,error,now),now,workerId,nonce);});
 }
+export function markWorkerCleanupRecovery(registry:WorkerRegistry,workerId:string,parentSessionFile:string,error:string,now:string):boolean{return transaction(registry,()=>{const row=registry.database.prepare("SELECT runtime_json,recovery_error FROM workers WHERE worker_id=? AND parent_session_file=? AND status='idle' AND operation_kind IS NULL").get(workerId,parentSessionFile) as {runtime_json:string;recovery_error:string|null}|undefined;if(!row)return false;const runtime=parseJson<Record<string,unknown>>(row.runtime_json);if(!runtime.cleanupConsent||typeof runtime.cleanupConsent!=="object")return false;const retainedError=row.recovery_error??error.slice(0,2048);const changed=registry.database.prepare("UPDATE workers SET recovery_error=?,runtime_json=?,version=version+1,updated_at=? WHERE worker_id=? AND parent_session_file=? AND status='idle' AND operation_kind IS NULL").run(retainedError,runtimeWithCleanupRecovery(row.runtime_json,retainedError,now),now,workerId,parentSessionFile);return Number(changed.changes)===1;});}
 
 export function countWorkers(registry: WorkerRegistry, parentSessionFile: string): { idle: number; queued: number; running: number } {
   const rows = registry.database.prepare("SELECT status,COUNT(*) AS count FROM workers WHERE parent_session_file=? GROUP BY status").all(parentSessionFile) as Array<{ status: WorkerStatus; count: number }>;
