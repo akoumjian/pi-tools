@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { closeSync, ftruncateSync, mkdirSync, mkdtempSync, openSync, renameSync, rmSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, ftruncateSync, mkdirSync, mkdtempSync, openSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -504,7 +504,7 @@ test("real forked sessions under symlinked roots and split state/workspace roots
     const split = fixture({ root: path.join(realRoot, "split"), splitRoots: true });
     writeFileSync(split.sessionFile, line(header(split.target)) + line(message("split", null, "split roots")));
     assert.deepEqual(loadWorkerSessionViewSnapshot(split.target).blocks.map((block) => block.text), ["split roots"]);
-  } finally { rmSync(alias, { force: true }); rmSync(realRoot, { recursive: true, force: true }); }
+  } finally { unlinkSync(alias); rmSync(realRoot, { recursive: true, force: true }); }
 });
 
 test("hostile headers and provider records are sanitized without raw message fallback", async () => {
