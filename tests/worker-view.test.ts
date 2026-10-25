@@ -65,13 +65,35 @@ function assertAlternatingOversizedReadBound(target: WorkerSessionViewTarget, ma
 function assertLargeCheckpointTraversal(target: WorkerSessionViewTarget, expectedEntries: number): void {
   const moduleUrl = new URL("../extensions/worker/view.js", import.meta.url).href;
   const script = `import fs from "node:fs"; import { syncBuiltinESMExports } from "node:module"; import { performance } from "node:perf_hooks"; const original = fs.readSync; let bytes = 0; fs.readSync = function(...args) { const count = original.apply(this, args); bytes += count; return count; }; syncBuiltinESMExports(); const view = await import(${JSON.stringify(moduleUrl)}); const target = JSON.parse(process.argv[1]); const expected = Number(process.argv[2]); await view.loadWorkerSessionViewSnapshotAsync(target); let maximumBytes = 0; let maximumMilliseconds = 0; const observe = (started) => { maximumBytes = Math.max(maximumBytes, bytes); maximumMilliseconds = Math.max(maximumMilliseconds, performance.now() - started); }; const traverseSync = (direction) => { let request = direction === "forward" ? { mode: "first" } : { mode: "tail" }; let total = 0; let prior; for (let step = 0; step < expected / 400 + 20; step += 1) { bytes = 0; const started = performance.now(); const page = view.loadWorkerSessionViewSnapshot(target, {}, request); observe(started); if (page.blocks.length === 0 || page.totalVisibleEntries !== expected || page.previousVisibleEntries + page.totalActiveEntries + page.nextVisibleEntries !== expected) throw new Error("invalid sync page"); const cursor = direction === "forward" ? page.pageEndLine : page.pageStartLine; if (prior !== undefined && (direction === "forward" ? cursor <= prior : cursor >= prior)) throw new Error("non-monotonic sync cursor"); prior = cursor; total += page.blocks.length; if (direction === "forward" ? !page.hasNextPage : !page.hasPreviousPage) break; request = direction === "forward" ? { mode: "after", line: page.pageEndLine, ...(page.hasNextBlocksInEntry ? { block: page.pageEndBlock } : {}) } : { mode: "before", line: page.pageStartLine, ...(page.hasPreviousBlocksInEntry ? { block: page.pageStartBlock } : {}) }; } if (total !== expected) throw new Error("sync traversal count " + total); }; traverseSync("forward"); let ticks = 0; let maximumStall = 0; let lastTick = performance.now(); const timer = setInterval(() => { const now = performance.now(); maximumStall = Math.max(maximumStall, now - lastTick); lastTick = now; ticks += 1; }, 1); const traverseAsync = async (direction) => { let request = direction === "forward" ? { mode: "first" } : { mode: "tail" }; let total = 0; let prior; for (let step = 0; step < expected / 400 + 20; step += 1) { bytes = 0; const started = performance.now(); const page = await view.loadWorkerSessionViewSnapshotAsync(target, request); observe(started); if (page.blocks.length === 0 || page.totalVisibleEntries !== expected || page.previousVisibleEntries + page.totalActiveEntries + page.nextVisibleEntries !== expected) throw new Error("invalid async page"); const cursor = direction === "forward" ? page.pageEndLine : page.pageStartLine; if (prior !== undefined && (direction === "forward" ? cursor <= prior : cursor >= prior)) throw new Error("non-monotonic async cursor"); prior = cursor; total += page.blocks.length; if (direction === "forward" ? !page.hasNextPage : !page.hasPreviousPage) break; request = direction === "forward" ? { mode: "after", line: page.pageEndLine, ...(page.hasNextBlocksInEntry ? { block: page.pageEndBlock } : {}) } : { mode: "before", line: page.pageStartLine, ...(page.hasPreviousBlocksInEntry ? { block: page.pageStartBlock } : {}) }; } if (total !== expected) throw new Error("async traversal count " + total); }; await traverseAsync("backward"); clearInterval(timer); if (maximumBytes > 8 * 1024 * 1024) throw new Error("deep page reread " + maximumBytes + " bytes"); if (maximumMilliseconds > 2000) throw new Error("deep page took " + maximumMilliseconds + "ms"); if (ticks < 2 || maximumStall > 1000) throw new Error("event loop stall " + maximumStall + "ms ticks=" + ticks);`;
-  execFileSync(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(target), String(expectedEntries)], { timeout: 45_000, stdio: "pipe" });
+  execFileSync(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(target), String(expectedEntries)], { timeout: 90_000, stdio: "pipe" });
 }
 
-function assertCountSessionLinesReadFailure(target: WorkerSessionViewTarget, mode: "retry" | "fail"): void {
+function assertCountSessionLinesReadFailure(target: WorkerSessionViewTarget, mode: "retry" | "fail" | "replace"): void {
   const moduleUrl = new URL("../extensions/worker/view.js", import.meta.url).href;
-  const script = `import fs from "node:fs"; import { syncBuiltinESMExports } from "node:module"; const original = fs.readSync; let injected = 0; const mode = process.argv[2]; fs.readSync = function(fd, buffer, offset, length, position) { if (typeof position === "number" && position > 0 && (mode === "fail" || injected === 0)) { injected += 1; return 0; } return original.call(this, fd, buffer, offset, length, position); }; syncBuiltinESMExports(); const view = await import(${JSON.stringify(moduleUrl)}); const target = JSON.parse(process.argv[1]); try { const count = view.countSessionLines(target.sessionFile); if (mode === "fail") throw new Error("count unexpectedly succeeded"); if (count !== target.sessionEndLine) throw new Error("retry count mismatch " + count); } catch (error) { if (mode !== "fail") throw error; if (error?.message !== "Worker session changed while counting lines; retry.") throw new Error("unstable count error: " + String(error?.message)); }`;
+  const script = `import fs from "node:fs"; import { syncBuiltinESMExports } from "node:module"; const original = fs.readSync; let injected = 0; const mode = process.argv[2]; const target = JSON.parse(process.argv[1]); fs.readSync = function(fd, buffer, offset, length, position) { if (typeof position === "number" && position > 0 && (mode === "fail" || injected === 0)) { injected += 1; if (mode === "replace") { fs.renameSync(target.sessionFile, target.sessionFile + ".original"); fs.writeFileSync(target.sessionFile, "replacement\\n"); } return 0; } return original.call(this, fd, buffer, offset, length, position); }; syncBuiltinESMExports(); const view = await import(${JSON.stringify(moduleUrl)}); try { const count = view.countSessionLines(target.sessionFile); if (mode !== "retry") throw new Error("count unexpectedly succeeded"); if (count !== target.sessionEndLine) throw new Error("retry count mismatch " + count); } catch (error) { if (mode === "retry") throw error; if (error?.message !== "Worker session changed while counting lines; retry.") throw new Error("unstable count error: " + String(error?.message)); }`;
   execFileSync(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(target), mode], { timeout: 8_000, stdio: "pipe" });
+}
+
+async function assertExactBidirectionalBlocks(target: WorkerSessionViewTarget, expected: string[], expectedEntries: number): Promise<void> {
+  for (const asyncMode of [false, true]) for (const direction of ["forward", "backward"] as const) {
+    const pages: WorkerSessionViewSnapshot[] = []; const cursors = new Set<string>();
+    let request: WorkerSessionPageRequest = direction === "forward" ? { mode: "first" } : { mode: "tail" };
+    for (let step = 0; step < expected.length / 1_000 + 32; step += 1) {
+      const page: WorkerSessionViewSnapshot = asyncMode ? await loadWorkerSessionViewSnapshotAsync(target, request) : loadWorkerSessionViewSnapshot(target, {}, request);
+      assert.ok(page.blocks.length > 0, `${direction} ${asyncMode ? "async" : "sync"} returned an empty page`);
+      assert.equal(page.totalVisibleEntries, expectedEntries);
+      assert.equal(page.previousVisibleEntries + page.totalActiveEntries + page.nextVisibleEntries, expectedEntries);
+      const cursor: string = direction === "forward" ? `${page.pageEndLine}:${page.pageEndBlock ?? 0}` : `${page.pageStartLine}:${page.pageStartBlock ?? 0}`;
+      assert.equal(cursors.has(cursor), false, `${direction} repeated ${cursor}`); cursors.add(cursor); pages.push(page);
+      if (direction === "forward" ? !page.hasNextPage : !page.hasPreviousPage) break;
+      request = direction === "forward"
+        ? { mode: "after", line: page.pageEndLine, ...(page.hasNextBlocksInEntry ? { block: page.pageEndBlock } : {}) }
+        : { mode: "before", line: page.pageStartLine, ...(page.hasPreviousBlocksInEntry ? { block: page.pageStartBlock } : {}) };
+      if (step + 1 >= expected.length / 1_000 + 32) assert.fail(`${direction} traversal did not terminate`);
+    }
+    if (direction === "backward") pages.reverse();
+    assert.deepEqual(pages.flatMap((page) => page.blocks.map((block) => block.text)), expected, `${direction} ${asyncMode ? "async" : "sync"} block sequence`);
+  }
 }
 
 const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as Theme;
@@ -480,6 +502,36 @@ test("settled runs with no written entries render an empty transcript", () => {
   } finally { f.close(); }
 });
 
+test("exact block-budget boundaries keep all 8-part, aligned-forward, and heavy-entry blocks reachable", async () => {
+  const assistant = (id: string, parentId: string | null, texts: string[]) => ({ type: "message", id, parentId, timestamp: "now", message: { role: "assistant", content: texts.map((text) => ({ type: "text", text })) } });
+  const eight = fixture();
+  try {
+    const expected = ["M0"]; const entries = [line(message("opening", null, "M0"))]; let marker = 1;
+    for (let index = 0; index < 2_000; index += 1) { const texts = Array.from({ length: 8 }, () => `M${marker++}`); expected.push(...texts); entries.push(line(assistant(`a-${index}`, index === 0 ? "opening" : `a-${index - 1}`, texts))); }
+    writeFileSync(eight.sessionFile, line(header(eight.target)) + entries.join(""));
+    await assertExactBidirectionalBlocks({ ...eight.target, sessionStartLine: 2, sessionEndLine: entries.length + 1 }, expected, entries.length);
+  } finally { eight.close(); }
+
+  const aligned = fixture();
+  try {
+    const expected = ["M0"]; const entries = [line(message("opening", null, "M0"))]; let marker = 1;
+    const lead = Array.from({ length: 7 }, () => `M${marker++}`); expected.push(...lead); entries.push(line(assistant("lead", "opening", lead)));
+    for (let index = 0; index < 1_999; index += 1) { const texts = Array.from({ length: 8 }, () => `M${marker++}`); expected.push(...texts); entries.push(line(assistant(`a-${index}`, index === 0 ? "lead" : `a-${index - 1}`, texts))); }
+    writeFileSync(aligned.sessionFile, line(header(aligned.target)) + entries.join(""));
+    await assertExactBidirectionalBlocks({ ...aligned.target, sessionStartLine: 2, sessionEndLine: entries.length + 1 }, expected, entries.length);
+  } finally { aligned.close(); }
+
+  const heavy = fixture();
+  try {
+    const expected: string[] = []; const entries: string[] = []; let parent: string | null = null; let marker = 0;
+    for (let index = 0; index < 300; index += 1) { const id = `before-${index}`; const text = `M${marker++}`; expected.push(text); entries.push(line(message(id, parent, text))); parent = id; }
+    const parts = Array.from({ length: 3_700 }, () => `M${marker++}`); expected.push(...parts); entries.push(line(assistant("heavy", parent, parts))); parent = "heavy";
+    for (let index = 0; index < 416; index += 1) { const id = `after-${index}`; const text = `M${marker++}`; expected.push(text); entries.push(line(message(id, parent, text))); parent = id; }
+    writeFileSync(heavy.sessionFile, line(header(heavy.target)) + entries.join(""));
+    await assertExactBidirectionalBlocks({ ...heavy.target, sessionStartLine: 2, sessionEndLine: entries.length + 1 }, expected, entries.length);
+  } finally { heavy.close(); }
+});
+
 test("rendered-block pages are hard-bounded and bidirectionally reachable within one entry", () => {
   const f = fixture();
   try {
@@ -568,14 +620,30 @@ test("byte-bounded cursor pages make monotonic progress across adjacent multi-Mi
   }
 });
 
-test("leveled checkpoints bound 60k, 100k, and 140k entry traversal reads and event-loop stalls", () => {
-  for (const count of [60_000, 100_000, 140_000]) {
+test("leveled checkpoints bound 60k, 100k, 140k-by-3KiB, and compacted traversal reads and stalls", () => {
+  const shapes = [
+    { count: 60_000, payloadBytes: 96 },
+    { count: 100_000, payloadBytes: 96 },
+    { count: 140_000, payloadBytes: 2_850 },
+    { count: 100_000, payloadBytes: 1_200, compactionAt: 70_000, firstKept: 40_000 },
+  ];
+  for (const shape of shapes) {
     const f = fixture();
     try {
-      const entries = Array.from({ length: count }, (_, index) => line(message(`entry-${index}`, index === 0 ? null : `entry-${index - 1}`, `ENTRY-${index}-${"x".repeat(96)}`)));
-      writeFileSync(f.sessionFile, line(header(f.target)) + entries.join(""));
-      const target = { ...f.target, sessionStartLine: 2, sessionEndLine: count + 1 };
-      assertLargeCheckpointTraversal(target, count);
+      const fd = openSync(f.sessionFile, "w");
+      try {
+        writeSync(fd, line(header(f.target))); let chunk = "";
+        for (let index = 0; index < shape.count; index += 1) {
+          chunk += line(message(`entry-${index}`, index === 0 ? null : `entry-${index - 1}`, `ENTRY-${index}-${"x".repeat(shape.payloadBytes)}`));
+          if (shape.compactionAt === index + 1) chunk += line({ type: "compaction", id: "compaction", parentId: `entry-${index}`, timestamp: "now", summary: "retained", firstKeptEntryId: `entry-${shape.firstKept}` });
+          if (index % 1_000 === 999) { writeSync(fd, chunk); chunk = ""; }
+        }
+        if (chunk) writeSync(fd, chunk);
+      } finally { closeSync(fd); }
+      const compacted = shape.compactionAt !== undefined;
+      const expected = compacted ? shape.count - shape.firstKept! + 2 : shape.count;
+      const target = { ...f.target, sessionStartLine: 2, sessionEndLine: shape.count + 1 + (compacted ? 1 : 0) };
+      assertLargeCheckpointTraversal(target, expected);
     } finally { f.close(); }
   }
 });
@@ -586,7 +654,7 @@ test("countSessionLines retries transient zero reads and translates persistent s
     const entries = Array.from({ length: 400 }, (_, index) => line(message(`count-${index}`, index === 0 ? null : `count-${index - 1}`, `COUNT-${index}-${"x".repeat(7000)}`)));
     writeFileSync(f.sessionFile, line(header(f.target)) + entries.join(""));
     const target = { ...f.target, sessionStartLine: 2, sessionEndLine: 401 };
-    assertCountSessionLinesReadFailure(target, "retry"); assertCountSessionLinesReadFailure(target, "fail");
+    assertCountSessionLinesReadFailure(target, "retry"); assertCountSessionLinesReadFailure(target, "fail"); assertCountSessionLinesReadFailure(target, "replace");
   } finally { f.close(); }
 });
 

@@ -61,18 +61,18 @@ type SessionLineIndex = {
 
 type RenderableCheckpoint = { line: number; count: number };
 type OversizedCheckpoint = { line: number; count: number };
-type RunVisibilityBase = { openingLine?: number; openingRenderable: boolean; keptLine: number; hiddenEntries: number; compactionCount: number; incompleteTrailingEntry: boolean; renderedEntries: number; oversizedEntries: number; incompleteLine?: number };
+type RunVisibilityBase = { openingLine?: number; openingRenderable: boolean; keptLine: number; renderedBeforeKept: number; hiddenEntries: number; compactionCount: number; incompleteTrailingEntry: boolean; renderedEntries: number; oversizedEntries: number; incompleteLine?: number };
 type RunVisibility = RunVisibilityBase & { renderableCheckpoints: RenderableCheckpoint[]; oversizedCheckpoints: OversizedCheckpoint[] };
 type RunVisibilityState = RunVisibilityBase & {
   generation: number;
   snapshotSize: number;
   analyzedEndLine: number;
   validEntries: number;
-  entryIds: Map<string, { line: number; ordinal: number }>;
+  entryIds: Map<string, { line: number; ordinal: number; renderedBefore: number }>;
   renderableCheckpointLevels: RenderableCheckpoint[][];
   oversizedCheckpointLevels: OversizedCheckpoint[][];
   incompleteSnapshotSize?: number;
-  pendingCompaction?: { line: number; ordinal: number; firstKeptEntryId?: string };
+  pendingCompaction?: { line: number; ordinal: number; renderedBefore: number; firstKeptEntryId?: string };
 };
 
 type ReadSessionPage = {
@@ -205,7 +205,7 @@ export async function loadWorkerSessionViewSnapshotAsync(target: WorkerSessionVi
 function snapshotFromPage(target: WorkerSessionViewTarget, selected: ReadSessionPage, request: WorkerSessionPageRequest): WorkerSessionViewSnapshot {
   const header = parseSessionHeader(selected.headerLine);
   validateSessionHeader(header, target);
-  const { entries, malformedEntries } = parseSessionEntriesForBlockPage(selected.lines, request);
+  const { entries, malformedEntries, truncated: entryParsingTruncated } = parseSessionEntriesForBlockPage(selected.lines, request);
   const ordered = orderedSessionEntries(entries);
   const descriptors = ordered.map((entry) => ({ entry, line: entry.lineNumber, count: renderableBlockCount(entry) }));
   const totalBlocks = descriptors.reduce((total, descriptor) => total + descriptor.count, 0);
@@ -238,8 +238,8 @@ function snapshotFromPage(target: WorkerSessionViewTarget, selected: ReadSession
     pageEndBlock = localEnd;
     blocks.push(...renderableBlockSlice(descriptor.entry, localStart, localEnd));
   }
-  if (!sliceFromTail && blockEnd === totalBlocks && representedEntries > 0 && selected.pageEndLine > pageEndLine) { pageEndLine = selected.pageEndLine; pageEndBlock = 0; }
-  if (sliceFromTail && blockStart === 0 && representedEntries > 0 && selected.pageStartLine < pageStartLine) { pageStartLine = selected.pageStartLine; pageStartBlock = 0; }
+  if (!entryParsingTruncated && !sliceFromTail && blockEnd === totalBlocks && representedEntries > 0 && selected.pageEndLine > pageEndLine) { pageEndLine = selected.pageEndLine; pageEndBlock = 0; }
+  if (!entryParsingTruncated && sliceFromTail && blockStart === 0 && representedEntries > 0 && selected.pageStartLine < pageStartLine) { pageStartLine = selected.pageStartLine; pageStartBlock = 0; }
   const activeEntries = representedEntries;
   const skippedDisplayedBefore = descriptors.filter((descriptor) => descriptor.count > 0 && descriptor.line < pageStartLine).length;
   const skippedDisplayedAfter = descriptors.filter((descriptor) => descriptor.count > 0 && descriptor.line > pageEndLine).length;
@@ -444,16 +444,6 @@ export function sanitizeViewText(value: string): string {
 
 export function countSessionLines(file: string): number {
   const exact = path.resolve(file);
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try { return countSessionLinesOnce(exact); }
-    catch (error) {
-      if (!(error instanceof SessionChangedDuringReadError)) throw error;
-    }
-  }
-  throw new Error("Worker session changed while counting lines; retry.");
-}
-
-function countSessionLinesOnce(exact: string): number {
   let leaf;
   try { leaf = lstatSync(exact); } catch { throw new Error("Worker session file is unavailable while counting lines."); }
   if (!leaf.isFile()) throw new Error("Worker session path is not a regular file while counting lines.");
@@ -461,20 +451,36 @@ function countSessionLinesOnce(exact: string): number {
   try { fd = openSync(exact, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
   catch { throw new Error("Worker session file could not be opened safely while counting lines."); }
   try {
-    let opened = fstatSync(fd);
-    if (!opened.isFile() || opened.dev !== leaf.dev || opened.ino !== leaf.ino) throw new SessionChangedDuringReadError();
-    let index = ensureSessionLineIndex(fd, exact, opened, opened.size);
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const after = fstatSync(fd);
-      if (after.dev !== opened.dev || after.ino !== opened.ino || after.size < opened.size) throw new SessionChangedDuringReadError();
-      if (after.size === opened.size) break;
-      opened = after;
-      index = ensureSessionLineIndex(fd, exact, opened, opened.size);
+    const identity = fstatSync(fd);
+    if (!identity.isFile() || identity.dev !== leaf.dev || identity.ino !== leaf.ino) throw new Error("Worker session changed while counting lines; retry.");
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try { return countSessionLinesFromOpenFile(fd, exact, identity); }
+      catch (error) {
+        if (!(error instanceof SessionChangedDuringReadError)) throw error;
+        let current;
+        try { current = lstatSync(exact); } catch { throw new Error("Worker session changed while counting lines; retry."); }
+        if (!current.isFile() || current.dev !== identity.dev || current.ino !== identity.ino) throw new Error("Worker session changed while counting lines; retry.");
+      }
     }
-    const current = lstatSync(exact);
-    if (!current.isFile() || current.dev !== opened.dev || current.ino !== opened.ino) throw new SessionChangedDuringReadError();
-    return sessionLineCount(index);
+    throw new Error("Worker session changed while counting lines; retry.");
   } finally { closeSync(fd); }
+}
+
+function countSessionLinesFromOpenFile(fd: number, exact: string, identity: Stats): number {
+  let opened = fstatSync(fd);
+  if (!opened.isFile() || opened.dev !== identity.dev || opened.ino !== identity.ino) throw new SessionChangedDuringReadError();
+  let index = ensureSessionLineIndex(fd, exact, opened, opened.size);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const after = fstatSync(fd);
+    if (after.dev !== identity.dev || after.ino !== identity.ino || after.size < opened.size) throw new SessionChangedDuringReadError();
+    if (after.size === opened.size) break;
+    opened = after;
+    index = ensureSessionLineIndex(fd, exact, opened, opened.size);
+  }
+  let current;
+  try { current = lstatSync(exact); } catch { throw new SessionChangedDuringReadError(); }
+  if (!current.isFile() || current.dev !== identity.dev || current.ino !== identity.ino) throw new SessionChangedDuringReadError();
+  return sessionLineCount(index);
 }
 
 function validateRunRange(target: WorkerSessionViewTarget): void {
@@ -697,8 +703,7 @@ function visibleRenderableCountLessThan(fd: number, snapshotSize: number, index:
   const rangeEnd = Math.min(runEndLine, line - 1);
   if (rangeEnd < visibility.keptLine) return opening;
   const throughEnd = renderableCountThrough(fd, snapshotSize, index, visibility, rangeEnd);
-  const beforeKept = renderableCountThrough(fd, snapshotSize, index, visibility, visibility.keptLine - 1);
-  return opening + Math.max(0, throughEnd - beforeKept);
+  return opening + Math.max(0, throughEnd - visibility.renderedBeforeKept);
 }
 
 function renderableCountThrough(fd: number, snapshotSize: number, index: SessionLineIndex, visibility: RunVisibility, line: number): number {
@@ -845,7 +850,7 @@ function visibilityState(file: string, index: SessionLineIndex, runStartLine: nu
   if (!state) {
     const reusable = reusableVisibilityState(file, index, runStartLine, fixedEndLine ?? runEndLine, snapshotSize);
     if (reusable) { state = cloneVisibilityState(reusable); state.snapshotSize = snapshotSize; }
-    else state = { generation: index.generation, snapshotSize, analyzedEndLine: runStartLine - 1, validEntries: 0, entryIds: new Map(), openingRenderable: false, keptLine: runStartLine, hiddenEntries: 0, compactionCount: 0, incompleteTrailingEntry: false, renderedEntries: 0, oversizedEntries: 0, renderableCheckpointLevels: [[{ line: runStartLine - 1, count: 0 }]], oversizedCheckpointLevels: [[{ line: runStartLine - 1, count: 0 }]] };
+    else state = { generation: index.generation, snapshotSize, analyzedEndLine: runStartLine - 1, validEntries: 0, entryIds: new Map(), openingRenderable: false, keptLine: runStartLine, renderedBeforeKept: 0, hiddenEntries: 0, compactionCount: 0, incompleteTrailingEntry: false, renderedEntries: 0, oversizedEntries: 0, renderableCheckpointLevels: [[{ line: runStartLine - 1, count: 0 }]], oversizedCheckpointLevels: [[{ line: runStartLine - 1, count: 0 }]] };
     runVisibilityStates.set(key, state);
   }
   touchVisibilityState(key, state);
@@ -866,7 +871,7 @@ function touchVisibilityState(key: string, state: RunVisibilityState): void {
 }
 
 function visibilityResult(state: RunVisibilityState): RunVisibility {
-  return { openingLine: state.openingLine, openingRenderable: state.openingRenderable, keptLine: state.keptLine, hiddenEntries: state.hiddenEntries, compactionCount: state.compactionCount, incompleteTrailingEntry: state.incompleteTrailingEntry, renderedEntries: state.renderedEntries, oversizedEntries: state.oversizedEntries, renderableCheckpoints: flattenCheckpointLevels(state.renderableCheckpointLevels), oversizedCheckpoints: flattenCheckpointLevels(state.oversizedCheckpointLevels), ...(state.incompleteLine === undefined ? {} : { incompleteLine: state.incompleteLine }) };
+  return { openingLine: state.openingLine, openingRenderable: state.openingRenderable, keptLine: state.keptLine, renderedBeforeKept: state.renderedBeforeKept, hiddenEntries: state.hiddenEntries, compactionCount: state.compactionCount, incompleteTrailingEntry: state.incompleteTrailingEntry, renderedEntries: state.renderedEntries, oversizedEntries: state.oversizedEntries, renderableCheckpoints: flattenCheckpointLevels(state.renderableCheckpointLevels), oversizedCheckpoints: flattenCheckpointLevels(state.oversizedCheckpointLevels), ...(state.incompleteLine === undefined ? {} : { incompleteLine: state.incompleteLine }) };
 }
 
 function visibilityAnalysisComplete(state: RunVisibilityState, runEndLine: number, snapshotSize: number): boolean {
@@ -933,17 +938,17 @@ function updateVisibilityState(state: RunVisibilityState, entry: WorkerSessionEn
   const ordinal = state.validEntries;
   const renderable = isRenderableSessionEntry(entry);
   state.entryIds.delete(entry.id);
-  state.entryIds.set(entry.id, { line, ordinal });
+  state.entryIds.set(entry.id, { line, ordinal, renderedBefore: state.renderedEntries });
   while (state.entryIds.size > MAX_VISIBILITY_ENTRY_IDS) state.entryIds.delete(state.entryIds.keys().next().value!);
   if (state.openingLine === undefined && entry.type === "message" && record(entry.message)?.role === "user") { state.openingLine = line; state.openingRenderable = renderable; }
   if (entry.type === "compaction") {
     state.compactionCount += 1;
     const firstKeptEntryId = typeof entry.firstKeptEntryId === "string" ? entry.firstKeptEntryId : undefined;
-    state.pendingCompaction = { line, ordinal, ...(firstKeptEntryId ? { firstKeptEntryId } : {}) };
-    if (!firstKeptEntryId) applyCompactionBoundary(state, line, ordinal);
+    state.pendingCompaction = { line, ordinal, renderedBefore: state.renderedEntries, ...(firstKeptEntryId ? { firstKeptEntryId } : {}) };
+    if (!firstKeptEntryId) applyCompactionBoundary(state, line, ordinal, state.renderedEntries);
     else {
       const known = state.entryIds.get(firstKeptEntryId);
-      if (known) applyCompactionBoundary(state, known.line, known.ordinal);
+      if (known) applyCompactionBoundary(state, known.line, known.ordinal, known.renderedBefore);
     }
   }
   state.validEntries += 1;
@@ -954,7 +959,7 @@ function isRenderableSessionEntry(entry: WorkerSessionEntry): boolean {
   return entry.oversized !== true && renderableBlockCount(entry) > 0;
 }
 
-const VISIBILITY_CHECKPOINT_LEVEL_CAPACITY = 256;
+const VISIBILITY_CHECKPOINT_LEVEL_CAPACITY = 1_024;
 const MAX_VISIBILITY_CHECKPOINT_LEVELS = Math.floor(MAX_VISIBILITY_CHECKPOINTS / VISIBILITY_CHECKPOINT_LEVEL_CAPACITY);
 
 function recordRenderableCheckpoint(state: RunVisibilityState, line: number): void {
@@ -998,8 +1003,9 @@ function flattenCheckpointLevels<T extends { line: number }>(levels: T[][]): T[]
   return deduplicated;
 }
 
-function applyCompactionBoundary(state: RunVisibilityState, keptLine: number, keptOrdinal: number): void {
+function applyCompactionBoundary(state: RunVisibilityState, keptLine: number, keptOrdinal: number, renderedBeforeKept: number): void {
   state.keptLine = keptLine;
+  state.renderedBeforeKept = renderedBeforeKept;
   const preservesOpening = state.openingLine !== undefined && state.openingLine < keptLine;
   state.hiddenEntries = Math.max(0, keptOrdinal - (preservesOpening ? 1 : 0));
   state.pendingCompaction = undefined;
@@ -1008,25 +1014,25 @@ function applyCompactionBoundary(state: RunVisibilityState, keptLine: number, ke
 function resolveCompactionBoundary(fd: number, snapshotSize: number, index: SessionLineIndex, runStartLine: number, state: RunVisibilityState): void {
   const pending = state.pendingCompaction;
   if (!pending) return;
-  if (!pending.firstKeptEntryId) return applyCompactionBoundary(state, pending.line, pending.ordinal);
+  if (!pending.firstKeptEntryId) return applyCompactionBoundary(state, pending.line, pending.ordinal, pending.renderedBefore);
   const beforeRun = findEntryLine(fd, snapshotSize, index, 2, runStartLine - 1, pending.firstKeptEntryId);
-  if (beforeRun !== undefined) return applyCompactionBoundary(state, runStartLine, 0);
-  let ordinal = 0; let found: { line: number; ordinal: number } | undefined;
-  scanRunEntries(fd, snapshotSize, index, runStartLine, pending.line, (entry, line) => { if (!found && entry.id === pending.firstKeptEntryId) found = { line, ordinal }; ordinal += 1; });
-  if (found) applyCompactionBoundary(state, found.line, found.ordinal);
-  else applyCompactionBoundary(state, pending.line, pending.ordinal);
+  if (beforeRun !== undefined) return applyCompactionBoundary(state, runStartLine, 0, 0);
+  let ordinal = 0; let rendered = 0; let found: { line: number; ordinal: number; renderedBefore: number } | undefined;
+  scanRunEntries(fd, snapshotSize, index, runStartLine, pending.line, (entry, line) => { if (!found && entry.id === pending.firstKeptEntryId) found = { line, ordinal, renderedBefore: rendered }; ordinal += 1; if (isRenderableSessionEntry(entry)) rendered += 1; });
+  if (found) applyCompactionBoundary(state, found.line, found.ordinal, found.renderedBefore);
+  else applyCompactionBoundary(state, pending.line, pending.ordinal, pending.renderedBefore);
 }
 
 async function resolveCompactionBoundaryCooperatively(fd: number, snapshotSize: number, index: SessionLineIndex, runStartLine: number, state: RunVisibilityState): Promise<void> {
   const pending = state.pendingCompaction;
   if (!pending) return;
-  if (!pending.firstKeptEntryId) return applyCompactionBoundary(state, pending.line, pending.ordinal);
+  if (!pending.firstKeptEntryId) return applyCompactionBoundary(state, pending.line, pending.ordinal, pending.renderedBefore);
   const beforeRun = await findEntryLineCooperatively(fd, snapshotSize, index, 2, runStartLine - 1, pending.firstKeptEntryId);
-  if (beforeRun !== undefined) return applyCompactionBoundary(state, runStartLine, 0);
-  let ordinal = 0; let found: { line: number; ordinal: number } | undefined;
-  await scanRunEntriesCooperatively(fd, snapshotSize, index, runStartLine, pending.line, (entry, line) => { if (!found && entry.id === pending.firstKeptEntryId) found = { line, ordinal }; ordinal += 1; });
-  if (found) applyCompactionBoundary(state, found.line, found.ordinal);
-  else applyCompactionBoundary(state, pending.line, pending.ordinal);
+  if (beforeRun !== undefined) return applyCompactionBoundary(state, runStartLine, 0, 0);
+  let ordinal = 0; let rendered = 0; let found: { line: number; ordinal: number; renderedBefore: number } | undefined;
+  await scanRunEntriesCooperatively(fd, snapshotSize, index, runStartLine, pending.line, (entry, line) => { if (!found && entry.id === pending.firstKeptEntryId) found = { line, ordinal, renderedBefore: rendered }; ordinal += 1; if (isRenderableSessionEntry(entry)) rendered += 1; });
+  if (found) applyCompactionBoundary(state, found.line, found.ordinal, found.renderedBefore);
+  else applyCompactionBoundary(state, pending.line, pending.ordinal, pending.renderedBefore);
 }
 
 function findEntryLine(fd: number, snapshotSize: number, index: SessionLineIndex, startLine: number, endLine: number, id: string): number | undefined {
@@ -1331,13 +1337,14 @@ function parseSessionHeader(text: string): WorkerSessionHeader {
   return value;
 }
 
-function parseSessionEntriesForBlockPage(lines: Array<{ lineNumber: number; text: string }>, request: WorkerSessionPageRequest): { entries: WorkerSessionEntry[]; malformedEntries: number } {
+function parseSessionEntriesForBlockPage(lines: Array<{ lineNumber: number; text: string }>, request: WorkerSessionPageRequest): { entries: WorkerSessionEntry[]; malformedEntries: number; truncated: boolean } {
   const keepTail = request.mode === "tail" || request.mode === "before";
   const source = keepTail ? [...lines].reverse() : lines;
   const entries: WorkerSessionEntry[] = [];
   let malformedEntries = 0;
   let remainingBlocks = MAX_SESSION_PAGE_BLOCKS;
-  for (const line of source) {
+  let truncated = false;
+  for (const [sourceIndex, line] of source.entries()) {
     if (!line.text.trim()) continue;
     let value: unknown;
     try { value = JSON.parse(line.text); } catch { malformedEntries += 1; continue; }
@@ -1348,10 +1355,10 @@ function parseSessionEntriesForBlockPage(lines: Array<{ lineNumber: number; text
     const available = request.mode === "after" && request.block !== undefined && line.lineNumber === request.line ? Math.max(0, count - request.block)
       : request.mode === "before" && request.block !== undefined && line.lineNumber === request.line ? Math.min(count, Math.max(0, request.block)) : count;
     remainingBlocks -= available;
-    if (remainingBlocks <= 0) break;
+    if (remainingBlocks <= 0) { truncated = source.slice(sourceIndex + 1).some((candidate) => candidate.text.trim().length > 0); break; }
   }
   if (keepTail) entries.reverse();
-  return { entries, malformedEntries };
+  return { entries, malformedEntries, truncated };
 }
 
 function validateSessionHeader(header: WorkerSessionHeader, target: WorkerSessionViewTarget): void {
