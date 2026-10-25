@@ -90,6 +90,7 @@ type ReadSessionPage = {
   hasNextPage: boolean;
   skippedOversizedEntries: number;
   leadingOversizedEntries: number;
+  trailingOversizedEntries: number;
   incompleteTrailingEntry: boolean;
   hiddenCompactedEntries: number;
   compactionCount: number;
@@ -100,7 +101,7 @@ type ReadSessionPage = {
   decodedBytes: number;
 };
 
-type ReadPageLines = Omit<ReadSessionPage, "headerLine" | "runStartLine" | "runEndLine" | "hasPreviousPage" | "hasNextPage" | "hiddenCompactedEntries" | "compactionCount" | "previousVisibleEntries" | "nextVisibleEntries" | "totalVisibleEntries" | "leadingOversizedEntries">;
+type ReadPageLines = Omit<ReadSessionPage, "headerLine" | "runStartLine" | "runEndLine" | "hasPreviousPage" | "hasNextPage" | "hiddenCompactedEntries" | "compactionCount" | "previousVisibleEntries" | "nextVisibleEntries" | "totalVisibleEntries" | "leadingOversizedEntries" | "trailingOversizedEntries">;
 
 const sessionLineIndexes = new Map<string, SessionLineIndex>();
 const runVisibilityStates = new Map<string, RunVisibilityState>();
@@ -261,8 +262,10 @@ function snapshotFromPage(target: WorkerSessionViewTarget, selected: ReadSession
     .filter((line) => sliceFromTail ? line >= pageStartLine : line <= pageEndLine));
   const unpositionedOversizedEntries = Math.max(0, selected.skippedOversizedEntries - new Set(selected.oversizedEntryPrefixes.map((item) => item.lineNumber)).size);
   const containsFirstDisplayedBlock = !entryParsingTruncated && selected.previousVisibleEntries === 0 && blockStart === 0;
+  const containsLastDisplayedBlock = !entryParsingTruncated && selected.nextVisibleEntries === 0 && blockEnd === totalBlocks;
   const skippedOversizedEntries = unpositionedOversizedEntries + positionedOversizedLines.size
-    + (sliceFromTail && containsFirstDisplayedBlock ? selected.leadingOversizedEntries : 0);
+    + (sliceFromTail && containsFirstDisplayedBlock ? selected.leadingOversizedEntries : 0)
+    + (!sliceFromTail && containsLastDisplayedBlock ? selected.trailingOversizedEntries : 0);
   return {
     target,
     blocks,
@@ -459,6 +462,7 @@ export function countSessionLines(file: string): number {
   try {
     const identity = fstatSync(fd);
     if (!identity.isFile() || identity.dev !== leaf.dev || identity.ino !== leaf.ino) throw new Error("Worker session changed while counting lines; retry.");
+    sessionRangeReaders.set(fd, new SessionRangeReader(fd, identity.size));
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try { return countSessionLinesFromOpenFile(fd, exact, identity); }
       catch (error) {
@@ -469,7 +473,7 @@ export function countSessionLines(file: string): number {
       }
     }
     throw new Error("Worker session changed while counting lines; retry.");
-  } finally { closeSync(fd); }
+  } finally { closeSessionRangeReader(fd); closeSync(fd); }
 }
 
 function countSessionLinesFromOpenFile(fd: number, exact: string, identity: Stats): number {
@@ -481,6 +485,7 @@ function countSessionLinesFromOpenFile(fd: number, exact: string, identity: Stat
     if (after.dev !== identity.dev || after.ino !== identity.ino || after.size < opened.size) throw new SessionChangedDuringReadError();
     if (after.size === opened.size) break;
     opened = after;
+    sessionRangeReaders.get(fd)?.setSnapshotSize(opened.size);
     index = ensureSessionLineIndex(fd, exact, opened, opened.size);
   }
   let current;
@@ -535,6 +540,58 @@ function trustedSessionPath(target: WorkerSessionViewTarget): string {
 }
 
 class SessionChangedDuringReadError extends Error {}
+class SessionPageReadBudgetExceededError extends Error {}
+
+type CachedSessionRange = { start: number; data: Buffer };
+class SessionRangeReader {
+  private snapshotSize: number;
+  private readonly ranges: CachedSessionRange[] = [];
+  private cachedBytes = 0;
+  private pageBudgetActive = false;
+  private pageReadBytes = 0;
+  actualReadBytes = 0;
+
+  constructor(private readonly fd: number, snapshotSize: number) { this.snapshotSize = snapshotSize; }
+
+  setSnapshotSize(snapshotSize: number): void { this.snapshotSize = snapshotSize; }
+  beginPageReads(): void { this.pageBudgetActive = true; this.pageReadBytes = 0; }
+
+  readInto(buffer: Buffer, bufferOffset: number, length: number, position: number): number {
+    const requestedEnd = Math.min(this.snapshotSize, position + Math.max(0, length));
+    let current = Math.max(0, position); let written = 0;
+    while (current < requestedEnd) {
+      const cached = this.ranges.find((range) => range.start <= current && current < range.start + range.data.length);
+      if (cached) {
+        const sourceOffset = current - cached.start;
+        const count = Math.min(requestedEnd - current, cached.data.length - sourceOffset);
+        cached.data.copy(buffer, bufferOffset + written, sourceOffset, sourceOffset + count);
+        current += count; written += count; continue;
+      }
+      const next = this.ranges.filter((range) => range.start > current).reduce<number | undefined>((best, range) => best === undefined || range.start < best ? range.start : best, undefined);
+      const gapLength = Math.min(requestedEnd - current, next === undefined ? requestedEnd - current : next - current);
+      if (this.pageBudgetActive && this.pageReadBytes + gapLength > MAX_SESSION_PAGE_BYTES) throw new SessionPageReadBudgetExceededError("Worker session page exceeded its read bound.");
+      const data = Buffer.allocUnsafe(gapLength);
+      const count = readSync(this.fd, data, 0, gapLength, current);
+      if (count === 0) break;
+      const value = Buffer.from(data.subarray(0, count));
+      value.copy(buffer, bufferOffset + written);
+      this.actualReadBytes += count;
+      if (this.pageBudgetActive) this.pageReadBytes += count;
+      this.ranges.push({ start: current, data: value }); this.cachedBytes += count;
+      while (this.cachedBytes > MAX_SESSION_PAGE_BYTES && this.ranges.length > 1) this.cachedBytes -= this.ranges.shift()!.data.length;
+      current += count; written += count;
+      if (count < gapLength) break;
+    }
+    return written;
+  }
+}
+
+const sessionRangeReaders = new Map<number, SessionRangeReader>();
+function readSessionRange(fd: number, buffer: Buffer, bufferOffset: number, length: number, position: number): number {
+  const reader = sessionRangeReaders.get(fd);
+  return reader ? reader.readInto(buffer, bufferOffset, length, position) : readSync(fd, buffer, bufferOffset, length, position);
+}
+function closeSessionRangeReader(fd: number): void { sessionRangeReaders.delete(fd); }
 
 type OpenSessionSnapshot = { fd: number; opened: Stats };
 function openSessionSnapshot(file: string, beforeOpen?: (file: string) => void): OpenSessionSnapshot {
@@ -552,6 +609,7 @@ function openSessionSnapshot(file: string, beforeOpen?: (file: string) => void):
   const opened = fstatSync(fd);
   if (!opened.isFile()) { closeSync(fd); throw new Error("Worker session path is not a regular file."); }
   if (opened.dev !== leaf.dev || opened.ino !== leaf.ino) { closeSync(fd); throw new SessionChangedDuringReadError(); }
+  sessionRangeReaders.set(fd, new SessionRangeReader(fd, opened.size));
   return { fd, opened };
 }
 
@@ -566,11 +624,12 @@ function readStableSessionPage(file: string, target: WorkerSessionViewTarget, re
     const runStartLine = Math.max(2, target.sessionStartLine);
     const runEndLine = Math.max(runStartLine - 1, target.sessionEndLine ?? availableLines);
     const visibility = analyzeRunVisibility(fd, file, opened.size, index, runStartLine, runEndLine, target.sessionEndLine);
+    sessionRangeReaders.get(fd)?.beginPageReads();
     const selected = selectVisiblePage(fd, opened.size, index, headerLine, request, runStartLine, runEndLine, visibility);
     dependencies.afterReadAttempt?.(file, attempt);
     validateSessionSnapshot(fd, file, opened);
     return selected;
-  } finally { closeSync(fd); }
+  } finally { closeSessionRangeReader(fd); closeSync(fd); }
 }
 
 async function readStableSessionPageAsync(file: string, target: WorkerSessionViewTarget, request: WorkerSessionPageRequest, dependencies: WorkerSessionReadDependencies): Promise<ReadSessionPage> {
@@ -580,7 +639,7 @@ async function readStableSessionPageAsync(file: string, target: WorkerSessionVie
     if (target.sessionStartLine === undefined) return emptyQueuedPage(headerLine);
     const index = cloneSessionLineIndex(reusableSessionLineIndex(fd, file, opened, opened.size));
     retainSessionLineIndexByCas(file, index);
-    while (index.size < opened.size && (target.sessionEndLine === undefined || sessionLineCount(index) < target.sessionEndLine)) {
+    while (index.size < opened.size && (target.sessionEndLine === undefined || index.newlineCount < target.sessionEndLine)) {
       extendSessionLineIndex(fd, file, index, opened.size, dependencies, 1);
       retainSessionLineIndexByCas(file, index);
       await yieldToEventLoop();
@@ -592,15 +651,16 @@ async function readStableSessionPageAsync(file: string, target: WorkerSessionVie
     const runEndLine = Math.max(runStartLine - 1, target.sessionEndLine ?? indexedLines);
     const visibility = await analyzeRunVisibilityCooperatively(fd, file, opened.size, index, runStartLine, runEndLine, target.sessionEndLine);
     await yieldToEventLoop();
+    sessionRangeReaders.get(fd)?.beginPageReads();
     const selected = selectVisiblePage(fd, opened.size, index, headerLine, request, runStartLine, runEndLine, visibility);
     dependencies.afterReadAttempt?.(file, 0);
     validateSessionSnapshot(fd, file, opened);
     return selected;
-  } finally { closeSync(fd); }
+  } finally { closeSessionRangeReader(fd); closeSync(fd); }
 }
 
 function emptyQueuedPage(headerLine: string): ReadSessionPage {
-  return { headerLine, lines: [], oversizedEntryPrefixes: [], runStartLine: 1, runEndLine: 0, pageStartLine: 1, pageEndLine: 0, hasPreviousPage: false, hasNextPage: false, skippedOversizedEntries: 0, leadingOversizedEntries: 0, incompleteTrailingEntry: false, hiddenCompactedEntries: 0, compactionCount: 0, previousVisibleEntries: 0, nextVisibleEntries: 0, totalVisibleEntries: 0, droppedLeadingEntries: 0, decodedBytes: 0 };
+  return { headerLine, lines: [], oversizedEntryPrefixes: [], runStartLine: 1, runEndLine: 0, pageStartLine: 1, pageEndLine: 0, hasPreviousPage: false, hasNextPage: false, skippedOversizedEntries: 0, leadingOversizedEntries: 0, trailingOversizedEntries: 0, incompleteTrailingEntry: false, hiddenCompactedEntries: 0, compactionCount: 0, previousVisibleEntries: 0, nextVisibleEntries: 0, totalVisibleEntries: 0, droppedLeadingEntries: 0, decodedBytes: 0 };
 }
 
 function selectVisiblePage(fd: number, snapshotSize: number, index: SessionLineIndex, headerLine: string, request: WorkerSessionPageRequest, runStartLine: number, runEndLine: number, visibility: RunVisibility): ReadSessionPage {
@@ -642,14 +702,23 @@ function selectVisiblePage(fd: number, snapshotSize: number, index: SessionLineI
     }
   }
   const nextVisibleEntries = Math.max(0, totalVisibleEntries - throughEnd);
+  let trailingOversizedEntries = 0;
+  if (!keepTail && nextVisibleEntries === 0 && page.pageEndLine < bounds.endLine) {
+    const trailingStart = page.pageEndLine + 1;
+    const indexedTrailing = indexedOversizedLineCount(index, trailingStart, bounds.endLine);
+    const loadedTrailingLines = new Set(page.oversizedEntryPrefixes.filter((item) => item.lineNumber >= trailingStart && item.lineNumber <= bounds.endLine).map((item) => item.lineNumber));
+    trailingOversizedEntries = Math.max(0, indexedTrailing - loadedTrailingLines.size);
+  }
   const firstDisplayedLine = firstRenderableLineInLoadedPage(page.lines);
+  const requestedStartLine = visibleLineAt(0, visibility);
+  const leadingEndLine = firstDisplayedLine === undefined && totalVisibleEntries === 0 ? bounds.endLine : (firstDisplayedLine ?? requestedStartLine) - 1;
   let leadingOversizedEntries = 0;
-  if (keepTail && previousVisibleEntries === 0 && firstDisplayedLine !== undefined && firstDisplayedLine > bounds.startLine) {
-    const indexedLeading = indexedOversizedLineCount(index, bounds.startLine, firstDisplayedLine - 1);
-    const loadedLeadingLines = new Set(page.oversizedEntryPrefixes.filter((item) => item.lineNumber >= bounds.startLine && item.lineNumber < firstDisplayedLine).map((item) => item.lineNumber));
+  if (keepTail && previousVisibleEntries === 0 && leadingEndLine >= requestedStartLine) {
+    const indexedLeading = indexedOversizedLineCount(index, requestedStartLine, leadingEndLine);
+    const loadedLeadingLines = new Set(page.oversizedEntryPrefixes.filter((item) => item.lineNumber >= requestedStartLine && item.lineNumber <= leadingEndLine).map((item) => item.lineNumber));
     leadingOversizedEntries = Math.max(0, indexedLeading - loadedLeadingLines.size);
   }
-  return { headerLine, ...page, leadingOversizedEntries, runStartLine, runEndLine, incompleteTrailingEntry: page.incompleteTrailingEntry || visibility.incompleteTrailingEntry, hasPreviousPage: previousVisibleEntries > 0, hasNextPage: nextVisibleEntries > 0, hiddenCompactedEntries: visibility.hiddenEntries, compactionCount: visibility.compactionCount, previousVisibleEntries, nextVisibleEntries, totalVisibleEntries };
+  return { headerLine, ...page, leadingOversizedEntries, trailingOversizedEntries, runStartLine, runEndLine, incompleteTrailingEntry: page.incompleteTrailingEntry || visibility.incompleteTrailingEntry, hasPreviousPage: previousVisibleEntries > 0, hasNextPage: nextVisibleEntries > 0, hiddenCompactedEntries: visibility.hiddenEntries, compactionCount: visibility.compactionCount, previousVisibleEntries, nextVisibleEntries, totalVisibleEntries };
 }
 
 function validateSessionSnapshot(fd: number, file: string, opened: Stats): void {
@@ -672,6 +741,8 @@ function cursorBoundaryNeedsEntry(fd: number, snapshotSize: number, index: Sessi
 }
 
 function renderableBlockCountAtLine(fd: number, snapshotSize: number, index: SessionLineIndex, line: number): number {
+  const prefixed = renderableBlockCountFromIndexedPrefix(fd, snapshotSize, index, line);
+  if (prefixed !== undefined) return prefixed;
   const page = readPageLines(fd, snapshotSize, index, line, line, false);
   const item = page.lines[0];
   if (!item) return 0;
@@ -679,6 +750,37 @@ function renderableBlockCountAtLine(fd: number, snapshotSize: number, index: Ses
     const value: unknown = JSON.parse(item.text);
     return isSessionEntry(value) ? renderableBlockCount({ ...value, lineNumber: line }) : 0;
   } catch { return 0; }
+}
+
+function renderableBlockCountFromIndexedPrefix(fd: number, snapshotSize: number, index: SessionLineIndex, line: number): number | undefined {
+  const start = index.checkpoints.find((checkpoint) => checkpoint.lineNumber === line)?.offset;
+  if (start === undefined) return undefined;
+  const nextCheckpoint = index.checkpoints.find((checkpoint) => checkpoint.lineNumber === line + 1);
+  if (nextCheckpoint?.oversizedStartOffset === start) return 0;
+  const next = nextCheckpoint?.offset;
+  const completeLength = next === undefined ? undefined : Math.max(0, next - start - 1);
+  const length = Math.min(OVERSIZED_ENTRY_PREFIX_BYTES, completeLength ?? Math.max(0, snapshotSize - start));
+  if (length === 0) return 0;
+  const buffer = Buffer.allocUnsafe(length);
+  const count = readSessionRange(fd, buffer, 0, length, start);
+  if (count !== length) throw new SessionChangedDuringReadError();
+  const prefix = new TextDecoder("utf-8").decode(buffer);
+  if (completeLength !== undefined && completeLength <= OVERSIZED_ENTRY_PREFIX_BYTES) {
+    try {
+      const value: unknown = JSON.parse(prefix);
+      return isSessionEntry(value) ? renderableBlockCount({ ...value, lineNumber: line }) : 0;
+    } catch { return 0; }
+  }
+  const type = prefix.match(/^\s*\{\s*"type"\s*:\s*"([^"]+)"/u)?.[1];
+  if (type === "message") {
+    const role = prefix.match(/"message"\s*:\s*\{\s*"role"\s*:\s*"([^"]+)"/u)?.[1];
+    if (role && role !== "assistant") return 1;
+    return undefined;
+  }
+  if (type === "compaction" || type === "branch_summary" || type === "model_change" || type === "thinking_level_change") return 1;
+  if (type === "custom_message") return /"display"\s*:\s*true/u.test(prefix) ? 1 : 0;
+  if (type !== undefined) return 0;
+  return undefined;
 }
 
 function visiblePageBounds(request: WorkerSessionPageRequest, runStartLine: number, runEndLine: number, visibility: RunVisibility, includeCursorLine = false): VisiblePageBounds {
@@ -820,17 +922,17 @@ function previousVisibleRenderableLine(fd: number, snapshotSize: number, index: 
 function readVisiblePage(fd: number, snapshotSize: number, index: SessionLineIndex, bounds: VisiblePageBounds, keepTail: boolean): ReadPageLines {
   const separateOpening = bounds.openingLine !== undefined && bounds.openingLine < bounds.startLine;
   if (separateOpening && !keepTail) {
-    const opening = readPageLines(fd, snapshotSize, index, bounds.openingLine!, bounds.openingLine!, false, MAX_SESSION_PAGE_CONTENT_BYTES);
+    const opening = readPageLines(fd, snapshotSize, index, bounds.openingLine!, bounds.openingLine!, false, MAX_SESSION_PAGE_CONTENT_BYTES, true);
     const remainingBytes = Math.max(1, MAX_SESSION_PAGE_CONTENT_BYTES - opening.decodedBytes);
-    const main = readPageLines(fd, snapshotSize, index, bounds.startLine, bounds.endLine, false, remainingBytes);
+    const main = readPageLines(fd, snapshotSize, index, bounds.startLine, bounds.endLine, false, remainingBytes, true);
     return combineOpeningAndMainPages(opening, main);
   }
   const byteBoundedStart = keepTail ? byteBoundedTailStart(index, bounds.startLine, bounds.endLine, snapshotSize) : bounds.startLine;
-  const main = readPageLines(fd, snapshotSize, index, byteBoundedStart, bounds.endLine, keepTail, MAX_SESSION_PAGE_CONTENT_BYTES);
+  const main = readPageLines(fd, snapshotSize, index, byteBoundedStart, bounds.endLine, keepTail, MAX_SESSION_PAGE_CONTENT_BYTES, true);
   if (byteBoundedStart > bounds.startLine) { main.droppedLeadingEntries += byteBoundedStart - bounds.startLine; main.pageStartLine = byteBoundedStart; }
   if (!separateOpening || main.droppedLeadingEntries > 0) return main;
   const remainingBytes = Math.max(1, MAX_SESSION_PAGE_CONTENT_BYTES - main.decodedBytes);
-  const opening = readPageLines(fd, snapshotSize, index, bounds.openingLine!, bounds.openingLine!, false, remainingBytes);
+  const opening = readPageLines(fd, snapshotSize, index, bounds.openingLine!, bounds.openingLine!, false, remainingBytes, true);
   if (opening.lines.length === 0 && opening.oversizedEntryPrefixes.length === 0) return main;
   return combineOpeningAndMainPages(opening, main);
 }
@@ -1215,7 +1317,7 @@ function extendSessionLineIndex(fd: number, file: string, index: SessionLineInde
   let position = index.size;
   let chunksRead = 0;
   while (position < snapshotSize && chunksRead < chunks) {
-    const count = readSync(fd, buffer, 0, Math.min(buffer.length, snapshotSize - position), position);
+    const count = readSessionRange(fd, buffer, 0, Math.min(buffer.length, snapshotSize - position), position);
     if (count === 0) throw new SessionChangedDuringReadError();
     let cursor = 0;
     while (cursor < count) {
@@ -1277,7 +1379,7 @@ function sessionPrefixFingerprint(fd: number, size: number): string {
     const length = Math.min(SESSION_INDEX_FINGERPRINT_BYTES, Math.max(0, size - offset));
     if (length === 0) continue;
     const buffer = Buffer.allocUnsafe(length);
-    const count = readSync(fd, buffer, 0, length, offset);
+    const count = readSessionRange(fd, buffer, 0, length, offset);
     if (count !== length) throw new SessionChangedDuringReadError();
     hash.update(buffer.subarray(0, count));
   }
@@ -1291,7 +1393,7 @@ function sessionLineCount(index: SessionLineIndex): number { return index.size =
 function readHeaderLine(fd: number, snapshotSize: number): string {
   const length = Math.min(MAX_SESSION_HEADER_BYTES + 1, snapshotSize);
   const buffer = Buffer.allocUnsafe(Math.max(1, length));
-  const count = length === 0 ? 0 : readSync(fd, buffer, 0, length, 0);
+  const count = length === 0 ? 0 : readSessionRange(fd, buffer, 0, length, 0);
   const newline = buffer.subarray(0, count).indexOf(0x0a);
   if (newline < 0) {
     if (count > MAX_SESSION_HEADER_BYTES) throw new Error("Worker session header exceeds its read bound.");
@@ -1300,7 +1402,23 @@ function readHeaderLine(fd: number, snapshotSize: number): string {
   return decodeUtf8(buffer.subarray(0, newline));
 }
 
-function readPageLines(fd: number, snapshotSize: number, index: SessionLineIndex, desiredStart: number, desiredEnd: number, keepTail: boolean, maxPageBytes = MAX_SESSION_PAGE_BYTES): ReadPageLines {
+function indexedNondisplayLineEnd(fd: number, snapshotSize: number, index: SessionLineIndex, line: number, lineStartOffset: number): number | undefined {
+  const start = index.checkpoints.find((checkpoint) => checkpoint.lineNumber === line)?.offset;
+  const next = index.checkpoints.find((checkpoint) => checkpoint.lineNumber === line + 1)?.offset;
+  if (start !== lineStartOffset || next === undefined || next > snapshotSize) return undefined;
+  const length = Math.min(OVERSIZED_ENTRY_PREFIX_BYTES, Math.max(0, next - start - 1));
+  if (length === 0) return undefined;
+  const buffer = Buffer.allocUnsafe(length);
+  const count = readSessionRange(fd, buffer, 0, length, start);
+  if (count !== length) throw new SessionChangedDuringReadError();
+  const prefix = new TextDecoder("utf-8").decode(buffer);
+  const type = prefix.match(/^\s*\{\s*"type"\s*:\s*"([^"]+)"/u)?.[1];
+  if (type === "custom") return next;
+  if (type === "custom_message" && !/"display"\s*:\s*true/u.test(prefix)) return next;
+  return undefined;
+}
+
+function readPageLines(fd: number, snapshotSize: number, index: SessionLineIndex, desiredStart: number, desiredEnd: number, keepTail: boolean, maxPageBytes = MAX_SESSION_PAGE_BYTES, skipKnownNondisplay = false): ReadPageLines {
   if (desiredEnd < desiredStart) return { lines: [], oversizedEntryPrefixes: [], pageStartLine: desiredStart, pageEndLine: desiredEnd, skippedOversizedEntries: 0, incompleteTrailingEntry: false, droppedLeadingEntries: 0, decodedBytes: 0 };
   const checkpoint = nearestCheckpoint(index, desiredStart);
   const buffer = Buffer.allocUnsafe(Math.min(SESSION_PAGE_READ_CHUNK, Math.max(1, snapshotSize - checkpoint.offset)));
@@ -1354,6 +1472,13 @@ function readPageLines(fd: number, snapshotSize: number, index: SessionLineIndex
   };
 
   scan: while (position < snapshotSize && lineNumber <= desiredEnd) {
+    if (skipKnownNondisplay && lineNumber >= desiredStart) {
+      const nondisplayEnd = indexedNondisplayLineEnd(fd, snapshotSize, index, lineNumber, position);
+      if (nondisplayEnd !== undefined) {
+        pageEndLine = lineNumber; position = nondisplayEnd; lineNumber += 1; lineStartOffset = position; parts = []; partBytes = 0; oversized = false;
+        continue;
+      }
+    }
     while (oversizedSpanIndex < oversizedSpans.length && oversizedSpans[oversizedSpanIndex]!.offset <= position) oversizedSpanIndex += 1;
     const span = oversizedSpans[oversizedSpanIndex];
     if (span?.oversizedStartOffset === position && span.lineNumber === lineNumber + 1) {
@@ -1366,7 +1491,7 @@ function readPageLines(fd: number, snapshotSize: number, index: SessionLineIndex
       continue;
     }
     const beforePinnedSpan = span?.oversizedStartOffset !== undefined && span.oversizedStartOffset > position ? span.oversizedStartOffset - position : buffer.length;
-    const count = readSync(fd, buffer, 0, Math.min(buffer.length, snapshotSize - position, beforePinnedSpan), position);
+    const count = readSessionRange(fd, buffer, 0, Math.min(buffer.length, snapshotSize - position, beforePinnedSpan), position);
     if (count === 0) throw new SessionChangedDuringReadError();
     let cursor = 0;
     while (cursor < count) {
@@ -1392,7 +1517,7 @@ function readOversizedEntryPrefix(fd: number, offsets: { startOffset: number; en
   const length = Math.min(OVERSIZED_ENTRY_PREFIX_BYTES, offsets.endOffset - offsets.startOffset, snapshotSize - offsets.startOffset);
   if (length <= 0) return "";
   const buffer = Buffer.allocUnsafe(length);
-  const count = readSync(fd, buffer, 0, length, offsets.startOffset);
+  const count = readSessionRange(fd, buffer, 0, length, offsets.startOffset);
   if (count !== length) throw new SessionChangedDuringReadError();
   return new TextDecoder("utf-8").decode(buffer);
 }

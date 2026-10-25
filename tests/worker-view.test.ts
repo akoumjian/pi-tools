@@ -821,8 +821,8 @@ test("multi-MiB skipped, compaction, and opening edge pages stay within the tota
   const f = fixture();
   try {
     const opening = message("opening", null, `OPENING-${"o".repeat(2 * 1024 * 1024)}`);
-    const hidden = { type: "custom", id: "hidden", parentId: "opening", timestamp: "now", customType: "internal", data: { hidden: true } };
-    const kept = message("kept", "hidden", `KEPT-${"k".repeat(3_500 * 1024)}`);
+    const hidden = { type: "custom", id: "hidden", parentId: "opening", timestamp: "now", customType: "internal", data: { hidden: true, padding: "h".repeat(3 * 1024 * 1024) } };
+    const kept = message("kept", "hidden", `KEPT-${"k".repeat(5 * 1024 * 1024)}`);
     const compact = { type: "compaction", id: "compact", parentId: "kept", timestamp: "now", summary: "EDGE-COMPACTION", firstKeptEntryId: "kept", tokensBefore: 10 };
     const oversized = message("oversized", "compact", `OVERSIZED-${"z".repeat(9 * 1024 * 1024)}`);
     const edgeOne = message("edge-1", "oversized", `EDGE-1-${"a".repeat(2_500 * 1024)}`);
@@ -832,6 +832,106 @@ test("multi-MiB skipped, compaction, and opening edge pages stay within the tota
     writeFileSync(f.sessionFile, line(header(f.target)) + entries.map(line).join(""));
     const target = { ...f.target, sessionStartLine: 2, sessionEndLine: entries.length + 1 };
     assertEdgePageReadCeiling(target, [{ mode: "first" }, { mode: "tail" }, { mode: "after", line: 2 }, { mode: "before", line: 9 }], 8 * 1024 * 1024);
+  } finally { f.close(); }
+});
+
+test("160 deterministic multi-MiB layouts preserve exact sync/async paging within the hard read ceiling", async () => {
+  const f = fixture();
+  try {
+    for (let layout = 0; layout < 160; layout += 1) {
+      const opening = message(`opening-${layout}`, null, `OPEN-${layout}`);
+      const before = { type: "message", id: `before-${layout}`, parentId: opening.id, timestamp: "now", message: { role: "toolResult", toolCallId: "before", toolName: "edge", content: `BEFORE-${"b".repeat(8_500 * 1024)}`, isError: false } };
+      const hiddenBefore = { type: "custom", id: `hidden-before-${layout}`, parentId: layout & 8 ? before.id : opening.id, timestamp: "now", customType: "internal", data: { padding: "h".repeat(3 * 1024 * 1024) } };
+      const userParent = layout & 1 ? hiddenBefore.id : layout & 8 ? before.id : opening.id;
+      const user = message(`user-${layout}`, userParent, `USER-${layout}-${"u".repeat(layout & 2 ? 5 * 1024 * 1024 : 64 * 1024)}`);
+      const compact = { type: "compaction", id: `compact-${layout}`, parentId: user.id, timestamp: "now", summary: `COMPACT-${layout}`, firstKeptEntryId: user.id, tokensBefore: 10 };
+      const assistantParent = layout & 16 ? compact.id : user.id;
+      const assistant = { type: "message", id: `assistant-${layout}`, parentId: assistantParent, timestamp: "now", message: { role: "assistant", content: Array.from({ length: layout & 4 ? 4_096 : 3 }, (_, index) => ({ type: "text", text: `PART-${layout}-${index}` })) } };
+      const hiddenAfter = { type: "custom", id: `hidden-after-${layout}`, parentId: assistant.id, timestamp: "now", customType: "internal", data: { padding: "z".repeat(3 * 1024 * 1024) } };
+      const customParent = layout & 32 ? hiddenAfter.id : assistant.id;
+      const custom = { type: "custom_message", id: `custom-${layout}`, parentId: customParent, timestamp: "now", customType: "shown", display: true, content: `CUSTOM-${layout}` };
+      const finalParent = layout & 64 ? custom.id : customParent;
+      const finalTool = { type: "message", id: `final-${layout}`, parentId: finalParent, timestamp: "now", message: { role: "toolResult", toolCallId: "final", toolName: "edge", content: `FINAL-${"f".repeat(8_500 * 1024)}`, isError: false } };
+      const entries: unknown[] = [opening];
+      if (layout & 8) entries.push(before);
+      if (layout & 1) entries.push(hiddenBefore);
+      entries.push(user);
+      if (layout & 16) entries.push(compact);
+      entries.push(assistant);
+      if (layout & 32) entries.push(hiddenAfter);
+      if (layout & 128) entries.push(custom);
+      if (layout & 64) entries.push(finalTool);
+      writeFileSync(f.sessionFile, line(header(f.target)) + entries.map(line).join(""));
+      const target = { ...f.target, sessionStartLine: 2, sessionEndLine: entries.length + 1 };
+      const collect = async (asyncMode: boolean, direction: "forward" | "backward") => {
+        const pages: WorkerSessionViewSnapshot[] = []; let request: WorkerSessionPageRequest = direction === "forward" ? { mode: "first" } : { mode: "tail" };
+        for (let step = 0; step < 32; step += 1) {
+          const page: WorkerSessionViewSnapshot = asyncMode ? await loadWorkerSessionViewSnapshotAsync(target, request) : loadWorkerSessionViewSnapshot(target, {}, request);
+          assert.ok(page.blocks.length > 0, `layout ${layout} ${direction} ${asyncMode} empty page`);
+          assert.equal(page.previousVisibleEntries + page.totalActiveEntries + page.nextVisibleEntries, page.totalVisibleEntries);
+          pages.push(page);
+          if (direction === "forward") {
+            if (!page.hasNextPage) break;
+            request = { mode: "after", line: page.pageEndLine, ...(page.hasNextBlocksInEntry ? { block: page.pageEndBlock } : {}) };
+          } else {
+            if (!page.hasPreviousPage) break;
+            request = { mode: "before", line: page.pageStartLine, ...(page.hasPreviousBlocksInEntry ? { block: page.pageStartBlock } : {}) };
+          }
+          if (step === 31) assert.fail(`layout ${layout} did not terminate`);
+        }
+        if (direction === "backward") pages.reverse();
+        return { blocks: pages.flatMap((page) => page.blocks.map((block) => `${block.kind}:${block.text}`)), notices: pages.reduce((total, page) => total + page.skippedOversizedEntries, 0), visible: pages[0]!.totalVisibleEntries };
+      };
+      const forward = await collect(false, "forward");
+      const backward = await collect(false, "backward");
+      const asyncForward = await collect(true, "forward");
+      const asyncBackward = await collect(true, "backward");
+      assert.deepEqual(backward.blocks, forward.blocks, `layout ${layout} sync order`);
+      assert.deepEqual(asyncForward.blocks, forward.blocks, `layout ${layout} async forward order`);
+      assert.deepEqual(asyncBackward.blocks, forward.blocks, `layout ${layout} async backward order`);
+      const expectedNotices = (layout & 8 && !(layout & 16) ? 1 : 0) + (layout & 64 ? 1 : 0);
+      for (const value of [forward, backward, asyncForward, asyncBackward]) { assert.equal(value.notices, expectedNotices, `layout ${layout} notices`); assert.ok(value.visible > 0); }
+    }
+  } finally { f.close(); }
+});
+
+test("forward terminal and all-undisplayable tail pages retain indexed oversized notices", async () => {
+  const terminal = fixture();
+  try {
+    const shown = message("shown", null, `SHOWN-${"s".repeat(5 * 1024 * 1024)}`);
+    const hidden = { type: "custom", id: "hidden", parentId: "shown", timestamp: "now", customType: "internal", data: { padding: "h".repeat(3 * 1024 * 1024) } };
+    const tool = { type: "message", id: "tool", parentId: "hidden", timestamp: "now", message: { role: "toolResult", toolCallId: "call", toolName: "edge", content: `TOOL-${"t".repeat(8_500 * 1024)}`, isError: false } };
+    const entries = [shown, hidden, tool]; writeFileSync(terminal.sessionFile, line(header(terminal.target)) + entries.map(line).join(""));
+    const target = { ...terminal.target, sessionStartLine: 2, sessionEndLine: 4 };
+    for (const page of [loadWorkerSessionViewSnapshot(target, {}, { mode: "first" }), await loadWorkerSessionViewSnapshotAsync(target, { mode: "first" })]) {
+      assert.equal(page.blocks.length, 1); assert.match(page.blocks[0]?.text ?? "", /^SHOWN-/); assert.equal(page.skippedOversizedEntries, 1); assert.equal(page.hasNextPage, false);
+    }
+  } finally { terminal.close(); }
+
+  const undisplayable = fixture();
+  try {
+    const before = { type: "custom", id: "before", parentId: null, timestamp: "now", customType: "internal", data: { padding: "b".repeat(3 * 1024 * 1024) } };
+    const tool = { type: "message", id: "tool", parentId: "before", timestamp: "now", message: { role: "toolResult", toolCallId: "call", toolName: "edge", content: `TOOL-${"t".repeat(8_500 * 1024)}`, isError: false } };
+    const after = { type: "custom", id: "after", parentId: "tool", timestamp: "now", customType: "internal", data: { hidden: true } };
+    const entries = [before, tool, after]; writeFileSync(undisplayable.sessionFile, line(header(undisplayable.target)) + entries.map(line).join(""));
+    const target = { ...undisplayable.target, sessionStartLine: 2, sessionEndLine: 4 };
+    for (const page of [loadWorkerSessionViewSnapshot(target), await loadWorkerSessionViewSnapshotAsync(target)]) {
+      assert.equal(page.blocks.length, 0); assert.equal(page.totalVisibleEntries, 0); assert.equal(page.skippedOversizedEntries, 1); assert.equal(page.hasPreviousPage, false); assert.equal(page.hasNextPage, false);
+    }
+  } finally { undisplayable.close(); }
+});
+
+test("async fixed-end indexing consumes a final newline beyond the first index chunk", async () => {
+  const f = fixture();
+  try {
+    const entry = message("final", null, "");
+    const empty = Buffer.byteLength(JSON.stringify(entry));
+    const headerBytes = Buffer.byteLength(line(header(f.target)));
+    entry.message.content = "F".repeat(1024 * 1024 + 128 - headerBytes - empty - 1);
+    const encoded = line(entry); writeFileSync(f.sessionFile, line(header(f.target)) + encoded);
+    assert.equal(Buffer.byteLength(line(header(f.target)) + encoded), 1024 * 1024 + 128);
+    const page = await loadWorkerSessionViewSnapshotAsync({ ...f.target, sessionStartLine: 2, sessionEndLine: 2 });
+    assert.equal(page.blocks.length, 1); assert.equal(page.incompleteTrailingEntry, false); assert.match(page.blocks[0]?.text ?? "", /^F+/);
   } finally { f.close(); }
 });
 
@@ -909,6 +1009,40 @@ test("backward fallback counts indexed oversized records before but not after it
       assert.equal(first.blocks.length, 2_048); assert.equal(first.blocks[0]?.text, "PART-0"); assert.equal(first.skippedOversizedEntries, 1); assert.equal(first.hasPreviousPage, false);
     }
   } finally { f.close(); }
+});
+
+test("backward notices include indexed oversized records before the 512-line fallback window", async () => {
+  const f = fixture();
+  try {
+    const first = message("huge-1", null, `HUGE-1-${"x".repeat(9 * 1024 * 1024)}`);
+    const second = message("huge-2", "huge-1", `HUGE-2-${"y".repeat(9 * 1024 * 1024)}`);
+    const hidden = Array.from({ length: 518 }, (_, index) => ({ type: "custom", id: `hidden-${index}`, parentId: index === 0 ? "huge-2" : `hidden-${index - 1}`, timestamp: "now", customType: "internal", data: { hidden: true } }));
+    const shown = message("shown", "hidden-517", "SHOWN");
+    const entries: unknown[] = [first, second, ...hidden, shown]; writeFileSync(f.sessionFile, line(header(f.target)) + entries.map(line).join(""));
+    const target = { ...f.target, sessionStartLine: 2, sessionEndLine: entries.length + 1 };
+    for (const page of [loadWorkerSessionViewSnapshot(target), await loadWorkerSessionViewSnapshotAsync(target)]) {
+      assert.deepEqual(page.blocks.map((block) => block.text), ["SHOWN"]); assert.equal(page.skippedOversizedEntries, 2); assert.equal(page.hasPreviousPage, false);
+    }
+  } finally { f.close(); }
+});
+
+test("async fallback parses exactly 512 KiB but not a byte-skipped region one byte larger", async () => {
+  for (const delta of [0, 1]) {
+    const f = fixture();
+    try {
+      const display = line(message("display", null, "FIRST"));
+      const malformedBytes = 512 * 1024 + delta - Buffer.byteLength(display);
+      const malformed = `{${"m".repeat(malformedBytes - 2)}\n`;
+      assert.equal(Buffer.byteLength(display + malformed), 512 * 1024 + delta);
+      const hidden = Array.from({ length: 8 }, (_, index) => line({ type: "custom", id: `hidden-${index}`, parentId: index === 0 ? "display" : `hidden-${index - 1}`, timestamp: "now", customType: "internal", data: { padding: "h".repeat(850 * 1024) } }));
+      writeFileSync(f.sessionFile, line(header(f.target)) + display + malformed + hidden.join(""));
+      const target = { ...f.target, sessionStartLine: 2, sessionEndLine: hidden.length + 3 };
+      const page = await loadWorkerSessionViewSnapshotAsync(target);
+      assert.deepEqual(page.blocks.map((block) => block.text), ["FIRST"]);
+      assert.equal(page.malformedEntries, delta === 0 ? 1 : 0);
+      assert.equal(page.hasPreviousPage, false); assert.equal(page.hasNextPage, false);
+    } finally { f.close(); }
+  }
 });
 
 test("backward fallback derives oversized notices across an over-8-MiB nondisplayed gap", () => {
