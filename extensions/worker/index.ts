@@ -1488,7 +1488,21 @@ function workerControlCallLabel(input: unknown): string {
   catch { return "worker control"; }
 }
 function publicPreparedSet(set: any) { return { preparedId: set.preparedId, status: set.status, order: set.order, repositories: set.repositories.map((item: any) => ({ id: item.id, candidateRepo: item.candidateRepo, candidateCommit: item.candidateCommit, targetRepo: item.targetRepo, targetRef: item.targetRef, method: item.method, status: item.status, expectedCommit: item.expectedCommit, ...(item.desiredCommit ? { desiredCommit: item.desiredCommit } : {}), preparedPath: item.preparedPath, overlapCount: item.overlapCount, dependsOn: item.dependsOn, ...(item.source ? { source: item.source } : {}), ...(item.warnings ? { warnings: item.warnings } : {}) })), ...(set.resolutionCases ? { resolutionCases: set.resolutionCases } : {}) }; }
-function sessionDeliveryIds(context: ExtensionContext): string[] { const ids = new Set<string>(); const visit = (value: unknown): void => { if (!value || typeof value !== "object") return; const record = value as Record<string, unknown>; if (typeof record.deliveryId === "string" && record.deliveryId.startsWith("worker-run:")) ids.add(record.deliveryId); for (const child of Object.values(record)) Array.isArray(child) ? child.forEach(visit) : visit(child); }; try { for (const entry of context.sessionManager.getEntries()) visit(entry); } catch {} return [...ids]; }
+function sessionDeliveryIds(context: ExtensionContext): string[] {
+  const ids = new Set<string>();
+  try {
+    for (const entry of context.sessionManager.getEntries()) {
+      if (entry.type !== "custom_message" || entry.customType !== "worker-run") continue;
+      const details = entry.details;
+      if (!details || typeof details !== "object") continue;
+      const record = details as Record<string, unknown>;
+      if (record.event !== "worker_settled" || typeof record.workerId !== "string" || typeof record.runId !== "string" || typeof record.deliveryId !== "string") continue;
+      const exactDeliveryId = `worker-run:${record.workerId}:${record.runId}`;
+      if (record.deliveryId === exactDeliveryId) ids.add(exactDeliveryId);
+    }
+  } catch {}
+  return [...ids];
+}
 function deliverPendingCompletions(api: ExtensionAPI, registry: WorkerRegistry, parent: string, generation: number): void {
   for (const delivery of pendingWorkerDeliveries(registry, parent)) {
     if (!claimWorkerDelivery(registry, delivery.deliveryId, parent, generation)) continue;

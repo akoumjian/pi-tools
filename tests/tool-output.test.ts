@@ -246,6 +246,25 @@ test("worker_control publishes strict bounded notification shapes for list and g
   };
   assert.equal(Check(RetainedToolOutputSchemas.worker_control, exactGet), true, "get accepts exact delivered notification evidence");
 
+  const getBase = {
+    workerId: "worker_20260910190000_12345678", role: "work", runId: "run_20260910190000_87654321", taskIds: ["personal-test"],
+    modelSelection: "openai-codex/gpt-test:xhigh", createdAt: "2026-09-10T19:00:00.000Z", sessionRange: {}, workspaceRoot: "/workspace"
+  };
+  const queuedGet = { content: [text("queued")], details: { ...getBase, status: "queued" } };
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, queuedGet), true, "queued pre-launch get may omit host job and log evidence");
+  const launchFailedGet = { content: [text("launch failed")], details: { ...getBase, status: "settled", settledAt: "2026-09-10T19:00:01.000Z", outcome: "failed", outcomeSource: "system", repositories: [], artifacts: [], errors: [{ scope: "run", message: "failed before host launch" }] } };
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, launchFailedGet), true, "settled failure before host publication may omit host job and log evidence");
+  const runningGet = { content: [text("running")], details: { ...getBase, status: "running", startedAt: "2026-09-10T19:00:00.500Z", jobId: "job_test", stdoutLog: "/tmp/stdout.log", stderrLog: "/tmp/stderr.log" } };
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, runningGet), true, "launched running get requires complete host evidence");
+  const malformedQueued: any = structuredClone(queuedGet); malformedQueued.details.hostPid = 123;
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, malformedQueued), false, "queued get rejects unknown lifecycle extras");
+  const incompleteRunning: any = structuredClone(runningGet); delete incompleteRunning.details.stderrLog;
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, incompleteRunning), false, "launched running get rejects partial host evidence");
+  const launchedSettledWithoutLogs: any = structuredClone(exactGet); delete launchedSettledWithoutLogs.details.stderrLog;
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, launchedSettledWithoutLogs), false, "launched settled get cannot fall back to a pre-launch shape");
+  const partialLaunchFailure: any = structuredClone(launchFailedGet); partialLaunchFailure.details.stdoutLog = "/tmp/stdout.log";
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, partialLaunchFailure), false, "pre-launch host evidence is all-or-none");
+
   const missingBoundary = structuredClone(list); delete missingBoundary.details.workers[0].notification.sendStartedAt;
   assert.equal(Check(RetainedToolOutputSchemas.worker_control, missingBoundary), false, "unconfirmed state requires its persisted send boundary");
   const missingGeneration = structuredClone(list); delete missingGeneration.details.workers[0].notification.runtimeGeneration;

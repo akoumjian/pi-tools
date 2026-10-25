@@ -745,8 +745,16 @@ test("agent_end acknowledges exact same-session completion history without repla
     const before = db.database.prepare("SELECT state,send_started_at FROM deliveries WHERE run_id=?").get(started.runId) as { state: string; send_started_at: string | null };
     assert.equal(before.state, "claimed"); assert.ok(before.send_started_at); db.close();
 
-    f.session.appendCustomMessageEntry("worker-run", JSON.stringify({ event: "worker_settled", workerId: started.workerId, runId: started.runId }), true, { deliveryId });
+    f.session.appendCustomMessageEntry("model-tool-arguments", "untrusted nested tool call", false, { toolCall: { name: "fixture_tool", arguments: { deliveryId } } });
+    f.session.appendCustomMessageEntry("other-extension", "nested argument", false, { event: "worker_settled", workerId: started.workerId, runId: started.runId, deliveryId });
+    f.session.appendCustomMessageEntry("worker-run", "wrong event", true, { event: "worker_progress", workerId: started.workerId, runId: started.runId, deliveryId });
+    f.session.appendCustomMessageEntry("worker-run", "wrong exact ID", true, { event: "worker_settled", workerId: started.workerId, runId: started.runId, deliveryId: `${deliveryId}-other` });
     const sendAttempts = f.messageAttempts.length;
+    await f.event("agent_end");
+    db = f.registry(); assert.equal((db.database.prepare("SELECT state FROM deliveries WHERE run_id=?").get(started.runId) as { state: string }).state, "claimed", "nested model/tool arguments and non-exact custom entries are never receipt evidence"); db.close();
+    assert.equal(f.messageAttempts.length, sendAttempts, "rejected receipt lookalikes cannot send or steer");
+
+    f.session.appendCustomMessageEntry("worker-run", JSON.stringify({ event: "worker_settled", workerId: started.workerId, runId: started.runId }), true, { event: "worker_settled", workerId: started.workerId, runId: started.runId, deliveryId });
     await f.event("agent_end");
 
     db = f.registry();
