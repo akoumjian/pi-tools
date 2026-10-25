@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { assertTrustedGitPolicy, runTrustedGit, trustedGit } from "../extensions/worker/trusted-git.js";
 import { inputMounts, validateAdditionalInputs } from "../extensions/worker/inputs.js";
-import { inspectInterruptedGitState, inventoryWorkerRepositories } from "../extensions/worker/inventory.js";
+import { inspectInterruptedGitState, inventoryWorkerRepositories, snapshotWorkerRepositories } from "../extensions/worker/inventory.js";
 
 function repository(root: string): string { const repo = path.join(root, "repo"); execFileSync("git", ["init", "-q", "-b", "main", repo]); execFileSync("git", ["-C", repo, "config", "user.name", "Test"]); execFileSync("git", ["-C", repo, "config", "user.email", "test@example.invalid"]); writeFileSync(path.join(repo, "file.txt"), "one\n"); execFileSync("git", ["-C", repo, "add", "."]); execFileSync("git", ["-C", repo, "commit", "-qm", "one"]); return repo; }
 
@@ -67,5 +67,109 @@ test("inventory retains structured repository policy failures and interrupted-st
     assert.equal(inventory.repositories.length, 1); assert.equal(inventory.repositories[0]!.path, "repos/parent/repo"); assert.equal(inventory.repositories[0]!.eligible, false); assert.match(inventory.repositories[0]!.issues?.join(" ") ?? "", /policy validation failed.*(?:gitlinks|submodule)|(?:gitlinks|submodule).*policy validation failed/i);
     assert.doesNotMatch(inventory.errors.join(" "), /not found by independent workspace scan/);
     assert.match(inspectInterruptedGitState(workspace).join(" "), /repos\/parent\/repo: Repository policy validation failed/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+
+test("inventory fails closed when repository HEAD changes during inspection and sanitizes remote controls", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-inventory-race-"));
+  try {
+    const workspace = path.join(root, "workspace"); mkdirSync(workspace, { recursive: true });
+    const repo = repository(workspace);
+    execFileSync("git", ["-C", repo, "remote", "add", "origin", "https://example.invalid/\u001b[31mrepo"]);
+    let changed = false;
+    const inventory = inventoryWorkerRepositories({ workspaceRoot: workspace, workerId: "worker_race", runId: "run_race", reported: ["repo"] }, {
+      afterHeadRead(repositoryPath) {
+        if (changed) return;
+        changed = true;
+        writeFileSync(path.join(repositoryPath, "raced.txt"), "race\n");
+        execFileSync("git", ["-C", repositoryPath, "add", "raced.txt"]);
+        execFileSync("git", ["-C", repositoryPath, "commit", "-qm", "race"]);
+      }
+    });
+    assert.equal(inventory.repositories.length, 1);
+    assert.equal(inventory.repositories[0]?.eligible, false);
+    assert.equal(inventory.repositories[0]?.commit, "unknown");
+    assert.match(inventory.repositories[0]?.issues?.join(" ") ?? "", /HEAD changed during inventory/);
+    assert.doesNotMatch(inventory.repositories[0]?.source ?? "", /\u001b/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+
+test("inventory scan limitations are precise and do not disqualify an independently proven repository", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-inventory-limits-"));
+  try {
+    const workspace = path.join(root, "workspace"); mkdirSync(workspace, { recursive: true });
+    const repo = repository(workspace);
+    const before = snapshotWorkerRepositories(workspace);
+    writeFileSync(path.join(repo, "changed.txt"), "changed\n"); execFileSync("git", ["-C", repo, "add", "."]); execFileSync("git", ["-C", repo, "commit", "-qm", "changed"]);
+    const cache = path.join(workspace, "cache", "npm", "_cacache"); mkdirSync(cache, { recursive: true });
+    const bulk = path.join(workspace, "bulk"); mkdirSync(bulk); for (let index = 0; index < 8; index += 1) mkdirSync(path.join(bulk, `entry-${index}`));
+    const inventory = inventoryWorkerRepositories({ workspaceRoot: workspace, workerId: "worker_limits", runId: "run_limits", reported: ["repo"], before }, { scanLimits: { maxDirectories: 4, maxDirectoryEntries: 3, maxDepth: 2 } });
+    assert.equal(inventory.repositories.find((item) => item.path === "repo")?.eligible, true);
+    assert.match(inventory.errors.join(" "), /directory bulk after 3 entries|subtree bulk\//);
+    assert.doesNotMatch(inventory.repositories.find((item) => item.path === "repo")?.issues?.join(" ") ?? "", /scan was incomplete/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("inventory bounds its traversal queue while preserving an already scheduled reported repository", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-inventory-queue-"));
+  try {
+    const workspace = path.join(root, "workspace"); mkdirSync(workspace, { recursive: true });
+    const repo = repository(workspace); const before = snapshotWorkerRepositories(workspace);
+    writeFileSync(path.join(repo, "changed.txt"), "changed\n"); execFileSync("git", ["-C", repo, "add", "."]); execFileSync("git", ["-C", repo, "commit", "-qm", "changed"]);
+    const wide = path.join(workspace, "wide"); mkdirSync(wide); for (let index = 0; index < 12; index += 1) mkdirSync(path.join(wide, `child-${String(index).padStart(2, "0")}`));
+    const inventory = inventoryWorkerRepositories({ workspaceRoot: workspace, workerId: "worker_queue", runId: "run_queue", reported: ["repo"], before }, { scanLimits: { maxDirectories: 3, maxDirectoryEntries: 32, maxDepth: 4 } });
+    assert.equal(inventory.repositories.find((item) => item.path === "repo")?.eligible, true);
+    assert.match(inventory.errors.join(" "), /broad subtree wide after scheduling 3 directories/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+
+test("inventory reports the precise subtree skipped by its depth bound without poisoning a proven candidate", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-inventory-depth-"));
+  try {
+    const workspace = path.join(root, "workspace"); mkdirSync(workspace, { recursive: true });
+    const repo = repository(workspace); const before = snapshotWorkerRepositories(workspace);
+    writeFileSync(path.join(repo, "changed.txt"), "changed\n"); execFileSync("git", ["-C", repo, "add", "."]); execFileSync("git", ["-C", repo, "commit", "-qm", "changed"]);
+    mkdirSync(path.join(workspace, "deep", "level-one", "level-two"), { recursive: true });
+    const inventory = inventoryWorkerRepositories({ workspaceRoot: workspace, workerId: "worker_depth", runId: "run_depth", reported: ["repo"], before }, { scanLimits: { maxDirectories: 16, maxDirectoryEntries: 32, maxDepth: 1 } });
+    assert.equal(inventory.repositories.find((item) => item.path === "repo")?.eligible, true);
+    assert.match(inventory.errors.join(" "), /deep\/level-one below depth 1/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("inventory matches symlink aliases by physical identity and sanitizes hostile repository paths", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-inventory-alias-"));
+  try {
+    const workspace = path.join(root, "workspace"); mkdirSync(workspace, { recursive: true });
+    const actualRoot = path.join(workspace, "actual"); const repo = repository(actualRoot); const alias = path.join(workspace, "alias"); symlinkSync(actualRoot, alias, "dir");
+    let inventory = inventoryWorkerRepositories({ workspaceRoot: workspace, workerId: "worker_alias", runId: "run_alias", reported: ["alias/repo"] });
+    assert.equal(inventory.repositories[0]?.reported, true); assert.equal(inventory.repositories[0]?.path, "actual/repo");
+
+    const hostileRoot = path.join(workspace, "hostile"); mkdirSync(hostileRoot); const hostile = repository(path.join(hostileRoot, "evil\u001b[31m"));
+    const relative = path.relative(workspace, hostile);
+    inventory = inventoryWorkerRepositories({ workspaceRoot: workspace, workerId: "worker_hostile", runId: "run_hostile", reported: [relative] });
+    const candidate = inventory.repositories.find((item) => item.path.includes("hostile"))!;
+    assert.equal(candidate.eligible, false); assert.doesNotMatch(candidate.path, /\u001b/); assert.match(candidate.issues?.join(" ") ?? "", /terminal-control/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+
+test("inventory protects repos priority and names broad artifact and HOME tool-cache limits", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-inventory-priority-"));
+  try {
+    const workspace = path.join(root, "workspace"); mkdirSync(workspace, { recursive: true });
+    const repo = repository(path.join(workspace, "repos", "a")); const relative = path.relative(workspace, repo);
+    const before = snapshotWorkerRepositories(workspace);
+    writeFileSync(path.join(repo, "changed.txt"), "changed\n"); execFileSync("git", ["-C", repo, "add", "."]); execFileSync("git", ["-C", repo, "commit", "-qm", "changed"]);
+    const artifacts = path.join(workspace, "artifacts"); mkdirSync(artifacts); for (let index = 0; index < 40; index += 1) mkdirSync(path.join(artifacts, `wide-${index}`));
+    mkdirSync(path.join(workspace, ".cargo", "registry", "src", "deep", "crate"), { recursive: true });
+    mkdirSync(path.join(workspace, "scratch", ".venv", "lib", "python", "site-packages", "pkg"), { recursive: true });
+    const inventory = inventoryWorkerRepositories({ workspaceRoot: workspace, workerId: "worker_priority", runId: "run_priority", reported: [relative], before }, { scanLimits: { maxDirectories: 8, maxDirectoryEntries: 128, maxDepth: 3 } });
+    assert.equal(inventory.repositories.find((item) => item.path === relative.split(path.sep).join("/"))?.eligible, true);
+    assert.match(inventory.errors.join(" "), /tool-cache subtree \.cargo\/registry/);
+    assert.match(inventory.errors.join(" "), /broad subtree artifacts/);
+    assert.match(inventory.errors.join(" "), /broad subtree artifacts after scheduling 8 directories/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

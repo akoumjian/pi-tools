@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { closeSync, ftruncateSync, openSync, writeSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -86,5 +87,22 @@ test("exact worker session verification rejects wrong session, cwd, and parent",
     assert.throws(() => verifyWorkerSession({ ...forked, sessionId: "wrong" }), /session id mismatch/);
     assert.throws(() => verifyWorkerSession({ ...forked, workspaceRoot: otherWorkspace }), /session cwd mismatch/);
     assert.throws(() => verifyWorkerSession({ ...forked, parentSessionFile: otherParent }), /session parent mismatch/);
+  });
+});
+
+
+test("retained worker session verification remains bounded beyond Node's maximum string length", async () => {
+  await withTempDir(async (directory) => {
+    const workspace = path.join(directory, "workspace"); await mkdir(workspace);
+    const parent = path.join(directory, "parent.jsonl");
+    await writeFile(parent, `${JSON.stringify({ type: "session", version: 3, id: "parent-large", timestamp: new Date().toISOString(), cwd: directory })}\n`);
+    const sessionFile = path.join(directory, "worker-large.jsonl");
+    const sessionId = "worker-large";
+    const header = Buffer.from(`${JSON.stringify({ type: "session", version: 3, id: sessionId, timestamp: new Date().toISOString(), cwd: await realpath(workspace), parentSession: await realpath(parent) })}\n`);
+    const fd = openSync(sessionFile, "w+");
+    try { writeSync(fd, header, 0, header.length, 0); ftruncateSync(fd, 513 * 1024 * 1024); }
+    finally { closeSync(fd); }
+    const verified = verifyWorkerSession({ sessionFile, sessionId, workspaceRoot: workspace, parentSessionFile: parent });
+    assert.equal(verified.sessionId, sessionId); assert.equal(verified.entries.length, 1); assert.equal(verified.entries[0]!.type, "session");
   });
 });
