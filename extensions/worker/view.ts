@@ -11,6 +11,7 @@ const MAX_SESSION_PAGE_BLOCKS = 2_048;
 const OVERSIZED_ENTRY_PREFIX_BYTES = 16 * 1024;
 const MAX_SESSION_HEADER_BYTES = 64 * 1024;
 const SESSION_READ_CHUNK = 1024 * 1024;
+const SESSION_PAGE_READ_CHUNK = 512 * 1024;
 const INITIAL_LINE_INDEX_STRIDE = 1;
 const MAX_LINE_INDEX_CHECKPOINTS = 65_536;
 const MAX_LINE_INDEX_FILES = 16;
@@ -600,35 +601,42 @@ function selectVisiblePage(fd: number, snapshotSize: number, index: SessionLineI
   const includeCursorLine = cursorBoundaryNeedsEntry(fd, snapshotSize, index, request);
   const selectableEndLine = visibility.incompleteLine === runEndLine ? runEndLine - 1 : runEndLine;
   const bounds = visiblePageBounds(request, runStartLine, selectableEndLine, visibility, includeCursorLine);
-  let page = readVisiblePage(fd, snapshotSize, index, bounds, request.mode === "tail" || request.mode === "before");
+  const keepTail = request.mode === "tail" || request.mode === "before";
+  let page = readVisiblePage(fd, snapshotSize, index, bounds, keepTail);
   if (visibility.incompleteLine !== undefined) {
     page.lines = page.lines.filter((item) => item.lineNumber !== visibility.incompleteLine);
     page.oversizedEntryPrefixes = page.oversizedEntryPrefixes.filter((item) => item.lineNumber !== visibility.incompleteLine);
   }
-  const totalVisibleEntries = visibleRenderableCountLessThan(fd, snapshotSize, index, runEndLine + 1, runEndLine, visibility);
-  let previousVisibleEntries = visibleRenderableCountLessThan(fd, snapshotSize, index, page.pageStartLine, runEndLine, visibility);
-  let throughEnd = visibleRenderableCountLessThan(fd, snapshotSize, index, page.pageEndLine + 1, runEndLine, visibility);
+  const renderableCounts = new Map<number, number>();
+  const totalVisibleEntries = visibleRenderableCountLessThan(fd, snapshotSize, index, runEndLine + 1, runEndLine, visibility, renderableCounts);
+  let previousVisibleEntries = visibleRenderableCountLessThan(fd, snapshotSize, index, page.pageStartLine, runEndLine, visibility, renderableCounts);
+  let throughEnd = visibleRenderableCountLessThan(fd, snapshotSize, index, page.pageEndLine + 1, runEndLine, visibility, renderableCounts);
   const requestedWindowExists = bounds.endLine >= bounds.startLine || bounds.openingLine !== undefined;
   if (requestedWindowExists && throughEnd === previousVisibleEntries && totalVisibleEntries > 0) {
-    const keepTail = request.mode === "tail" || request.mode === "before";
     const display = keepTail
-      ? previousVisibleRenderableLine(fd, snapshotSize, index, page.pageStartLine - 1, selectableEndLine, visibility)
-      : nextVisibleRenderableLine(fd, snapshotSize, index, page.pageEndLine + 1, selectableEndLine, visibility);
+      ? previousVisibleRenderableLine(fd, snapshotSize, index, page.pageStartLine - 1, selectableEndLine, visibility, renderableCounts)
+      : nextVisibleRenderableLine(fd, snapshotSize, index, page.pageEndLine + 1, selectableEndLine, visibility, renderableCounts);
     if (display?.line !== undefined) {
-      const skippedOversizedEntries = page.skippedOversizedEntries + display.skippedOversizedEntries;
+      const skippedOversizedEntries = page.skippedOversizedEntries + (keepTail ? 0 : display.skippedOversizedEntries);
       const oversizedEntryPrefixes = page.oversizedEntryPrefixes;
+      const nondisplayedLines = page.lines;
       const incompleteTrailingEntry = page.incompleteTrailingEntry;
       const droppedLeadingEntries = page.droppedLeadingEntries;
-      page = readVisiblePage(fd, snapshotSize, index, { startLine: display.line, endLine: display.line }, false);
+      const displayEndLine = keepTail ? Math.max(display.line, page.pageStartLine - 1) : display.line;
+      page = readVisiblePage(fd, snapshotSize, index, { startLine: display.line, endLine: displayEndLine }, false);
       page.skippedOversizedEntries += skippedOversizedEntries;
+      page.lines = [...nondisplayedLines, ...page.lines].sort((left, right) => left.lineNumber - right.lineNumber);
       page.oversizedEntryPrefixes = [...oversizedEntryPrefixes, ...page.oversizedEntryPrefixes];
       page.incompleteTrailingEntry ||= incompleteTrailingEntry;
       page.droppedLeadingEntries += droppedLeadingEntries;
-      previousVisibleEntries = visibleRenderableCountLessThan(fd, snapshotSize, index, page.pageStartLine, runEndLine, visibility);
-      throughEnd = visibleRenderableCountLessThan(fd, snapshotSize, index, page.pageEndLine + 1, runEndLine, visibility);
+      previousVisibleEntries = visibleRenderableCountLessThan(fd, snapshotSize, index, page.pageStartLine, runEndLine, visibility, renderableCounts);
+      throughEnd = visibleRenderableCountLessThan(fd, snapshotSize, index, page.pageEndLine + 1, runEndLine, visibility, renderableCounts);
     }
   }
   const nextVisibleEntries = Math.max(0, totalVisibleEntries - throughEnd);
+  if (keepTail && previousVisibleEntries === 0 && page.pageStartLine > bounds.startLine) {
+    page.skippedOversizedEntries += oversizedLineCount(fd, snapshotSize, index, visibility, bounds.startLine, page.pageStartLine - 1);
+  }
   return { headerLine, ...page, runStartLine, runEndLine, incompleteTrailingEntry: page.incompleteTrailingEntry || visibility.incompleteTrailingEntry, hasPreviousPage: previousVisibleEntries > 0, hasNextPage: nextVisibleEntries > 0, hiddenCompactedEntries: visibility.hiddenEntries, compactionCount: visibility.compactionCount, previousVisibleEntries, nextVisibleEntries, totalVisibleEntries };
 }
 
@@ -697,33 +705,38 @@ function visibleCountLessThanOrEqual(line: number, runEndLine: number, visibilit
   return visibleCountLessThan(line + 1, runEndLine, visibility);
 }
 
-function visibleRenderableCountLessThan(fd: number, snapshotSize: number, index: SessionLineIndex, line: number, runEndLine: number, visibility: RunVisibility): number {
+function visibleRenderableCountLessThan(fd: number, snapshotSize: number, index: SessionLineIndex, line: number, runEndLine: number, visibility: RunVisibility, memo?: Map<number, number>): number {
   const opening = visibility.openingLine !== undefined && visibility.openingLine < visibility.keptLine && visibility.openingRenderable && visibility.openingLine < line ? 1 : 0;
   const rangeEnd = Math.min(runEndLine, line - 1);
   if (rangeEnd < visibility.keptLine) return opening;
-  const throughEnd = renderableCountThrough(fd, snapshotSize, index, visibility, rangeEnd);
+  const throughEnd = renderableCountThrough(fd, snapshotSize, index, visibility, rangeEnd, memo);
   return opening + Math.max(0, throughEnd - visibility.renderedBeforeKept);
 }
 
-function renderableCountThrough(fd: number, snapshotSize: number, index: SessionLineIndex, visibility: RunVisibility, line: number): number {
+function renderableCountThrough(fd: number, snapshotSize: number, index: SessionLineIndex, visibility: RunVisibility, line: number, memo?: Map<number, number>): number {
   if (visibility.incompleteLine !== undefined) line = Math.min(line, visibility.incompleteLine - 1);
+  const cached = memo?.get(line);
+  if (cached !== undefined) return cached;
   let checkpoint = visibility.renderableCheckpoints[0]!;
   for (const candidate of visibility.renderableCheckpoints) {
     if (candidate.line > line) break;
     checkpoint = candidate;
   }
-  if (line <= checkpoint.line) return checkpoint.count;
-  let count = checkpoint.count;
-  scanRunEntries(fd, snapshotSize, index, checkpoint.line + 1, line, (entry) => { if (isRenderableSessionEntry(entry)) count += 1; });
+  let checkpointLine = checkpoint.line; let count = checkpoint.count;
+  if (memo) for (const [candidateLine, candidateCount] of memo) {
+    if (candidateLine <= line && candidateLine > checkpointLine) { checkpointLine = candidateLine; count = candidateCount; }
+  }
+  if (line > checkpointLine) scanRunEntries(fd, snapshotSize, index, checkpointLine + 1, line, (entry) => { if (isRenderableSessionEntry(entry)) count += 1; });
+  memo?.set(line, count);
   return count;
 }
 
 type RenderableLineSearch = { line?: number; skippedOversizedEntries: number };
 
-function firstRenderableLineInRange(fd: number, snapshotSize: number, index: SessionLineIndex, startLine: number, endLine: number, visibility: RunVisibility): RenderableLineSearch {
+function firstRenderableLineInRange(fd: number, snapshotSize: number, index: SessionLineIndex, startLine: number, endLine: number, visibility: RunVisibility, memo?: Map<number, number>): RenderableLineSearch {
   if (endLine < startLine) return { skippedOversizedEntries: 0 };
-  const before = renderableCountThrough(fd, snapshotSize, index, visibility, startLine - 1);
-  const containsRenderable = renderableCountThrough(fd, snapshotSize, index, visibility, endLine) > before;
+  const before = renderableCountThrough(fd, snapshotSize, index, visibility, startLine - 1, memo);
+  const containsRenderable = renderableCountThrough(fd, snapshotSize, index, visibility, endLine, memo) > before;
   let scanStart = startLine;
   let scanEnd = endLine;
   if (containsRenderable) {
@@ -739,10 +752,10 @@ function firstRenderableLineInRange(fd: number, snapshotSize: number, index: Ses
   return { line, skippedOversizedEntries: oversizedLineCount(fd, snapshotSize, index, visibility, startLine, (line ?? startLine) - 1) };
 }
 
-function lastRenderableLineInRange(fd: number, snapshotSize: number, index: SessionLineIndex, startLine: number, endLine: number, visibility: RunVisibility): RenderableLineSearch {
+function lastRenderableLineInRange(fd: number, snapshotSize: number, index: SessionLineIndex, startLine: number, endLine: number, visibility: RunVisibility, memo?: Map<number, number>): RenderableLineSearch {
   if (endLine < startLine) return { skippedOversizedEntries: 0 };
-  const target = renderableCountThrough(fd, snapshotSize, index, visibility, endLine);
-  const containsRenderable = target > renderableCountThrough(fd, snapshotSize, index, visibility, startLine - 1);
+  const target = renderableCountThrough(fd, snapshotSize, index, visibility, endLine, memo);
+  const containsRenderable = target > renderableCountThrough(fd, snapshotSize, index, visibility, startLine - 1, memo);
   let scanStart = startLine;
   if (containsRenderable) {
     for (const checkpoint of visibility.renderableCheckpoints) {
@@ -772,14 +785,14 @@ function oversizedCountThrough(fd: number, snapshotSize: number, index: SessionL
   return checkpoint.count + scanRunEntries(fd, snapshotSize, index, checkpoint.line + 1, line, () => {}).skippedOversizedEntries;
 }
 
-function nextVisibleRenderableLine(fd: number, snapshotSize: number, index: SessionLineIndex, startLine: number, runEndLine: number, visibility: RunVisibility): RenderableLineSearch {
+function nextVisibleRenderableLine(fd: number, snapshotSize: number, index: SessionLineIndex, startLine: number, runEndLine: number, visibility: RunVisibility, memo?: Map<number, number>): RenderableLineSearch {
   const separateOpening = visibility.openingLine !== undefined && visibility.openingLine < visibility.keptLine;
   if (separateOpening && visibility.openingRenderable && visibility.openingLine! >= startLine) return { line: visibility.openingLine, skippedOversizedEntries: 0 };
-  return firstRenderableLineInRange(fd, snapshotSize, index, Math.max(startLine, visibility.keptLine), runEndLine, visibility);
+  return firstRenderableLineInRange(fd, snapshotSize, index, Math.max(startLine, visibility.keptLine), runEndLine, visibility, memo);
 }
 
-function previousVisibleRenderableLine(fd: number, snapshotSize: number, index: SessionLineIndex, endLine: number, runEndLine: number, visibility: RunVisibility): RenderableLineSearch {
-  const search = lastRenderableLineInRange(fd, snapshotSize, index, visibility.keptLine, Math.min(endLine, runEndLine), visibility);
+function previousVisibleRenderableLine(fd: number, snapshotSize: number, index: SessionLineIndex, endLine: number, runEndLine: number, visibility: RunVisibility, memo?: Map<number, number>): RenderableLineSearch {
+  const search = lastRenderableLineInRange(fd, snapshotSize, index, visibility.keptLine, Math.min(endLine, runEndLine), visibility, memo);
   if (search.line !== undefined) return search;
   const separateOpening = visibility.openingLine !== undefined && visibility.openingLine < visibility.keptLine;
   return { ...search, ...(separateOpening && visibility.openingRenderable && visibility.openingLine! <= endLine ? { line: visibility.openingLine } : {}) };
@@ -1231,7 +1244,7 @@ function readHeaderLine(fd: number, snapshotSize: number): string {
 function readPageLines(fd: number, snapshotSize: number, index: SessionLineIndex, desiredStart: number, desiredEnd: number, keepTail: boolean, maxPageBytes = MAX_SESSION_PAGE_BYTES): ReadPageLines {
   if (desiredEnd < desiredStart) return { lines: [], oversizedEntryPrefixes: [], pageStartLine: desiredStart, pageEndLine: desiredEnd, skippedOversizedEntries: 0, incompleteTrailingEntry: false, droppedLeadingEntries: 0, decodedBytes: 0 };
   const checkpoint = nearestCheckpoint(index, desiredStart);
-  const buffer = Buffer.allocUnsafe(Math.min(SESSION_READ_CHUNK, Math.max(1, snapshotSize - checkpoint.offset)));
+  const buffer = Buffer.allocUnsafe(Math.min(SESSION_PAGE_READ_CHUNK, Math.max(1, snapshotSize - checkpoint.offset)));
   const oversizedSpans = index.checkpoints.filter((value) => value.oversizedStartOffset !== undefined && value.offset <= snapshotSize);
   let oversizedSpanIndex = oversizedSpans.findIndex((value) => value.offset > checkpoint.offset);
   if (oversizedSpanIndex < 0) oversizedSpanIndex = oversizedSpans.length;
@@ -1363,7 +1376,7 @@ function parseSessionEntriesForBlockPage(lines: Array<{ lineNumber: number; text
         if (!isSessionEntry(later)) { trailingMalformedEntries += 1; continue; }
         if (renderableBlockCount({ ...later, lineNumber: candidate.lineNumber }) > 0) { truncated = true; break; }
       }
-      if (!truncated) malformedEntries += trailingMalformedEntries;
+      if (!truncated && remainingBlocks === 0) malformedEntries += trailingMalformedEntries;
       break;
     }
   }

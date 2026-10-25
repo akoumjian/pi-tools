@@ -69,10 +69,10 @@ function assertLargeCheckpointTraversal(target: WorkerSessionViewTarget, expecte
 }
 
 
-function assertDeepCheckpointSamples(target: WorkerSessionViewTarget, expectedEntries: number): void {
+function assertDeepCheckpointSamples(target: WorkerSessionViewTarget, expectedEntries: number, payloadBytes: number): void {
   const moduleUrl = new URL("../extensions/worker/view.js", import.meta.url).href;
-  const script = `import fs from "node:fs"; import { syncBuiltinESMExports } from "node:module"; import { performance } from "node:perf_hooks"; const original = fs.readSync; let bytes = 0; fs.readSync = function(...args) { const count = original.apply(this, args); bytes += count; return count; }; syncBuiltinESMExports(); const view = await import(${JSON.stringify(moduleUrl)}); const target = JSON.parse(process.argv[1]); const expected = Number(process.argv[2]); await view.loadWorkerSessionViewSnapshotAsync(target); const positions = [0.05, 0.2, 0.4, 0.6, 0.8].map((ratio) => Math.floor(expected * ratio)); const requests = [{ request: { mode: "first" }, first: 0 }]; for (const before of positions) { requests.push({ request: { mode: "after", line: before + 1 }, first: before }); requests.push({ request: { mode: "before", line: before + 2 }, last: before - 1 }); } let maximumBytes = 0; let maximumMilliseconds = 0; let maximumStall = 0; let ticks = 0; let lastTick = performance.now(); const timer = setInterval(() => { const now = performance.now(); maximumStall = Math.max(maximumStall, now - lastTick); lastTick = now; ticks += 1; }, 1); const verify = (page, sample) => { if (page.blocks.length === 0 || page.totalVisibleEntries !== expected || page.previousVisibleEntries + page.totalActiveEntries + page.nextVisibleEntries !== expected) throw new Error("invalid sampled page"); if (sample.first !== undefined && page.blocks[0]?.text !== "ENTRY-" + sample.first + "-" + "x".repeat(96)) throw new Error("wrong sampled first block"); if (sample.last !== undefined && page.blocks.at(-1)?.text !== "ENTRY-" + sample.last + "-" + "x".repeat(96)) throw new Error("wrong sampled last block"); }; const observe = (started) => { maximumBytes = Math.max(maximumBytes, bytes); maximumMilliseconds = Math.max(maximumMilliseconds, performance.now() - started); if (bytes > 8 * 1024 * 1024) throw new Error("deep sampled page reread " + bytes + " bytes"); }; for (const sample of requests) { bytes = 0; const started = performance.now(); const page = view.loadWorkerSessionViewSnapshot(target, {}, sample.request); observe(started); verify(page, sample); await new Promise((resolve) => setImmediate(resolve)); } for (const sample of requests) { bytes = 0; const started = performance.now(); const page = await view.loadWorkerSessionViewSnapshotAsync(target, sample.request); observe(started); verify(page, sample); await new Promise((resolve) => setImmediate(resolve)); } clearInterval(timer); if (maximumMilliseconds > 2000) throw new Error("deep sampled page took " + maximumMilliseconds + "ms"); if (ticks < requests.length || maximumStall > 1000) throw new Error("deep sampled event-loop stall " + maximumStall + "ms ticks=" + ticks);`;
-  execFileSync(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(target), String(expectedEntries)], { timeout: 120_000, stdio: "pipe" });
+  const script = `import fs from "node:fs"; import { syncBuiltinESMExports } from "node:module"; import { performance } from "node:perf_hooks"; const original = fs.readSync; let bytes = 0; fs.readSync = function(...args) { const count = original.apply(this, args); bytes += count; return count; }; syncBuiltinESMExports(); const view = await import(${JSON.stringify(moduleUrl)}); const target = JSON.parse(process.argv[1]); const expected = Number(process.argv[2]); const payloadBytes = Number(process.argv[3]); await view.loadWorkerSessionViewSnapshotAsync(target); const positions = [0.05, 0.2, 0.4, 0.6, 0.8].map((ratio) => Math.floor(expected * ratio)); const requests = [{ request: { mode: "first" }, first: 0 }]; for (const before of positions) { requests.push({ request: { mode: "after", line: before + 1 }, first: before }); requests.push({ request: { mode: "before", line: before + 2 }, last: before - 1 }); } let maximumBytes = 0; let maximumMilliseconds = 0; let maximumStall = 0; let ticks = 0; let lastTick = performance.now(); const timer = setInterval(() => { const now = performance.now(); maximumStall = Math.max(maximumStall, now - lastTick); lastTick = now; ticks += 1; }, 1); const verify = (page, sample) => { if (page.blocks.length === 0 || page.totalVisibleEntries !== expected || page.previousVisibleEntries + page.totalActiveEntries + page.nextVisibleEntries !== expected) throw new Error("invalid sampled page"); if (sample.first !== undefined && page.blocks[0]?.text !== "ENTRY-" + sample.first + "-" + "x".repeat(payloadBytes)) throw new Error("wrong sampled first block"); if (sample.last !== undefined && page.blocks.at(-1)?.text !== "ENTRY-" + sample.last + "-" + "x".repeat(payloadBytes)) throw new Error("wrong sampled last block"); }; const observe = (started) => { maximumBytes = Math.max(maximumBytes, bytes); maximumMilliseconds = Math.max(maximumMilliseconds, performance.now() - started); if (bytes > 8 * 1024 * 1024) throw new Error("deep sampled page reread " + bytes + " bytes"); }; for (const sample of requests) { bytes = 0; const started = performance.now(); const page = view.loadWorkerSessionViewSnapshot(target, {}, sample.request); observe(started); verify(page, sample); await new Promise((resolve) => setImmediate(resolve)); } for (const sample of requests) { bytes = 0; const started = performance.now(); const page = await view.loadWorkerSessionViewSnapshotAsync(target, sample.request); observe(started); verify(page, sample); await new Promise((resolve) => setImmediate(resolve)); } clearInterval(timer); if (maximumMilliseconds > 2000) throw new Error("deep sampled page took " + maximumMilliseconds + "ms"); if (ticks < requests.length || maximumStall > 1000) throw new Error("deep sampled event-loop stall " + maximumStall + "ms ticks=" + ticks);`;
+  execFileSync(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(target), String(expectedEntries), String(payloadBytes)], { timeout: 180_000, stdio: "pipe" });
 }
 
 function assertCountSessionLinesReadFailure(target: WorkerSessionViewTarget, mode: "retry" | "fail" | "replace"): void {
@@ -81,7 +81,7 @@ function assertCountSessionLinesReadFailure(target: WorkerSessionViewTarget, mod
   execFileSync(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(target), mode], { timeout: 8_000, stdio: "pipe" });
 }
 
-async function assertExactBidirectionalBlocks(target: WorkerSessionViewTarget, expected: string[], expectedEntries: number): Promise<void> {
+async function assertExactBidirectionalBlocks(target: WorkerSessionViewTarget, expected: string[], expectedEntries: number, expectedMalformedEntries = 0, expectedOversizedEntries = 0): Promise<void> {
   for (const asyncMode of [false, true]) for (const direction of ["forward", "backward"] as const) {
     const pages: WorkerSessionViewSnapshot[] = []; const cursors = new Set<string>();
     let request: WorkerSessionPageRequest = direction === "forward" ? { mode: "first" } : { mode: "tail" };
@@ -100,6 +100,8 @@ async function assertExactBidirectionalBlocks(target: WorkerSessionViewTarget, e
     }
     if (direction === "backward") pages.reverse();
     assert.deepEqual(pages.flatMap((page) => page.blocks.map((block) => block.text)), expected, `${direction} ${asyncMode ? "async" : "sync"} block sequence`);
+    assert.equal(pages.reduce((total, page) => total + page.malformedEntries, 0), expectedMalformedEntries, `${direction} ${asyncMode ? "async" : "sync"} malformed count`);
+    assert.equal(pages.reduce((total, page) => total + page.skippedOversizedEntries, 0), expectedOversizedEntries, `${direction} ${asyncMode ? "async" : "sync"} oversized count`);
   }
 }
 
@@ -539,6 +541,36 @@ test("exact block-budget boundaries keep all 8-part, aligned-forward, and heavy-
   } finally { heavy.close(); }
 });
 
+test("U/A2048/B/H/X pages report post-budget malformed and oversized notices once", async () => {
+  const f = fixture();
+  try {
+    const parts = Array.from({ length: 2_048 }, (_, index) => `A${index}`); const expected = ["U", ...parts];
+    const assistant = { type: "message", id: "A", parentId: "U", timestamp: "now", message: { role: "assistant", content: parts.map((text) => ({ type: "text", text })) } };
+    const hidden = { type: "custom", id: "H", parentId: "A", timestamp: "now", customType: "internal", data: { hidden: true } };
+    const oversized = message("X", "H", `X-${"x".repeat(9 * 1024 * 1024)}`);
+    writeFileSync(f.sessionFile, line(header(f.target)) + line(message("U", null, "U")) + line(assistant) + "{bad json}\n" + line(hidden) + line(oversized));
+    await assertExactBidirectionalBlocks({ ...f.target, sessionStartLine: 2, sessionEndLine: 6 }, expected, 2, 1, 1);
+  } finally { f.close(); }
+});
+
+test("post-budget hidden and malformed fuzz counts every notice exactly once", async () => {
+  let random = 0x51f15e;
+  const next = () => { random = (Math.imul(random, 1_664_525) + 1_013_904_223) >>> 0; return random; };
+  for (let seed = 0; seed < 16; seed += 1) {
+    const f = fixture();
+    try {
+      const partCount = seed === 0 ? 2_048 : 2_044 + next() % 10; const malformedCount = 1 + next() % 3; const hiddenCount = 1 + next() % 3; const oversizedEnd = seed % 4 === 0;
+      const parts = Array.from({ length: partCount }, (_, index) => `S${seed}-A${index}`);
+      const assistant = { type: "message", id: "A", parentId: "U", timestamp: "now", message: { role: "assistant", content: parts.map((text) => ({ type: "text", text })) } };
+      const malformed = Array.from({ length: malformedCount }, (_, index) => `{bad-${seed}-${index}}\n`).join("");
+      const hidden = Array.from({ length: hiddenCount }, (_, index) => line({ type: "custom", id: `H-${index}`, parentId: index === 0 ? "A" : `H-${index - 1}`, timestamp: "now", customType: "internal", data: { hidden: true } })).join("");
+      const end = message("X", `H-${hiddenCount - 1}`, oversizedEnd ? `X-${"x".repeat(9 * 1024 * 1024)}` : "X");
+      writeFileSync(f.sessionFile, line(header(f.target)) + line(message("U", null, "U")) + line(assistant) + malformed + hidden + line(end));
+      await assertExactBidirectionalBlocks({ ...f.target, sessionStartLine: 2, sessionEndLine: 4 + malformedCount + hiddenCount }, ["U", ...parts, ...(oversizedEnd ? [] : ["X"])], oversizedEnd ? 2 : 3, malformedCount, oversizedEnd ? 1 : 0);
+    } finally { f.close(); }
+  }
+});
+
 test("rendered-block pages are hard-bounded and bidirectionally reachable within one entry", () => {
   const f = fixture();
   try {
@@ -655,20 +687,20 @@ test("leveled checkpoints bound 60k, 100k, 140k-by-3KiB, and compacted traversal
   }
 });
 
-test("400k and 1M entry deep pages stay within read, latency, and event-loop bounds", () => {
-  for (const count of [400_000, 1_000_000]) {
+test("400k and physical 1M-by-3KiB deep pages stay within read, latency, and event-loop bounds", () => {
+  for (const { count, payloadBytes } of [{ count: 400_000, payloadBytes: 96 }, { count: 1_000_000, payloadBytes: 2_850 }]) {
     const f = fixture();
     try {
       const fd = openSync(f.sessionFile, "w");
       try {
         writeSync(fd, line(header(f.target))); let chunk = "";
         for (let index = 0; index < count; index += 1) {
-          chunk += line(message(`entry-${index}`, index === 0 ? null : `entry-${index - 1}`, `ENTRY-${index}-${"x".repeat(96)}`));
+          chunk += line(message(`entry-${index}`, index === 0 ? null : `entry-${index - 1}`, `ENTRY-${index}-${"x".repeat(payloadBytes)}`));
           if (index % 1_000 === 999) { writeSync(fd, chunk); chunk = ""; }
         }
         if (chunk) writeSync(fd, chunk);
       } finally { closeSync(fd); }
-      assertDeepCheckpointSamples({ ...f.target, sessionStartLine: 2, sessionEndLine: count + 1 }, count);
+      assertDeepCheckpointSamples({ ...f.target, sessionStartLine: 2, sessionEndLine: count + 1 }, count, payloadBytes);
     } finally { f.close(); }
   }
 });
@@ -749,6 +781,28 @@ test("exact-budget end pages include trailing oversized notices without inventin
       assert.equal(page.malformedEntries, 1);
       assert.equal(page.hasNextPage, false);
       assert.equal(page.pageEndLine, 6);
+    }
+  } finally { f.close(); }
+});
+
+test("backward paging reports one oversized entry before the first displayed entry without moving cursors", async () => {
+  const f = fixture();
+  try {
+    const hiddenBefore = { type: "custom", id: "hidden-before", parentId: null, timestamp: "now", customType: "internal", data: { hidden: true } };
+    const huge = message("huge", "hidden-before", `HUGE-${"h".repeat(9 * 1024 * 1024)}`);
+    const hiddenAfter = { type: "custom", id: "hidden-after", parentId: "huge", timestamp: "now", customType: "internal", data: { hidden: true } };
+    const assistant = { type: "message", id: "assistant", parentId: "hidden-after", timestamp: "now", message: { role: "assistant", content: Array.from({ length: 2_048 }, (_, index) => ({ type: "text", text: `PART-${index}` })) } };
+    writeFileSync(f.sessionFile, line(header(f.target)) + line(hiddenBefore) + line(huge) + line(hiddenAfter) + line(assistant));
+    const target = { ...f.target, sessionStartLine: 2, sessionEndLine: 5 };
+    for (const page of [loadWorkerSessionViewSnapshot(target), await loadWorkerSessionViewSnapshotAsync(target)]) {
+      assert.equal(page.blocks.length, 2_048);
+      assert.equal(page.blocks[0]?.text, "PART-0"); assert.equal(page.blocks.at(-1)?.text, "PART-2047");
+      assert.equal(page.skippedOversizedEntries, 1);
+      assert.equal(page.totalVisibleEntries, 1);
+      assert.equal(page.previousVisibleEntries + page.totalActiveEntries + page.nextVisibleEntries, 1);
+      assert.equal(page.pageStartLine, 4); assert.equal(page.pageEndLine, 5);
+      assert.equal(page.pageStartBlock, 0); assert.equal(page.pageEndBlock, 2_048);
+      assert.equal(page.hasPreviousPage, false); assert.equal(page.hasNextPage, false);
     }
   } finally { f.close(); }
 });
