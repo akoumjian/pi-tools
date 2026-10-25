@@ -993,8 +993,10 @@ test("worker_control allows every valid exact-session lifecycle action without s
     { action: "cancel", workerId },
     { action: "discard", workerId },
     { action: "discard", workerIds: [workerId], preparedIds: [`prepared_${"a".repeat(24)}`], artifactLossAcknowledged: [workerId] },
-    { action: "inventory" },
-    { action: "inventory", allSessions: true }
+    { action: "cleanup_inventory" },
+    { action: "cleanup_inventory", allSessions: true },
+    { action: "cleanup_preview", workerIds: [workerId] },
+    { action: "cleanup_apply", token: `cleanup_${"a".repeat(48)}` }
   ];
 
   for (const input of validInputs) {
@@ -1016,6 +1018,7 @@ test("worker_control allows every valid exact-session lifecycle action without s
   const discard = evaluateWorkerControl({ action: "discard", workerId });
   assert.equal(discard.risk, "medium");
   assert.equal(discard.ruleId, "worker-control-discard");
+  assert.equal(evaluateWorkerControl({ action: "cleanup_apply", token: `cleanup_${"a".repeat(48)}` }).risk, "medium");
 
   const malformedInputs: unknown[] = [
     null,

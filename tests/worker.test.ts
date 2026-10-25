@@ -40,7 +40,7 @@ test("worker_run schema exposes orthogonal action and role branches", () => {
 });
 
 test("worker_control and merge schemas use only v2 actions", () => {
-  for (const value of [{ action: "list" }, { action: "runs", workerId: "worker_20260101000000_aaaaaaaa" }, { action: "get", workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_aaaaaaaa" }, { action: "cancel", workerId: "worker_20260101000000_aaaaaaaa" }, { action: "discard", workerId: "worker_20260101000000_aaaaaaaa" }, { action: "discard", workerIds: ["worker_20260101000000_aaaaaaaa"], artifactLossAcknowledged: ["worker_20260101000000_aaaaaaaa"] }, { action: "preserve", workerId: "worker_20260101000000_aaaaaaaa", destination: "/tmp/archive", paths: ["artifacts/report.md"] }, { action: "inventory", allSessions: true }]) assert.equal(Check(WorkerControlParams, value), true);
+  for (const value of [{ action: "list" }, { action: "runs", workerId: "worker_20260101000000_aaaaaaaa" }, { action: "get", workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_aaaaaaaa" }, { action: "cancel", workerId: "worker_20260101000000_aaaaaaaa" }, { action: "discard", workerId: "worker_20260101000000_aaaaaaaa" }, { action: "discard", workerIds: ["worker_20260101000000_aaaaaaaa"], artifactLossAcknowledged: ["worker_20260101000000_aaaaaaaa"] }, { action: "preserve", workerId: "worker_20260101000000_aaaaaaaa", destination: "/tmp/archive", paths: ["artifacts/report.md"] }, { action: "cleanup_inventory", allSessions: true }, { action: "cleanup_preview", workerIds: ["worker_20260101000000_aaaaaaaa"] }, { action: "cleanup_apply", token: `cleanup_${"a".repeat(48)}` }]) assert.equal(Check(WorkerControlParams, value), true);
   assert.equal(Check(WorkerControlParams, { action: "status" }), false);
   assert.equal(Check(WorkerControlParams, { action: "discard", workerIds: ["worker_20260101000000_aaaaaaaa"], artifactLossAcknowledged: ["worker_20260101000000_bbbbbbbb"] }), true, "schema validates shape; runtime and tool-safety enforce acknowledgement subset");
   assert.equal(Check(WorkerControlParams, { action: "discard" }), false);
@@ -70,7 +70,7 @@ test("parent extension exposes only the v2 worker tool and command surface", asy
   } as never;
   registerWorkerExtension(api);
   assert.deepEqual(tools.sort(), ["worker_control", "worker_merge_apply", "worker_merge_test", "worker_run"]);
-  assert.deepEqual(commands.sort(), ["worker:adopt", "worker:cancel", "worker:cleanup", "worker:discard", "worker:list", "worker:logs", "worker:show", "worker:view"]);
+  assert.deepEqual(commands.sort(), ["worker:cancel", "worker:cleanup", "worker:discard", "worker:list", "worker:logs", "worker:show", "worker:view"]);
 });
 
 
@@ -223,7 +223,7 @@ test("reconciliation timer and slash cancel/discard paths recheck package genera
     settleWorkerRun(registry, { parentSessionFile: sessionFile, ...created, outcome: "failed", outcomeSource: "system", settledAt: "2026-01-01T00:00:00.000Z" });
     blocked = true;
     await assert.rejects(() => commands.get("worker:cancel")!.handler(created.workerId, context), /Fully quit and restart Pi/);
-    await assert.rejects(() => commands.get("worker:discard")!.handler(`${created.workerId} --confirm`, context), /Fully quit and restart Pi/);
+    await commands.get("worker:discard")!.handler(`${created.workerId} --confirm`, context);assert.match(notifications.at(-1)??"",/Fully quit and restart Pi/);
     assert.equal(getWorker(registry, created.workerId)?.status, "idle", "guarded commands do not mutate the worker");
     registry.close();
   } finally {

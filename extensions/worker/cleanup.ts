@@ -1,33 +1,42 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { constants as fsConstants, createReadStream, createWriteStream, existsSync, lstatSync, mkdirSync, openSync, opendirSync, readFileSync, realpathSync, renameSync, rmSync, statSync } from "node:fs";
+import { constants as fsConstants, closeSync, createReadStream, createWriteStream, existsSync, linkSync, lstatSync, mkdirSync, openSync, opendirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { lstat as lstatAsync, opendir as opendirAsync, readFile as readFileAsync } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { homedir } from "node:os";
 import { isAsyncJobExecutionAlive } from "../_shared/async-job.js";
+import { asyncJobProcessStartToken } from "../_shared/async-job-process.js";
 import { isWorkerId } from "../_shared/worker-id.js";
 import { defaultPreparedMergeRoot } from "./merge.js";
-import { getWorker, listAllWorkers, listWorkerRuns, listWorkers, type WorkerRegistry, type WorkerRegistryRecord, type WorkerRunRecord } from "./registry.js";
+import { getWorker, getWorkerRun, listAllWorkers, listWorkerRuns, listWorkers, type WorkerRegistry, type WorkerRegistryRecord, type WorkerRunRecord } from "./registry.js";
 import { workerPaths, type WorkerRoots } from "./identity.js";
 
 export type CleanupClass = "active" | "recovery" | "undelivered" | "unknown:task_missing" | "unknown:beads_unavailable" | "retained" | "due" | "leased";
 export type BeadsTaskFact = { id: string; status: string };
+export type OwnerSessionIdentity = { file: string; state: "named" | "unnamed" | "missing" | "unreadable"; id?: string; name?: string; label: string };
+export type CleanupDelivery = { deliveryId: string; runId: string; state: "pending" | "claimed"; runtimeGeneration?: number; sendStartedAt?: string; outcome?: string; summary?: string };
 export type CleanupWorkerItem = {
-  workerId: string; ownerSession: string; role: WorkerRegistryRecord["role"]; class: CleanupClass; reason: string;
-  taskIds: string[]; unpreservedArtifacts: string[]; pendingResults: Array<{ runId: string; outcome?: string; summary?: string }>;
-  after?: string; recoveryError?: string; preservations: ReturnType<typeof preservationRecords>;
+  workerId: string; ownerSession: string; owner: OwnerSessionIdentity; role: WorkerRegistryRecord["role"]; class: CleanupClass; reason: string;
+  version: number; latestRunId?: string; reviewedByWorkerId?: string; taskIds: string[]; taskFacts: Array<{ id: string; status: string }>;
+  unpreservedArtifacts: string[]; additionalUnpreservedArtifacts: number; pendingResults: CleanupDelivery[]; additionalPendingResults: number; additionalPendingPreservations: number; after?: string; recoveryError?: string; preservations: ReturnType<typeof preservationRecords>;
 };
-export type PreparedCleanupItem = { preparedId: string; ownerSession: string; status: string; class: "due" | "retained" | "explicit_decision" | "partial" | "claimed" | "discarding"; taskIds: string[]; reason: string };
-export type CleanupInventory = { workers: CleanupWorkerItem[]; prepared: PreparedCleanupItem[]; leftovers: CleanupLeftover[]; scan: { partial: boolean; examinedWorkers: number; totalWorkers: number; examinedFilesystemEntries: number }; generatedAt: string };
-export type CleanupPreview = CleanupInventory & { version: 1; allSessions: boolean; token: string };
+export type PreparedCleanupItem = { preparedId: string; ownerSession: string; owner:OwnerSessionIdentity; status: string; class: "due" | "retained" | "explicit_decision" | "partial" | "claimed" | "discarding"; taskIds: string[]; taskFacts:Array<{id:string;status:string}>; reason: string };
+export type CleanupInventory = { workers: CleanupWorkerItem[]; prepared: PreparedCleanupItem[]; leftovers: CleanupLeftover[]; total: { workers: number; prepared: number; leftovers: number }; scan: { partial: boolean; examinedWorkers: number; totalWorkers: number; examinedFilesystemEntries: number; roots: Array<{ root: string; examined: number; partial: boolean }> }; generatedAt: string };
+export type CleanupOwnerAuthority = { state: "current" | "retired" | "dead" | "live" | "ambiguous" | "missing"; generation?: number; members?: Array<{ generation: number; runtimeId: string; pid: number; processStartToken: string; retired: boolean; liveness: string }> };
+export type CleanupSnapshotWorker = { item: CleanupWorkerItem; status: string; operationKind?: string; operationNonce?: string; runClaims: Array<{ runId: string; claimKind: string; claimNonce?: string }>; authority: CleanupOwnerAuthority; runtime: Record<string, unknown> };
+export type CleanupSnapshotPrepared = PreparedCleanupItem & { applyNonce?: string; authority:CleanupOwnerAuthority };
+export type CleanupSnapshot = { version: 2; parentSessionFile: string; createdAt: string; workers: CleanupSnapshotWorker[]; prepared: CleanupSnapshotPrepared[]; leftovers: CleanupLeftover[]; scan: CleanupInventory["scan"] };
+export type PersistedCleanupPreview = { token: string; snapshotHash: string; snapshot: CleanupSnapshot };
+
 
 const execFileAsync = promisify(execFile);
 const PREPARED_ID = /^prepared_[0-9a-f]{24}$/;
 const MAX_TASKS_PER_READ = 50;
 const MAX_BEADS_OUTPUT = 8 * 1024 * 1024;
-const MAX_PRESERVATION_ENTRIES = 200_000;
-const MAX_PRESERVATION_RECORDS = 64;
+const MAX_PRESERVATION_ENTRIES = 50_000;
+const MAX_PRESERVATION_BYTES = 1024 * 1024 * 1024;
 
 function transaction<T>(registry: WorkerRegistry, fn: () => T): T {
   registry.database.exec("BEGIN IMMEDIATE");
@@ -40,9 +49,7 @@ function canonical(value: unknown): unknown {
   if (!value || typeof value !== "object") return value;
   return Object.fromEntries(Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => [key, canonical(item)]));
 }
-function cleanupToken(value: Omit<CleanupPreview, "token">): string {
-  return createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex").slice(0, 24);
-}
+function cleanupHash(value: unknown): string { return createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex"); }
 function boundedSummary(value: string | undefined): string | undefined { return value === undefined ? undefined : value.slice(0, 512); }
 
 /** Reads exact personal Beads facts with bounded async subprocesses. Any chunk failure is fail-closed for that chunk. */
@@ -78,9 +85,9 @@ export async function readCleanupBeadsFacts(taskIds: string[], input: { bdPath?:
 }
 
 function workerRunsBounded(registry: WorkerRegistry, workerId: string): WorkerRunRecord[] {
-  const runs: WorkerRunRecord[] = []; let offset = 0; let total = 0;
-  while (runs.length < LEFTOVER_SCAN_LIMIT) { const page = listWorkerRuns(registry, workerId, Math.min(100, LEFTOVER_SCAN_LIMIT - runs.length), offset); total = page.total; runs.push(...page.runs); if (page.nextOffset === undefined) break; offset = page.nextOffset; }
-  if (runs.length < total) throw new Error(`Worker ${workerId} run inventory exceeds the bounded scan.`); return runs;
+  const maximum=4096;const runs: WorkerRunRecord[] = []; let offset = 0; let total = 0;
+  while (runs.length < maximum) { const page = listWorkerRuns(registry, workerId, Math.min(100, maximum - runs.length), offset); total = page.total; runs.push(...page.runs); if (page.nextOffset === undefined) break; offset = page.nextOffset; }
+  if (runs.length < total) throw new Error(`Worker ${workerId} run inventory exceeds the ${maximum}-run bound.`); return runs;
 }
 export function reportedArtifacts(registry: WorkerRegistry, worker: WorkerRegistryRecord): string[] {
   const runs = workerRunsBounded(registry, worker.workerId);
@@ -105,33 +112,48 @@ export function unpreservedArtifacts(registry: WorkerRegistry, worker: WorkerReg
 function hasRunClaim(registry: WorkerRegistry, workerId: string): boolean {
   return Boolean(registry.database.prepare("SELECT 1 FROM runs WHERE worker_id=? AND claim_kind IS NOT NULL LIMIT 1").get(workerId));
 }
-function hasUndelivered(registry: WorkerRegistry, workerId: string): boolean {
-  return Boolean(registry.database.prepare("SELECT 1 FROM deliveries WHERE worker_id=? AND state!='delivered' LIMIT 1").get(workerId));
+function hasUndelivered(registry: WorkerRegistry, workerId: string): boolean { return Boolean(registry.database.prepare("SELECT 1 FROM deliveries WHERE worker_id=? AND state!='delivered' LIMIT 1").get(workerId)); }
+function pendingResults(registry: WorkerRegistry, workerId: string): {items:CleanupDelivery[];additional:number} {
+  const total=Number((registry.database.prepare("SELECT COUNT(*) AS count FROM deliveries WHERE worker_id=? AND state!='delivered'").get(workerId) as {count:number|bigint}).count);const rows = registry.database.prepare(`SELECT d.delivery_id,d.run_id,d.state,d.runtime_generation,d.send_started_at,r.outcome,r.summary FROM deliveries d JOIN runs r ON r.run_id=d.run_id
+    WHERE d.worker_id=? AND d.state!='delivered' ORDER BY d.created_at,d.delivery_id LIMIT 256`).all(workerId) as Array<{ delivery_id: string; run_id: string; state: "pending" | "claimed"; runtime_generation: number | null; send_started_at: string | null; outcome: string | null; summary: string | null }>;
+  return {items:rows.map((row) => ({ deliveryId: row.delivery_id, runId: row.run_id, state: row.state, ...(row.runtime_generation === null ? {} : { runtimeGeneration: row.runtime_generation }), ...(row.send_started_at === null ? {} : { sendStartedAt: row.send_started_at }), ...(row.outcome ? { outcome: row.outcome } : {}), ...(row.summary ? { summary: boundedSummary(row.summary) } : {}) })),additional:Math.max(0,total-rows.length)};
 }
-function pendingResults(registry: WorkerRegistry, workerId: string): CleanupWorkerItem["pendingResults"] {
-  const rows = registry.database.prepare(`SELECT r.run_id,r.outcome,r.summary FROM runs r JOIN deliveries d ON d.run_id=r.run_id
-    WHERE r.worker_id=? AND d.state!='delivered' ORDER BY r.created_at`).all(workerId) as Array<{ run_id: string; outcome: string | null; summary: string | null }>;
-  return rows.map((row) => ({ runId: row.run_id, ...(row.outcome ? { outcome: row.outcome } : {}), ...(row.summary ? { summary: boundedSummary(row.summary) } : {}) }));
+function ownerSessionIdentity(sessionFile: string): OwnerSessionIdentity {
+  const exact = path.resolve(sessionFile); if (!existsSync(exact)) return { file: exact, state: "missing", label: exact };
+  try {
+    const info = lstatSync(exact); if (!info.isFile() || info.isSymbolicLink() || info.size > 512 * 1024 * 1024) return { file: exact, state: "unreadable", label: exact };
+    const fd = openSync(exact, fsConstants.O_RDONLY | ((fsConstants as any).O_NOFOLLOW ?? 0)); let text = ""; try { const buffer=Buffer.allocUnsafe(64*1024);const bytes=readSync(fd,buffer,0,buffer.length,0);text=buffer.subarray(0,bytes).toString("utf8"); } finally { closeSync(fd); }
+    const line = text.split("\n", 1)[0] ?? ""; const header = JSON.parse(line) as Record<string, unknown>; const id = typeof header.id === "string" && header.id.length <= 256 ? header.id : undefined; const name = typeof header.name === "string" && header.name.trim() && header.name.length <= 256 ? header.name.trim() : typeof header.sessionName === "string" && header.sessionName.trim() && header.sessionName.length <= 256 ? header.sessionName.trim() : undefined;
+    return { file: exact, state: name ? "named" : "unnamed", ...(id ? { id } : {}), ...(name ? { name } : {}), label: name ?? id ?? exact };
+  } catch { return { file: exact, state: "unreadable", label: exact }; }
 }
-
+function baseCleanupClass(registry: WorkerRegistry, worker: WorkerRegistryRecord, facts: Map<string, BeadsTaskFact | "missing" | "unavailable">): { kind: CleanupClass; reason: string } {
+  if (worker.status !== "idle" || worker.operationKind || hasRunClaim(registry, worker.workerId)) return { kind: "active", reason: "Worker or lifecycle operation is active." };
+  if (worker.recoveryError) return { kind: "recovery", reason: worker.recoveryError };
+  if (hasUndelivered(registry, worker.workerId)) return { kind: "undelivered", reason: "A completion result is not durably delivered." };
+  if (worker.taskIds.length === 0 || worker.taskIds.some((id) => facts.get(id) === "missing")) return { kind: "unknown:task_missing", reason: "An assigned personal Beads task is missing or mismatched." };
+  if (worker.taskIds.some((id) => facts.get(id) === "unavailable" || !facts.has(id))) return { kind: "unknown:beads_unavailable", reason: "Central personal Beads facts are unavailable." };
+  if (worker.taskIds.some((id) => (facts.get(id) as BeadsTaskFact).status !== "closed")) return { kind: "retained", reason: "At least one assigned task is open." };
+  return { kind: "due", reason: "All assigned tasks are closed." };
+}
 export function classifyCleanupWorker(registry: WorkerRegistry, worker: WorkerRegistryRecord, facts: Map<string, BeadsTaskFact | "missing" | "unavailable">): CleanupWorkerItem {
-  let kind: CleanupClass; let reason: string;
-  if (worker.status !== "idle" || worker.operationKind || hasRunClaim(registry, worker.workerId)) { kind = "active"; reason = "Worker or lifecycle operation is active."; }
-  else if (worker.recoveryError) { kind = "recovery"; reason = worker.recoveryError; }
-  else if (hasUndelivered(registry, worker.workerId)) { kind = "undelivered"; reason = "A completion result is not durably delivered."; }
-  else if (worker.taskIds.length === 0 || worker.taskIds.some((id) => facts.get(id) === "missing")) { kind = "unknown:task_missing"; reason = "An assigned personal Beads task is missing or mismatched."; }
-  else if (worker.taskIds.some((id) => facts.get(id) === "unavailable" || !facts.has(id))) { kind = "unknown:beads_unavailable"; reason = "Central personal Beads facts are unavailable."; }
-  else if (worker.taskIds.some((id) => (facts.get(id) as BeadsTaskFact).status !== "closed")) { kind = "retained"; reason = "At least one assigned task is open."; }
-  else { kind = "due"; reason = worker.reviewedByWorkerId ? `All assigned tasks are closed; discard after reviewer ${worker.reviewedByWorkerId}.` : "All assigned tasks are closed."; }
-  return { workerId: worker.workerId, ownerSession: worker.parentSessionFile, role: worker.role, class: kind, reason, taskIds: worker.taskIds, unpreservedArtifacts: unpreservedArtifacts(registry, worker), pendingResults: pendingResults(registry, worker.workerId), preservations: preservationRecords(registry, worker.workerId), ...(kind === "due" && worker.reviewedByWorkerId ? { after: `reviewer ${worker.reviewedByWorkerId}` } : {}), ...(worker.recoveryError ? { recoveryError: worker.recoveryError } : {}) };
+  let { kind, reason } = baseCleanupClass(registry, worker, facts); let after: string | undefined;
+  if (kind === "due" && worker.reviewedByWorkerId) {
+    const reviewer = getWorker(registry, worker.reviewedByWorkerId); const reviewerClass = reviewer ? baseCleanupClass(registry, reviewer, facts).kind : "unknown:task_missing";
+    if (reviewerClass === "due") { after = `reviewer ${worker.reviewedByWorkerId}`; reason = `All assigned tasks are closed; discard after reviewer ${worker.reviewedByWorkerId}.`; }
+    else { kind = "leased"; reason = `Worker is leased by reviewer ${worker.reviewedByWorkerId}, which is not due.`; }
+  }
+  const taskFacts = worker.taskIds.map((id) => { const fact = facts.get(id); return { id, status: fact === "missing" ? "missing" : fact === "unavailable" || !fact ? "unavailable" : fact.status }; });
+  let artifacts:string[]=[];let preservations:ReturnType<typeof preservationRecords>=[];let evidenceError:string|undefined;try{artifacts=unpreservedArtifacts(registry,worker);preservations=preservationRecords(registry,worker.workerId);}catch(error){evidenceError=`Cleanup evidence accounting failed: ${error instanceof Error?error.message:String(error)}`;kind="recovery";reason=evidenceError;}const pending=pendingResults(registry,worker.workerId);const pendingPreservationTotal=Number((registry.database.prepare("SELECT COUNT(*) AS count FROM preservation_records WHERE worker_id=? AND status='pending'").get(worker.workerId) as {count:number|bigint}).count);return { workerId: worker.workerId, ownerSession: worker.parentSessionFile, owner: ownerSessionIdentity(worker.parentSessionFile), role: worker.role, class: kind, reason, version: worker.version, ...(worker.latestRunId ? { latestRunId: worker.latestRunId } : {}), ...(worker.reviewedByWorkerId ? { reviewedByWorkerId: worker.reviewedByWorkerId } : {}), taskIds: worker.taskIds, taskFacts, unpreservedArtifacts: artifacts.slice(0,256),additionalUnpreservedArtifacts:Math.max(0,artifacts.length-256), pendingResults: pending.items,additionalPendingResults:pending.additional, preservations,additionalPendingPreservations:Math.max(0,pendingPreservationTotal-preservations.filter((record)=>record.status==="pending").length), ...(after ? { after } : {}), ...(worker.recoveryError||evidenceError ? { recoveryError: worker.recoveryError??evidenceError } : {}) };
 }
 
 type PreparedRow = { prepared_id: string; parent_session_file: string; status: string; task_ids_json: string; apply_nonce: string | null };
-function listPreparedRows(registry: WorkerRegistry, parent?: string): { rows: PreparedRow[]; partial: boolean } {
+function listPreparedRows(registry: WorkerRegistry, parent: string | undefined, limit: number, offset: number): { rows: PreparedRow[]; total: number } {
+  const total = Number(((parent ? registry.database.prepare("SELECT COUNT(*) AS count FROM prepared_sets WHERE parent_session_file=?").get(parent) : registry.database.prepare("SELECT COUNT(*) AS count FROM prepared_sets").get()) as { count: number }).count);
   const rows = (parent
-    ? registry.database.prepare("SELECT prepared_id,parent_session_file,status,task_ids_json,apply_nonce FROM prepared_sets WHERE parent_session_file=? ORDER BY updated_at DESC LIMIT ?").all(parent, LEFTOVER_SCAN_LIMIT + 1)
-    : registry.database.prepare("SELECT prepared_id,parent_session_file,status,task_ids_json,apply_nonce FROM prepared_sets ORDER BY parent_session_file,updated_at DESC LIMIT ?").all(LEFTOVER_SCAN_LIMIT + 1)) as PreparedRow[];
-  return { rows: rows.slice(0, LEFTOVER_SCAN_LIMIT), partial: rows.length > LEFTOVER_SCAN_LIMIT };
+    ? registry.database.prepare("SELECT prepared_id,parent_session_file,status,task_ids_json,apply_nonce FROM prepared_sets WHERE parent_session_file=? ORDER BY updated_at DESC,prepared_id LIMIT ? OFFSET ?").all(parent, limit, offset)
+    : registry.database.prepare("SELECT prepared_id,parent_session_file,status,task_ids_json,apply_nonce FROM prepared_sets ORDER BY parent_session_file,updated_at DESC,prepared_id LIMIT ? OFFSET ?").all(limit, offset)) as PreparedRow[];
+  return { rows, total };
 }
 function preparedTaskLineage(registry: WorkerRegistry, row: PreparedRow): { taskIds: string[]; missingRepository: boolean } {
   const repositories = registry.database.prepare("SELECT record_json FROM prepared_repositories WHERE prepared_id=?").all(row.prepared_id) as Array<{ record_json: string }>;
@@ -147,38 +169,33 @@ function preparedTaskLineage(registry: WorkerRegistry, row: PreparedRow): { task
   return { taskIds: [...taskIds].sort(), missingRepository };
 }
 function classifyPrepared(registry: WorkerRegistry, row: PreparedRow, facts: Map<string, BeadsTaskFact | "missing" | "unavailable">): PreparedCleanupItem {
-  const lineage = preparedTaskLineage(registry, row); const taskIds = lineage.taskIds;
-  if (row.status === "discarding") return { preparedId: row.prepared_id, ownerSession: row.parent_session_file, status: row.status, class: "discarding", taskIds, reason: "A committed discard must be finished." };
-  if (row.apply_nonce !== null) return { preparedId: row.prepared_id, ownerSession: row.parent_session_file, status: row.status, class: "claimed", taskIds, reason: "Prepared apply is claimed." };
-  if (row.status === "partial") return { preparedId: row.prepared_id, ownerSession: row.parent_session_file, status: row.status, class: "partial", taskIds, reason: "Application is partial and requires an explicit decision." };
-  if (!["ready", "resolution_required", "failed"].includes(row.status)) return { preparedId: row.prepared_id, ownerSession: row.parent_session_file, status: row.status, class: "explicit_decision", taskIds, reason: `Prepared status ${row.status} is not cleanup-eligible.` };
-  if (lineage.missingRepository || taskIds.length === 0 || taskIds.some((id) => !facts.has(id) || facts.get(id) === "missing" || facts.get(id) === "unavailable")) return { preparedId: row.prepared_id, ownerSession: row.parent_session_file, status: row.status, class: "explicit_decision", taskIds, reason: "Task ownership is missing or unavailable." };
-  if (taskIds.some((id) => (facts.get(id) as BeadsTaskFact).status !== "closed")) return { preparedId: row.prepared_id, ownerSession: row.parent_session_file, status: row.status, class: "retained", taskIds, reason: "An inherited task is open." };
-  return { preparedId: row.prepared_id, ownerSession: row.parent_session_file, status: row.status, class: "due", taskIds, reason: "All inherited tasks are closed." };
+  const lineage=preparedTaskLineage(registry,row),taskIds=lineage.taskIds,owner=ownerSessionIdentity(row.parent_session_file);const taskFacts=taskIds.map((id)=>{const fact=facts.get(id);return{id,status:fact==="missing"?"missing":fact==="unavailable"||!fact?"unavailable":fact.status};});const value=(className:PreparedCleanupItem["class"],reason:string):PreparedCleanupItem=>({preparedId:row.prepared_id,ownerSession:row.parent_session_file,owner,status:row.status,class:className,taskIds,taskFacts,reason});
+  if(row.status==="discarding")return value("discarding","A committed discard must be finished.");
+  if(row.apply_nonce!==null)return value("claimed","Prepared apply is claimed.");
+  if(lineage.missingRepository||taskIds.length===0||taskFacts.some((fact)=>fact.status==="missing"))return value("explicit_decision","Task ownership is missing.");
+  if(taskFacts.some((fact)=>fact.status==="unavailable"))return value("retained","Central personal Beads facts are unavailable.");
+  if(taskFacts.some((fact)=>fact.status!=="closed"))return value("retained","An inherited task is open.");
+  if(row.status==="partial")return value("partial","Application is partial and requires an explicit decision.");
+  if(!["ready","resolution_required","failed"].includes(row.status))return value("explicit_decision",`Prepared status ${row.status} is not cleanup-eligible.`);
+  return value("due","All inherited tasks are closed.");
 }
 
-export async function buildCleanupInventory(registry: WorkerRegistry, input: { parentSessionFile: string; allSessions: boolean; cwd: string; bdPath?: string; now?: Date; roots?: WorkerRoots; preparedRoot?: string }): Promise<CleanupInventory> {
-  const workers: WorkerRegistryRecord[] = []; let offset = 0; let totalWorkers = 0; let workerPartial = false;
-  while (workers.length < LEFTOVER_SCAN_LIMIT) {
-    const remaining = LEFTOVER_SCAN_LIMIT - workers.length; const page = input.allSessions ? listAllWorkers(registry, Math.min(1000, remaining), offset) : listWorkers(registry, { parentSessionFile: input.parentSessionFile, limit: Math.min(100, remaining), offset });
-    totalWorkers = page.total; workers.push(...page.workers); if (page.nextOffset === undefined) break; offset = page.nextOffset;
-  }
-  if (workers.length < totalWorkers) workerPartial = true;
-  const preparedPage = listPreparedRows(registry, input.allSessions ? undefined : input.parentSessionFile); const prepared = preparedPage.rows;
+export function preparedCleanupTaskIds(registry:WorkerRegistry,preparedIds:string[]):string[]{const rows=preparedIds.map((preparedId)=>{const row=registry.database.prepare("SELECT prepared_id,parent_session_file,status,task_ids_json,apply_nonce FROM prepared_sets WHERE prepared_id=?").get(preparedId) as PreparedRow|undefined;if(!row)throw new Error(`Unknown prepared set ${preparedId}.`);return row;});return[...new Set(rows.flatMap((row)=>preparedTaskLineage(registry,row).taskIds))];}
+export function classifyPreparedCleanupIds(registry:WorkerRegistry,preparedIds:string[],facts:Map<string,BeadsTaskFact|"missing"|"unavailable">):PreparedCleanupItem[]{return preparedIds.map((preparedId)=>{const row=registry.database.prepare("SELECT prepared_id,parent_session_file,status,task_ids_json,apply_nonce FROM prepared_sets WHERE prepared_id=?").get(preparedId) as PreparedRow|undefined;if(!row)throw new Error(`Unknown prepared set ${preparedId}.`);return classifyPrepared(registry,row,facts);});}
+
+export async function buildCleanupInventory(registry: WorkerRegistry, input: { parentSessionFile: string; allSessions: boolean; cwd: string; bdPath?: string; now?: Date; roots?: WorkerRoots; preparedRoot?: string; limit?: number; offset?: number }): Promise<CleanupInventory> {
+  const limit = Math.max(1, Math.min(100, input.limit ?? 100)); const offset = Math.max(0, input.offset ?? 0);
+  const workerPage = input.allSessions ? listAllWorkers(registry, limit, offset) : listWorkers(registry, { parentSessionFile: input.parentSessionFile, limit, offset });
+  const workers = workerPage.workers; const preparedPage = listPreparedRows(registry, input.allSessions ? undefined : input.parentSessionFile, limit, offset); const prepared = preparedPage.rows;
   const ids = [...new Set([...workers.flatMap((worker) => worker.taskIds), ...prepared.flatMap((row) => preparedTaskLineage(registry, row).taskIds)])];
   const facts = await readCleanupBeadsFacts(ids, { cwd: input.cwd, ...(input.bdPath ? { bdPath: input.bdPath } : {}) });
-  const leftoverScan = input.allSessions && input.roots ? scanCleanupLeftoversDetailed(registry, { roots: input.roots, preparedRoot: input.preparedRoot ?? defaultPreparedMergeRoot(), projectCwd: input.cwd, now: input.now }) : { items: [] as CleanupLeftover[], partial: false, examined: 0 };
-  return { workers: workers.map((worker) => classifyCleanupWorker(registry, worker, facts)), prepared: prepared.map((row) => classifyPrepared(registry, row, facts)), leftovers: leftoverScan.items, scan: { partial: workerPartial || preparedPage.partial || leftoverScan.partial, examinedWorkers: workers.length, totalWorkers, examinedFilesystemEntries: leftoverScan.examined }, generatedAt: (input.now ?? new Date()).toISOString() };
+  const leftoverScan = input.allSessions && input.roots ? await scanCleanupLeftoversDetailed(registry, { roots: input.roots, preparedRoot: input.preparedRoot ?? defaultPreparedMergeRoot(), projectCwd: input.cwd, now: input.now,offset,limit }) : { items: [] as CleanupLeftover[],matched:0, partial: false, examined: 0, roots: [] as Array<{ root: string; examined: number; partial: boolean }> };
+  const leftovers = leftoverScan.items; const partial = workerPage.total > offset + workers.length || preparedPage.total > offset + prepared.length || leftoverScan.matched > offset + leftovers.length || leftoverScan.partial;
+  return { workers: workers.map((worker) => classifyCleanupWorker(registry, worker, facts)), prepared: prepared.map((row) => classifyPrepared(registry, row, facts)), leftovers, total: { workers: workerPage.total, prepared: preparedPage.total, leftovers: leftoverScan.matched }, scan: { partial, examinedWorkers: workers.length, totalWorkers: workerPage.total, examinedFilesystemEntries: leftoverScan.examined, roots: leftoverScan.roots }, generatedAt: (input.now ?? new Date()).toISOString() };
 }
-export async function buildCleanupPreview(registry: WorkerRegistry, input: { parentSessionFile: string; allSessions: boolean; cwd: string; bdPath?: string; now?: Date; roots?: WorkerRoots; preparedRoot?: string }): Promise<CleanupPreview> {
-  const inventory = await buildCleanupInventory(registry, input);
-  const base = { version: 1 as const, allSessions: input.allSessions, ...inventory };
-  const tokenInput = { ...base, generatedAt: "" };
-  return { ...base, token: cleanupToken(tokenInput) };
-}
-
 export type PreservationResult = { preservationId: string; destination: string; items: string[]; entries: number; bytes: number };
 type PreservationEntry = { path: string; type: "file" | "directory"; bytes: number; executable: boolean };
+type WalkEntry = PreservationEntry & { source: string; device: number; inode: number };
 
 export async function preserveWorkerArtifacts(registry: WorkerRegistry, roots: WorkerRoots, runtimeRoot: string, input: { workerId: string; destination: string; paths?: string[]; now?: Date; nonce?: string }): Promise<PreservationResult> {
   const worker = getWorker(registry, input.workerId); if (!worker) throw new Error(`Unknown worker ${input.workerId}.`);
@@ -191,63 +208,73 @@ export async function preserveWorkerArtifacts(registry: WorkerRegistry, roots: W
   if (items.includes("worker-preservation.json")) throw new Error("worker-preservation.json is reserved for the preservation manifest.");
   const now = input.now ?? new Date(); const nonce = input.nonce ?? randomUUID().replaceAll("-", "");
   const preservationId = `preservation_${nonce.slice(0, 24)}`; const tempPath = path.join(path.dirname(destination), `.${path.basename(destination)}.worker-preserve-${nonce.slice(0, 24)}`);
-  mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
-  const priorPending = preservationRecords(registry, worker.workerId).filter((record) => record.status === "pending" && record.destination === destination);
-  for (const pending of priorPending) assertPreservationTemporaryPath(pending.destination, pending.tempPath);
-  if (existsSync(destination)) {
-    const recovered = priorPending.find((record) => record.latestRunId === worker.latestRunId && JSON.stringify(record.items) === JSON.stringify(items)); if (!recovered) throw new Error(`Preservation destination already exists: ${destination}`);
-    const existing = await verifyPublishedPreservation(destination, worker, items);
-    const changed = transaction(registry, () => registry.database.prepare("UPDATE preservation_records SET status='published',manifest_json=?,updated_at=? WHERE preservation_id=? AND status='pending'").run(JSON.stringify(existing.manifest), now.toISOString(), recovered.id));
-    if (Number(changed.changes) !== 1) throw new Error("Pending preservation changed during publication recovery.");
-    return { preservationId: recovered.id, destination, items, entries: existing.entries, bytes: existing.bytes };
-  }
-  for (const pending of priorPending) {
-    let removed = false; try { rmSync(pending.tempPath, { recursive: true, force: true }); removed = !existsSync(pending.tempPath); } catch {}
-    transaction(registry, () => registry.database.prepare("UPDATE preservation_records SET status='failed',error=?,updated_at=? WHERE preservation_id=? AND status='pending'").run(removed ? "Superseded pending preservation temporary path was removed for exact retry." : "Superseded pending preservation temporary path could not be removed.", now.toISOString(), pending.id));
-    if (!removed) throw new Error(`Pending preservation temporary path could not be removed safely: ${pending.tempPath}`);
-  }
-  if (existsSync(tempPath)) throw new Error(`Preservation temporary path already exists without a matching trusted record: ${tempPath}`);
-  transaction(registry, () => {
-    registry.database.prepare(`INSERT INTO preservation_records(preservation_id,worker_id,status,destination,temp_path,latest_run_id,items_json,created_at,updated_at)
-      VALUES(?,?,'pending',?,?,?,?,?,?)`).run(preservationId, worker.workerId, destination, tempPath, worker.latestRunId ?? null, JSON.stringify(items), now.toISOString(), now.toISOString());
-  });
-  let publicationRenamed = false;
+  const lockPath = path.join(path.dirname(destination), `.${path.basename(destination)}.worker-preserve.lock`);
+  mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });assertNoSymlinkAncestors(destination);
+  const lock = acquirePreservationLock(lockPath, preservationId, destination, nonce);
+  let publicationRenamed = false; let recordInserted = false;
   try {
-    const entries = collectPreservationEntries(worker.workspaceRoot, items);
+    const pendingRows=registry.database.prepare("SELECT * FROM preservation_records WHERE worker_id=? AND status='pending' AND destination=? ORDER BY created_at DESC,preservation_id DESC LIMIT 257").all(worker.workerId,destination) as Array<Record<string,any>>;if(pendingRows.length>256)throw new Error("Pending preservation recovery exceeds the exact 256-record bound.");const priorPending=pendingRows.map((row)=>({id:row.preservation_id,status:row.status as "pending",destination:row.destination,tempPath:row.temp_path,...(row.latest_run_id===null?{}:{latestRunId:row.latest_run_id}),items:parseJson<string[]>(row.items_json),...(row.error===null?{}:{error:row.error})}));
+    for (const pending of priorPending) assertPreservationTemporaryPath(pending.destination, pending.tempPath);
+    if (existsSync(destination)) {
+      const recovered = priorPending.find((record) => record.latestRunId === worker.latestRunId && JSON.stringify(record.items) === JSON.stringify(items)); if (!recovered) throw new Error(`Preservation destination already exists: ${destination}`);
+      const existing = await verifyPublishedPreservation(destination, worker, items);
+      const changed = transaction(registry, () => registry.database.prepare("UPDATE preservation_records SET status='published',manifest_json=?,updated_at=? WHERE preservation_id=? AND status='pending'").run(JSON.stringify(existing.manifest), now.toISOString(), recovered.id));
+      if (Number(changed.changes) !== 1) throw new Error("Pending preservation changed during publication recovery.");
+      return { preservationId: recovered.id, destination, items, entries: existing.entries, bytes: existing.bytes };
+    }
+    for (const pending of priorPending) {
+      let removed = false; try { rmSync(pending.tempPath, { recursive: true, force: true }); removed = !existsSync(pending.tempPath); } catch {}
+      transaction(registry, () => registry.database.prepare("UPDATE preservation_records SET status='failed',error=?,updated_at=? WHERE preservation_id=? AND status='pending'").run(removed ? "Superseded pending preservation temporary path was removed for exact retry." : "Superseded pending preservation temporary path could not be removed.", now.toISOString(), pending.id));
+      if (!removed) throw new Error(`Pending preservation temporary path could not be removed safely: ${pending.tempPath}`);
+    }
+    if (existsSync(tempPath)) throw new Error(`Preservation temporary path already exists without a matching trusted record: ${tempPath}`);
+    transaction(registry, () => registry.database.prepare(`INSERT INTO preservation_records(preservation_id,worker_id,status,destination,temp_path,latest_run_id,items_json,created_at,updated_at)
+        VALUES(?,?,'pending',?,?,?,?,?,?)`).run(preservationId, worker.workerId, destination, tempPath, worker.latestRunId ?? null, JSON.stringify(items), now.toISOString(), now.toISOString())); recordInserted = true;
+    if (existsSync(destination)) throw new Error(`Preservation destination already exists: ${destination}`);
+    const entries = await collectPreservationEntries(worker.workspaceRoot, items);
     mkdirSync(tempPath, { recursive: false, mode: 0o700 });
     let bytes = 0;
     for (const entry of entries.filter((item) => item.type === "directory")) mkdirSync(path.join(tempPath, entry.path), { recursive: true, mode: 0o700 });
-    for (const entry of entries.filter((item) => item.type === "file")) { await copyVerifiedFile(path.join(worker.workspaceRoot, entry.path), path.join(tempPath, entry.path), entry); bytes += entry.bytes; }
-    const manifest = { version: 1, preservedAt: now.toISOString(), workerId: worker.workerId, role: worker.role, taskIds: worker.taskIds, sourceWorkspace: worker.workspaceRoot, latestRunIdAtStart: worker.latestRunId, items, entries, totals: { entries: entries.length, bytes } };
+    const files = entries.filter((item) => item.type === "file");
+    for (let offset = 0; offset < files.length; offset += 4) await Promise.all(files.slice(offset, offset + 4).map(async (entry) => { await copyVerifiedFile(entry, path.join(tempPath, entry.path)); bytes += entry.bytes; }));
+    for (const entry of entries.filter((item) => item.type === "directory")) assertSourceIdentity(entry);
+    const publicEntries = entries.map(({ source: _source, device: _device, inode: _inode, ...entry }) => entry);
+    const manifest = { version: 1, preservedAt: now.toISOString(), workerId: worker.workerId, role: worker.role, taskIds: worker.taskIds, sourceWorkspace: realpathSync(worker.workspaceRoot), latestRunIdAtStart: worker.latestRunId, items, entries: publicEntries, totals: { entries: entries.length, bytes } };
     await import("node:fs/promises").then(({ writeFile }) => writeFile(path.join(tempPath, "worker-preservation.json"), `${JSON.stringify(manifest, null, 2)}\n`, { flag: "wx", mode: 0o600 }));
     const current = getWorker(registry, worker.workerId); if (!current || current.latestRunId !== worker.latestRunId) throw new Error("Worker latest run changed during preservation.");
-    assertQuiescent(registry, current, true);
-    if (existsSync(destination)) throw new Error(`Preservation destination appeared during publication: ${destination}`);
-    renameSync(tempPath, destination); publicationRenamed = true;
+    assertQuiescent(registry, current, true);assertNoSymlinkAncestors(destination); if (existsSync(destination)) throw new Error(`Preservation destination appeared during publication: ${destination}`);
+    const staged=lstatSync(tempPath);await execFileAsync("/bin/mv", ["-n", tempPath, destination], { maxBuffer: 64 * 1024 });
+    if (existsSync(tempPath) || !existsSync(destination)) throw new Error(`Preservation destination appeared during atomic no-overwrite publication: ${destination}`);const published=lstatSync(destination);if(!published.isDirectory()||published.isSymbolicLink()||Number(published.dev)!==Number(staged.dev)||Number(published.ino)!==Number(staged.ino)){const nested=path.join(destination,path.basename(tempPath));try{const moved=lstatSync(nested);if(!moved.isSymbolicLink()&&Number(moved.dev)===Number(staged.dev)&&Number(moved.ino)===Number(staged.ino)&&!existsSync(tempPath))renameSync(nested,tempPath);}catch{}throw new Error(`Preservation destination won the atomic no-overwrite publication race: ${destination}`);}publicationRenamed = true;
     const changed = transaction(registry, () => registry.database.prepare("UPDATE preservation_records SET status='published',manifest_json=?,updated_at=? WHERE preservation_id=? AND status='pending'").run(JSON.stringify(manifest), new Date().toISOString(), preservationId));
     if (Number(changed.changes) !== 1) throw new Error("Pending preservation record changed during publication.");
-    prunePreservationRecords(registry, worker.workerId);
     return { preservationId, destination, items, entries: entries.length, bytes };
   } catch (error) {
-    if (publicationRenamed || (existsSync(destination) && !existsSync(tempPath))) throw new Error(`Preservation publication requires exact pending-record recovery: ${error instanceof Error ? error.message : String(error)}`);
+    if (publicationRenamed || (existsSync(destination) && !existsSync(tempPath) && recordInserted)) throw new Error(`Preservation publication requires exact pending-record recovery: ${error instanceof Error ? error.message : String(error)}`);
     let removed = false; try { rmSync(tempPath, { recursive: true, force: true }); removed = !existsSync(tempPath); } catch {}
-    transaction(registry, () => registry.database.prepare("UPDATE preservation_records SET status='failed',error=?,updated_at=? WHERE preservation_id=? AND status='pending'").run(`${error instanceof Error ? error.message : String(error)}${removed ? "" : " (temporary path remains)"}`.slice(0, 2000), new Date().toISOString(), preservationId));
+    if (recordInserted) transaction(registry, () => registry.database.prepare("UPDATE preservation_records SET status='failed',error=?,updated_at=? WHERE preservation_id=? AND status='pending'").run(`${error instanceof Error ? error.message : String(error)}${removed ? "" : " (temporary path remains)"}`.slice(0, 2000), new Date().toISOString(), preservationId));
     throw error;
-  }
+  } finally { releasePreservationLock(lockPath, lock); }
 }
+type PreservationLockIdentity = { device: number; inode: number; metadata: string };
+function acquirePreservationLock(lockPath: string, preservationId: string, destination: string, nonce: string): PreservationLockIdentity {
+  const processStartToken=asyncJobProcessStartToken(process.pid);if(typeof processStartToken!=="string")throw new Error("Cannot capture exact preservation-lock process identity.");
+  const candidate=`${lockPath}.${nonce.slice(0,24)}`;const metadata=JSON.stringify({version:1,pid:process.pid,processStartToken,preservationId,destination});let fd:number|undefined;
+  try{fd=openSync(candidate,fsConstants.O_WRONLY|fsConstants.O_CREAT|fsConstants.O_EXCL,0o600);writeFileSync(fd,metadata);closeSync(fd);fd=undefined;
+    for(let attempt=0;attempt<2;attempt+=1){try{linkSync(candidate,lockPath);const info=lstatSync(lockPath);if(!info.isFile()||info.isSymbolicLink())throw new Error("Preservation publication lock is unsafe.");return{device:Number(info.dev),inode:Number(info.ino),metadata};}catch(error){if((error as NodeJS.ErrnoException).code!=="EEXIST")throw error;const info=lstatSync(lockPath);if(!info.isFile()||info.isSymbolicLink()||info.size>8192)throw new Error("Preservation publication lock is unsafe or ambiguous.");let owner:{pid?:unknown;processStartToken?:unknown};const ownerMetadata=readFileSync(lockPath,"utf8");try{owner=JSON.parse(ownerMetadata) as typeof owner;}catch{throw new Error("Preservation publication lock owner is unreadable.");}if(typeof owner.pid!=="number"||typeof owner.processStartToken!=="string")throw new Error("Preservation publication lock owner is invalid.");const current=asyncJobProcessStartToken(owner.pid);let dead=current!==undefined&&current!==owner.processStartToken;if(current===owner.processStartToken)dead=false;if(current===undefined){try{process.kill(owner.pid,0);dead=false;}catch(killError){dead=(killError as NodeJS.ErrnoException).code==="ESRCH";}}if(!dead)throw new Error("Preservation destination is locked by a live or ambiguous publisher.");const stable=readFileSync(lockPath,"utf8");if(stable!==ownerMetadata)throw new Error("Preservation publication lock changed during stale-owner recovery.");const again=lstatSync(lockPath);if(!again.isFile()||again.isSymbolicLink()||Number(again.dev)!==Number(info.dev)||Number(again.ino)!==Number(info.ino))throw new Error("Preservation publication lock changed during stale-owner recovery.");unlinkSync(lockPath);}
+    }throw new Error("Preservation publication lock could not be acquired.");
+  }finally{if(fd!==undefined)closeSync(fd);try{unlinkSync(candidate);}catch(error){if((error as NodeJS.ErrnoException).code!=="ENOENT")throw error;}}
+}
+function releasePreservationLock(lockPath:string,identity:PreservationLockIdentity):void{try{const info=lstatSync(lockPath);if(!info.isFile()||info.isSymbolicLink()||info.size>8192||readFileSync(lockPath,"utf8")!==identity.metadata)return;const again=lstatSync(lockPath);if(Number(again.dev)===Number(info.dev)&&Number(again.ino)===Number(info.ino))unlinkSync(lockPath);}catch(error){if((error as NodeJS.ErrnoException).code!=="ENOENT")throw error;}}
 
 async function verifyPublishedPreservation(destination: string, worker: WorkerRegistryRecord, items: string[]): Promise<{ manifest: Record<string, unknown>; entries: number; bytes: number }> {
   const manifestPath = path.join(destination, "worker-preservation.json"); const info = lstatSync(manifestPath);
   if (!info.isFile() || info.isSymbolicLink() || info.size > 8 * 1024 * 1024) throw new Error("Existing preservation manifest is missing, unsafe, or oversized.");
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, any>;
   if (manifest.version !== 1 || manifest.workerId !== worker.workerId || manifest.latestRunIdAtStart !== worker.latestRunId || JSON.stringify(manifest.items) !== JSON.stringify(items) || !Array.isArray(manifest.entries)) throw new Error("Existing preservation manifest does not match this exact worker run and item set.");
-  const current = collectPreservationEntries(worker.workspaceRoot, items); const targetEntries = collectPreservationEntries(destination, items); const expected = manifest.entries as PreservationEntry[];
-  if (JSON.stringify(current) !== JSON.stringify(expected)) throw new Error("Preservation sources changed since the pending publication.");
-  if (JSON.stringify(targetEntries) !== JSON.stringify(expected)) throw new Error("Existing preservation tree does not match the pending publication manifest.");
-  for (const entry of expected.filter((item) => item.type === "file")) {
-    const target = path.join(destination, entry.path); const metadata = lstatSync(target); if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size !== entry.bytes) throw new Error(`Existing preservation file is unsafe or changed: ${entry.path}`);
-    const [sourceHash, targetHash] = await Promise.all([hashFile(path.join(worker.workspaceRoot, entry.path)), hashFile(target)]); if (sourceHash !== targetHash) throw new Error(`Existing preservation file does not match its source: ${entry.path}`);
-  }
+  const current = (await collectPreservationEntries(worker.workspaceRoot, items)).map(({ source: _source, device: _device, inode: _inode, ...entry }) => entry);
+  const target = (await collectPreservationEntries(destination, items)).map(({ source: _source, device: _device, inode: _inode, ...entry }) => entry); const expected = manifest.entries as PreservationEntry[];
+  if (JSON.stringify(current) !== JSON.stringify(expected) || JSON.stringify(target) !== JSON.stringify(expected)) throw new Error("Existing preservation tree does not match the pending publication manifest.");
+  for (const entry of expected.filter((item) => item.type === "file")) { const [sourceHash, targetHash] = await Promise.all([hashFile(sourcePathNoFollow(worker.workspaceRoot, entry.path)), hashFile(sourcePathNoFollow(destination, entry.path))]); if (sourceHash !== targetHash) throw new Error(`Existing preservation file does not match its source: ${entry.path}`); }
   const bytes = expected.reduce((total, entry) => total + (entry.type === "file" ? entry.bytes : 0), 0); return { manifest, entries: expected.length, bytes };
 }
 
@@ -256,87 +283,78 @@ function assertQuiescent(registry: WorkerRegistry, worker: WorkerRegistryRecord,
   if (!allowReviewLease && worker.reviewedByWorkerId) throw new Error(`Worker ${worker.workerId} has a review lease.`);
 }
 function resolveSafeDestination(destination: string, runtimeRoot: string, roots: WorkerRoots, workspace: string): string {
-  if (!path.isAbsolute(destination) || Buffer.byteLength(destination) > 4096) throw new Error("Preservation destination must be an absolute path of at most 4096 bytes.");
-  if (destination.split(path.sep).some((part) => part.toLowerCase() === ".git")) throw new Error("Preservation destination cannot contain a .git component.");
-  const resolved = resolveNearestExisting(destination);
+  if (!path.isAbsolute(destination) || Buffer.byteLength(destination) > 4096 || destination.includes("\0")) throw new Error("Preservation destination must be an absolute path of at most 4096 bytes.");
+  const resolved = resolveNearestExisting(destination);assertNoSymlinkAncestors(resolved);
+  if (resolved.split(path.sep).some((part) => part.toLowerCase() === ".git")) throw new Error("Preservation destination cannot contain a resolved .git component.");
   const home = homedir();
   const sensitive = [runtimeRoot, roots.stateRoot, roots.workspaceRoot, workspace, path.join(home, ".pi"), path.join(home, ".ssh"), path.join(home, ".aws"), path.join(home, ".gnupg"), path.join(home, ".config"), path.join(home, ".docker"), path.join(home, ".kube"), path.join(home, ".local", "share", "agent"), process.env.XDG_CONFIG_HOME, process.env.AWS_SHARED_CREDENTIALS_FILE, process.env.AWS_CONFIG_FILE, process.env.KUBECONFIG, process.env.DOCKER_CONFIG, process.env.NPM_CONFIG_USERCONFIG, process.env.BEADS_DIR].filter((value): value is string => typeof value === "string" && value.length > 0);
-  for (const forbidden of sensitive) if (within(resolved, path.resolve(forbidden))) throw new Error("Preservation destination is inside managed worker or sensitive storage.");
-  return path.resolve(destination);
+  for (const forbidden of sensitive) { const canonical = resolveNearestExisting(path.resolve(forbidden)); if (within(resolved, canonical)) throw new Error("Preservation destination is inside managed worker or sensitive storage."); }
+  return resolved;
 }
-function resolveNearestExisting(value: string): string { let cursor = path.resolve(value); const suffix: string[] = []; while (!existsSync(cursor)) { const parent = path.dirname(cursor); if (parent === cursor) break; suffix.unshift(path.basename(cursor)); cursor = parent; } return path.join(realpathSync(cursor), ...suffix); }
-function assertPreservationTemporaryPath(destination: string, tempPath: string): void {
-  const prefix = `.${path.basename(destination)}.worker-preserve-`;
-  if (path.dirname(tempPath) !== path.dirname(destination) || !path.basename(tempPath).startsWith(prefix) || path.basename(tempPath).length !== prefix.length + 24) throw new Error("Pending preservation temporary path is inconsistent with its trusted destination.");
-}
+function assertNoSymlinkAncestors(value:string):void{const resolved=path.resolve(value);const parsed=path.parse(resolved);let cursor=parsed.root;for(const component of resolved.slice(parsed.root.length).split(path.sep).filter(Boolean)){cursor=path.join(cursor,component);try{const info=lstatSync(cursor);if(info.isSymbolicLink())throw new Error(`Preservation destination has a symlink ancestor: ${cursor}`);if(!info.isDirectory()&&cursor!==resolved)throw new Error(`Preservation destination ancestor is not a directory: ${cursor}`);}catch(error){if((error as NodeJS.ErrnoException).code==="ENOENT")return;throw error;}}}
+function resolveNearestExisting(value: string): string { let cursor = path.resolve(value); const suffix: string[] = []; while (!existsSync(cursor)) { const parent = path.dirname(cursor); if (parent === cursor) break; suffix.unshift(path.basename(cursor)); cursor = parent; } const info = lstatSync(cursor); if (!info.isDirectory() && suffix.length) throw new Error("Preservation destination ancestor is not a directory."); return path.join(realpathSync(cursor), ...suffix); }
+function assertPreservationTemporaryPath(destination: string, tempPath: string): void { const prefix = `.${path.basename(destination)}.worker-preserve-`; if (path.dirname(tempPath) !== path.dirname(destination) || !path.basename(tempPath).startsWith(prefix) || path.basename(tempPath).length !== prefix.length + 24) throw new Error("Pending preservation temporary path is inconsistent with its trusted destination."); }
 function within(candidate: string, root: string): boolean { const relative = path.relative(root, candidate); return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative)); }
 function normalizeWorkspacePointer(value: string): string | undefined { try { return normalizeRequiredWorkspacePointer(value); } catch { return undefined; } }
-function normalizeRequiredWorkspacePointer(value: string): string {
-  if (Buffer.byteLength(value) > 4096 || value.includes("\0")) throw new Error("Invalid preservation path.");
-  const candidate = value.startsWith("/workspace/") ? value.slice(11) : value;
-  if (path.isAbsolute(candidate)) throw new Error(`Preservation path must be workspace-relative: ${value}`);
-  const normalized = path.posix.normalize(candidate.replaceAll(path.sep, "/"));
-  if (!normalized || normalized === "." || normalized === ".." || normalized.startsWith("../")) throw new Error(`Preservation path escapes the workspace: ${value}`);
-  return normalized;
-}
+function normalizeRequiredWorkspacePointer(value: string): string { if (Buffer.byteLength(value) > 4096 || value.includes("\0")) throw new Error("Invalid preservation path."); const candidate = value.startsWith("/workspace/") ? value.slice(11) : value; if (path.isAbsolute(candidate)) throw new Error(`Preservation path must be workspace-relative: ${value}`); const normalized = path.posix.normalize(candidate.replaceAll(path.sep, "/")); if (!normalized || normalized === "." || normalized === ".." || normalized.startsWith("../")) throw new Error(`Preservation path escapes the workspace: ${value}`); return normalized; }
 function collapseParents(values: string[]): string[] { const sorted = [...new Set(values)].sort(); return sorted.filter((value, index) => !sorted.slice(0, index).some((parent) => value.startsWith(`${parent}/`))); }
-function collectPreservationEntries(workspace: string, items: string[]): PreservationEntry[] {
-  const entries: PreservationEntry[] = [];
-  const visit = (relative: string): void => {
-    if (entries.length >= MAX_PRESERVATION_ENTRIES) throw new Error(`Preservation exceeds ${MAX_PRESERVATION_ENTRIES} entries.`);
-    if (relative.split("/").some((part) => part.toLowerCase() === ".git")) throw new Error(`Preservation refuses nested .git content: ${relative}`);
-    const absolute = path.join(workspace, relative); const info = lstatSync(absolute);
-    if (info.isDirectory() && existsSync(path.join(absolute, "HEAD")) && existsSync(path.join(absolute, "objects")) && existsSync(path.join(absolute, "refs"))) throw new Error(`Preservation refuses Git repositories: ${relative}`);
+
+async function collectPreservationEntries(workspace: string, items: string[]): Promise<WalkEntry[]> {
+  const root = realpathSync(workspace); const rootInfo = lstatSync(root); if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw new Error("Worker workspace root is not an ordinary directory.");
+  const entries: WalkEntry[] = []; let totalBytes = 0; const pending = [...items].reverse();
+  while (pending.length) {
+    const relative = pending.pop()!; if (relative.split("/").some((part) => part.toLowerCase() === ".git")) throw new Error(`Preservation refuses nested .git content: ${relative}`);
+    const source = sourcePathNoFollow(root, relative); const info = await lstatAsync(source);
     if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory())) throw new Error(`Preservation refuses symlinks and special files: ${relative}`);
-    if (!within(path.resolve(absolute), path.resolve(workspace))) throw new Error(`Preservation path escapes the workspace: ${relative}`);
-    entries.push({ path: relative, type: info.isDirectory() ? "directory" : "file", bytes: info.isFile() ? info.size : 0, executable: Boolean(info.mode & 0o111) });
-    if (info.isDirectory()) { const children: string[] = []; for (const entry of directoryEntries(absolute)) { if (entries.length + children.length >= MAX_PRESERVATION_ENTRIES) throw new Error(`Preservation exceeds ${MAX_PRESERVATION_ENTRIES} entries.`); children.push(entry.name); } children.sort(); for (const child of children) visit(path.posix.join(relative, child)); }
-  };
-  for (const item of items) visit(item);
+    if (info.isDirectory() && existsSync(path.join(source, "HEAD")) && existsSync(path.join(source, "objects")) && existsSync(path.join(source, "refs"))) throw new Error(`Preservation refuses Git repositories: ${relative}`);
+    if (entries.length >= MAX_PRESERVATION_ENTRIES) throw new Error(`Preservation exceeds ${MAX_PRESERVATION_ENTRIES} entries.`);
+    if (info.isFile()) { totalBytes += info.size; if (totalBytes > MAX_PRESERVATION_BYTES) throw new Error("Preservation exceeds the 1 GiB byte bound."); }
+    entries.push({ path: relative, type: info.isDirectory() ? "directory" : "file", bytes: info.isFile() ? info.size : 0, executable: Boolean(info.mode & 0o111), source, device: info.dev, inode: info.ino });
+    if (info.isDirectory()) { const names: string[] = []; const dir = await opendirAsync(source); try { for await (const child of dir) {if(entries.length+names.length>=MAX_PRESERVATION_ENTRIES)throw new Error(`Preservation exceeds ${MAX_PRESERVATION_ENTRIES} entries.`);names.push(child.name);} } finally { try { await dir.close(); } catch {} } names.sort().reverse(); for (const name of names) pending.push(path.posix.join(relative, name)); }
+    if (entries.length % 256 === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+  }
   return entries;
 }
+function sourcePathNoFollow(workspace: string, relative: string): string { const root = realpathSync(workspace); let cursor = root; for (const component of relative.split("/")) { if (!component || component === "." || component === "..") throw new Error(`Preservation path escapes the workspace: ${relative}`); cursor = path.join(cursor, component); const info = lstatSync(cursor); if (info.isSymbolicLink()) throw new Error(`Preservation refuses symlink ancestors: ${relative}`); } if (!within(cursor, root)) throw new Error(`Preservation path escapes the workspace: ${relative}`); return cursor; }
 function noFollowReadStream(value: string) { const fd = openSync(value, fsConstants.O_RDONLY | ((fsConstants as any).O_NOFOLLOW ?? 0)); return createReadStream(value, { fd, autoClose: true }); }
 async function hashFile(value: string): Promise<string> { const hash = createHash("sha256"); for await (const chunk of noFollowReadStream(value)) hash.update(chunk as Buffer); return hash.digest("hex"); }
-async function copyVerifiedFile(source: string, destination: string, expected: PreservationEntry): Promise<void> {
-  mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
-  const sourceBefore = lstatSync(source); if (!sourceBefore.isFile() || sourceBefore.size !== expected.bytes) throw new Error(`Artifact changed during preservation: ${expected.path}`);
-  await pipeline(noFollowReadStream(source), createWriteStream(destination, { flags: "wx", mode: expected.executable ? 0o700 : 0o600 }));
-  const [sourceHash, destinationHash] = await Promise.all([hashFile(source), hashFile(destination)]);
-  const sourceAfter = lstatSync(source); if (sourceBefore.dev !== sourceAfter.dev || sourceBefore.ino !== sourceAfter.ino || sourceBefore.size !== sourceAfter.size || sourceHash !== destinationHash) throw new Error(`Artifact changed or failed verification during preservation: ${expected.path}`);
-}
-function prunePreservationRecords(registry: WorkerRegistry, workerId: string): void {
-  transaction(registry, () => {
-    const rows = registry.database.prepare("SELECT preservation_id,status,temp_path FROM preservation_records WHERE worker_id=? ORDER BY created_at DESC,preservation_id DESC").all(workerId) as Array<{ preservation_id: string; status: string; temp_path: string }>;
-    if (rows.length <= MAX_PRESERVATION_RECORDS) return;
-    const removable = rows.slice(MAX_PRESERVATION_RECORDS).filter((row) => !(row.status === "pending" && existsSync(row.temp_path)));
-    const remove = registry.database.prepare("DELETE FROM preservation_records WHERE preservation_id=? AND worker_id=?"); for (const row of removable) remove.run(row.preservation_id, workerId);
-  });
-}
-
-export type HostLogCleanup = { deleted: string[]; leftovers: Array<{ path: string; reason: string }> };
-export function deleteSettledWorkerHostLogs(registry: WorkerRegistry, worker: WorkerRegistryRecord): HostLogCleanup {
+function assertSourceIdentity(entry: WalkEntry): void { const info = lstatSync(entry.source); if ((entry.type === "file" ? !info.isFile() : !info.isDirectory()) || info.isSymbolicLink() || info.dev !== entry.device || info.ino !== entry.inode || (entry.type === "file" && info.size !== entry.bytes)) throw new Error(`Artifact changed during preservation: ${entry.path}`); }
+async function copyVerifiedFile(entry: WalkEntry, destination: string): Promise<void> { mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 }); assertSourceIdentity(entry); await pipeline(noFollowReadStream(entry.source), createWriteStream(destination, { flags: "wx", mode: entry.executable ? 0o700 : 0o600 })); const [sourceHash, destinationHash] = await Promise.all([hashFile(entry.source), hashFile(destination)]); assertSourceIdentity(entry); if (sourceHash !== destinationHash) throw new Error(`Artifact changed or failed verification during preservation: ${entry.path}`); }
+export type HostLogPlan = { deletable: Array<{ path: string; device: number; inode: number; metaPath:string; metaDevice:number; metaInode:number; metaSize:number; metaHash:string }>; absent: string[]; skipped: string[]; leftovers: Array<{ path: string; reason: string }> };
+export function planSettledWorkerHostLogs(registry: WorkerRegistry, worker: WorkerRegistryRecord): HostLogPlan {
   if (worker.status !== "idle" || worker.activeRunId) throw new Error(`Worker ${worker.workerId} is not idle for host-log cleanup.`);
   const runs = workerRunsBounded(registry, worker.workerId); if (runs.some((run) => run.status !== "settled")) throw new Error(`Worker ${worker.workerId} has an unsettled retained run.`);
-  const result: HostLogCleanup = { deleted: [], leftovers: [] };
+  const result: HostLogPlan = { deletable: [], absent: [], skipped: [], leftovers: [] };
   for (const run of runs) {
-    if (!run.jobId || !run.stdoutLog || !run.stderrLog) continue;
-    const directory = path.dirname(run.stdoutLog);
+    if (!run.jobId || !run.stdoutLog || !run.stderrLog) { result.skipped.push(run.runId); continue; }
+    const directory = path.dirname(run.stdoutLog); const pseudo = path.basename(directory) !== run.jobId && path.basename(run.stdoutLog).startsWith("launch-") && path.basename(run.stderrLog).startsWith("launch-");
+    if (pseudo) { result.skipped.push(run.runId); continue; }
     try {
       if (path.basename(directory) !== run.jobId || path.dirname(run.stderrLog) !== directory) throw new Error("registered log paths do not identify the exact job directory");
+      if (!existsSync(directory)) { result.absent.push(directory); continue; }
       const directoryInfo = lstatSync(directory); if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) throw new Error("host-log path is not an ordinary directory");
       const metaPath = path.join(directory, "meta.json"); const metaInfo = lstatSync(metaPath); if (!metaInfo.isFile() || metaInfo.isSymbolicLink() || metaInfo.size > 1024 * 1024) throw new Error("host-log metadata is unsafe or oversized");
-      const meta = JSON.parse(readFileSync(metaPath, "utf8")) as Record<string, unknown>;
+      const metaText=readFileSync(metaPath,"utf8");const meta = JSON.parse(metaText) as Record<string, unknown>;
       if (meta.jobId !== run.jobId || meta.command !== `Pi worker host ${worker.workerId}/${run.runId}` || path.resolve(String(meta.stdoutLog ?? "")) !== path.resolve(run.stdoutLog) || path.resolve(String(meta.stderrLog ?? "")) !== path.resolve(run.stderrLog)) throw new Error("host-log metadata identity mismatch");
-      const status = meta.status; if (!["exited", "failed", "cancelled", "unknown", "running"].includes(String(status))) throw new Error("host-log status is invalid");
-      if (status === "running" || status === "unknown") {
-        if (typeof meta.pid !== "number" || typeof meta.processToken !== "string") throw new Error("unsettled host-log process identity is incomplete");
-        let alive = true; try { alive = isAsyncJobExecutionAlive(meta.pid, meta.processToken); } catch { alive = true; }
-        if (alive) throw new Error("worker host is still live or liveness is ambiguous");
-      }
-      rmSync(directory, { recursive: true, force: true }); if (existsSync(directory)) throw new Error("host-log directory remains after deletion"); result.deleted.push(directory);
+      const status = String(meta.status); if (!["exited","failed","cancelled","unknown","running"].includes(status)) throw new Error("host-log status is invalid");
+      if (status === "running" || status === "unknown") { if (typeof meta.pid !== "number" || typeof meta.processToken !== "string") throw new Error("unsettled host-log process identity is incomplete"); let alive = true; try { alive = isAsyncJobExecutionAlive(meta.pid, meta.processToken); } catch { alive = true; } if (alive) throw new Error("worker host is still live or liveness is ambiguous"); }
+      result.deletable.push({ path: directory, device: Number(directoryInfo.dev), inode: Number(directoryInfo.ino),metaPath,metaDevice:Number(metaInfo.dev),metaInode:Number(metaInfo.ino),metaSize:Number(metaInfo.size),metaHash:createHash("sha256").update(metaText).digest("hex") });
     } catch (error) { result.leftovers.push({ path: directory, reason: error instanceof Error ? error.message : String(error) }); }
   }
   return result;
+}
+export function deletePlannedWorkerHostLogs(plan: HostLogPlan): string[] {
+  const appeared=plan.absent.find((directory)=>existsSync(directory));if(appeared)throw new Error(`A worker host-log directory appeared after preflight: ${appeared}`);
+  if(plan.leftovers.length)throw new Error(`Worker host logs could not be deleted safely: ${plan.leftovers.map((item)=>`${item.path}: ${item.reason}`).join("; ")}`);
+  const deleted:string[]=[];
+  for(const item of plan.deletable){
+    if(!existsSync(item.path)){deleted.push(item.path);continue;}
+    const directory=lstatSync(item.path);if(!directory.isDirectory()||directory.isSymbolicLink()||Number(directory.dev)!==item.device||Number(directory.ino)!==item.inode)throw new Error(`Worker host log identity changed before irreversible deletion: ${item.path}`);
+    const metadata=lstatSync(item.metaPath);if(!metadata.isFile()||metadata.isSymbolicLink()||Number(metadata.dev)!==item.metaDevice||Number(metadata.ino)!==item.metaInode||Number(metadata.size)!==item.metaSize)throw new Error(`Worker host-log metadata changed before irreversible deletion: ${item.path}`);
+    const metaHash=createHash("sha256").update(readFileSync(item.metaPath)).digest("hex"),metadataAfter=lstatSync(item.metaPath);if(metaHash!==item.metaHash||!metadataAfter.isFile()||metadataAfter.isSymbolicLink()||Number(metadataAfter.dev)!==item.metaDevice||Number(metadataAfter.ino)!==item.metaInode||Number(metadataAfter.size)!==item.metaSize)throw new Error(`Worker host-log metadata changed before irreversible deletion: ${item.path}`);
+    rmSync(item.path,{recursive:true,force:true});if(existsSync(item.path))throw new Error(`Worker host log remains after deletion: ${item.path}`);deleted.push(item.path);
+  }
+  return deleted;
 }
 
 export function preflightWorkerDiscard(registry: WorkerRegistry, parentSessionFile: string, input: { workerIds: string[]; artifactLossAcknowledged?: string[]; allowCrossSession?: boolean }): Array<{ worker: WorkerRegistryRecord; erasedArtifacts: string[] }> {
@@ -348,8 +366,8 @@ export function preflightWorkerDiscard(registry: WorkerRegistry, parentSessionFi
     try { assertQuiescent(registry, worker, true); } catch (error) { failures.push(error instanceof Error ? error.message : String(error)); }
     if (registry.database.prepare("SELECT 1 FROM runs WHERE worker_id=? AND status!='settled' LIMIT 1").get(worker.workerId)) failures.push(`Worker ${worker.workerId} has an unsettled retained run.`);
     const reviewer = worker.reviewedByWorkerId; if (reviewer && !selected.has(reviewer)) failures.push(`Worker ${worker.workerId} is leased by reviewer ${reviewer}, which is not in the batch.`);
-    const claimedDelivery = registry.database.prepare("SELECT delivery_id FROM deliveries WHERE worker_id=? AND state='claimed' LIMIT 1").get(worker.workerId) as { delivery_id: string } | undefined;
-    if (claimedDelivery) failures.push(`Worker ${worker.workerId} has claimed delivery ${claimedDelivery.delivery_id}.`);
+    const undelivered = registry.database.prepare("SELECT delivery_id,state FROM deliveries WHERE worker_id=? AND state!='delivered' ORDER BY created_at LIMIT 1").get(worker.workerId) as { delivery_id: string; state: string } | undefined;
+    if (undelivered) failures.push(`Worker ${worker.workerId} has ${undelivered.state} delivery ${undelivered.delivery_id}; use cleanup_preview/cleanup_apply for explicit takeover.`);
     const erasedArtifacts = unpreservedArtifacts(registry, worker); if (erasedArtifacts.length && !acknowledgements.has(worker.workerId)) failures.push(`Worker ${worker.workerId} has unpreserved reported artifacts: ${erasedArtifacts.join(", ")}.`);
     output.push({ worker, erasedArtifacts });
   }
@@ -364,8 +382,7 @@ export function claimPreparedSetDiscard(registry: WorkerRegistry, parentSessionF
     const row = registry.database.prepare("SELECT status,apply_nonce FROM prepared_sets WHERE prepared_id=? AND parent_session_file=?").get(preparedId, parentSessionFile) as { status: string; apply_nonce: string | null } | undefined;
     if (!row) throw new Error(`Unknown prepared set ${preparedId} for this parent session.`);
     if (row.apply_nonce !== null || !["ready", "resolution_required", "failed", "partial", "discarding"].includes(row.status)) throw new Error(`Prepared set ${preparedId} cannot be discarded from status ${row.status}.`);
-    const changed = registry.database.prepare("UPDATE prepared_sets SET status='discarding',updated_at=? WHERE prepared_id=? AND parent_session_file=? AND apply_nonce IS NULL AND status IN ('ready','resolution_required','failed','partial','discarding')").run(now, preparedId, parentSessionFile);
-    if (Number(changed.changes) !== 1) throw new Error(`Prepared set ${preparedId} changed during discard.`);
+    if (row.status !== "discarding") { const changed = registry.database.prepare("UPDATE prepared_sets SET status='discarding',updated_at=? WHERE prepared_id=? AND parent_session_file=? AND apply_nonce IS NULL AND status=?").run(now, preparedId, parentSessionFile, row.status); if (Number(changed.changes) !== 1) throw new Error(`Prepared set ${preparedId} changed during discard.`); }
     return { partial: row.status === "partial" };
   });
 }
@@ -380,124 +397,85 @@ export function recoverPreparedSetDiscards(registry: WorkerRegistry, preparedRoo
   for (const row of rows) finishPreparedSetDiscard(registry, preparedRoot, row.prepared_id); return rows.map((row) => row.prepared_id);
 }
 
-export function preflightWorkerAdoption(registry: WorkerRegistry, input: { workerIds: string[]; expectedOwners: Record<string, string>; acknowledgePending: boolean }): void {
-  for (const workerId of input.workerIds) {
-    const row = registry.database.prepare("SELECT parent_session_file,status,operation_kind,recovery_error,reviewed_by_worker_id FROM workers WHERE worker_id=?").get(workerId) as { parent_session_file: string; status: string; operation_kind: string | null; recovery_error: string | null; reviewed_by_worker_id: string | null } | undefined;
-    if (!row || row.parent_session_file !== input.expectedOwners[workerId] || row.status !== "idle" || row.operation_kind !== null || row.recovery_error !== null || (row.reviewed_by_worker_id !== null && !input.workerIds.includes(row.reviewed_by_worker_id))) throw new Error(`Worker ${workerId} is not safely adoptable.`);
-    if (registry.database.prepare("SELECT 1 FROM runs WHERE worker_id=? AND claim_kind IS NOT NULL LIMIT 1").get(workerId)) throw new Error(`Worker ${workerId} has a lifecycle claim.`);
-    if (registry.database.prepare("SELECT 1 FROM deliveries WHERE worker_id=? AND state='claimed' LIMIT 1").get(workerId)) throw new Error(`Worker ${workerId} has a stranded delivery claim.`);
-    if (!input.acknowledgePending && registry.database.prepare("SELECT 1 FROM deliveries WHERE worker_id=? AND state='pending' LIMIT 1").get(workerId)) throw new Error(`Worker ${workerId} has pending results that require explicit preview-bound consent.`);
-  }
+function exactWorkerRows(registry: WorkerRegistry, workerIds: string[]): WorkerRegistryRecord[] { return workerIds.map((workerId) => { const worker=getWorker(registry,workerId); if(!worker) throw new Error(`Unknown worker ${workerId}.`); return worker; }); }
+function leaseClosure(registry: WorkerRegistry, workerIds: string[]): string[] {
+  const selected=new Set(workerIds); let changed=true; while(changed){ changed=false; for(const worker of exactWorkerRows(registry,[...selected])) { if(worker.reviewedByWorkerId && !selected.has(worker.reviewedByWorkerId)){selected.add(worker.reviewedByWorkerId);changed=true;} const subject=registry.database.prepare("SELECT worker_id FROM workers WHERE reviewed_by_worker_id=?").get(worker.workerId) as {worker_id:string}|undefined;if(subject){const run=worker.latestRunId?getWorkerRun(registry,worker.workerId,worker.latestRunId):undefined;const binding=run?.binding;if(worker.role!=="review"||!binding||!("reviewedWorkerId" in binding)||binding.reviewedWorkerId!==subject.worker_id)throw new Error(`Reviewer ${worker.workerId} has an inconsistent subject lease.`);if(!selected.has(subject.worker_id)){selected.add(subject.worker_id);changed=true;}} } }
+  if(selected.size>32) throw new Error("Lease-connected cleanup selection exceeds 32 workers."); return [...selected];
+}
+export async function createCleanupSnapshot(registry: WorkerRegistry, input: { parentSessionFile: string; workerIds?: string[]; preparedIds?: string[]; leftoverIds?: string[]; cwd: string; roots: WorkerRoots; preparedRoot: string; bdPath?: string; now?: Date; ownerAuthority: (owner: string) => CleanupOwnerAuthority }): Promise<PersistedCleanupPreview> {
+  const requestedWorkers=input.workerIds??[]; const preparedIds=input.preparedIds??[]; const leftoverIds=input.leftoverIds??[]; if(!requestedWorkers.length&&!preparedIds.length&&!leftoverIds.length) throw new Error("cleanup_preview requires at least one exact worker, prepared-set, or leftover ID.");
+  const workerIds=leaseClosure(registry,requestedWorkers); const workerRows=exactWorkerRows(registry,workerIds); const preparedRows=preparedIds.map((preparedId)=>{ const row=registry.database.prepare("SELECT prepared_id,parent_session_file,status,task_ids_json,apply_nonce FROM prepared_sets WHERE prepared_id=?").get(preparedId) as PreparedRow|undefined; if(!row) throw new Error(`Unknown prepared set ${preparedId}.`); return row; });
+  const taskIds=[...new Set([...workerRows.flatMap((worker)=>worker.taskIds),...preparedRows.flatMap((row)=>preparedTaskLineage(registry,row).taskIds)])]; const facts=await readCleanupBeadsFacts(taskIds,{cwd:input.cwd,...(input.bdPath?{bdPath:input.bdPath}:{})});
+  const workers:CleanupSnapshotWorker[]=workerRows.map((worker)=>{ const runClaims=registry.database.prepare("SELECT run_id,claim_kind,claim_nonce FROM runs WHERE worker_id=? AND claim_kind IS NOT NULL ORDER BY run_id LIMIT 257").all(worker.workerId) as Array<{run_id:string;claim_kind:string;claim_nonce:string|null}>;if(runClaims.length>256)throw new Error(`Worker ${worker.workerId} lifecycle claims exceed the exact preview bound.`); return { item:classifyCleanupWorker(registry,worker,facts),status:worker.status,...(worker.operationKind?{operationKind:worker.operationKind}:{}),...(worker.operationNonce?{operationNonce:worker.operationNonce}:{}),runClaims:runClaims.map((row)=>({runId:row.run_id,claimKind:row.claim_kind,...(row.claim_nonce?{claimNonce:row.claim_nonce}:{})})),authority:input.ownerAuthority(worker.parentSessionFile),runtime:worker.runtime??{} }; });
+  const prepared:CleanupSnapshotPrepared[]=preparedRows.map((row)=>({...classifyPrepared(registry,row,facts),...(row.apply_nonce?{applyNonce:row.apply_nonce}:{}),authority:input.ownerAuthority(row.parent_session_file)}));
+  const leftoverScan=leftoverIds.length?await scanCleanupLeftoversDetailed(registry,{roots:input.roots,preparedRoot:input.preparedRoot,projectCwd:input.cwd,now:input.now,wantedIds:new Set(leftoverIds),limit:leftoverIds.length}):{items:[] as CleanupLeftover[],matched:0,partial:false,examined:0,roots:[] as Array<{root:string;examined:number;partial:boolean}>}; const byLeftover=new Map(leftoverScan.items.map((item)=>[item.leftoverId,item])); const leftovers=leftoverIds.map((id)=>{const item=byLeftover.get(id);if(!item)throw new Error(`Unknown or changed cleanup leftover ${id}.`);return item;});
+  const snapshot:CleanupSnapshot={version:2,parentSessionFile:path.resolve(input.parentSessionFile),createdAt:(input.now??new Date()).toISOString(),workers:workers.sort((a,b)=>a.item.workerId.localeCompare(b.item.workerId)),prepared:prepared.sort((a,b)=>a.preparedId.localeCompare(b.preparedId)),leftovers:leftovers.sort((a,b)=>a.leftoverId.localeCompare(b.leftoverId)),scan:{partial:leftoverScan.partial,examinedWorkers:workerRows.length,totalWorkers:workerRows.length,examinedFilesystemEntries:leftoverScan.examined,roots:leftoverScan.roots}};
+  const token=`cleanup_${createHash("sha256").update(randomUUID()+cleanupHash(snapshot)).digest("hex").slice(0,48)}`; const snapshotHash=cleanupHash({...snapshot,createdAt:""});
+  transaction(registry,()=>{ registry.database.prepare("UPDATE cleanup_snapshots SET consumed_at=? WHERE parent_session_file=? AND consumed_at IS NULL").run(snapshot.createdAt,snapshot.parentSessionFile); registry.database.prepare("INSERT INTO cleanup_snapshots(token,parent_session_file,snapshot_json,snapshot_hash,created_at) VALUES(?,?,?,?,?)").run(token,snapshot.parentSessionFile,JSON.stringify(snapshot),snapshotHash,snapshot.createdAt); });
+  return {token,snapshotHash,snapshot};
+}
+export function loadCleanupSnapshot(registry: WorkerRegistry,parentSessionFile:string,token:string):PersistedCleanupPreview { const row=registry.database.prepare("SELECT snapshot_json,snapshot_hash,consumed_at FROM cleanup_snapshots WHERE token=? AND parent_session_file=?").get(token,path.resolve(parentSessionFile)) as {snapshot_json:string;snapshot_hash:string;consumed_at:string|null}|undefined; if(!row)throw new Error("Unknown cleanup snapshot token.");if(row.consumed_at)throw new Error("Cleanup snapshot token was already consumed.");return {token,snapshotHash:row.snapshot_hash,snapshot:parseJson<CleanupSnapshot>(row.snapshot_json)}; }
+export function consumeCleanupSnapshot(registry:WorkerRegistry,parentSessionFile:string,token:string,expectedHash:string,now:string):void { const result=transaction(registry,()=>registry.database.prepare("UPDATE cleanup_snapshots SET consumed_at=? WHERE token=? AND parent_session_file=? AND snapshot_hash=? AND consumed_at IS NULL").run(now,token,path.resolve(parentSessionFile),expectedHash));if(Number(result.changes)!==1)throw new Error("Cleanup snapshot changed or was already consumed."); }
+export async function revalidateCleanupSnapshot(registry:WorkerRegistry,preview:PersistedCleanupPreview,input:{cwd:string;roots:WorkerRoots;preparedRoot:string;bdPath?:string;now?:Date;ownerAuthority:(owner:string)=>CleanupOwnerAuthority}):Promise<PersistedCleanupPreview>{ const current=await createCleanupSnapshotUnstored(registry,{...input,parentSessionFile:preview.snapshot.parentSessionFile,workerIds:preview.snapshot.workers.map((item)=>item.item.workerId),preparedIds:preview.snapshot.prepared.map((item)=>item.preparedId),leftoverIds:preview.snapshot.leftovers.map((item)=>item.leftoverId)}); if(current.snapshotHash!==preview.snapshotHash)throw new Error("Cleanup snapshot is stale; request a new cleanup_preview.");return {...current,token:preview.token}; }
+async function createCleanupSnapshotUnstored(registry:WorkerRegistry,input:{parentSessionFile:string;workerIds:string[];preparedIds:string[];leftoverIds:string[];cwd:string;roots:WorkerRoots;preparedRoot:string;bdPath?:string;now?:Date;ownerAuthority:(owner:string)=>CleanupOwnerAuthority}):Promise<PersistedCleanupPreview>{
+  const workerRows=exactWorkerRows(registry,input.workerIds); const preparedRows=input.preparedIds.map((preparedId)=>{const row=registry.database.prepare("SELECT prepared_id,parent_session_file,status,task_ids_json,apply_nonce FROM prepared_sets WHERE prepared_id=?").get(preparedId) as PreparedRow|undefined;if(!row)throw new Error(`Unknown prepared set ${preparedId}.`);return row;}); const taskIds=[...new Set([...workerRows.flatMap((w)=>w.taskIds),...preparedRows.flatMap((r)=>preparedTaskLineage(registry,r).taskIds)])]; const facts=await readCleanupBeadsFacts(taskIds,{cwd:input.cwd,...(input.bdPath?{bdPath:input.bdPath}:{})});
+  const workers=workerRows.map((worker)=>{const runClaims=registry.database.prepare("SELECT run_id,claim_kind,claim_nonce FROM runs WHERE worker_id=? AND claim_kind IS NOT NULL ORDER BY run_id LIMIT 257").all(worker.workerId) as Array<{run_id:string;claim_kind:string;claim_nonce:string|null}>;if(runClaims.length>256)throw new Error(`Worker ${worker.workerId} lifecycle claims exceed the exact preview bound.`);return {item:classifyCleanupWorker(registry,worker,facts),status:worker.status,...(worker.operationKind?{operationKind:worker.operationKind}:{}),...(worker.operationNonce?{operationNonce:worker.operationNonce}:{}),runClaims:runClaims.map((r)=>({runId:r.run_id,claimKind:r.claim_kind,...(r.claim_nonce?{claimNonce:r.claim_nonce}:{})})),authority:input.ownerAuthority(worker.parentSessionFile),runtime:worker.runtime??{}} satisfies CleanupSnapshotWorker;});
+  const prepared=preparedRows.map((row)=>({...classifyPrepared(registry,row,facts),...(row.apply_nonce?{applyNonce:row.apply_nonce}:{}),authority:input.ownerAuthority(row.parent_session_file)})); const scan=input.leftoverIds.length?await scanCleanupLeftoversDetailed(registry,{roots:input.roots,preparedRoot:input.preparedRoot,projectCwd:input.cwd,now:input.now,wantedIds:new Set(input.leftoverIds),limit:input.leftoverIds.length}):{items:[] as CleanupLeftover[],matched:0,partial:false,examined:0,roots:[] as Array<{root:string;examined:number;partial:boolean}>};const map=new Map(scan.items.map((i)=>[i.leftoverId,i]));const leftovers=input.leftoverIds.map((id)=>{const x=map.get(id);if(!x)throw new Error(`Cleanup leftover changed: ${id}.`);return x;}); const snapshot:CleanupSnapshot={version:2,parentSessionFile:path.resolve(input.parentSessionFile),createdAt:"",workers:workers.sort((a,b)=>a.item.workerId.localeCompare(b.item.workerId)),prepared:prepared.sort((a,b)=>a.preparedId.localeCompare(b.preparedId)),leftovers:leftovers.sort((a,b)=>a.leftoverId.localeCompare(b.leftoverId)),scan:{partial:scan.partial,examinedWorkers:workerRows.length,totalWorkers:workerRows.length,examinedFilesystemEntries:scan.examined,roots:scan.roots}};return {token:"",snapshotHash:cleanupHash(snapshot),snapshot};
 }
 
-/** Atomically adopts exact idle workers and optionally claims them for discard. Pending deliveries are acknowledged only with preview-bound consent. */
-export function adoptWorkers(registry: WorkerRegistry, input: { workerIds: string[]; expectedOwners: Record<string, string>; newParentSessionFile: string; discardNonce?: string; acknowledgePending: boolean; now: string }): void {
-  preflightWorkerAdoption(registry, input);
-  transaction(registry, () => {
-    for (const workerId of input.workerIds) {
-      const row = registry.database.prepare("SELECT parent_session_file,status,version,operation_kind,recovery_error,reviewed_by_worker_id,runtime_json FROM workers WHERE worker_id=?").get(workerId) as { parent_session_file: string; status: string; version: number; operation_kind: string | null; recovery_error: string | null; reviewed_by_worker_id: string | null; runtime_json: string } | undefined;
-      if (!row || row.parent_session_file !== input.expectedOwners[workerId] || row.status !== "idle" || row.operation_kind !== null || row.recovery_error !== null || (row.reviewed_by_worker_id !== null && !input.workerIds.includes(row.reviewed_by_worker_id))) throw new Error(`Worker ${workerId} is not safely adoptable.`);
-      if (registry.database.prepare("SELECT 1 FROM runs WHERE worker_id=? AND claim_kind IS NOT NULL LIMIT 1").get(workerId)) throw new Error(`Worker ${workerId} has a lifecycle claim.`);
-      if (registry.database.prepare("SELECT 1 FROM deliveries WHERE worker_id=? AND state='claimed' LIMIT 1").get(workerId)) throw new Error(`Worker ${workerId} has a stranded delivery claim.`);
-      if (!input.acknowledgePending && registry.database.prepare("SELECT 1 FROM deliveries WHERE worker_id=? AND state='pending' LIMIT 1").get(workerId)) throw new Error(`Worker ${workerId} has pending results that require explicit preview-bound consent.`);
-      if (input.acknowledgePending) registry.database.prepare("UPDATE deliveries SET state='delivered',delivered_at=?,runtime_generation=NULL WHERE worker_id=? AND state='pending'").run(input.now, workerId);
-      const runtime = { ...parseJson<Record<string, unknown>>(row.runtime_json), adoptedFromSession: row.parent_session_file, adoptedAt: input.now };
-      const changed = registry.database.prepare(`UPDATE workers SET parent_session_file=?,operation_kind=?,operation_nonce=?,runtime_json=?,version=version+1,updated_at=?
-        WHERE worker_id=? AND parent_session_file=? AND version=? AND status='idle' AND operation_kind IS NULL`).run(input.newParentSessionFile, input.discardNonce ? "discard" : null, input.discardNonce ?? null, JSON.stringify(runtime), input.now, workerId, row.parent_session_file, row.version);
-      if (Number(changed.changes) !== 1) throw new Error(`Worker ${workerId} changed during adoption.`);
-    }
-  });
-}
+export function adoptCleanupWorkers(registry:WorkerRegistry,input:{snapshots:CleanupSnapshotWorker[];newParentSessionFile:string;claimWorkerIds:string[];nonce:string;now:string;pendingAcknowledged:Set<string>;claimedAcknowledged:Set<string>;ownerAuthority:(owner:string)=>CleanupOwnerAuthority}):void { transaction(registry,()=>{ const selected=new Set(input.snapshots.map((s)=>s.item.workerId)); for(const snap of input.snapshots){if(snap.item.additionalPendingResults||snap.item.additionalUnpreservedArtifacts||snap.item.additionalPendingPreservations)throw new Error(`Worker ${snap.item.workerId} cleanup evidence exceeds the exact preview bound.`);const authority=input.ownerAuthority(snap.item.ownerSession);if(JSON.stringify(authority)!==JSON.stringify(snap.authority))throw new Error(`Owner authority for ${snap.item.workerId} changed before adoption.`);if(snap.item.ownerSession!==path.resolve(input.newParentSessionFile)&&!["dead","retired","missing"].includes(authority.state))throw new Error(`Owner of ${snap.item.workerId} is live or ambiguous.`);const row=registry.database.prepare("SELECT parent_session_file,status,latest_run_id,version,operation_kind,recovery_error,reviewed_by_worker_id,runtime_json FROM workers WHERE worker_id=?").get(snap.item.workerId) as {parent_session_file:string;status:string;latest_run_id:string|null;version:number;operation_kind:string|null;recovery_error:string|null;reviewed_by_worker_id:string|null;runtime_json:string}|undefined;if(!row||row.parent_session_file!==snap.item.ownerSession||row.version!==snap.item.version||row.latest_run_id!==(snap.item.latestRunId??null)||row.status!=="idle"||row.operation_kind||row.recovery_error||row.reviewed_by_worker_id!==(snap.item.reviewedByWorkerId??null)||(row.reviewed_by_worker_id&&!selected.has(row.reviewed_by_worker_id))||row.runtime_json!==JSON.stringify(snap.runtime))throw new Error(`Worker ${snap.item.workerId} changed before adoption.`);if(registry.database.prepare("SELECT 1 FROM runs WHERE worker_id=? AND claim_kind IS NOT NULL LIMIT 1").get(snap.item.workerId))throw new Error(`Worker ${snap.item.workerId} has a lifecycle claim.`);const deliveries=registry.database.prepare("SELECT d.delivery_id,d.run_id,d.state,d.runtime_generation,d.send_started_at,r.outcome,r.summary FROM deliveries d JOIN runs r ON r.run_id=d.run_id WHERE d.worker_id=? AND d.state!='delivered' ORDER BY d.created_at,d.delivery_id").all(snap.item.workerId) as Array<{delivery_id:string;run_id:string;state:string;runtime_generation:number|null;send_started_at:string|null;outcome:string|null;summary:string|null}>;if(JSON.stringify(deliveries.map((d)=>({deliveryId:d.delivery_id,runId:d.run_id,state:d.state,...(d.runtime_generation===null?{}:{runtimeGeneration:d.runtime_generation}),...(d.send_started_at===null?{}:{sendStartedAt:d.send_started_at}),...(d.outcome?{outcome:d.outcome}:{}),...(d.summary?{summary:boundedSummary(d.summary)}:{})})))!==JSON.stringify(snap.item.pendingResults))throw new Error(`Worker ${snap.item.workerId} delivery evidence changed.`);for(const delivery of deliveries){const acknowledged=delivery.state==="pending"?input.pendingAcknowledged.has(snap.item.workerId):input.claimedAcknowledged.has(snap.item.workerId);if(!acknowledged)throw new Error(`Worker ${snap.item.workerId} ${delivery.state} delivery lacks exact takeover acknowledgement.`);const changed=delivery.state==="pending"?registry.database.prepare("UPDATE deliveries SET state='delivered',delivered_at=?,runtime_generation=NULL WHERE delivery_id=? AND state='pending'").run(input.now,delivery.delivery_id):registry.database.prepare("UPDATE deliveries SET state='delivered',delivered_at=?,runtime_generation=NULL WHERE delivery_id=? AND state='claimed' AND runtime_generation=?").run(input.now,delivery.delivery_id,delivery.runtime_generation);if(Number(changed.changes)!==1)throw new Error(`Delivery ${delivery.delivery_id} changed during takeover.`);}const runtime={...parseJson<Record<string,unknown>>(row.runtime_json),adoptedFromSession:row.parent_session_file,adoptedAt:input.now};const claim=input.claimWorkerIds.includes(snap.item.workerId);if(claim&&row.reviewed_by_worker_id)throw new Error(`Leased subject ${snap.item.workerId} cannot be claimed before its reviewer is discarded.`);const changed=registry.database.prepare("UPDATE workers SET parent_session_file=?,operation_kind=?,operation_nonce=?,runtime_json=?,version=version+1,updated_at=? WHERE worker_id=? AND parent_session_file=? AND version=? AND status='idle' AND operation_kind IS NULL").run(path.resolve(input.newParentSessionFile),claim?"discard":null,claim?input.nonce:null,JSON.stringify(runtime),input.now,snap.item.workerId,row.parent_session_file,row.version);if(Number(changed.changes)!==1)throw new Error(`Worker ${snap.item.workerId} changed during adoption.`);} }); }
+export function releaseUnexecutedAdoption(registry:WorkerRegistry,snapshot:CleanupSnapshotWorker,currentParent:string,now:string):boolean { return transaction(registry,()=>{const row=getWorker(registry,snapshot.item.workerId);if(!row||row.parentSessionFile!==path.resolve(currentParent)||row.operationKind)return false;const changed=registry.database.prepare("UPDATE workers SET parent_session_file=?,runtime_json=?,version=version+1,updated_at=? WHERE worker_id=? AND parent_session_file=? AND version=? AND status='idle' AND operation_kind IS NULL").run(snapshot.item.ownerSession,JSON.stringify(snapshot.runtime),now,snapshot.item.workerId,path.resolve(currentParent),row.version);return Number(changed.changes)===1;}); }
 
-export function validateCleanupConfirmation(preview: CleanupPreview, token: string): void { if (preview.token !== token) throw new Error(`Cleanup preview changed; confirmation token does not match. New token: ${preview.token}`); }
-
-export function adoptPreparedSetDiscard(registry: WorkerRegistry, input: { preparedId: string; expectedOwner: string; newParentSessionFile: string; now: string }): void {
+export function adoptPreparedSetDiscard(registry: WorkerRegistry, input: { preparedId: string; expectedOwner: string; newParentSessionFile: string; now: string; expectedAuthority:CleanupOwnerAuthority; ownerAuthority:(owner:string)=>CleanupOwnerAuthority }): void {
   if (!PREPARED_ID.test(input.preparedId)) throw new Error(`Invalid prepared set ID: ${input.preparedId}`);
   transaction(registry, () => {
+    const authority=input.ownerAuthority(input.expectedOwner);if(JSON.stringify(authority)!==JSON.stringify(input.expectedAuthority)||!["dead","retired","missing"].includes(authority.state))throw new Error(`Prepared-set owner authority changed or remains live/ambiguous.`);
     const changed = registry.database.prepare(`UPDATE prepared_sets SET parent_session_file=?,status='discarding',updated_at=?
       WHERE prepared_id=? AND parent_session_file=? AND apply_nonce IS NULL AND status IN ('ready','resolution_required','failed','partial')`).run(input.newParentSessionFile, input.now, input.preparedId, input.expectedOwner);
     if (Number(changed.changes) !== 1) throw new Error(`Prepared set ${input.preparedId} is not safely adoptable for discard.`);
   });
 }
 
-export type CleanupLeftover = { kind: "worker_root" | "worker_trash" | "prepared_root" | "worker_host_log"; id: string; path: string; eligible: boolean; reason: string; device: number; inode: number };
+export type CleanupLeftover = { leftoverId: string; kind: "worker_root" | "worker_trash" | "prepared_root" | "worker_host_log" | "cleanup_trash"; id: string; path: string; eligible: boolean; reason: string; device: number; inode: number; mtimeMs: number };
 const LEFTOVER_MIN_AGE_MS = 24 * 60 * 60 * 1000;
 const LEFTOVER_SCAN_LIMIT = 200_000;
+function leftoverRecord(kind: CleanupLeftover["kind"], id: string, candidate: string, info: { dev: number | bigint; ino: number | bigint; mtimeMs: number | bigint }, eligible: boolean, reason: string): CleanupLeftover { const device=Number(info.dev),inode=Number(info.ino),mtimeMs=Number(info.mtimeMs); return { leftoverId: `leftover_${createHash("sha256").update(`${kind}\0${id}\0${candidate}\0${device}\0${inode}`).digest("hex").slice(0,24)}`, kind, id, path: candidate, eligible, reason, device, inode, mtimeMs }; }
 
-/** Bounded accounting for unregistered physical leftovers. Nothing here deletes automatically. */
-function scanCleanupLeftoversDetailed(registry: WorkerRegistry, input: { roots: WorkerRoots; preparedRoot: string; projectCwd: string; now?: Date }): { items: CleanupLeftover[]; partial: boolean; examined: number } {
-  const nowMs = (input.now ?? new Date()).getTime(); const deadline = Date.now() + 60_000; const output: CleanupLeftover[] = []; let examined = 0; let partial = false;
-  const add = (kind: CleanupLeftover["kind"], id: string, candidate: string, registered: boolean): void => {
-    if (registered) return;
-    try {
-      const info = lstatSync(candidate); if (!info.isDirectory() || info.isSymbolicLink()) return;
-      const oldEnough = nowMs - info.mtimeMs >= LEFTOVER_MIN_AGE_MS;
-      output.push({ kind, id, path: candidate, eligible: oldEnough, reason: oldEnough ? "Unregistered directory passed the 24-hour age guard." : "Unregistered directory is younger than 24 hours.", device: info.dev, inode: info.ino });
-    } catch { /* Concurrent removal is omitted from this snapshot. */ }
+/** Async bounded accounting for unregistered physical leftovers. Nothing here deletes automatically. */
+async function scanCleanupLeftoversDetailed(registry: WorkerRegistry, input: { roots: WorkerRoots; preparedRoot: string; projectCwd: string; now?: Date; offset?:number; limit?:number; wantedIds?:Set<string> }): Promise<{ items: CleanupLeftover[]; matched:number; partial: boolean; examined: number; roots: Array<{ root: string; examined: number; partial: boolean }> }> {
+  const nowMs = (input.now ?? new Date()).getTime(); const deadline = Date.now() + 60_000; const output: CleanupLeftover[] = [];let matched=0;const offset=Math.max(0,input.offset??0),limit=Math.max(1,Math.min(100,input.limit??100));const emit=(item:CleanupLeftover)=>{matched+=1;if(input.wantedIds?!input.wantedIds.has(item.leftoverId):matched<=offset||output.length>=limit)return;output.push(item);}; const rootStats: Array<{ root: string; examined: number; partial: boolean }> = [];
+  const scanRoot = async (root: string, visit: (name: string, candidate: string, info: any) => Promise<void>): Promise<void> => {
+    let examined = 0; let partial = false;
+    try { const handle = await opendirAsync(root); try { for await (const entry of handle) { if (examined >= LEFTOVER_SCAN_LIMIT || Date.now() >= deadline) { partial = true; break; } examined += 1; if (!entry.isDirectory() || entry.isSymbolicLink()) continue; const candidate = path.join(root, entry.name); try { const info = await lstatAsync(candidate); if (info.isDirectory() && !info.isSymbolicLink()) await visit(entry.name, candidate, info); } catch { partial = true; } if (examined % 128 === 0) await new Promise<void>((resolve) => setImmediate(resolve)); } } finally { try { await handle.close(); } catch {} } }
+    catch { if (existsSync(root)) partial = true; }
+    rootStats.push({ root, examined, partial });
   };
-  try {
-    for (const entry of directoryEntries(path.resolve(input.roots.stateRoot))) {
-      if (examined++ >= LEFTOVER_SCAN_LIMIT || Date.now() >= deadline) { partial = true; break; } if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
-      const trashAt = entry.name.indexOf(".discard-"); const workerId = trashAt < 0 ? entry.name : entry.name.slice(0, trashAt);
-      if (!isWorkerId(workerId)) continue;
-      add(trashAt < 0 ? "worker_root" : "worker_trash", workerId, path.join(path.resolve(input.roots.stateRoot), entry.name), getWorker(registry, workerId) !== undefined);
-    }
-  } catch { /* Missing/unreadable roots remain fail-closed and produce no deletable entries. */ }
-  if (path.resolve(input.roots.workspaceRoot) !== path.resolve(input.roots.stateRoot)) try {
-    for (const entry of directoryEntries(path.resolve(input.roots.workspaceRoot))) {
-      if (examined++ >= LEFTOVER_SCAN_LIMIT || Date.now() >= deadline) { partial = true; break; } if (!entry.isDirectory() || entry.isSymbolicLink() || !isWorkerId(entry.name)) continue;
-      add("worker_root", entry.name, path.join(path.resolve(input.roots.workspaceRoot), entry.name), getWorker(registry, entry.name) !== undefined);
-    }
-  } catch {}
-  try {
-    for (const entry of directoryEntries(path.resolve(input.preparedRoot))) {
-      if (examined++ >= LEFTOVER_SCAN_LIMIT || Date.now() >= deadline) { partial = true; break; } if (!entry.isDirectory() || entry.isSymbolicLink() || !PREPARED_ID.test(entry.name)) continue;
-      const registered = Boolean(registry.database.prepare("SELECT 1 FROM prepared_sets WHERE prepared_id=?").get(entry.name));
-      add("prepared_root", entry.name, path.join(path.resolve(input.preparedRoot), entry.name), registered);
-    }
-  } catch {}
+  const workerRoot = path.resolve(input.roots.stateRoot);
+  await scanRoot(workerRoot, async (name, candidate, info) => {
+    const cleanupAt = name.lastIndexOf(".cleanup-"); if (cleanupAt > 0) { const original = name.slice(0, cleanupAt); emit(leftoverRecord("cleanup_trash", original, candidate, info, true, "Interrupted explicit cleanup trash is recoverable.")); return; }
+    const discardAt = name.indexOf(".discard-"); const workerId = discardAt < 0 ? name : name.slice(0, discardAt); if (!isWorkerId(workerId) || getWorker(registry, workerId)) return;
+    const oldEnough = nowMs - Number(info.mtimeMs) >= LEFTOVER_MIN_AGE_MS; emit(leftoverRecord(discardAt < 0 ? "worker_root" : "worker_trash", workerId, candidate, info, oldEnough, oldEnough ? "Unregistered worker directory passed the 24-hour age guard." : "Unregistered worker directory is younger than 24 hours."));
+  });
+  const workspaceRoot = path.resolve(input.roots.workspaceRoot);
+  if (workspaceRoot !== workerRoot) await scanRoot(workspaceRoot, async (name, candidate, info) => { const cleanupAt = name.lastIndexOf(".cleanup-"); if (cleanupAt > 0) { emit(leftoverRecord("cleanup_trash", name.slice(0, cleanupAt), candidate, info, true, "Interrupted explicit cleanup trash is recoverable.")); return; } if (!isWorkerId(name) || getWorker(registry, name)) return; const oldEnough = nowMs - Number(info.mtimeMs) >= LEFTOVER_MIN_AGE_MS; emit(leftoverRecord("worker_root", name, candidate, info, oldEnough, oldEnough ? "Unregistered workspace passed the 24-hour age guard." : "Unregistered workspace is younger than 24 hours.")); });
+  const preparedRoot = path.resolve(input.preparedRoot);
+  await scanRoot(preparedRoot, async (name, candidate, info) => { const cleanupAt = name.lastIndexOf(".cleanup-"); if (cleanupAt > 0) { emit(leftoverRecord("cleanup_trash", name.slice(0, cleanupAt), candidate, info, true, "Interrupted explicit cleanup trash is recoverable.")); return; } if (!/^prepared_[0-9a-f]{24}$/.test(name) || registry.database.prepare("SELECT 1 FROM prepared_sets WHERE prepared_id=?").get(name)) return; const oldEnough = nowMs - Number(info.mtimeMs) >= LEFTOVER_MIN_AGE_MS; emit(leftoverRecord("prepared_root", name, candidate, info, oldEnough, oldEnough ? "Unregistered prepared directory passed the 24-hour age guard." : "Unregistered prepared directory is younger than 24 hours.")); });
   const jobsRoot = path.join(path.resolve(input.projectCwd), ".pi", "async-shell", "jobs");
-  try {
-    for (const entry of directoryEntries(jobsRoot)) {
-      if (examined++ >= LEFTOVER_SCAN_LIMIT || Date.now() >= deadline) { partial = true; break; } if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
-      const directory = path.join(jobsRoot, entry.name); let meta: Record<string, unknown>;
-      try { const metaPath = path.join(directory, "meta.json"); const info = lstatSync(metaPath); if (!info.isFile() || info.isSymbolicLink() || info.size > 1024 * 1024) continue; meta = JSON.parse(readFileSync(metaPath, "utf8")) as Record<string, unknown>; } catch { continue; }
-      const match = typeof meta.command === "string" ? /^Pi worker host (worker_[A-Za-z0-9][A-Za-z0-9_-]{0,127})\/(run_[A-Za-z0-9][A-Za-z0-9_-]{0,127})$/.exec(meta.command) : null;
-      if (!match || meta.jobId !== entry.name || getWorker(registry, match[1]!) !== undefined) continue;
-      let eligible = false; let reason = "Historical worker-host log failed its exact identity or age guard.";
-      try {
-        const age = nowMs - lstatSync(directory).mtimeMs; const pathsMatch = path.resolve(String(meta.stdoutLog ?? "")) === path.join(directory, "stdout.log") && path.resolve(String(meta.stderrLog ?? "")) === path.join(directory, "stderr.log");
-        if (!pathsMatch) reason = "Historical worker-host log paths do not match the exact directory.";
-        else if (age < LEFTOVER_MIN_AGE_MS) reason = "Historical worker-host log is younger than 24 hours.";
-        else if (["exited", "failed", "cancelled"].includes(String(meta.status))) { eligible = true; reason = "Unregistered settled worker-host log passed identity and age guards."; }
-        else if (["unknown", "running"].includes(String(meta.status)) && typeof meta.pid === "number" && typeof meta.processToken === "string") {
-          let alive = true; try { alive = isAsyncJobExecutionAlive(meta.pid, meta.processToken); } catch { alive = true; }
-          if (!alive) { eligible = true; reason = "Unregistered stale worker-host log has a provably dead process identity."; } else reason = "Worker-host process identity is live or ambiguous.";
-        }
-      } catch {}
-      const identity = lstatSync(directory); output.push({ kind: "worker_host_log", id: entry.name, path: directory, eligible, reason, device: identity.dev, inode: identity.ino });
-    }
-  } catch {}
-  return { items: output.sort((a, b) => a.kind.localeCompare(b.kind) || a.id.localeCompare(b.id)), partial, examined };
+  await scanRoot(jobsRoot, async (name, directory, info) => {
+    const cleanupAt = name.lastIndexOf(".cleanup-"); if (cleanupAt > 0) { emit(leftoverRecord("cleanup_trash", name.slice(0, cleanupAt), directory, info, true, "Interrupted explicit cleanup trash is recoverable.")); return; }
+    let meta: Record<string, unknown>; try { const metaPath = path.join(directory, "meta.json"); const metadata = await lstatAsync(metaPath); if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > 1024 * 1024) return; meta = JSON.parse(await readFileAsync(metaPath, "utf8")) as Record<string, unknown>; } catch { return; }
+    const match = typeof meta.command === "string" ? /^Pi worker host (worker_[A-Za-z0-9][A-Za-z0-9_-]{0,127})\/(run_[A-Za-z0-9][A-Za-z0-9_-]{0,127})$/.exec(meta.command) : null; if (!match || meta.jobId !== name || getWorker(registry, match[1]!)) return;
+    const pathsMatch = path.resolve(String(meta.stdoutLog ?? "")) === path.join(directory, "stdout.log") && path.resolve(String(meta.stderrLog ?? "")) === path.join(directory, "stderr.log"); let eligible = false; let reason = "Historical worker-host log failed its exact identity guard.";
+    const age = nowMs - Number(info.mtimeMs); if (!pathsMatch) reason = "Historical worker-host log paths do not match the exact directory."; else if (age < LEFTOVER_MIN_AGE_MS) reason = "Historical worker-host log is younger than 24 hours."; else if (["exited","failed","cancelled"].includes(String(meta.status))) { eligible = true; reason = "Unregistered settled worker-host log passed identity and age guards."; } else if (["unknown","running"].includes(String(meta.status)) && typeof meta.pid === "number" && typeof meta.processToken === "string") { let alive = true; try { alive = isAsyncJobExecutionAlive(meta.pid, meta.processToken); } catch { alive = true; } if (!alive) { eligible = true; reason = "Unregistered stale worker-host log has a provably dead process identity."; } else reason = "Worker-host process identity is live or ambiguous."; }
+    emit(leftoverRecord("worker_host_log", name, directory, info, eligible, reason));
+  });
+  return { items: output.sort((a,b) => a.kind.localeCompare(b.kind) || a.id.localeCompare(b.id) || a.path.localeCompare(b.path)), matched, partial: rootStats.some((item) => item.partial), examined: rootStats.reduce((sum,item) => sum + item.examined,0), roots: rootStats };
 }
-export function scanCleanupLeftovers(registry: WorkerRegistry, input: { roots: WorkerRoots; preparedRoot: string; projectCwd: string; now?: Date }): CleanupLeftover[] { return scanCleanupLeftoversDetailed(registry, input).items; }
-function* directoryEntries(directory: string): Generator<import("node:fs").Dirent> { const handle = opendirSync(directory); try { while (true) { const entry = handle.readSync(); if (!entry) return; yield entry; } } finally { handle.closeSync(); } }
-
-export function preflightCleanupLeftovers(registry: WorkerRegistry, expected: CleanupLeftover[], input: { roots: WorkerRoots; preparedRoot: string; projectCwd: string; now?: Date }): void {
-  if (expected.length === 0) return;
-  const snapshot = scanCleanupLeftovers(registry, input); const byKey = new Map(snapshot.map((item) => [`${item.kind}\0${item.id}\0${item.path}`, item]));
-  for (const item of expected) { const current = byKey.get(`${item.kind}\0${item.id}\0${item.path}`); if (!current?.eligible || JSON.stringify(current) !== JSON.stringify(item)) throw new Error(`Cleanup leftover changed or is no longer eligible: ${item.path}`); }
+export async function scanCleanupLeftovers(registry: WorkerRegistry, input: { roots: WorkerRoots; preparedRoot: string; projectCwd: string; now?: Date }): Promise<CleanupLeftover[]> { return (await scanCleanupLeftoversDetailed(registry,{...input,limit:100})).items; }
+export async function preflightCleanupLeftovers(registry: WorkerRegistry, expected: CleanupLeftover[], input: { roots: WorkerRoots; preparedRoot: string; projectCwd: string; now?: Date }): Promise<void> { if (!expected.length) return; const snapshot = (await scanCleanupLeftoversDetailed(registry,{...input,wantedIds:new Set(expected.map((item)=>item.leftoverId)),limit:expected.length})).items; const byId = new Map(snapshot.map((item) => [item.leftoverId,item])); for (const item of expected) { const current=byId.get(item.leftoverId); if (!current?.eligible || JSON.stringify(current)!==JSON.stringify(item)) throw new Error(`Cleanup leftover changed or is no longer eligible: ${item.path}`); } }
+export async function deleteCleanupLeftovers(registry: WorkerRegistry, expected: CleanupLeftover[], input: { roots: WorkerRoots; preparedRoot: string; projectCwd: string; now?: Date; nonce?: string }): Promise<Array<{ id: string; status: "discarded" | "failed"; reason?: string }>> {
+  await preflightCleanupLeftovers(registry,expected,input); const nonce=input.nonce ?? randomUUID().replaceAll("-","").slice(0,24); const results:Array<{id:string;status:"discarded"|"failed";reason?:string}>=[];
+  for (const item of expected) { try { const info=await lstatAsync(item.path); if (!info.isDirectory() || info.isSymbolicLink() || info.dev!==item.device || info.ino!==item.inode) throw new Error("identity changed"); const trash=item.kind==="cleanup_trash"?item.path:`${item.path}.cleanup-${nonce}`; if (trash!==item.path) { if (existsSync(trash)) throw new Error("cleanup trash path already exists"); renameSync(item.path,trash); const moved=lstatSync(trash); if (moved.dev!==item.device || moved.ino!==item.inode) throw new Error("identity changed during claim"); } rmSync(trash,{recursive:true,force:true}); if (existsSync(trash)) throw new Error("cleanup trash remains"); results.push({id:item.leftoverId,status:"discarded"}); } catch(error) { results.push({id:item.leftoverId,status:"failed",reason:error instanceof Error?error.message:String(error)}); } }
+  return results;
 }
-
-/** Revalidates the complete exact previewed leftover batch before deleting any item. */
-export function deleteCleanupLeftovers(registry: WorkerRegistry, expected: CleanupLeftover[], input: { roots: WorkerRoots; preparedRoot: string; projectCwd: string; now?: Date; nonce?: string }): void {
-  preflightCleanupLeftovers(registry, expected, input);
-  const nonce = input.nonce ?? randomUUID().replaceAll("-", "").slice(0, 24);
-  for (const item of expected) {
-    const info = lstatSync(item.path); if (!info.isDirectory() || info.isSymbolicLink() || info.dev !== item.device || info.ino !== item.inode) throw new Error(`Cleanup leftover identity changed: ${item.path}`);
-    const trash = `${item.path}.cleanup-${nonce}`; if (existsSync(trash)) throw new Error(`Cleanup leftover trash path already exists: ${trash}`); renameSync(item.path, trash);
-    const moved = lstatSync(trash); if (moved.dev !== item.device || moved.ino !== item.inode) { if (!existsSync(item.path)) renameSync(trash, item.path); throw new Error(`Cleanup leftover changed during claim: ${item.path}`); }
-    rmSync(trash, { recursive: true, force: true }); if (existsSync(trash)) throw new Error(`Cleanup leftover remains after deletion: ${trash}`);
-  }
-}
-export function deleteCleanupLeftover(registry: WorkerRegistry, expected: CleanupLeftover, input: { roots: WorkerRoots; preparedRoot: string; projectCwd: string; now?: Date }): void { deleteCleanupLeftovers(registry, [expected], input); }
+export async function deleteCleanupLeftover(registry: WorkerRegistry, expected: CleanupLeftover, input: { roots: WorkerRoots; preparedRoot: string; projectCwd: string; now?: Date }): Promise<void> { const [result]=await deleteCleanupLeftovers(registry,[expected],input); if(result?.status==="failed") throw new Error(result.reason); }

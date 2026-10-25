@@ -67,3 +67,11 @@ Cancel only active work. Discard an idle worker only when no further review, res
 - Review outcomes are advisory and never authorize repository application.
 - Workers never modify authoritative repositories, push, publish, release, or write parent grounding.
 - Worker workspaces, sessions, and run evidence remain retained until explicit discard.
+
+## Retention, preservation, and explicit cleanup
+
+Treat retained workers, sessions, runs, results, repositories, and artifacts as durable evidence; settlement, age, storage pressure, or task closure never deletes them. Use `worker_control cleanup_inventory` for bounded current/all-session accounting. For any cross-session action, open-task abandonment, artifact loss, pending/claimed delivery takeover, prepared state, or physical leftover, request `cleanup_preview` with exact IDs and then call `cleanup_apply` with its one-use token and the exact acknowledgement lists shown by the preview. Never synthesize acknowledgements from memory or reuse a token. Live/ambiguous owners, unavailable Beads, recovery state, claims, and changed snapshots must remain blocked.
+
+Use `preserve` before cleanup for non-reproducible evidence that must outlive the worker. Choose a new absolute destination outside repositories, `.git`, worker/runtime roots, and credential/configuration storage. Preservation rejects links and repositories by design. Narrow same-session `discard` is only for already-delivered, closed-task idle workers; use preview/apply for every earlier-loss case. Reviewer/subject lease pairs must be previewed together and are deleted reviewer first. Inspect per-item results because a cleanup batch continues after exact failures and reports partial failure as an error.
+
+Before requesting review, ask workers to remove temporary clones, generated environments, caches, and other reproducible debris while retaining clean committed repositories, required reports, declared artifacts, and session/evidence needed for review or resume. Repository paths and artifact paths are different contracts: never report a Git repository root as an artifact, never place candidate repositories under cache/tmp subtrees, and keep every declared path workspace-contained.

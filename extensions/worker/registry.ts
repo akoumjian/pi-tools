@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import type { DatabaseSync as SQLiteDatabaseSync, SQLInputValue } from "node:sqlite";
 
-export const WORKER_REGISTRY_SCHEMA_VERSION = 6;
+export const WORKER_REGISTRY_SCHEMA_VERSION = 7;
 export const DEFAULT_WORKER_RUNTIME_ROOT = path.join(homedir(), ".local", "share", "agent", "worker-runtime");
 
 export type WorkerRole = "work" | "review" | "integration";
@@ -254,6 +254,15 @@ CREATE TABLE IF NOT EXISTS preservation_records (
   updated_at TEXT NOT NULL
 ) STRICT;
 CREATE INDEX IF NOT EXISTS preservation_records_worker ON preservation_records(worker_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS cleanup_snapshots (
+  token TEXT PRIMARY KEY,
+  parent_session_file TEXT NOT NULL,
+  snapshot_json TEXT NOT NULL,
+  snapshot_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  consumed_at TEXT
+) STRICT;
+CREATE INDEX IF NOT EXISTS cleanup_snapshots_parent ON cleanup_snapshots(parent_session_file, created_at DESC);
 CREATE TABLE IF NOT EXISTS prepared_repositories (
   prepared_id TEXT NOT NULL REFERENCES prepared_sets(prepared_id) ON DELETE CASCADE,
   repository_id TEXT NOT NULL,
@@ -341,6 +350,12 @@ function migrateWorkerRegistry(database: SQLiteDatabaseSync, fromVersion: number
         status TEXT NOT NULL CHECK (status IN ('pending','published','failed')), destination TEXT NOT NULL, temp_path TEXT NOT NULL,
         latest_run_id TEXT, items_json TEXT NOT NULL, manifest_json TEXT, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       ) STRICT; CREATE INDEX IF NOT EXISTS preservation_records_worker ON preservation_records(worker_id, created_at DESC)`);
+    },
+    6: () => {
+      database.exec(`CREATE TABLE IF NOT EXISTS cleanup_snapshots (
+        token TEXT PRIMARY KEY, parent_session_file TEXT NOT NULL, snapshot_json TEXT NOT NULL, snapshot_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL, consumed_at TEXT
+      ) STRICT; CREATE INDEX IF NOT EXISTS cleanup_snapshots_parent ON cleanup_snapshots(parent_session_file, created_at DESC)`);
     }
   };
   for (let version = fromVersion; version < WORKER_REGISTRY_SCHEMA_VERSION; version += 1) {
@@ -746,10 +761,12 @@ export function releasePreparedSetApply(registry: WorkerRegistry, preparedId: st
   transaction(registry, () => { registry.database.prepare("UPDATE prepared_sets SET apply_nonce=NULL,updated_at=? WHERE prepared_id=? AND parent_session_file=? AND apply_nonce=?").run(now, preparedId, parentSessionFile, nonce); });
 }
 
-export function updatePreparedSetStatus(registry: WorkerRegistry, preparedId: string, parentSessionFile: string, status: string, now: string): void {
+export function updatePreparedSetStatus(registry: WorkerRegistry, preparedId: string, parentSessionFile: string, status: string, now: string, expectedStatuses: string[] = ["ready","resolution_required","partial","failed"]): void {
+  if (!expectedStatuses.length || expectedStatuses.includes("discarding")) throw new Error("Prepared status transition cannot accept discarding.");
   transaction(registry, () => {
-    const result = registry.database.prepare("UPDATE prepared_sets SET status=?,updated_at=? WHERE prepared_id=? AND parent_session_file=? AND apply_nonce IS NULL").run(status, now, preparedId, parentSessionFile);
-    if (Number(result.changes) !== 1) throw new Error(`Unknown prepared set ${preparedId}.`);
+    const placeholders = expectedStatuses.map(() => "?").join(",");
+    const result = registry.database.prepare(`UPDATE prepared_sets SET status=?,updated_at=? WHERE prepared_id=? AND parent_session_file=? AND apply_nonce IS NULL AND status IN (${placeholders})`).run(status, now, preparedId, parentSessionFile, ...expectedStatuses);
+    if (Number(result.changes) !== 1) throw new Error(`Prepared set ${preparedId} changed status or authority.`);
   });
 }
 
@@ -830,10 +847,15 @@ function recoverInterruptedClaimsInTransaction(
     if (item.claim_kind === "cancellation") registry.database.prepare("UPDATE workers SET recovery_error=?,version=version+1,updated_at=? WHERE worker_id=?")
       .run("Interrupted cancellation claim is ready for exact containment recovery.", now, item.worker_id);
   }
-  registry.database.prepare("UPDATE workers SET operation_kind=NULL,operation_nonce=NULL,recovery_error=COALESCE(recovery_error,'Interrupted discard claim is ready for an exact discard retry.'),version=version+1,updated_at=? WHERE parent_session_file=? AND operation_kind='discard' AND (operation_nonce IS NULL OR operation_nonce NOT LIKE ?)")
-    .run(now, parentSessionFile, currentPrefix);
-  registry.database.prepare("UPDATE prepared_sets SET apply_nonce=NULL,updated_at=? WHERE parent_session_file=? AND apply_nonce IS NOT NULL AND apply_nonce NOT LIKE ?")
-    .run(now, parentSessionFile, currentPrefix);
+  // Discard operations and prepared apply nonces are not generic lifecycle
+  // claims. Their dedicated recovery paths preserve irreversible/root and
+  // repository authority instead of clearing it during runtime registration.
+}
+
+export type PreparedSetApplyRecoveryCandidate={preparedId:string;claimNonce:string;runtimeGeneration:number};
+/** Roll back only exact stale prepared-apply authority after its runtime owner is proved dead, retired, or missing. Repository application is idempotently revalidated by the next explicit apply. */
+export function recoverInterruptedPreparedSetAppliesForParent(registry:WorkerRegistry,parentSessionFile:string,runtimeGeneration:number,now:string,mayRecover:(candidate:PreparedSetApplyRecoveryCandidate)=>boolean):string[]{
+ return transaction(registry,()=>{const recovered:string[]=[];const rows=registry.database.prepare("SELECT prepared_id,apply_nonce FROM prepared_sets WHERE parent_session_file=? AND apply_nonce IS NOT NULL").all(canonicalSessionFile(parentSessionFile)) as Array<{prepared_id:string;apply_nonce:string}>;for(const row of rows){const match=/^(\d+)-/.exec(row.apply_nonce);if(!match)continue;const ownerGeneration=Number(match[1]);if(!Number.isSafeInteger(ownerGeneration)||ownerGeneration>=runtimeGeneration)continue;const candidate={preparedId:row.prepared_id,claimNonce:row.apply_nonce,runtimeGeneration:ownerGeneration};let allowed=false;try{allowed=mayRecover(candidate);}catch{}if(!allowed)continue;const changed=registry.database.prepare("UPDATE prepared_sets SET apply_nonce=NULL,updated_at=? WHERE prepared_id=? AND parent_session_file=? AND apply_nonce=?").run(now,row.prepared_id,canonicalSessionFile(parentSessionFile),row.apply_nonce);if(Number(changed.changes)===1)recovered.push(row.prepared_id);}return recovered;});
 }
 
 export function reconcileWorkerDeliveries(registry: WorkerRegistry, parentSessionFile: string, deliveredIds: string[]): void {

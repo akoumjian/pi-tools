@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, existsSync, ftruncateSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, ftruncateSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -14,30 +14,34 @@ import { currentParentRuntime, getWorker, getWorkerRun, listWorkers, markWorkerD
 import type { ManagedAsyncJobHandle, JobMeta } from "../extensions/async-shell/index.js";
 import type { ReviewOverlayRecord } from "../extensions/worker/review-workspace.js";
 import { prepareWorkerMerges } from "../extensions/worker/merge.js";
+import { planSettledWorkerHostLogs } from "../extensions/worker/cleanup.js";
 import { asyncJobProcessStartToken } from "../extensions/_shared/async-job.js";
 
 const model = (provider: string, id: string) => ({ id, name: id, provider, api: "openai-responses", baseUrl: "https://example.invalid", reasoning: true, thinkingLevelMap: { xhigh: "xhigh" }, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 10000 }) as Model<Api>;
 
-type Launch = { record: any; runtime: any; resolve(job: JobMeta): void; handle: ManagedAsyncJobHandle };
+type Launch = { record: any; runtime: any; resolve(job: JobMeta): void; handle: ManagedAsyncJobHandle; job(status: JobMeta["status"], exitCode?: number): JobMeta };
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
-async function fixture(options: { tui?: boolean; staleWarningContext?: boolean; sendMessageThrows?: boolean; launchThrows?: boolean; overlayThrows?: boolean; removeThrowsOnce?: boolean; removeAlwaysThrows?: boolean; deferRemove?: boolean; containerThrows?: boolean; deferContainer?: boolean; cleanupFailsWhileContainerLive?: boolean; staleOnReload?: boolean; launchReadsContext?: boolean; revokeClaimDuringLaunchOnce?: boolean; dockerOutage?: boolean; ownerWaitTimeoutMs?: number; ownerProbeIntervalMs?: number; readProcessStartToken?: (pid: number) => string | undefined; probeHostIdentity?: () => "alive" | "dead" | "unknown"; beforeCreateRunBatch?: () => void | Promise<void>; signalHostIdentity?: (_identity: any, signal: NodeJS.Signals) => boolean; models?: Model<Api>[]; authenticatedProviders?: string[] } = {}) {
+async function fixture(options: { tui?: boolean; staleWarningContext?: boolean; sendMessageThrows?: boolean; launchThrows?: boolean; overlayThrows?: boolean; removeThrowsOnce?: boolean; removeAlwaysThrows?: boolean; deferRemove?: boolean; containerThrows?: boolean; deferContainer?: boolean; cleanupFailsWhileContainerLive?: boolean; staleOnReload?: boolean; launchReadsContext?: boolean; revokeClaimDuringLaunchOnce?: boolean; dockerOutage?: boolean; ownerWaitTimeoutMs?: number; ownerProbeIntervalMs?: number; readProcessStartToken?: (pid: number) => string | undefined; probeHostIdentity?: () => "alive" | "dead" | "unknown"; beforeCreateRunBatch?: () => void | Promise<void>; cleanupHostLogRaceOnce?:boolean; beadsStatus?: "closed" | "open" | "unavailable"; signalHostIdentity?: (_identity: any, signal: NodeJS.Signals) => boolean; models?: Model<Api>[]; authenticatedProviders?: string[] } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "pi-worker-v2-lifecycle-"));
   const runtimeRoot = path.join(root, "runtime"); const workersRoot = path.join(runtimeRoot, "workers"); mkdirSync(workersRoot, { recursive: true });
+  const bdPath=path.join(root,"bd");const beadsStatus=options.beadsStatus??"closed";writeFileSync(bdPath,`#!/usr/bin/env node
+const a=process.argv.slice(2);if(a[0]==='where')console.log(JSON.stringify({prefix:'personal',path:'/Users/aleck/.local/share/agent/beads/personal',database_path:'/Users/aleck/.local/share/agent/beads/personal/.beads/embeddeddolt'}));else if('${beadsStatus}'==='unavailable')process.exit(2);else console.log(JSON.stringify(a.filter(x=>x.startsWith('personal-')).map(id=>({id,status:'${beadsStatus}'==='open'?'in_progress':'closed'}))));
+`);chmodSync(bdPath,0o700);
   const session = SessionManager.create(root, path.join(root, "parent-session"), { id: `parent-${Date.now()}` }); writeFileSync(session.getSessionFile()!, `${JSON.stringify(session.getHeader())}\n`, { mode: 0o600 });
   const messages: any[] = []; const messageAttempts: any[] = []; const notifications: string[] = []; const launches: Launch[] = []; const created: string[] = []; const removed: string[] = [];
   const overlays: ReviewOverlayRecord[] = []; const cleaned: ReviewOverlayRecord[] = []; const cleanupLeaseOwners: Array<string | undefined> = []; const liveContainers = new Set<string>(); const lifecycleEvents: string[] = []; const overlayRuns = new Map<string, string>();
-  let containerGate: Promise<void> | undefined; let releaseContainer = () => {}; let removeGate: Promise<void> | undefined; let releaseRemove = () => {}; let removeFailures = 0; let counter = 0; let dockerOutage = options.dockerOutage ?? false; let revokeOnLaunch = options.revokeClaimDuringLaunchOnce ?? false; let cancelledHandles = 0;
+  let containerGate: Promise<void> | undefined; let releaseContainer = () => {}; let removeGate: Promise<void> | undefined; let releaseRemove = () => {}; let removeFailures = 0; let counter = 0; let dockerOutage = options.dockerOutage ?? false; let revokeOnLaunch = options.revokeClaimDuringLaunchOnce ?? false; let cancelledHandles = 0;let cleanupHostLogRaces=0;
   const blockContainer = () => { let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; }); containerGate = gate; releaseContainer = () => { release(); if (containerGate === gate) containerGate = undefined; }; return releaseContainer; };
   if (options.deferContainer) blockContainer();
   if (options.deferRemove) removeGate = new Promise<void>((resolve) => { releaseRemove = resolve; });
   const random = () => `${(++counter).toString(16).padStart(8, "0")}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`;
   const baseContext = { cwd: root, hasUI: options.tui ?? false, mode: options.tui ? "tui" : "rpc", sessionManager: session, modelRegistry: { hasConfiguredAuth: (candidate: Model<Api>) => options.authenticatedProviders?.includes(candidate.provider) ?? true, getAll: () => options.models ?? [model("openai-codex", "gpt-5.6-sol"), model("anthropic", "claude-opus-5-5")] }, thinkingLevel: "xhigh", isIdle: () => true, hasPendingMessages: () => false, ui: { notify(message: string) { notifications.push(message); } } } as unknown as ExtensionContext;
   const dependencies = {
-    runtimeRoot, roots: { stateRoot: workersRoot, workspaceRoot: workersRoot }, codeRoot: root, preparedRoot: path.join(runtimeRoot, "prepared"), targetRoot: root, dockerPath: "/fake/docker", random, now: () => new Date(`2026-01-01T00:00:${String(counter).padStart(2, "0")}.000Z`),
+    runtimeRoot, roots: { stateRoot: workersRoot, workspaceRoot: workersRoot }, codeRoot: root, bdPath, preparedRoot: path.join(runtimeRoot, "prepared"), targetRoot: root, dockerPath: "/fake/docker", random, now: () => new Date(`2026-01-01T00:00:${String(counter).padStart(2, "0")}.000Z`),
     waitForHostIdentity: async () => {}, ...(options.probeHostIdentity ? { probeHostIdentity: options.probeHostIdentity } : {}), ...(options.signalHostIdentity ? { signalHostIdentity: options.signalHostIdentity } : {}),
     hostTerminationGraceAttempts: 2, hostForcedTerminationAttempts: 2, hostProbeDelayMs: 1, ownerWaitTimeoutMs: options.ownerWaitTimeoutMs ?? 12_000, ownerProbeIntervalMs: options.ownerProbeIntervalMs ?? 20,
-    ...(options.readProcessStartToken ? { readProcessStartToken: options.readProcessStartToken } : {}), ...(options.beforeCreateRunBatch ? { beforeCreateRunBatch: options.beforeCreateRunBatch } : {}),
+    ...(options.readProcessStartToken ? { readProcessStartToken: options.readProcessStartToken } : {}), ...(options.beforeCreateRunBatch ? { beforeCreateRunBatch: options.beforeCreateRunBatch } : {}),...(options.cleanupHostLogRaceOnce?{cleanupHostLogs:(registry:any,worker:any)=>{const plan=planSettledWorkerHostLogs(registry,worker);if(cleanupHostLogRaces++===0){const appeared=path.join(root,"appeared-after-host-log-preflight");mkdirSync(appeared,{recursive:true});return{...plan,absent:[...plan.absent,appeared]};}return plan;}}:{}),
     createContainer: async (_docker: string, reference: any, guard: { assertAuthority?: () => void }) => {
       guard.assertAuthority?.(); created.push(reference.runId); liveContainers.add(reference.runId); lifecycleEvents.push(`${reference.runId}:create`); const gate = containerGate; if (gate) await gate; guard.assertAuthority?.();
       if (dockerOutage || options.containerThrows) throw new Error(dockerOutage ? "Docker daemon unavailable" : "container disappeared between inspect and start"); return { ...reference, containerId: (++counter).toString(16).padStart(64, "0") };
@@ -54,7 +58,8 @@ async function fixture(options: { tui?: boolean; staleWarningContext?: boolean; 
       cleanupLeaseOwners.push(row?.reviewed_by_worker_id); lifecycleEvents.push(`${overlayRun}:cleanup`); cleaned.push(overlay);
     },
     launch: (_api: ExtensionAPI, launchContext: ExtensionContext, input: any) => { if (options.launchReadsContext) { void launchContext.cwd; void launchContext.sessionManager.getSessionId(); } if (options.launchThrows) throw new Error("launch probe failure"); let resolve!: (job: JobMeta) => void; const completion = new Promise<JobMeta>((done) => { resolve = done; });
-      const running = job(input.record.jobId, "running"); const handle: ManagedAsyncJobHandle = { jobId: input.record.jobId, completion, snapshot: () => running, cancel: () => { cancelledHandles += 1; resolve(job(input.record.jobId, "cancelled")); } }; launches.push({ ...input, resolve, handle });
+      const exactJob=(status:JobMeta["status"],exitCode=status==="exited"?0:undefined):JobMeta=>{const jobId=input.record.jobId;const logDir=path.join(root,".pi","async-shell","jobs",jobId);mkdirSync(logDir,{recursive:true});const stdoutLog=path.join(logDir,"stdout.log"),stderrLog=path.join(logDir,"stderr.log");if(!existsSync(stdoutLog))writeFileSync(stdoutLog,"");if(!existsSync(stderrLog))writeFileSync(stderrLog,"");const value={jobId,command:`Pi worker host ${input.record.workerId}/${input.record.runId}`,cwd:root,status,durationMs:1,exitCode,signal:null,notifyOnExit:false,completionNotified:true,logDir,stdoutLog,stderrLog,outputBytes:{stdout:0,stderr:0}} as JobMeta;writeFileSync(path.join(logDir,"meta.json"),JSON.stringify(value));return value;};
+      const running = exactJob("running"); const handle: ManagedAsyncJobHandle = { jobId: input.record.jobId, completion, snapshot: () => running, cancel: () => { cancelledHandles += 1; resolve(exactJob("cancelled")); } }; launches.push({ ...input, resolve, handle, job:exactJob });
       if (revokeOnLaunch) { revokeOnLaunch = false; const db = openWorkerRegistry(runtimeRoot); db.database.prepare("UPDATE runs SET claim_kind=NULL,claim_nonce=NULL WHERE worker_id=? AND run_id=?").run(input.record.workerId, input.record.runId); db.close(); }
       return handle; }
   };
@@ -113,7 +118,6 @@ async function stopLifecycleClaimOwner(child: ReturnType<typeof spawn>, signal: 
   child.kill(signal); await new Promise<void>((resolve) => child.once("exit", () => resolve()));
 }
 
-function job(jobId: string, status: JobMeta["status"], exitCode = status === "exited" ? 0 : undefined): JobMeta { return { jobId, command: "worker", cwd: "/tmp", status, durationMs: 1, exitCode, signal: null, notifyOnExit: false, completionNotified: true, logDir: "/tmp", stdoutLog: `/tmp/${jobId}.out`, stderrLog: `/tmp/${jobId}.err`, outputBytes: { stdout: 0, stderr: 0 } } as JobMeta; }
 function receipt(result: any) { return result.details.runs[0] as { workerId: string; runId: string; role: string }; }
 async function waitFor(check: () => boolean, timeout = 3_000) { const end = Date.now() + timeout; while (!check()) { if (Date.now() > end) throw new Error("condition timed out"); await new Promise((resolve) => setTimeout(resolve, 10)); } }
 function writeCompletionEvidence(f: Fixture, item: { workerId: string; runId: string }, result: any): Launch {
@@ -128,7 +132,7 @@ function writeCompletionEvidence(f: Fixture, item: { workerId: string; runId: st
 
 async function complete(f: Fixture, item: { workerId: string; runId: string }, result: any = { outcome: "completed", summary: "done" }) {
   const launch = writeCompletionEvidence(f, item, result);
-  launch.resolve(job(launch.record.jobId, "exited", 0));
+  launch.resolve(launch.job("exited", 0));
   await waitFor(() => { const side = f.registry(); const run = getWorkerRun(side, item.workerId, item.runId); side.close(); return run?.status === "settled"; });
 }
 async function acknowledgeWorkerDeliveries(f: Fixture, workerId: string): Promise<void> {
@@ -398,7 +402,7 @@ test("K3: elected runtime reclaims a crashed settlement claim and preserves acce
   const f = await fixture(); let owner: Awaited<ReturnType<typeof spawnLifecycleClaimOwner>> | undefined; try {
     const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "K3 accepted settlement" }] })); await f.event("turn_end");
     owner = await spawnLifecycleClaimOwner(f, started, "settlement");
-    const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: "accepted K3" }); launch.resolve(job(launch.record.jobId, "exited", 0));
+    const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: "accepted K3" }); launch.resolve(launch.job("exited", 0));
     await stopLifecycleClaimOwner(owner.child);
     await waitFor(() => { const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId); db.close(); return run?.outcome === "completed"; }, 4_000);
     const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; db.close(); assert.equal(run.summary, "accepted K3"); assert.equal(run.outcomeSource, "worker");
@@ -410,7 +414,7 @@ test("K3c: cancel after settlement-owner death settles accepted completion inste
   const f = await fixture(); let owner: Awaited<ReturnType<typeof spawnLifecycleClaimOwner>> | undefined; try {
     const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "K3c accepted result wins" }] })); await f.event("turn_end");
     owner = await spawnLifecycleClaimOwner(f, started, "settlement");
-    const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: "accepted K3c" }); launch.resolve(job(launch.record.jobId, "exited", 0));
+    const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: "accepted K3c" }); launch.resolve(launch.job("exited", 0));
     await stopLifecycleClaimOwner(owner.child);
     const cancelled = await f.call("worker_control", { action: "cancel", workerId: started.workerId }); assert.ok(["superseded", "not_active"].includes((cancelled.details as any).cancellation));
     const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; db.close(); assert.equal(run.outcome, "completed"); assert.equal(run.summary, "accepted K3c"); assert.equal(run.terminalIntent, undefined);
@@ -429,7 +433,7 @@ test("D1: promotion reclaims a crashed process pre-send delivery claim and notif
     await waitFor(() => f.messages.filter((message) => message.details?.event === "worker_settled" && message.details?.runId === started.runId).length === 1, 4_000);
     state = f.registry(); delivery = state.database.prepare("SELECT state,runtime_generation,send_started_at FROM deliveries WHERE run_id=?").get(started.runId) as any; const current = currentParentRuntime(state, realpathSync(f.session.getSessionFile()!)); state.close();
     assert.equal(delivery.state, "claimed"); assert.ok(delivery.send_started_at); assert.ok(current!.generation > claimed.generation); assert.equal(f.messageAttempts.filter((message) => message.details?.runId === started.runId).length, 1);
-    const launch = f.launches.find((candidate) => candidate.record.runId === started.runId); if (launch) launch.resolve(job(launch.record.jobId, "exited", 0));
+    const launch = f.launches.find((candidate) => candidate.record.runId === started.runId); if (launch) launch.resolve(launch.job("exited", 0));
   } finally { if (owner) await stopLifecycleClaimOwner(owner.child); await f.close(); }
 });
 
@@ -472,7 +476,7 @@ test("owner crash promotion emits one UI-only unconfirmed warning without model 
     assert.equal(f.messageAttempts.filter((message) => message.details?.runId === started.runId).length, 0, "promotion warning is UI-only and never replays the send");
     db = f.registry(); const parent = realpathSync(f.session.getSessionFile()!); assert.ok(currentParentRuntime(db, parent)!.generation > claimed.generation); const delivery = db.database.prepare("SELECT state,send_started_at FROM deliveries WHERE run_id=?").get(started.runId) as any; db.close(); assert.equal(delivery.state, "claimed"); assert.ok(delivery.send_started_at);
     await f.event("session_start"); assert.equal(f.notifications.filter((message) => message.includes(`${started.workerId}/${started.runId}`)).length, 1, "same-generation promotion notice remains deduped");
-    const launch = f.launches.find((candidate) => candidate.record.runId === started.runId); if (launch) launch.resolve(job(launch.record.jobId, "exited", 0));
+    const launch = f.launches.find((candidate) => candidate.record.runId === started.runId); if (launch) launch.resolve(launch.job("exited", 0));
   } finally { if (owner) await stopLifecycleClaimOwner(owner.child); await f.close(); }
 });
 
@@ -497,7 +501,7 @@ test("cancel during a live accepted settlement returns result-preserved supersed
   const f = await fixture(); let owner: Awaited<ReturnType<typeof spawnLifecycleClaimOwner>> | undefined; try {
     const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "live accepted settlement" }] })); await f.event("turn_end");
     owner = await spawnLifecycleClaimOwner(f, started, "settlement");
-    const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: "accepted before cancellation" }); launch.resolve(job(launch.record.jobId, "exited", 0));
+    const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: "accepted before cancellation" }); launch.resolve(launch.job("exited", 0));
     const result = await f.call("worker_control", { action: "cancel", workerId: started.workerId }); assert.equal((result.details as any).cancellation, "superseded");
     let db = f.registry(); let run = getWorkerRun(db, started.workerId, started.runId)!; db.close(); assert.equal(run.status, "running"); assert.equal(run.terminalIntent, undefined); assert.equal(run.claimKind, "settlement");
     await stopLifecycleClaimOwner(owner.child);
@@ -509,7 +513,7 @@ test("cancel during a live accepted settlement returns result-preserved supersed
 test("cancel during this runtime's live accepted settlement returns superseded and preserves the result", async () => {
   const f = await fixture({ deferRemove: true }); try {
     const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "own live settlement" }] })); await f.event("turn_end");
-    const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: "own accepted settlement" }); launch.resolve(job(launch.record.jobId, "exited", 0));
+    const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: "own accepted settlement" }); launch.resolve(launch.job("exited", 0));
     await waitFor(() => { const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId); db.close(); return run?.claimKind === "settlement"; });
     const result = await f.call("worker_control", { action: "cancel", workerId: started.workerId }); assert.equal((result.details as any).cancellation, "superseded");
     let db = f.registry(); let run = getWorkerRun(db, started.workerId, started.runId)!; db.close(); assert.equal(run.terminalIntent, undefined); assert.equal(run.status, "running");
@@ -527,7 +531,7 @@ test("cancel in an attached accepted-result window is side-effect-free through a
     let db = f.registry(); let run = getWorkerRun(db, started.workerId, started.runId)!; let worker = getWorker(db, started.workerId)!; db.close();
     assert.equal(run.status, "running"); assert.equal(run.terminalIntent, undefined); assert.equal(worker.recoveryError, undefined); assert.equal(f.cancelledHandles, 0); assert.equal(f.removed.length, 0);
     assert.equal(f.messages.filter((message) => message.details?.event === "worker_recovery_required" && message.details?.runId === started.runId).length, 0);
-    launch.resolve(job(launch.record.jobId, "exited", 0)); await waitFor(() => { const state = f.registry(); const current = getWorkerRun(state, started.workerId, started.runId); state.close(); return current?.status === "settled"; }, 4_000);
+    launch.resolve(launch.job("exited", 0)); await waitFor(() => { const state = f.registry(); const current = getWorkerRun(state, started.workerId, started.runId); state.close(); return current?.status === "settled"; }, 4_000);
     db = f.registry(); run = getWorkerRun(db, started.workerId, started.runId)!; worker = getWorker(db, started.workerId)!; db.close(); assert.equal(run.outcome, "completed"); assert.equal(run.summary, "accepted before slow attached exit"); assert.equal(worker.recoveryError, undefined); assert.equal(f.removed.length, 1);
     assert.equal(f.messages.filter((message) => message.details?.event === "worker_recovery_required" && message.details?.runId === started.runId).length, 0);
   } finally { await f.close(); }
@@ -540,7 +544,7 @@ test("an attached host may exit more than five seconds after accepted evidence w
     await new Promise((resolve) => setTimeout(resolve, 5_200));
     let db = f.registry(); assert.equal(getWorkerRun(db, started.workerId, started.runId)!.status, "running"); assert.equal(getWorker(db, started.workerId)!.recoveryError, undefined); db.close();
     assert.equal(f.messages.filter((message) => message.details?.event === "worker_recovery_required" && message.details?.runId === started.runId).length, 0); assert.equal(f.removed.length, 0);
-    launch.resolve(job(launch.record.jobId, "exited", 0));
+    launch.resolve(launch.job("exited", 0));
     await waitFor(() => { const state = f.registry(); const run = getWorkerRun(state, started.workerId, started.runId); state.close(); return run?.status === "settled"; }, 4_000);
     db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; const worker = getWorker(db, started.workerId)!; db.close(); assert.equal(run.outcome, "completed"); assert.equal(worker.recoveryError, undefined); assert.equal(f.removed.length, 1);
     assert.equal(f.messages.filter((message) => message.details?.event === "worker_recovery_required" && message.details?.runId === started.runId).length, 0);
@@ -755,7 +759,7 @@ test("a new parent runtime adopts exact settlement after the launching runtime s
     assert.equal(run.outcomeSource, "worker"); assert.equal(run.summary, "detached completion"); assert.equal(relaunches, 0);
     const delivery = db.database.prepare("SELECT state FROM deliveries WHERE run_id=?").get(started.runId) as any; assert.equal(delivery.state, "claimed"); db.close();
     assert.equal(secondMessages.filter((message) => message.details?.event === "worker_settled").length, 1);
-    detachedLaunch.resolve(job(detachedLaunch.record.jobId, "exited", 0));
+    detachedLaunch.resolve(detachedLaunch.job("exited", 0));
   } finally {
     for (const handler of secondHandlers.get("session_shutdown") ?? []) await handler({}, f.context);
     await f.close();
@@ -877,7 +881,7 @@ test("truncated and non-regular sessions become bounded settlement evidence", as
       const db = f.registry(); const sessionFile = getWorker(db, started.workerId)!.sessionFile!; db.close();
       if (damage === "truncated") writeFileSync(sessionFile, "");
       else { rmSync(sessionFile); mkdirSync(sessionFile); }
-      launch.resolve(job(launch.record.jobId, "exited", 0));
+      launch.resolve(launch.job("exited", 0));
       await waitFor(() => { const side = f.registry(); const run = getWorkerRun(side, started.workerId, started.runId); side.close(); return run?.status === "settled"; });
       const after = f.registry(); const run = getWorkerRun(after, started.workerId, started.runId)!; after.close();
       assert.equal(run.outcome, "completed"); assert.equal(run.outcomeSource, "worker"); assert.equal(run.sessionEndLine, undefined);
@@ -914,7 +918,7 @@ test("missing session settlement is best-effort and repeated reconciliation neve
     const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; db.close();
     assert.equal(run.outcome, "completed"); assert.equal(run.outcomeSource, "worker"); assert.equal(run.sessionEndLine, undefined);
     assert.match(run.errors.map((error) => error.message).join(" "), /session end line could not be recorded safely.*unavailable/i);
-    detached.resolve(job(detached.record.jobId, "exited", 0));
+    detached.resolve(detached.job("exited", 0));
   } finally {
     for (const runtime of runtimes) for (const handler of runtime.handlers.get("session_shutdown") ?? []) await handler({}, f.context);
     await f.close();
@@ -1092,7 +1096,7 @@ test("post-containment evidence failure alone uses the bounded failed settlement
     const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "corrupt settled evidence" }] })); await f.event("turn_end");
     const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: "accepted but mismatched settlement" });
     const settled = JSON.parse(readFileSync(launch.runtime.settledFile, "utf8")); writeFileSync(launch.runtime.settledFile, `${JSON.stringify({ ...settled, workerId: "worker_mismatch" })}\n`);
-    launch.resolve(job(launch.record.jobId, "exited", 0));
+    launch.resolve(launch.job("exited", 0));
     await waitFor(() => { const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId); db.close(); return run?.status === "settled"; }, 6_000);
     const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; const worker = getWorker(db, started.workerId)!; db.close();
     assert.equal(run.outcome, "failed"); assert.equal(run.outcomeSource, "system"); assert.equal(worker.status, "idle"); assert.equal((run.runtime as any).settlementRecoveryAttempts, 3);
@@ -1103,7 +1107,7 @@ test("post-containment evidence failure alone uses the bounded failed settlement
 test("persistent exact-container cleanup failure retains recovery authority without aging into finalization", async () => {
   const f = await fixture({ removeAlwaysThrows: true }); try {
     const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "settle persistently" }] })); await f.event("turn_end");
-    const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: "accepted before cleanup failure" }); launch.resolve(job(launch.record.jobId, "exited", 0));
+    const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: "accepted before cleanup failure" }); launch.resolve(launch.job("exited", 0));
     await waitFor(() => f.removed.length >= 3, 8_000);
     const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; const worker = getWorker(db, started.workerId)!; const runtime = run.runtime as any; db.close();
     assert.equal(run.status, "running"); assert.equal(run.outcome, undefined); assert.equal(worker.status, "running");
@@ -1120,7 +1124,7 @@ test("a provably live host is SIGKILLed before probing and never finalizes while
     const started = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "retain live host" }] })); await f.event("turn_end");
     const db0 = f.registry(); const runtime = getWorkerRun(db0, started.workerId, started.runId)!.runtime as any; db0.close();
     writeFileSync(runtime.processFile, `${JSON.stringify({ version: 2, workerId: started.workerId, runId: started.runId, pid: 4242, processToken: "owned", processStartToken: "darwin:expected", nonce: runtime.processNonce, hostConfigFile: path.join(runtime.runDir, "host.json"), startedAt: new Date().toISOString() })}\n`);
-    const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: "accepted while host survives" }); launch.resolve(job(launch.record.jobId, "exited", 0));
+    const launch = writeCompletionEvidence(f, started, { outcome: "completed", summary: "accepted while host survives" }); launch.resolve(launch.job("exited", 0));
     await waitFor(() => events.includes("SIGKILL") && f.removed.length >= 1, 3_000); await new Promise((resolve) => setTimeout(resolve, 25));
     const firstKill = events.indexOf("SIGKILL"); assert.ok(firstKill >= 2, `grace probes must precede SIGKILL: ${events.join(",")}`); assert.ok(events.slice(firstKill + 1).includes("probe"), `post-SIGKILL absence probes must follow the signal: ${events.join(",")}`);
     const db = f.registry(); const run = getWorkerRun(db, started.workerId, started.runId)!; const worker = getWorker(db, started.workerId)!; db.close();
@@ -1151,3 +1155,37 @@ test("worker commands exercise compact list/show and exact cancel/discard lifecy
 function gitInit(repo: string): void { mkdirSync(repo, { recursive: true }); execFileSync("git", ["init", "-q", "-b", "main", repo]); git(repo, "config", "user.name", "Test"); git(repo, "config", "user.email", "test@example.invalid"); }
 function git(repo: string, ...args: string[]): string { return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } }).trim(); }
 function readDirs(root: string): string[] { return readdirSync(root).filter((name) => !name.startsWith(".")); }
+
+test("cleanup_inventory preview and one-use apply discard a delivered closed-task worker through real host logs", async () => {
+  const f=await fixture({beadsStatus:"closed"});try{const started=receipt(await f.call("worker_run",{runs:[{action:"start",role:"work",taskIds:["personal-cleanup"],instructions:"cleanup"}]}));await f.event("turn_end");await complete(f,started);await acknowledgeWorkerDeliveries(f,started.workerId);
+    const inventory=await f.call("worker_control",{action:"cleanup_inventory"}) as any;const item=inventory.details.inventory.workers.find((value:any)=>value.workerId===started.workerId);assert.equal(item.class,"due");assert.equal(typeof item.version,"number");
+    const preview=await f.call("worker_control",{action:"cleanup_preview",workerIds:[started.workerId]}) as any;assert.match(preview.details.token,/^cleanup_[a-f0-9]{48}$/);const logDir=f.launches.find((value)=>value.record.runId===started.runId)!.job("exited",0).logDir;
+    const applied=await f.call("worker_control",{action:"cleanup_apply",token:preview.details.token}) as any;assert.equal(applied.details.cleanup.results[0].status,"discarded");const db=f.registry();assert.equal(getWorker(db,started.workerId),undefined);db.close();assert.equal(existsSync(logDir),false);await assert.rejects(()=>f.call("worker_control",{action:"cleanup_apply",token:preview.details.token}),/consumed/);
+  }finally{await f.close();}
+});
+
+test("cleanup_apply rejects a stale version without consuming the persisted preview", async()=>{
+ const f=await fixture({beadsStatus:"closed"});try{const started=receipt(await f.call("worker_run",{runs:[{action:"start",role:"work",taskIds:["personal-stale"],instructions:"stale"}]}));await f.event("turn_end");await complete(f,started);await acknowledgeWorkerDeliveries(f,started.workerId);const preview=await f.call("worker_control",{action:"cleanup_preview",workerIds:[started.workerId]}) as any;let db=f.registry();db.database.prepare("UPDATE workers SET version=version+1 WHERE worker_id=?").run(started.workerId);db.close();await assert.rejects(()=>f.call("worker_control",{action:"cleanup_apply",token:preview.details.token}),/stale/);db=f.registry();assert.equal((db.database.prepare("SELECT consumed_at FROM cleanup_snapshots WHERE token=?").get(preview.details.token) as any).consumed_at,null);db.close();}finally{await f.close();}
+});
+
+test("cleanup_apply binds exact open-task abandonment consent",async()=>{
+ const f=await fixture({beadsStatus:"open"});try{const started=receipt(await f.call("worker_run",{runs:[{action:"start",role:"work",taskIds:["personal-open"],instructions:"open"}]}));await f.event("turn_end");await complete(f,started);await acknowledgeWorkerDeliveries(f,started.workerId);const preview=await f.call("worker_control",{action:"cleanup_preview",workerIds:[started.workerId]}) as any;await assert.rejects(()=>f.call("worker_control",{action:"cleanup_apply",token:preview.details.token}),/Open-task abandonment/);const applied=await f.call("worker_control",{action:"cleanup_apply",token:preview.details.token,openTaskAbandonmentAcknowledged:[started.workerId]}) as any;assert.equal(applied.details.cleanup.results[0].status,"discarded");}finally{await f.close();}
+});
+
+test("cleanup notices are generation-scoped and Beads-unavailable state alone stays silent",async()=>{
+ const f=await fixture({beadsStatus:"closed"});try{const started=receipt(await f.call("worker_run",{runs:[{action:"start",role:"work",taskIds:["personal-notice"],instructions:"notice"}]}));await f.event("turn_end");await complete(f,started);await acknowledgeWorkerDeliveries(f,started.workerId);const before=f.messages.length;await f.event("agent_end");await waitFor(()=>f.messages.length>before);const first=f.messages.filter((message)=>message.details?.event==="worker_cleanup_due").length;await f.event("agent_end");await new Promise((resolve)=>setTimeout(resolve,100));assert.equal(f.messages.filter((message)=>message.details?.event==="worker_cleanup_due").length,first);const reloaded=await f.reload();await reloaded.event("agent_end");await waitFor(()=>f.messages.filter((message)=>message.details?.event==="worker_cleanup_due").length>first);
+ }finally{await f.close();}
+ const unavailable=await fixture({beadsStatus:"unavailable"});try{const started=receipt(await unavailable.call("worker_run",{runs:[{action:"start",role:"work",taskIds:["personal-unavailable"],instructions:"silent"}]}));await unavailable.event("turn_end");await complete(unavailable,started);await acknowledgeWorkerDeliveries(unavailable,started.workerId);const before=unavailable.messages.length;await unavailable.event("agent_end");await new Promise((resolve)=>setTimeout(resolve,150));assert.equal(unavailable.messages.length,before);}finally{await unavailable.close();}
+});
+
+test("cleanup_apply continues after an exact host-log preflight failure without claiming the failed worker",async()=>{
+ const f=await fixture({beadsStatus:"closed"});try{const batch=await f.call("worker_run",{runs:[{action:"start",role:"work",taskIds:["personal-batch-one"],instructions:"one"},{action:"start",role:"work",taskIds:["personal-batch-two"],instructions:"two"}]}) as any;const [first,second]=batch.details.runs;await f.event("turn_end");await complete(f,first);await complete(f,second);await acknowledgeWorkerDeliveries(f,first.workerId);await acknowledgeWorkerDeliveries(f,second.workerId);const badLaunch=f.launches.find((value)=>value.record.runId===first.runId)!;const metaPath=path.join(badLaunch.job("exited",0).logDir,"meta.json");const meta=JSON.parse(readFileSync(metaPath,"utf8"));writeFileSync(metaPath,JSON.stringify({...meta,command:"not the exact worker host"}));const beforeVersion=(()=>{const db=f.registry();const version=getWorker(db,first.workerId)!.version;db.close();return version;})();const preview=await f.call("worker_control",{action:"cleanup_preview",workerIds:[first.workerId,second.workerId]}) as any;const applied=await f.call("worker_control",{action:"cleanup_apply",token:preview.details.token}) as any;assert.equal(applied.isError,true);assert.equal(applied.details.cleanup.results.find((item:any)=>item.id===first.workerId).status,"failed");assert.equal(applied.details.cleanup.results.find((item:any)=>item.id===second.workerId).status,"discarded");const db=f.registry();const retained=getWorker(db,first.workerId)!;assert.equal(retained.operationKind,undefined);assert.equal(retained.version,beforeVersion);assert.equal(getWorker(db,second.workerId),undefined);db.close();}finally{await f.close();}
+});
+
+test("first agent_end reports other-session cleanup even when the current session owns zero workers",async()=>{
+ const f=await fixture({beadsStatus:"closed"});try{const started=receipt(await f.call("worker_run",{runs:[{action:"start",role:"work",taskIds:["personal-other"],instructions:"other"}]}));await f.event("turn_end");await complete(f,started);await acknowledgeWorkerDeliveries(f,started.workerId);const old=path.join(f.root,"retired-parent.jsonl");writeFileSync(old,`${JSON.stringify({type:"session",id:"retired",name:"Retired cleanup owner"})}\n`);const db=f.registry();db.database.prepare("UPDATE workers SET parent_session_file=?,version=version+1 WHERE worker_id=?").run(path.resolve(old),started.workerId);db.close();const before=f.messages.length;await f.event("agent_end");await waitFor(()=>f.messages.length>before);const notice=f.messages.at(-1)!.details;assert.equal(notice.workers.length,0);assert.equal(notice.otherSessions.length,1);assert.equal(notice.otherSessions[0].owner.state,"named");assert.equal(notice.otherSessions[0].workerIds[0],started.workerId);await f.event("agent_end");await new Promise((resolve)=>setTimeout(resolve,100));assert.equal(f.messages.length,before+1);}finally{await f.close();}
+});
+
+test("an irreversible discard host-log failure is retained and completed by fresh-generation recovery",async()=>{
+ const f=await fixture({beadsStatus:"closed",cleanupHostLogRaceOnce:true});try{const started=receipt(await f.call("worker_run",{runs:[{action:"start",role:"work",taskIds:["personal-recover-discard"],instructions:"recover discard"}]}));await f.event("turn_end");await complete(f,started);await acknowledgeWorkerDeliveries(f,started.workerId);const result=await f.call("worker_control",{action:"discard",workerId:started.workerId}) as any;assert.equal(result.isError,true);let db=f.registry();const interrupted=getWorker(db,started.workerId)!;assert.equal(interrupted.operationKind,"discard");assert.match(interrupted.recoveryError??"",/Irreversible discard/);db.close();assert.equal(existsSync(path.join(f.workersRoot,started.workerId)),false);assert.equal(readdirSync(f.workersRoot).some((name)=>name.startsWith(`${started.workerId}.discard-`)),true);await f.reload();await waitFor(()=>{const check=f.registry();const absent=getWorker(check,started.workerId)===undefined;check.close();return absent;});assert.equal(readdirSync(f.workersRoot).some((name)=>name.startsWith(`${started.workerId}.discard-`)),false);}finally{await f.close();}
+});
