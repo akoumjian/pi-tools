@@ -12,7 +12,7 @@ import { isWorkerId } from "../_shared/worker-id.js";
 import { matchWorkerHostJobIdentity } from "../_shared/worker-host-job.js";
 import { defaultPreparedMergeRoot } from "./merge.js";
 import { getWorker, getWorkerRun, listAllWorkers, listWorkerRuns, listWorkers, type WorkerRegistry, type WorkerRegistryRecord, type WorkerRunRecord } from "./registry.js";
-import { workerPaths, type WorkerRoots } from "./identity.js";
+import { storedWorkerPaths, type WorkerRoots } from "./identity.js";
 
 export type CleanupClass = "active" | "recovery" | "undelivered" | "unknown:task_missing" | "unknown:beads_unavailable" | "retained" | "due" | "leased";
 export type BeadsTaskFact = { id: string; status: string };
@@ -205,7 +205,7 @@ type WalkEntry = PreservationEntry & { source: string; device: number; inode: nu
 export async function preserveWorkerArtifacts(registry: WorkerRegistry, roots: WorkerRoots, runtimeRoot: string, input: { workerId: string; destination: string; projectCwd: string; paths?: string[]; now?: Date; nonce?: string }): Promise<PreservationResult> {
   const worker = getWorker(registry, input.workerId); if (!worker) throw new Error(`Unknown worker ${input.workerId}.`);
   assertQuiescent(registry, worker, true);
-  const paths = workerPaths(roots, worker.workerId); if (!existsSync(paths.stateDir)) throw new Error(`Worker state is missing for ${worker.workerId}; preservation requires recovery.`);
+  const paths = storedWorkerPaths(roots, worker); if (!existsSync(paths.stateDir)) throw new Error(`Worker state is missing for ${worker.workerId}; preservation requires recovery.`);
   const destination = resolveSafeDestination(input.destination, runtimeRoot, roots, worker.workspaceRoot, input.projectCwd);
   const selected = input.paths ? input.paths.map(normalizeRequiredWorkspacePointer) : reportedArtifacts(registry, worker);
   if (selected.length === 0) throw new Error("No existing worker artifacts were selected for preservation.");

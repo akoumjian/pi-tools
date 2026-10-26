@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -314,7 +314,7 @@ test("registry applies an ordered idempotent v2 migration while mixed live opene
     migrated = openWorkerRegistry(root);
     const version = migrated.database.prepare("SELECT value FROM registry_meta WHERE key='schema_version'").get() as { value: string };
     const columns = migrated.database.prepare("PRAGMA table_info(prepared_sets)").all() as Array<{ name: string }>; const runColumns = migrated.database.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>; const deliveryColumns = migrated.database.prepare("PRAGMA table_info(deliveries)").all() as Array<{ name: string }>;
-    assert.equal(version.value, "9"); assert.equal(columns.some((column) => column.name === "apply_nonce"), true); assert.equal(runColumns.some((column) => column.name === "terminal_intent"), true); assert.equal(deliveryColumns.some((column) => column.name === "send_started_at"), true);
+    assert.equal(version.value, "10"); assert.equal(columns.some((column) => column.name === "apply_nonce"), true); assert.equal(runColumns.some((column) => column.name === "terminal_intent"), true); assert.equal(deliveryColumns.some((column) => column.name === "send_started_at"), true);
     const legacyHash = migrated.database.prepare("SELECT value FROM registry_meta WHERE key='schema_hash'").get() as { value: string };
     assert.equal(legacyHash.value, "old-live-build-fingerprint", "migration must not overwrite another live build's diagnostic hash");
     oldOpener.database.prepare("UPDATE registry_meta SET value='old-opener-still-live' WHERE key='schema_hash'").run();
@@ -324,7 +324,17 @@ test("registry applies an ordered idempotent v2 migration while mixed live opene
   } finally { migrated?.close(); oldOpener?.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
-test("v5 migration adds preservation, prepared lineage, and host-only cleanup snapshots through v9", () => {
+test("v9 migration marks every unversioned split-layout worker recovery-required without moving it", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "pi-worker-registry-v9-storage-")); let registry: ReturnType<typeof openWorkerRegistry> | undefined;
+  try {
+    registry = openWorkerRegistry(root); const workerId="worker_20260101000000_layout09",runId="run_20260101000000_layout09",workspace=path.join(root,"workers",workerId,"workspace");
+    createWorkerAndRun(registry,{workerId,parentSessionFile:path.join(root,"parent.jsonl"),role:"work",status:"idle",latestRunId:runId,taskIds:["personal-layout"],workspaceRoot:workspace,createdAt:"2026-01-01T00:00:00.000Z",updatedAt:"2026-01-01T00:00:00.000Z"},{...queuedRun(workerId,runId),status:"settled",outcome:"completed",outcomeSource:"worker",settledAt:"2026-01-01T00:00:01.000Z"});
+    registry.database.exec("DROP TRIGGER workers_require_current_layout_insert; DROP TRIGGER workers_refuse_legacy_resume; DROP TRIGGER runs_refuse_legacy_launch; ALTER TABLE workers DROP COLUMN storage_layout"); registry.database.prepare("UPDATE registry_meta SET value='9' WHERE key='schema_version'").run(); registry.database.exec("PRAGMA user_version = 9"); registry.close(); registry=undefined;
+    registry=openWorkerRegistry(root); const migrated=getWorker(registry,workerId)!; assert.equal(migrated.storageLayout,1); assert.match(migrated.recoveryError??"",/Legacy split worker storage requires explicit guarded cleanup/); assert.equal(migrated.workspaceRoot,workspace); assert.equal(existsSync(path.join(root,"workers",workerId,"guest")),false,"migration must not silently create or move guest state"); assert.throws(()=>registry!.database.prepare("UPDATE workers SET status='queued',active_run_id=?,recovery_error=NULL WHERE worker_id=?").run(runId,workerId),/legacy worker storage cannot resume/); assert.throws(()=>registry!.database.prepare("UPDATE runs SET claim_kind='launch',claim_nonce='old-process' WHERE run_id=?").run(runId),/legacy worker storage cannot launch/); assert.throws(()=>registry!.database.prepare("UPDATE runs SET status='running' WHERE run_id=?").run(runId),/legacy worker storage cannot launch/);
+  } finally { registry?.close(); rmSync(root,{recursive:true,force:true}); }
+});
+
+test("v5 migration adds preservation, prepared lineage, host-only cleanup snapshots, and storage layout through v10", () => {
   const f = fixture(); let registry: ReturnType<typeof openWorkerRegistry> | undefined = f.registry;
   try {
     registry.database.exec("DROP TABLE preservation_records");
@@ -334,7 +344,7 @@ test("v5 migration adds preservation, prepared lineage, and host-only cleanup sn
     const preparedColumns = migrated.database.prepare("PRAGMA table_info(prepared_sets)").all() as Array<{ name: string }>;
     const preservation = migrated.database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='preservation_records'").get() as { sql: string } | undefined;const snapshots=migrated.database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='cleanup_snapshots'").get() as {sql:string}|undefined;const cursors=migrated.database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='cleanup_scan_cursors'").get() as {sql:string}|undefined;const observations=migrated.database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='cleanup_leftover_observations'").get() as {sql:string}|undefined;const claims=migrated.database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='cleanup_leftover_claims'").get() as {sql:string}|undefined;
     assert.equal(preparedColumns.some((column) => column.name === "task_ids_json"), true); assert.match(preservation?.sql ?? "", /STRICT/);assert.match(snapshots?.sql??"",/STRICT/);assert.match(cursors?.sql??"",/STRICT/);assert.match(observations?.sql??"",/STRICT/);assert.match(claims?.sql??"",/STRICT/);
-    assert.equal((migrated.database.prepare("SELECT value FROM registry_meta WHERE key='schema_version'").get() as { value: string }).value, "9");
+    assert.equal((migrated.database.prepare("SELECT value FROM registry_meta WHERE key='schema_version'").get() as { value: string }).value, "10");
   } finally { try { registry?.close(); } catch {} rmSync(f.root, { recursive: true, force: true }); }
 });
 

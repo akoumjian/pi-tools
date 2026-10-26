@@ -3,8 +3,9 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { DatabaseSync as SQLiteDatabaseSync, SQLInputValue } from "node:sqlite";
+import { CURRENT_WORKER_STORAGE_LAYOUT, type WorkerStorageLayout } from "./identity.js";
 
-export const WORKER_REGISTRY_SCHEMA_VERSION = 9;
+export const WORKER_REGISTRY_SCHEMA_VERSION = 10;
 export const DEFAULT_WORKER_RUNTIME_ROOT = path.join(homedir(), ".local", "share", "agent", "worker-runtime");
 
 export type WorkerRole = "work" | "review" | "integration";
@@ -56,6 +57,7 @@ export type WorkerRegistryRecord = {
   sessionId?: string;
   sessionFile?: string;
   workspaceRoot: string;
+  storageLayout: WorkerStorageLayout;
   recoveryError?: string;
   reviewedByWorkerId?: string;
   runtime?: Record<string, unknown>;
@@ -160,6 +162,7 @@ CREATE TABLE IF NOT EXISTS workers (
   session_id TEXT,
   session_file TEXT,
   workspace_root TEXT NOT NULL,
+  storage_layout INTEGER NOT NULL DEFAULT 2 CHECK (storage_layout IN (1,2)),
   recovery_error TEXT,
   reviewed_by_worker_id TEXT,
   runtime_json TEXT NOT NULL DEFAULT '{}',
@@ -169,6 +172,13 @@ CREATE TABLE IF NOT EXISTS workers (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 ) STRICT;
+CREATE TRIGGER IF NOT EXISTS workers_require_current_layout_insert
+BEFORE INSERT ON workers WHEN NEW.storage_layout != 2
+BEGIN SELECT RAISE(ABORT, 'new workers require current storage layout'); END;
+CREATE TRIGGER IF NOT EXISTS workers_refuse_legacy_resume
+BEFORE UPDATE OF status,active_run_id,recovery_error,operation_kind ON workers
+WHEN OLD.storage_layout = 1 AND NEW.recovery_error IS NULL AND COALESCE(NEW.operation_kind, '') != 'discard'
+BEGIN SELECT RAISE(ABORT, 'legacy worker storage cannot resume'); END;
 CREATE TABLE IF NOT EXISTS runs (
   run_id TEXT PRIMARY KEY,
   worker_id TEXT NOT NULL REFERENCES workers(worker_id) ON DELETE CASCADE,
@@ -199,6 +209,11 @@ CREATE TABLE IF NOT EXISTS runs (
   settled_at TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS runs_worker_created ON runs(worker_id, created_at DESC, run_id DESC);
+CREATE TRIGGER IF NOT EXISTS runs_refuse_legacy_launch
+BEFORE UPDATE OF status,claim_kind ON runs WHEN (NEW.status = 'running' OR NEW.claim_kind = 'launch') AND EXISTS (
+  SELECT 1 FROM workers WHERE worker_id = NEW.worker_id AND storage_layout = 1
+)
+BEGIN SELECT RAISE(ABORT, 'legacy worker storage cannot launch'); END;
 CREATE TABLE IF NOT EXISTS deliveries (
   delivery_id TEXT PRIMARY KEY,
   parent_session_file TEXT NOT NULL,
@@ -401,6 +416,11 @@ function migrateWorkerRegistry(database: SQLiteDatabaseSync, fromVersion: number
         root_path TEXT NOT NULL, device INTEGER NOT NULL, inode INTEGER NOT NULL, nonce TEXT NOT NULL,
         owner_pid INTEGER NOT NULL, owner_start_token TEXT NOT NULL, created_at TEXT NOT NULL
       ) STRICT; CREATE INDEX IF NOT EXISTS cleanup_leftover_claims_root ON cleanup_leftover_claims(root_path, trash_path)`);
+    },
+    9: () => {
+      addColumnIfMissing(database, "workers", "storage_layout", "INTEGER NOT NULL DEFAULT 1 CHECK (storage_layout IN (1,2))");
+      database.prepare(`UPDATE workers SET recovery_error=COALESCE(recovery_error,?),version=version+1
+        WHERE storage_layout=1`).run("Legacy split worker storage requires explicit guarded cleanup; it cannot be resumed or silently migrated into the common-parent layout.");
     }
   };
   for (let version = fromVersion; version < WORKER_REGISTRY_SCHEMA_VERSION; version += 1) {
@@ -488,7 +508,9 @@ export function parentRuntimeGenerationMatches(registry: WorkerRegistry, parentS
   return row?.generation === runtimeGeneration;
 }
 
-export function createWorkerAndRun(registry: WorkerRegistry, worker: Omit<WorkerRegistryRecord, "version">, run: WorkerRunRecord): void {
+export type NewWorkerRegistryRecord = Omit<WorkerRegistryRecord, "version" | "storageLayout"> & { storageLayout?: typeof CURRENT_WORKER_STORAGE_LAYOUT };
+
+export function createWorkerAndRun(registry: WorkerRegistry, worker: NewWorkerRegistryRecord, run: WorkerRunRecord): void {
   transaction(registry, () => {
     insertWorker(registry, worker);
     insertRun(registry, run);
@@ -704,7 +726,7 @@ function readRunRow(registry: WorkerRegistry, runId: string): RunRow {
 
 type WorkerRow = {
   worker_id: string; parent_session_file: string; role: WorkerRole; status: WorkerStatus; active_run_id: string | null; latest_run_id: string | null;
-  task_ids_json: string; model_selection: string | null; session_id: string | null; session_file: string | null; workspace_root: string;
+  task_ids_json: string; model_selection: string | null; session_id: string | null; session_file: string | null; workspace_root: string; storage_layout: WorkerStorageLayout;
   recovery_error: string | null; reviewed_by_worker_id: string | null; runtime_json: string; operation_kind: "discard" | null; operation_nonce: string | null; version: number; created_at: string; updated_at: string;
 };
 type RunRow = {
@@ -725,7 +747,7 @@ function decodeWorker(row: WorkerRow): WorkerRegistryRecord {
     ...(row.active_run_id === null ? {} : { activeRunId: row.active_run_id }), ...(row.latest_run_id === null ? {} : { latestRunId: row.latest_run_id }),
     taskIds: parseJson<string[]>(row.task_ids_json), ...(row.model_selection === null ? {} : { modelSelection: row.model_selection }),
     ...(row.session_id === null ? {} : { sessionId: row.session_id }), ...(row.session_file === null ? {} : { sessionFile: row.session_file }),
-    workspaceRoot: row.workspace_root, ...(row.recovery_error === null ? {} : { recoveryError: row.recovery_error }), ...(row.reviewed_by_worker_id === null ? {} : { reviewedByWorkerId: row.reviewed_by_worker_id }), runtime: parseJson<Record<string, unknown>>(row.runtime_json), ...(row.operation_kind === null ? {} : { operationKind: row.operation_kind }), ...(row.operation_nonce === null ? {} : { operationNonce: row.operation_nonce }), version: row.version,
+    workspaceRoot: row.workspace_root, storageLayout: row.storage_layout, ...(row.recovery_error === null ? {} : { recoveryError: row.recovery_error }), ...(row.reviewed_by_worker_id === null ? {} : { reviewedByWorkerId: row.reviewed_by_worker_id }), runtime: parseJson<Record<string, unknown>>(row.runtime_json), ...(row.operation_kind === null ? {} : { operationKind: row.operation_kind }), ...(row.operation_nonce === null ? {} : { operationNonce: row.operation_nonce }), version: row.version,
     createdAt: row.created_at, updatedAt: row.updated_at
   };
 }
@@ -914,7 +936,7 @@ export function reconcileWorkerDeliveries(registry: WorkerRegistry, parentSessio
 }
 
 export type WorkerBatchCreateItem =
-  | { kind: "new"; worker: Omit<WorkerRegistryRecord, "version">; run: WorkerRunRecord }
+  | { kind: "new"; worker: NewWorkerRegistryRecord; run: WorkerRunRecord }
   | { kind: "resume"; workerId: string; expectedVersion: number; taskIds: string[]; runtime?: Record<string, unknown>; run: WorkerRunRecord };
 export type WorkerReviewLeaseClaim = { subjectWorkerId: string; reviewerWorkerId: string; reviewedRunId: string };
 
@@ -1154,10 +1176,10 @@ export function findWorkerRunById(registry: WorkerRegistry, runId: string): { wo
   return worker && run ? { worker, run } : undefined;
 }
 
-function insertWorker(registry: WorkerRegistry, worker: Omit<WorkerRegistryRecord, "version">): void {
-  registry.database.prepare(`INSERT INTO workers(worker_id,parent_session_file,role,status,active_run_id,latest_run_id,task_ids_json,model_selection,session_id,session_file,workspace_root,recovery_error,reviewed_by_worker_id,runtime_json,operation_kind,operation_nonce,version,created_at,updated_at)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)`).run(
-    worker.workerId, canonicalSessionFile(worker.parentSessionFile), worker.role, worker.status, nullable(worker.activeRunId), nullable(worker.latestRunId), json(worker.taskIds), nullable(worker.modelSelection), nullable(worker.sessionId), nullable(worker.sessionFile), worker.workspaceRoot, nullable(worker.recoveryError), nullable(worker.reviewedByWorkerId), json(worker.runtime ?? {}), nullable(worker.operationKind), nullable(worker.operationNonce), worker.createdAt, worker.updatedAt
+function insertWorker(registry: WorkerRegistry, worker: NewWorkerRegistryRecord): void {
+  registry.database.prepare(`INSERT INTO workers(worker_id,parent_session_file,role,status,active_run_id,latest_run_id,task_ids_json,model_selection,session_id,session_file,workspace_root,storage_layout,recovery_error,reviewed_by_worker_id,runtime_json,operation_kind,operation_nonce,version,created_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)`).run(
+    worker.workerId, canonicalSessionFile(worker.parentSessionFile), worker.role, worker.status, nullable(worker.activeRunId), nullable(worker.latestRunId), json(worker.taskIds), nullable(worker.modelSelection), nullable(worker.sessionId), nullable(worker.sessionFile), worker.workspaceRoot, worker.storageLayout ?? CURRENT_WORKER_STORAGE_LAYOUT, nullable(worker.recoveryError), nullable(worker.reviewedByWorkerId), json(worker.runtime ?? {}), nullable(worker.operationKind), nullable(worker.operationNonce), worker.createdAt, worker.updatedAt
   );
 }
 

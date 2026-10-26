@@ -12,7 +12,7 @@ import {
   adoptCleanupWorkers, advanceCleanupScanCursor, buildCleanupInventory, claimPreparedSetDiscard, classifyCleanupWorker, classifyPreparedCleanupIds, createCleanupSnapshot, loadCleanupSnapshot, loadCleanupScanCursor, consumeCleanupSnapshot, readCleanupBeadsFacts, deletePlannedWorkerHostLogs, planSettledWorkerHostLogs,
   deleteCleanupLeftover, preserveWorkerArtifacts, existingAncestorIdentityOverlap, preflightWorkerDiscard, recoverPreparedSetDiscards, scanCleanupLeftovers, unpreservedArtifacts
 } from "../extensions/worker/cleanup.js";
-import { claimWorkerDiscard, createWorkerAndRun, finalizeWorkerDiscard, getWorker, openWorkerRegistry, storePreparedSet, type WorkerRegistry, type WorkerRegistryRecord, type WorkerRunRecord } from "../extensions/worker/registry.js";
+import { claimWorkerDiscard, createWorkerAndRun, finalizeWorkerDiscard, getWorker, openWorkerRegistry, storePreparedSet, type NewWorkerRegistryRecord, type WorkerRegistry, type WorkerRegistryRecord, type WorkerRunRecord } from "../extensions/worker/registry.js";
 import { workerPaths, type WorkerRoots } from "../extensions/worker/identity.js";
 import { startManagedAsyncJob } from "../extensions/async-shell/index.js";
 import { matchWorkerHostJobIdentity, workerHostJobIdentity } from "../extensions/_shared/worker-host-job.js";
@@ -32,7 +32,7 @@ function insertSettled(registry: WorkerRegistry, roots: WorkerRoots, parent: str
   const workerId = input.workerId ?? WORKER_A; const runId = input.runId ?? RUN_A; const paths = workerPaths(roots, workerId);
   mkdirSync(paths.stateDir, { recursive: true }); mkdirSync(paths.workspaceRoot, { recursive: true });
   const now = "2026-10-25T10:00:02.000Z";
-  const worker: Omit<WorkerRegistryRecord, "version"> = { workerId, parentSessionFile: input.owner ?? parent, role: input.role ?? "work", status: "idle", latestRunId: runId, taskIds: ["personal-test"], workspaceRoot: paths.workspaceRoot, ...(input.recoveryError ? { recoveryError: input.recoveryError } : {}), ...(input.reviewedByWorkerId ? { reviewedByWorkerId: input.reviewedByWorkerId } : {}), createdAt: now, updatedAt: now };
+  const worker: NewWorkerRegistryRecord = { workerId, parentSessionFile: input.owner ?? parent, role: input.role ?? "work", status: "idle", latestRunId: runId, taskIds: ["personal-test"], workspaceRoot: paths.workspaceRoot, ...(input.recoveryError ? { recoveryError: input.recoveryError } : {}), ...(input.reviewedByWorkerId ? { reviewedByWorkerId: input.reviewedByWorkerId } : {}), createdAt: now, updatedAt: now };
   const run: WorkerRunRecord = { workerId, runId, status: "settled", taskIds: ["personal-test"], completionDelivery: "steer", ...(input.job ? { jobId: input.job.id, stdoutLog: input.job.stdout, stderrLog: input.job.stderr } : {}), outcome: "completed", outcomeSource: "worker", summary: "done", ...(input.binding?{binding:input.binding}:{}), repositories: [], artifacts: input.artifacts ?? [], errors: [], createdAt: now, settledAt: now };
   createWorkerAndRun(registry, worker, run); return getWorker(registry, workerId)!;
 }
