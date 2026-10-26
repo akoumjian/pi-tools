@@ -92,7 +92,7 @@ printf 'PI_REVIEW_OVERLAY_V1\nlower=%s\nscratch=%s\nupper=%s\nwork=%s\nmerged=%s
 
 export function assertReviewWorkspaceOverlay(value: ReviewWorkspaceOverlay, requireEvidence: boolean): void {
   if (value.version !== 1 || !isWorkerId(value.workerId) || !RUN_ID.test(value.runId)) throw new Error("Invalid exact review OverlayFS identity.");
-  if (!path.isAbsolute(value.lowerDirectory) || path.normalize(value.lowerDirectory) !== value.lowerDirectory || !Number.isSafeInteger(value.lowerDevice) || value.lowerDevice < 0 || !Number.isSafeInteger(value.lowerInode) || value.lowerInode < 0) throw new Error("Invalid review OverlayFS lower layer.");
+  if (!path.isAbsolute(value.lowerDirectory) || path.normalize(value.lowerDirectory) !== value.lowerDirectory || /[\u0000-\u0020,:\\]/.test(value.lowerDirectory) || !Number.isSafeInteger(value.lowerDevice) || value.lowerDevice < 0 || !Number.isSafeInteger(value.lowerInode) || value.lowerInode < 0) throw new Error("Invalid or unsafe review OverlayFS lower layer.");
   const expected = planPaths(value.workerId, value.runId);
   if (value.scratchDirectory !== expected.scratchDirectory || value.upperDirectory !== expected.upperDirectory || value.workDirectory !== expected.workDirectory || value.mergedDirectory !== GUEST_MERGED) throw new Error("Invalid exact review OverlayFS guest paths.");
   if (value.setupEvidenceSha256 !== undefined && !SHA256.test(value.setupEvidenceSha256)) throw new Error("Invalid review OverlayFS setup evidence digest.");

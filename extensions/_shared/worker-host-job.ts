@@ -35,9 +35,9 @@ export function workerHostJobIdentity(workerId: string, runId: string, format: W
 
 /**
  * Match only an exact current or legacy command. If managedBy is present it must
- * be the exact three-field worker-host identity bound to the same IDs. A
- * managedBy-only value is accepted so ordinary retention can conservatively
- * protect trusted worker-host markers even when command text is unavailable.
+ * be the exact three-field worker-host identity bound to the same IDs. Command
+ * text is mandatory; ordinary retention separately protects plausible markers
+ * without granting cleanup authority.
  */
 export function matchWorkerHostJobIdentity(
   value: unknown,
