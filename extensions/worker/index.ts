@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { chmodSync, closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -39,7 +38,7 @@ import { renderWorkerRuntimePrompt } from "./prompts.js";
 import { contextInputs, inputMounts, validateAdditionalInputs, type RetainedInput } from "./inputs.js";
 import { inspectInterruptedGitState, inventoryWorkerRepositories, snapshotWorkerRepositories, type RepositorySnapshot } from "./inventory.js";
 import { countSessionLines, openWorkerSessionViewer, sanitizeViewText, type WorkerSessionViewTarget } from "./view.js";
-import { canonicalPathWithin, canonicalRepository, trustedGit, trustedGitArgs, trustedGitEnvironment } from "./trusted-git.js";
+import { canonicalPathWithin, canonicalRepository, trustedGit } from "./trusted-git.js";
 import { continueWorkerCacheLineage, prepareWorkerCacheLineage, registerParentCacheLineageCapture, type WorkerCacheLineageRecord } from "./cache-lineage.js";
 import { adoptCleanupWorkers, adoptPreparedSetDiscard, buildCleanupInventory, classifyCleanupWorker, classifyPreparedCleanupIds, claimPreparedSetDiscard, consumeCleanupSnapshot, invalidateCleanupSnapshot, createCleanupSnapshot, deleteCleanupLeftovers, deletePlannedWorkerHostLogs, finishPreparedSetDiscard, loadCleanupSnapshot, loadCleanupScanCursor, invalidateCleanupScanCursor, advanceCleanupScanCursor, planSettledWorkerHostLogs, preflightWorkerDiscard, preservationRecords, preserveWorkerArtifacts, preparedCleanupTaskIds, readCleanupBeadsFacts, recoverPreparedSetDiscards, revalidateCleanupSnapshot, type CleanupInventory, type CleanupOwnerAuthority, type CleanupSnapshotWorker, type PersistedCleanupPreview } from "./cleanup.js";
 
@@ -434,7 +433,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
           const binding = latest?.binding; provisionWorkerPaths(paths);
           const role = worker.role;
           const retainedInputs = validateAdditionalInputs({ values: request.additionalInputs, existing: runtimeInputs(worker), role, workspaceRoot: paths.workspaceRoot, runtimeRoot });
-          let contextFile: string | undefined; let reviewedRunId: string | undefined; let preparedId: string | undefined; let operationRepositories: Array<Record<string, unknown>> | undefined;
+          let contextFile: string | undefined; let reviewSubjectWorkspace: string | undefined; let reviewedRunId: string | undefined; let preparedId: string | undefined; let operationRepositories: Array<Record<string, unknown>> | undefined;
           const pendingWorkSessionId = !worker.sessionId && role === "work" ? randomUUID() : undefined;
           const reservedRunId = createWorkerRunId(now(), random());
           pendingReservation = { paths, runId: reservedRunId };
@@ -443,7 +442,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
           let modelSelection = worker.modelSelection!;
           if (role === "review") {
             if (!binding || !("reviewedRunId" in binding)) throw new Error(`Review worker ${worker.workerId} lost its reviewed-run binding.`);
-            const subject = reviewSubject(binding.reviewedRunId, parentSessionFile, worker.workerId); reviewedRunId = binding.reviewedRunId;
+            const subject = reviewSubject(binding.reviewedRunId, parentSessionFile, worker.workerId); reviewedRunId = binding.reviewedRunId; reviewSubjectWorkspace = subject.worker.workspaceRoot;
             if (!modelSelection) throw new Error(`Review worker ${worker.workerId} has no model provider provenance.`);
             modelSelection = resolveModel(role, modelSelection, context, reviewedRunProvider(subject.run));
             contextFile = writeReviewContext(runEvidenceDirectory(paths, reservedRunId), workerPaths(roots, subject.worker.workerId), request.workerId, reservedRunId, subject.worker, subject.run, inputs);
@@ -461,7 +460,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
             retained.cacheLineage ??= { ...prepareWorkerCacheLineage({ stateRoot: roots.stateRoot, workerStateDir: lineageDir, parentSessionFile, parentSessionId: context.sessionManager.getSessionId(), route: parseWorkerModelSelection(worker.modelSelection!), now: now() }), hostGeneration: reservedRunId };
             if (retained.cacheLineage.mode === "eligible" && priorFingerprint) retained.cacheLineage.runtimeFingerprint = priorFingerprint;
           }
-          const plan = finishPlanSafely({ request, role, workerId: worker.workerId, runId: reservedRunId, paths, promptInputs: inputs, taskIds: unique([...worker.taskIds, ...(request.additionalTaskIds ?? [])]), modelSelection, binding, workerRuntime: { version: 2, inputs: retainedInputs, ...retained }, newWorker: false, ...(sessionStartLine === undefined ? {} : { sessionStartLine }), expectedVersion: worker.version, contextFile, reviewedRunId, preparedId, operationRepositories, pendingWorkSessionId, mounts, parentSessionFile, context });
+          const plan = finishPlanSafely({ request, role, workerId: worker.workerId, runId: reservedRunId, paths, promptInputs: inputs, taskIds: unique([...worker.taskIds, ...(request.additionalTaskIds ?? [])]), modelSelection, binding, workerRuntime: { version: 2, inputs: retainedInputs, ...retained }, newWorker: false, ...(sessionStartLine === undefined ? {} : { sessionStartLine }), expectedVersion: worker.version, contextFile, reviewSubjectWorkspace, reviewedRunId, preparedId, operationRepositories, pendingWorkSessionId, mounts, parentSessionFile, context });
           plans.push(plan); pendingReservation = undefined; continue;
         }
         const role = request.role;
@@ -484,12 +483,12 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         try { if (role === "work") cacheLineage = { ...prepareWorkerCacheLineage({ stateRoot: roots.stateRoot, workerStateDir: prepareCacheLineageDirectory(paths, reservedRunId), parentSessionFile, parentSessionId: context.sessionManager.getSessionId(), route: parseWorkerModelSelection(modelSelection), now: now() }), hostGeneration: reservedRunId }; }
         catch (error) { rmSync(paths.stateDir, { recursive: true, force: true }); throw error; }
         let binding: WorkerRunRecord["binding"]; let reviewedRunId: string | undefined; let preparedId: string | undefined; let consumedPrepared = false;
-        let contextFile: string | undefined; let mounts: WorkerSandboxMount[] = [];
+        let contextFile: string | undefined; let reviewSubjectWorkspace: string | undefined; let mounts: WorkerSandboxMount[] = [];
         try {
           const pendingWorkSessionId = role === "work" ? randomUUID() : undefined;
           const mountedInputs = snapshotAdditionalInputs(runEvidenceDirectory(paths, reservedRunId), inputs);
           if (role === "review") {
-            reviewedRunId = request.reviewedRunId; binding = { reviewedWorkerId: subject!.worker.workerId, reviewedRunId };
+            reviewedRunId = request.reviewedRunId; reviewSubjectWorkspace = subject!.worker.workspaceRoot; binding = { reviewedWorkerId: subject!.worker.workerId, reviewedRunId };
             createWorkerSession({ workspaceRoot: paths.workspaceRoot, sessionDir: paths.sessionDir, sessionId: randomUUID() });
             contextFile = writeReviewContext(runEvidenceDirectory(paths, reservedRunId), workerPaths(roots, subject!.worker.workerId), workerId, reservedRunId, subject!.worker, subject!.run, mountedInputs);
             mounts = [{ source: path.dirname(contextFile), readOnly: true }];
@@ -499,7 +498,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
             contextFile = writeIntegrationContext(paths, runEvidenceDirectory(paths, reservedRunId), moved, mountedInputs, false); mounts = [{ source: path.dirname(contextFile), readOnly: true }];
           }
           const plan = finishPlan({ request, role, workerId, ...(reservedRunId ? { runId: reservedRunId } : {}), paths, promptInputs: mountedInputs, taskIds: role === "review" ? subject!.run.taskIds : taskIds, modelSelection, binding,
-            workerRuntime: { version: 2, inputs, ...(repositoryBaselines ? { repositoryBaselines } : {}), ...(cacheLineage ? { cacheLineage } : {}) }, newWorker: true, contextFile, reviewedRunId, preparedId, consumedPrepared, operationRepositories: snapshotOperationRepositories(integrationSet?.repositories), pendingWorkSessionId, mounts, parentSessionFile, context });
+            workerRuntime: { version: 2, inputs, ...(repositoryBaselines ? { repositoryBaselines } : {}), ...(cacheLineage ? { cacheLineage } : {}) }, newWorker: true, contextFile, reviewSubjectWorkspace, reviewedRunId, preparedId, consumedPrepared, operationRepositories: snapshotOperationRepositories(integrationSet?.repositories), pendingWorkSessionId, mounts, parentSessionFile, context });
           plans.push(plan);
         } catch (error) {
           if (consumedPrepared && preparedId) { try { restoreConsumedPreparedMergeSet(parentSessionFile, preparedId, paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, trustedSet: trustedPreparedSet(getRegistry(), parentSessionFile, preparedId) }); } catch {} }
@@ -517,7 +516,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     removeOwnerTree(path.join(paths.stateDir, "cache-lineage", runId));
   }
 
-  function finishPlanSafely(input: Omit<PlannedRun, "runId" | "jobId" | "runRuntime"> & { runId?: string; contextFile?: string; pendingWorkSessionId?: string; promptInputs: RetainedInput[]; mounts: WorkerSandboxMount[]; parentSessionFile: string; context: ExtensionContext }): PlannedRun {
+  function finishPlanSafely(input: Omit<PlannedRun, "runId" | "jobId" | "runRuntime"> & { runId?: string; contextFile?: string; reviewSubjectWorkspace?: string; pendingWorkSessionId?: string; promptInputs: RetainedInput[]; mounts: WorkerSandboxMount[]; parentSessionFile: string; context: ExtensionContext }): PlannedRun {
     try { return finishPlan(input); } catch (error) {
       if (input.consumedPrepared && input.preparedId) { try { restoreConsumedPreparedMergeSet(input.parentSessionFile, input.preparedId, input.paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, trustedSet: trustedPreparedSet(getRegistry(), input.parentSessionFile, input.preparedId) }); } catch {} }
       if (input.newWorker) { removeOwnerTree(input.paths.stateDir); removeOwnerTree(input.paths.supervisionDir); removeOwnerTree(input.paths.evidenceDir); }
@@ -526,13 +525,13 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     }
   }
 
-  function finishPlan(input: Omit<PlannedRun, "runId" | "jobId" | "runRuntime"> & { runId?: string; contextFile?: string; pendingWorkSessionId?: string; promptInputs: RetainedInput[]; mounts: WorkerSandboxMount[]; parentSessionFile: string; context: ExtensionContext }): PlannedRun {
+  function finishPlan(input: Omit<PlannedRun, "runId" | "jobId" | "runRuntime"> & { runId?: string; contextFile?: string; reviewSubjectWorkspace?: string; pendingWorkSessionId?: string; promptInputs: RetainedInput[]; mounts: WorkerSandboxMount[]; parentSessionFile: string; context: ExtensionContext }): PlannedRun {
     assertWorkerStoragePaths(input.paths);
     const runId = input.runId ?? createWorkerRunId(now(), random()); const jobId = createAsyncJobId(now(), random());
     const runDir = path.join(input.paths.supervisionDir, "runs", runId); mkdirSync(runDir, { recursive: true, mode: 0o700 });
     const nonce = randomUUID();
     const codeRoot = overrides.codeRoot ?? (testLaunch ? input.context.cwd : path.join(homedir(), "Code"));
-    const sandbox = planWorkerSandbox({ workerId: input.workerId, runId, creationNonce: nonce, workerRoot: input.paths.stateDir, workingDirectory: input.paths.workspaceRoot, codeRoot, mounts: input.mounts.map((mount) => ({ source: mount.source, ...(mount.readOnly ? { readOnly: true } : {}) })), ...(sandboxRelease ? { release: sandboxRelease } : {}) });
+    const sandbox = planWorkerSandbox({ workerId: input.workerId, runId, creationNonce: nonce, workerRoot: input.paths.stateDir, workingDirectory: input.paths.workspaceRoot, codeRoot, mounts: input.mounts.map((mount) => ({ source: mount.source, ...(mount.readOnly ? { readOnly: true } : {}) })), ...(input.reviewSubjectWorkspace ? { reviewSubjectWorkspace: input.reviewSubjectWorkspace } : {}), ...(sandboxRelease ? { release: sandboxRelease } : {}) });
     const runtimeFingerprint = createHash("sha256").update(JSON.stringify({ imageDigest: sandbox.imageDigest, kitSha256: sandbox.kitSha256, sbxVersion: sandbox.sbxVersion, sbxBuildCommit: sandbox.sbxBuildCommit, templateId: sandbox.templateId, templateRepository: sandbox.templateRepository, templateTag: sandbox.templateTag, templateFlavor: sandbox.templateFlavor, stagedLockSha256: sandbox.stagedLockSha256, resourceManifestSha256: sandbox.resourceManifestSha256, runtimeProvenanceSha256: sandbox.runtimeProvenanceSha256, revisions: sandbox.revisions })).digest("hex");
     const roleInstructions = roleInstructionsFor(input.role);
     const cacheBoundaryFingerprint = createHash("sha256").update(JSON.stringify({ runtimeFingerprint, role: input.role, modelSelection: input.modelSelection, roleInstructions, taskIds: [...input.taskIds].sort(), repositoryBaselines: input.workerRuntime.repositoryBaselines ?? [] })).digest("hex");
@@ -548,7 +547,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const prompt = renderWorkerRuntimePrompt(input.role, { workerId: input.workerId, runId, workspaceRoot: input.paths.workspaceRoot,
       codeRoot, taskIds: input.taskIds, roleInstructions,
       instructions: request.instructions, repositoryBaselines: input.workerRuntime.repositoryBaselines, additionalInputs: immutablePromptInputs(input.promptInputs),
-      reviewSubjectPath: input.contextFile && input.role === "review" ? (JSON.parse(readFileSync(input.contextFile, "utf8")) as { subjectWorkspace: string }).subjectWorkspace : undefined, reviewContextPath: input.role === "review" ? input.contextFile : undefined, integrationContextPath: input.role === "integration" ? input.contextFile : undefined, resumed: !input.newWorker,
+      reviewSubjectPath: input.role === "review" ? sandbox.reviewOverlay?.mergedDirectory : undefined, reviewContextPath: input.role === "review" ? input.contextFile : undefined, integrationContextPath: input.role === "integration" ? input.contextFile : undefined, resumed: !input.newWorker,
       cacheLineageMarker: input.workerRuntime.cacheLineage?.mode === "eligible" ? input.workerRuntime.cacheLineage.marker : undefined, initialSession: Boolean(input.pendingWorkSessionId),
       cancelledPreviously: interruptedPreviously, interruptionWarnings, runtimeChange: legacyRuntimeTransition ? "This is the first version-4 Docker Sandbox run after retained legacy metadata; the old runtime was not reattached or trusted, a fresh immutable Sandbox was created, and executable contracts were refreshed." : runtimeChanged ? `Approved runtime changed from ${previousRuntime!.runtimeFingerprint.slice(0, 12)} to ${runtimeFingerprint.slice(0, 12)} (release ${previousRuntime!.releaseOrdinal} -> ${sandbox.releaseOrdinal}); executable contracts were refreshed and cache lineage is fresh.` : undefined });
     const runRuntime: RunRuntime = { version: 4, prompt, runDir, resultFile: path.join(runDir, "result.json"), settledFile: path.join(runDir, "settled.json"), processFile: path.join(runDir, "host-process.json"), processNonce: nonce,
@@ -654,7 +653,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       const record: WorkerLaunchRecord = { workerId: worker.workerId, runId: run.runId, jobId: run.jobId!, sessionId, sessionFile, workerRoot: paths.stateDir, workspaceRoot: worker.workspaceRoot, taskIds: run.taskIds, role: worker.role, modelSelection: worker.modelSelection!, ...(worker.runtime?.cacheLineage ? { cacheLineage: worker.runtime.cacheLineage as WorkerCacheLineageRecord } : {}) };
       assertLaunchClaimOpen(item.workerId, item.runId, nonce);
       item.runtime.sandbox = await launchSideEffect(item.workerId, item.runId, nonce, () => createSandbox(sbx(), item.runtime.sandbox));
-      writeReadonlyJson(path.join(item.runtime.runDir, "sandbox-created.json"), { version: 1, workerId: item.workerId, runId: item.runId, creationNonce: item.runtime.sandbox.creationNonce, sandboxName: item.runtime.sandbox.sandboxName, sandboxId: item.runtime.sandbox.observedSandboxId, imageReference: item.runtime.sandbox.imageReference, imageDigest: item.runtime.sandbox.imageDigest, kitReference: item.runtime.sandbox.kitReference, kitSha256: item.runtime.sandbox.kitSha256, sbxVersion: item.runtime.sandbox.sbxVersion, sbxBuildCommit: item.runtime.sandbox.sbxBuildCommit, templateId: item.runtime.sandbox.templateId, templateRepository: item.runtime.sandbox.templateRepository, templateTag: item.runtime.sandbox.templateTag, templateFlavor: item.runtime.sandbox.templateFlavor, createEvidenceSha256: item.runtime.sandbox.createEvidenceSha256, inspectEvidenceSha256: item.runtime.sandbox.inspectEvidenceSha256, sbxVersionEvidenceSha256: item.runtime.sandbox.sbxVersionEvidenceSha256, stagedLockSha256: item.runtime.sandbox.stagedLockSha256, runtimeProvenanceSha256: item.runtime.sandbox.runtimeProvenanceSha256, observedRuntimeSha256: item.runtime.sandbox.observedRuntimeSha256, observedCpu: item.runtime.sandbox.observedCpu, observedMemoryBytes: item.runtime.sandbox.observedMemoryBytes, observedAt: now().toISOString() });
+      writeReadonlyJson(path.join(item.runtime.runDir, "sandbox-created.json"), { version: 1, workerId: item.workerId, runId: item.runId, creationNonce: item.runtime.sandbox.creationNonce, sandboxName: item.runtime.sandbox.sandboxName, sandboxId: item.runtime.sandbox.observedSandboxId, imageReference: item.runtime.sandbox.imageReference, imageDigest: item.runtime.sandbox.imageDigest, kitReference: item.runtime.sandbox.kitReference, kitSha256: item.runtime.sandbox.kitSha256, sbxVersion: item.runtime.sandbox.sbxVersion, sbxBuildCommit: item.runtime.sandbox.sbxBuildCommit, templateId: item.runtime.sandbox.templateId, templateRepository: item.runtime.sandbox.templateRepository, templateTag: item.runtime.sandbox.templateTag, templateFlavor: item.runtime.sandbox.templateFlavor, createEvidenceSha256: item.runtime.sandbox.createEvidenceSha256, inspectEvidenceSha256: item.runtime.sandbox.inspectEvidenceSha256, sbxVersionEvidenceSha256: item.runtime.sandbox.sbxVersionEvidenceSha256, stagedLockSha256: item.runtime.sandbox.stagedLockSha256, runtimeProvenanceSha256: item.runtime.sandbox.runtimeProvenanceSha256, observedRuntimeSha256: item.runtime.sandbox.observedRuntimeSha256, observedCpu: item.runtime.sandbox.observedCpu, observedMemoryBytes: item.runtime.sandbox.observedMemoryBytes, reviewOverlay: item.runtime.sandbox.reviewOverlay, observedAt: now().toISOString() });
       assertLaunchClaimOpen(item.workerId, item.runId, nonce);
       persistClaimedRuntime(item.runtime, item.workerId, item.runId, "launch", nonce); assertLaunchClaimOpen(item.workerId, item.runId, nonce);
       assertLaunchClaimOpen(item.workerId, item.runId, nonce);
@@ -1508,40 +1507,21 @@ function writeReviewContext(directory: string, subjectPaths: WorkerPaths, review
   if (!Number.isSafeInteger(startLine) || !Number.isSafeInteger(endLine) || startLine < 1 || endLine < startLine || endLine > sourceLineCount) throw new Error("Review subject session range is invalid.");
   const selected = lines.slice(startLine - 1, endLine).join("\n");
   writeFileSync(sessionFile, `${selected}${selected && !selected.endsWith("\n") ? "\n" : ""}`, { mode: 0o400 });
-  const subjectWorkspace = path.join(directory, "subject"); mkdirSync(subjectWorkspace, { mode: 0o700 });
   const skippedRepositories: Array<{ candidateId: string; path: string; reason: string }> = [];
-  const materializedRepositories: WorkerRepositoryResult[] = [];
-  for (const [index, repository] of subjectRun.repositories.entries()) {
-    if (!repository.eligible || !/^[0-9a-f]{40}$/.test(repository.commit)) {
-      skippedRepositories.push({ candidateId: repository.candidateId, path: repository.path, reason: repository.eligible ? "The reported commit is not an exact lowercase 40-hex object ID." : (repository.issues?.join("; ") || "Repository was not eligible at result acceptance.") });
-      continue;
-    }
+  const repositories: WorkerRepositoryResult[] = [];
+  for (const repository of subjectRun.repositories) {
+    if (!repository.eligible || !/^[0-9a-f]{40}$/.test(repository.commit)) { skippedRepositories.push({ candidateId: repository.candidateId, path: repository.path, reason: repository.eligible ? "The reported commit is not an exact lowercase 40-hex object ID." : (repository.issues?.join("; ") || "Repository was not eligible at result acceptance.") }); continue; }
     const source = path.join(subjectWorker.workspaceRoot, repository.path); assertContainedOrdinaryDirectory(subjectWorker.workspaceRoot, source, "review candidate repository");
     if (trustedGit(source, ["rev-parse", `${repository.commit}^{commit}`]).trim() !== repository.commit) throw new Error("Review candidate commit is unavailable from its reported repository.");
-    const target = path.join(subjectWorkspace, `${String(index + 1).padStart(3, "0")}-${repository.candidateId}`);
-    execFileSync("git", trustedGitArgs(["clone", "--no-local", "--no-hardlinks", "--no-checkout", "--no-tags", "--", source, target]), { env: trustedGitEnvironment(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 16 * 1024 * 1024 });
-    if (trustedGit(target, ["rev-parse", `${repository.commit}^{commit}`]).trim() !== repository.commit) throw new Error("Cloned review candidate does not contain its accepted exact commit.");
-    trustedGit(target, ["checkout", "--detach", repository.commit]);
-    try { trustedGit(target, ["remote", "remove", "origin"]); } catch {}
-    for (const ref of trustedGit(target, ["for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes", "refs/tags"]).split("\n").filter(Boolean)) trustedGit(target, ["update-ref", "-d", ref]);
-    if (trustedGit(target, ["rev-parse", "HEAD"]).trim() !== repository.commit) throw new Error("Materialized review candidate commit mismatch.");
-    makeReadonlyTree(target, { nodes: 0, bytes: 0 }); materializedRepositories.push({ ...repository, path: path.relative(subjectWorkspace, target) });
+    repositories.push({ ...repository, path: repository.path });
   }
-  chmodSync(subjectWorkspace, 0o700);
-  const artifactRoot = path.join(directory, "artifacts"); mkdirSync(artifactRoot, { mode: 0o700 }); const artifactBudget = { nodes: 0, bytes: 0 };
-  const materializedArtifacts = subjectRun.artifacts.map((artifact, index) => { const source = path.resolve(subjectWorker.workspaceRoot, artifact); assertContainedPathWithoutSymlinks(subjectWorker.workspaceRoot, source, "review subject artifact"); const target = path.join(artifactRoot, `${String(index + 1).padStart(3, "0")}-${createHash("sha256").update(source).digest("hex").slice(0, 12)}-${path.basename(source)}`); snapshotOrdinaryNode(source, target, artifactBudget); return target; }); chmodSync(artifactRoot, 0o700);
+  const overlayPath = (source: string, label: string): string => { assertContainedPathWithoutSymlinks(subjectWorker.workspaceRoot, source, label); const relative = path.relative(subjectWorker.workspaceRoot, source); return path.posix.join("/review/subject", ...relative.split(path.sep)); };
+  const artifacts = subjectRun.artifacts.map((artifact) => overlayPath(path.resolve(subjectWorker.workspaceRoot, artifact), "review subject artifact"));
+  const available = new Map(repositories.map((repository) => [repository.candidateId, repository]));
+  const candidates = subjectRun.repositories.map(({ candidateId, path: reportedPath, reported, changed, dirty, eligible, issues }) => { const repository = available.get(candidateId); return { candidateId, reportedPath, reported, changed, dirty, eligible, available: Boolean(repository), ...(repository ? { path: repository.path } : {}), ...(issues ? { issues } : {}) }; });
   const file = path.join(directory, "context.json");
-  const materializedByCandidate = new Map(materializedRepositories.map((repository) => [repository.candidateId, repository]));
-  const candidates = subjectRun.repositories.map(({ candidateId, path: reportedPath, reported, changed, dirty, eligible, issues }) => { const materialized = materializedByCandidate.get(candidateId); return { candidateId, reportedPath, reported, changed, dirty, eligible, materialized: Boolean(materialized), ...(materialized ? { path: materialized.path } : {}), ...(issues ? { issues } : {}) }; });
-  const value = { version: 2, reviewerWorkerId, reviewedWorkerId: subjectWorker.workerId, reviewedRunId: subjectRun.runId, subjectWorkspace, session: { path: sessionFile, sourceRange: { startLine, endLine }, snapshotRange: { startLine: 1, endLine: endLine - startLine + 1 } }, repositories: materializedRepositories, skippedRepositories, artifacts: materializedArtifacts, candidates, additionalInputs: contextInputs(inputs) };
+  const value = { version: 3, reviewerWorkerId, reviewedWorkerId: subjectWorker.workerId, reviewedRunId: subjectRun.runId, subjectWorkspace: "/review/subject", session: { path: sessionFile, sourceRange: { startLine, endLine }, snapshotRange: { startLine: 1, endLine: endLine - startLine + 1 } }, repositories, skippedRepositories, artifacts, candidates, additionalInputs: contextInputs(inputs) };
   writeReadonlyJson(file, value); return file;
-}
-function makeReadonlyTree(root: string, budget: { nodes: number; bytes: number }): void {
-  if (++budget.nodes > 250_000) throw new Error("Review candidate snapshot exceeds 250000 filesystem nodes.");
-  const metadata = lstatSync(root); if (metadata.isSymbolicLink()) throw new Error(`Review candidate snapshots reject symbolic links: ${root}.`);
-  if (metadata.isDirectory()) { for (const name of readdirSync(root).sort()) makeReadonlyTree(path.join(root, name), budget); chmodSync(root, 0o700); }
-  else if (metadata.isFile()) { if ((budget.bytes += metadata.size) > 2 * 1024 * 1024 * 1024) throw new Error("Review candidate snapshot exceeds 2 GiB."); chmodSync(root, 0o400); }
-  else throw new Error(`Review candidate contains an unsupported filesystem node: ${root}.`);
 }
 function reviewSessionFile(contextFile: string): string { return path.join(path.dirname(contextFile), "session.jsonl"); }
 function readBoundedNoFollowFile(file: string, trustedRoot: string, maximumBytes: number, label: string): Buffer {

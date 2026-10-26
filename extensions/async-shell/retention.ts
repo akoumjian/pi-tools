@@ -3,6 +3,7 @@ import { lstat, readFile, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { isAsyncJobExecutionAlive } from "../_shared/async-job.js";
+import { matchWorkerHostJobIdentity } from "../_shared/worker-host-job.js";
 
 export type AsyncShellRetentionKind = "eligible" | "ineligible" | "pending" | "prune" | "unknown-leftover";
 
@@ -46,7 +47,6 @@ const LEFTOVER_PATTERN = /^\.(pending|prune)-(job_[A-Za-z0-9][A-Za-z0-9_-]{0,127
 const TERMINAL = new Set(["exited", "failed", "cancelled"]);
 const SCAN_BATCH_SIZE = 256;
 const DEFAULT_WORKER_RUNTIME_ROOT = path.join(homedir(), ".local", "share", "agent", "worker-runtime");
-const WORKER_HOST_COMMAND_PATTERN = /^Pi worker host (worker_[A-Za-z0-9][A-Za-z0-9_-]{0,127})\/(run_[A-Za-z0-9][A-Za-z0-9_-]{0,127})$/;
 const MANAGED_WORKER_EVIDENCE_REASON = "managed-worker evidence; ordinary prune refused; host-log cleanup is separate";
 
 export function parseAsyncShellLeftoverName(name: string): { kind: "pending" | "prune"; jobId: string } | undefined {
@@ -64,10 +64,11 @@ export function managedWorkerEvidenceReason(
   managedWorkerJobIds: ReadonlySet<string> = readManagedWorkerHostJobIds()
 ): string | undefined {
   if (typeof job.jobId === "string" && managedWorkerJobIds.has(job.jobId)) return MANAGED_WORKER_EVIDENCE_REASON;
-  if (isRecord(job.managedBy) && job.managedBy.kind === "worker-host" && typeof job.managedBy.workerId === "string" && typeof job.managedBy.runId === "string") {
-    return MANAGED_WORKER_EVIDENCE_REASON;
-  }
-  if (typeof job.command === "string" && WORKER_HOST_COMMAND_PATTERN.test(job.command)) return MANAGED_WORKER_EVIDENCE_REASON;
+  if (matchWorkerHostJobIdentity(job)) return MANAGED_WORKER_EVIDENCE_REASON;
+  // Retention is conservative: a contradictory but plausible marker/command is
+  // unsafe to prune even though cleanup's full identity matcher rejects it.
+  if (isRecord(job.managedBy) && job.managedBy.kind === "worker-host" && typeof job.managedBy.workerId === "string" && typeof job.managedBy.runId === "string") return MANAGED_WORKER_EVIDENCE_REASON;
+  if (job.command !== undefined && matchWorkerHostJobIdentity({ command: job.command })) return MANAGED_WORKER_EVIDENCE_REASON;
   return undefined;
 }
 

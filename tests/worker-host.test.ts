@@ -8,6 +8,7 @@ import path from "node:path";
 import test from "node:test";
 import { buildWorkerRpcArgs, type WorkerHostConfig } from "../extensions/worker/runner.js";
 import { assertWorkerSandboxReference, createWorkerSandboxAsync, planWorkerSandbox, settleWorkerSandboxAsync, type WorkerSandboxRelease } from "../extensions/worker/sandbox.js";
+import { createReviewWorkspaceOverlayAsync, planReviewWorkspaceOverlay } from "../extensions/worker/review-workspace.js";
 
 const revisions = { pi: "1".repeat(40), profile: "2".repeat(40), piTools: "3".repeat(40), piDocparser: "4".repeat(40) };
 const extensionPaths = ["/opt/profile/extensions", "/opt/pi-tools/extensions/worker/runtime.ts"];
@@ -34,6 +35,20 @@ test("Sandbox planning freezes exact runtime provenance and deterministic mounts
   assert.equal(planned.kind, "docker-sandbox"); assert.equal(planned.imageDigest, "b".repeat(64)); assert.equal(planned.kitSha256, "a".repeat(64)); assert.deepEqual(planned.mounts, [{ source: input, readOnly: true }]); assert.equal(planned.extensionPaths.length, 2); assert.ok(planned.sandboxName.endsWith(`-${planned.creationNonce}`)); assert.equal(planned.sandboxName.length, 60);
 }));
 
+
+
+test("review OverlayFS uses exact privileged sbx exec, private upper/work, and no host copy fallback", async () => temp(async (root) => {
+  const subject = path.join(root, "subject"), reviewer = path.join(root, "reviewer"), codeRoot = path.join(root, "Code"); await mkdir(path.join(subject, "deep"), { recursive: true }); await mkdir(reviewer); await mkdir(codeRoot); await writeFile(path.join(subject, "source.txt"), "authoritative\n"); await writeFile(path.join(subject, "deep", "untouched.txt"), "untouched\n");
+  const workerId = "worker_20260101000000_aaaaaaaa", runId = "run_20260101000000_bbbbbbbb"; const overlay = planReviewWorkspaceOverlay({ workerId, runId, subjectWorkspace: subject });
+  const planned = planWorkerSandbox({ workerId, runId, creationNonce: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", workerRoot: reviewer, codeRoot, mounts: [], reviewSubjectWorkspace: subject, release });
+  assert.equal(planned.workingDirectory, "/review/subject"); assert.deepEqual(planned.mounts, [{ source: subject, readOnly: true }]); assert.deepEqual(planned.reviewOverlay, overlay); assert.equal(existsSync(path.join(reviewer, "subject")), false, "planning must not recursively copy the subject");
+  const calls: string[][] = []; const created = await createReviewWorkspaceOverlayAsync("/sbx", planned.sandboxName, overlay, async (args) => { calls.push(args); if (args.includes("--privileged")) return { stdout: `PI_REVIEW_OVERLAY_V1\nlower=${overlay.lowerDirectory}\nscratch=${overlay.scratchDirectory}\nupper=${overlay.upperDirectory}\nwork=${overlay.workDirectory}\nmerged=${overlay.mergedDirectory}\n`, stderr: "" }; return { stdout: "PI_REVIEW_OVERLAY_WRITABLE_V1\n", stderr: "" }; });
+  assert.match(created.setupEvidenceSha256 ?? "", /^[a-f0-9]{64}$/); assert.deepEqual(calls[0]!.slice(0, 5), ["exec", "--user", "root", "--privileged", planned.sandboxName]); assert.ok(calls[0]!.some((argument) => argument.includes("mount -t overlay overlay"))); assert.deepEqual(calls[1]!.slice(0, 6), ["exec", "--user", "1000", "--workdir", "/review/subject", planned.sandboxName]);
+  assert.equal(await readFile(path.join(subject, "source.txt"), "utf8"), "authoritative\n"); assert.equal(await readFile(path.join(subject, "deep", "untouched.txt"), "utf8"), "untouched\n");
+  await assert.rejects(createReviewWorkspaceOverlayAsync("/sbx", planned.sandboxName, overlay, async () => { throw new Error("mount denied"); }), /mount denied/);
+  const replaced = path.join(root, "subject-replaced"); await import("node:fs/promises").then(({ rename }) => rename(subject, replaced)); await mkdir(subject);
+  await assert.rejects(createReviewWorkspaceOverlayAsync("/sbx", planned.sandboxName, overlay, async () => { throw new Error("must not execute"); }), /lower layer identity changed/);
+}));
 
 test("exact Sandbox references reject writable extension paths, duplicate extensions, and credential-bearing service URLs", async () => temp(async (root) => {
   const workerRoot = path.join(root, "worker"); const codeRoot = path.join(root, "Code"); await mkdir(workerRoot); await mkdir(codeRoot);

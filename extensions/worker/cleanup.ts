@@ -9,6 +9,7 @@ import { homedir } from "node:os";
 import { isAsyncJobExecutionAlive } from "../_shared/async-job.js";
 import { asyncJobProcessStartToken } from "../_shared/async-job-process.js";
 import { isWorkerId } from "../_shared/worker-id.js";
+import { matchWorkerHostJobIdentity } from "../_shared/worker-host-job.js";
 import { defaultPreparedMergeRoot } from "./merge.js";
 import { getWorker, getWorkerRun, listAllWorkers, listWorkerRuns, listWorkers, type WorkerRegistry, type WorkerRegistryRecord, type WorkerRunRecord } from "./registry.js";
 import { workerPaths, type WorkerRoots } from "./identity.js";
@@ -343,7 +344,7 @@ export function planSettledWorkerHostLogs(registry: WorkerRegistry, worker: Work
       const directoryInfo = lstatSync(directory); if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) throw new Error("host-log path is not an ordinary directory");
       const metaPath = path.join(directory, "meta.json"); const metaInfo = lstatSync(metaPath); if (!metaInfo.isFile() || metaInfo.isSymbolicLink() || metaInfo.size > 1024 * 1024) throw new Error("host-log metadata is unsafe or oversized");
       const metaText=readFileSync(metaPath,"utf8");const meta = JSON.parse(metaText) as Record<string, unknown>;
-      if (meta.jobId !== run.jobId || meta.command !== `Pi worker host ${worker.workerId}/${run.runId}` || path.resolve(String(meta.stdoutLog ?? "")) !== path.resolve(run.stdoutLog) || path.resolve(String(meta.stderrLog ?? "")) !== path.resolve(run.stderrLog)) throw new Error("host-log metadata identity mismatch");
+      if (meta.jobId !== run.jobId || !matchWorkerHostJobIdentity(meta, { workerId: worker.workerId, runId: run.runId }) || path.resolve(String(meta.stdoutLog ?? "")) !== path.resolve(run.stdoutLog) || path.resolve(String(meta.stderrLog ?? "")) !== path.resolve(run.stderrLog)) throw new Error("host-log metadata identity mismatch");
       const status = String(meta.status); if (!["exited","failed","cancelled","unknown","running"].includes(status)) throw new Error("host-log status is invalid");
       if (status === "running" || status === "unknown") { if (typeof meta.pid !== "number" || typeof meta.processToken !== "string") throw new Error("unsettled host-log process identity is incomplete"); let alive = true; try { alive = isAsyncJobExecutionAlive(meta.pid, meta.processToken); } catch { alive = true; } if (alive) throw new Error("worker host is still live or liveness is ambiguous"); }
       result.deletable.push({ path: directory, device: Number(directoryInfo.dev), inode: Number(directoryInfo.ino),metaPath,metaDevice:Number(metaInfo.dev),metaInode:Number(metaInfo.ino),metaSize:Number(metaInfo.size),metaHash:createHash("sha256").update(metaText).digest("hex") });
@@ -466,7 +467,31 @@ function cleanupTrashCandidate(registry:WorkerRegistry,candidate:string,info:{de
 }
 function workerRootCandidate(registry:WorkerRegistry,name:string,candidate:string,info:any,nowMs:number):CleanupLeftover|undefined{const cleanupAt=name.lastIndexOf(".cleanup-");if(cleanupAt>0)return cleanupTrashCandidate(registry,candidate,info);const discardAt=name.indexOf(".discard-"),workerId=discardAt<0?name:name.slice(0,discardAt);if(!isWorkerId(workerId)||getWorker(registry,workerId))return;const oldEnough=nowMs-Number(info.mtimeMs)>=LEFTOVER_MIN_AGE_MS;return leftoverRecord(discardAt<0?"worker_root":"worker_trash",workerId,candidate,info,oldEnough,oldEnough?"Unregistered worker directory passed the 24-hour age guard.":"Unregistered worker directory is younger than 24 hours.");}
 function preparedRootCandidate(registry:WorkerRegistry,name:string,candidate:string,info:any,nowMs:number):CleanupLeftover|undefined{const cleanupAt=name.lastIndexOf(".cleanup-");if(cleanupAt>0)return cleanupTrashCandidate(registry,candidate,info);if(!/^prepared_[0-9a-f]{24}$/.test(name)||registry.database.prepare("SELECT 1 FROM prepared_sets WHERE prepared_id=?").get(name))return;const oldEnough=nowMs-Number(info.mtimeMs)>=LEFTOVER_MIN_AGE_MS;return leftoverRecord("prepared_root",name,candidate,info,oldEnough,oldEnough?"Unregistered prepared directory passed the 24-hour age guard.":"Unregistered prepared directory is younger than 24 hours.");}
-async function hostLogCandidate(registry:WorkerRegistry,name:string,directory:string,info:any,nowMs:number):Promise<CleanupLeftover|undefined>{const cleanupAt=name.lastIndexOf(".cleanup-");if(cleanupAt>0)return cleanupTrashCandidate(registry,directory,info);let meta:Record<string,unknown>;try{const metaPath=path.join(directory,"meta.json"),metadata=await lstatAsync(metaPath);if(!metadata.isFile()||metadata.isSymbolicLink()||metadata.size>1024*1024)return;meta=JSON.parse(await readFileAsync(metaPath,"utf8")) as Record<string,unknown>;}catch{return;}const match=typeof meta.command==="string"?/^Pi worker host (worker_[A-Za-z0-9][A-Za-z0-9_-]{0,127})\/(run_[A-Za-z0-9][A-Za-z0-9_-]{0,127})$/.exec(meta.command):null;if(!match||meta.jobId!==name||getWorker(registry,match[1]!))return;const pathsMatch=path.resolve(String(meta.stdoutLog??""))===path.join(directory,"stdout.log")&&path.resolve(String(meta.stderrLog??""))===path.join(directory,"stderr.log");let eligible=false,reason="Historical worker-host log failed its exact identity guard.";const age=nowMs-Number(info.mtimeMs);if(!pathsMatch)reason="Historical worker-host log paths do not match the exact directory.";else if(age<LEFTOVER_MIN_AGE_MS)reason="Historical worker-host log is younger than 24 hours.";else if(["exited","failed","cancelled"].includes(String(meta.status))){eligible=true;reason="Unregistered settled worker-host log passed identity and age guards.";}else if(["unknown","running"].includes(String(meta.status))&&typeof meta.pid==="number"&&typeof meta.processToken==="string"){let alive=true;try{alive=isAsyncJobExecutionAlive(meta.pid,meta.processToken);}catch{}if(!alive){eligible=true;reason="Unregistered stale worker-host log has a provably dead process identity.";}else reason="Worker-host process identity is live or ambiguous.";}return leftoverRecord("worker_host_log",name,directory,info,eligible,reason);}
+async function hostLogCandidate(registry: WorkerRegistry, name: string, directory: string, info: any, nowMs: number): Promise<CleanupLeftover | undefined> {
+  const cleanupAt = name.lastIndexOf(".cleanup-");
+  if (cleanupAt > 0) return cleanupTrashCandidate(registry, directory, info);
+  let meta: Record<string, unknown>;
+  try {
+    const metaPath = path.join(directory, "meta.json"), metadata = await lstatAsync(metaPath);
+    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > 1024 * 1024) return;
+    meta = JSON.parse(await readFileAsync(metaPath, "utf8")) as Record<string, unknown>;
+  } catch { return; }
+  const identity = matchWorkerHostJobIdentity(meta);
+  if (!identity || meta.jobId !== name || getWorker(registry, identity.workerId)) return;
+  const pathsMatch = path.resolve(String(meta.stdoutLog ?? "")) === path.join(directory, "stdout.log") && path.resolve(String(meta.stderrLog ?? "")) === path.join(directory, "stderr.log");
+  let eligible = false, reason = "Historical worker-host log failed its exact identity guard.";
+  const age = nowMs - Number(info.mtimeMs);
+  if (!pathsMatch) reason = "Historical worker-host log paths do not match the exact directory.";
+  else if (age < LEFTOVER_MIN_AGE_MS) reason = "Historical worker-host log is younger than 24 hours.";
+  else if (["exited", "failed", "cancelled"].includes(String(meta.status))) { eligible = true; reason = "Unregistered settled worker-host log passed identity and age guards."; }
+  else if (["unknown", "running"].includes(String(meta.status)) && typeof meta.pid === "number" && typeof meta.processToken === "string") {
+    let alive = true; try { alive = isAsyncJobExecutionAlive(meta.pid, meta.processToken); } catch {}
+    if (!alive) { eligible = true; reason = "Unregistered stale worker-host log has a provably dead process identity."; }
+    else reason = "Worker-host process identity is live or ambiguous.";
+  }
+  return leftoverRecord("worker_host_log", name, directory, info, eligible, reason);
+}
+
 function rootCursorIdentity(root:string):CleanupRootCursor{try{const info=lstatSync(root);if(!info.isDirectory()||info.isSymbolicLink())throw new Error(`Cleanup scan root is not an ordinary directory: ${root}`);return{position:0,complete:false,device:Number(info.dev),inode:Number(info.ino),mtimeMs:Number(info.mtimeMs),ctimeMs:Number(info.ctimeMs)};}catch(error){if((error as NodeJS.ErrnoException).code==="ENOENT")return{position:0,complete:true,missing:true};throw error;}}
 function assertRootCursorStable(root:string,prior:CleanupRootCursor,current:CleanupRootCursor):void{if(prior.missing!==current.missing||prior.device!==current.device||prior.inode!==current.inode||prior.mtimeMs!==current.mtimeMs||prior.ctimeMs!==current.ctimeMs)throw new Error(`Cleanup scan cursor was invalidated by directory changes: ${root}`);}
 /** Async, per-root resumable accounting. Directory positions are bound to root identity and name-change metadata. */

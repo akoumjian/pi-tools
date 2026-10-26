@@ -67,7 +67,7 @@ Cancel only active work. Discard an idle worker only when no further review, res
 - Review outcomes are advisory and never authorize repository application.
 - Workers never modify authoritative repositories, push, publish, release, or write parent grounding.
 - Worker workspaces, sessions, and run evidence remain retained until explicit discard; Sandbox removal never means logical-worker discard.
-- Review subjects and prepared evidence are read-only; reviewers and integration workers write only in their own retained roots.
+- A review subject’s authoritative lower layer and prepared/session evidence are read-only. Reviewers run tests, builds, edits, and experiments directly in the fresh disposable copy-on-write merged view; only retained reports/artifacts belong in their own worker root. Integration workers write only in their retained roots.
 
 ## Retention, preservation, and explicit cleanup
 

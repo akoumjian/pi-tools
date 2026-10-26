@@ -36,6 +36,7 @@ import asyncShellExtension, {
   type AsyncShellViewerSnapshot
 } from "../extensions/async-shell/index.js";
 import { managedWorkerEvidenceReason, readManagedWorkerHostJobIds, scanAsyncShellRetention } from "../extensions/async-shell/retention.js";
+import { workerHostJobIdentity } from "../extensions/_shared/worker-host-job.js";
 
 type SentMessage = {
   message: unknown;
@@ -253,18 +254,23 @@ test("async-shell pruning is exact, previewed, terminal-only, and separate from 
 
 test("ordinary retention protects new, legacy-command, and exact-registry managed-worker host evidence", async () => {
   await withTempDir(async (dir) => {
+    const sandbox = "job_20261024180000_workerhost0";
     const marked = "job_20261024180000_workerhost1";
     const legacy = "job_20261024180000_workerhost2";
     const registryId = "job_20261024180000_workerhost3";
+    const sandboxIdentity = workerHostJobIdentity("worker_20261024180000_host00", "run_20261024180000_host00");
+    const markedIdentity = workerHostJobIdentity("worker_20261024180000_host01", "run_20261024180000_host01");
+    const legacyIdentity = workerHostJobIdentity("worker_20261024180000_host02", "run_20261024180000_host02", "legacy");
+    await writeJobMeta(dir, sandbox, { command: sandboxIdentity.command, status: "exited", notifyOnExit: false, processToken: "123e4567-e89b-42d3-a456-426614174300" });
     await writeJobMeta(dir, marked, {
       command: "host process changed wording",
       status: "exited",
       notifyOnExit: false,
       processToken: "123e4567-e89b-42d3-a456-426614174301",
-      managedBy: { kind: "worker-host", workerId: "worker_20261024180000_host01", runId: "run_20261024180000_host01" }
+      managedBy: markedIdentity.managedBy
     });
     await writeJobMeta(dir, legacy, {
-      command: "Pi worker host worker_20261024180000_host02/run_20261024180000_host02",
+      command: legacyIdentity.command,
       status: "failed",
       notifyOnExit: false,
       processToken: "123e4567-e89b-42d3-a456-426614174302"
@@ -273,11 +279,13 @@ test("ordinary retention protects new, legacy-command, and exact-registry manage
 
     const inventory = await listEligibleAsyncShellPrune({ cwd: dir }, undefined, 100, "ineligible");
     assert.deepEqual(inventory.entries.map((entry) => [entry.name, entry.reason]), [
+      [sandbox, "managed-worker evidence; ordinary prune refused; host-log cleanup is separate"],
       [marked, "managed-worker evidence; ordinary prune refused; host-log cleanup is separate"],
       [legacy, "managed-worker evidence; ordinary prune refused; host-log cleanup is separate"]
     ]);
     assert.throws(() => previewAsyncShellPrune({ cwd: dir }, [marked]), /managed-worker evidence; ordinary prune refused/);
     assert.throws(() => pruneAsyncShellJobs({ cwd: dir }, [legacy]), /managed-worker evidence; ordinary prune refused/);
+    assert.equal(managedWorkerEvidenceReason({ command: sandboxIdentity.command, managedBy: legacyIdentity.managedBy }, new Set()), "managed-worker evidence; ordinary prune refused; host-log cleanup is separate", "contradictory worker-host evidence must remain fail-closed for ordinary pruning");
 
     const runtimeRoot = path.join(dir, "worker-runtime");
     await mkdir(runtimeRoot);
@@ -315,19 +323,19 @@ test("managed async host marker persists in canonical metadata", async () => {
   await withTempDir(async (dir) => {
     const api = createFakeApi();
     asyncShellExtension(api);
-    const managedBy = { kind: "worker-host" as const, workerId: "worker_20261024180000_marked", runId: "run_20261024180000_marked" };
+    const identity = workerHostJobIdentity("worker_20261024180000_marked", "run_20261024180000_marked");
     const handle = startManagedAsyncJob(api, createContext(dir), {
       jobId: "job_20261024180000_markedhost",
-      command: `Pi worker host ${managedBy.workerId}/${managedBy.runId}`,
+      command: identity.command,
       cwd: dir,
       executable: process.execPath,
       args: ["-e", "process.exit(0)"],
       notifyOnExit: false,
-      managedBy
+      managedBy: identity.managedBy
     });
     await waitWithRefTimeout(handle.completion);
     const persisted = JSON.parse(await readFile(path.join(handle.snapshot().logDir, "meta.json"), "utf8")) as { managedBy?: unknown };
-    assert.deepEqual(persisted.managedBy, managedBy);
+    assert.deepEqual(persisted.managedBy, identity.managedBy);
     assert.throws(() => previewAsyncShellPrune({ cwd: dir }, [handle.jobId]), /managed-worker evidence; ordinary prune refused/);
   });
 });

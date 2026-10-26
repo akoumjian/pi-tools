@@ -7,6 +7,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { startManagedAsyncJob, type ManagedAsyncJobHandle } from "../async-shell/index.js";
 import { resolveExecutable } from "../_shared/executable.js";
 import { assertSubagentRouteAllowed } from "../_shared/model-spec.js";
+import { workerHostJobIdentity } from "../_shared/worker-host-job.js";
 import type { WorkerRole } from "./registry.js";
 import type { WorkerSandboxReference } from "./sandbox.js";
 import type { WorkerCacheLineageRecord } from "./cache-lineage.js";
@@ -42,6 +43,8 @@ export function launchWorkerHost(api: ExtensionAPI, context: ExtensionContext, i
   const bdPath = input.bdPath ?? resolveExecutable("bd");
   const configFile = path.join(input.runDir, "host.json"); const authorizationFile = path.join(input.runDir, "host-authorization.json"); const launchManifestFile = path.join(input.runDir, "sandbox-launch.json");
   if (!input.sandbox.observedRuntimeSha256 || !input.sandbox.createEvidenceSha256 || !input.sandbox.inspectEvidenceSha256 || !input.sandbox.sbxVersionEvidenceSha256) throw new Error("Worker Sandbox host observation is required before supervisor launch.");
+  if (record.role === "review" && !input.sandbox.reviewOverlay?.setupEvidenceSha256) throw new Error("Review worker launch requires exact writable disposable OverlayFS setup evidence.");
+  if (record.role !== "review" && input.sandbox.reviewOverlay) throw new Error("Non-review worker launch refused unexpected review OverlayFS authority.");
   const runtimeProvenance: WorkerRuntimeProvenance = { protocolVersion: 1, sandboxName: input.sandbox.sandboxName, creationNonce: input.sandbox.creationNonce, piRevision: input.sandbox.revisions.pi, profileRevision: input.sandbox.revisions.profile, piToolsRevision: input.sandbox.revisions.piTools, piDocparserRevision: input.sandbox.revisions.piDocparser, stagedLockSha256: input.sandbox.stagedLockSha256, resourceManifestSha256: input.sandbox.resourceManifestSha256, runtimeProvenanceSha256: input.sandbox.runtimeProvenanceSha256, imageDigest: input.sandbox.imageDigest, kitSha256: input.sandbox.kitSha256, sbxVersion: input.sandbox.sbxVersion, sbxBuildCommit: input.sandbox.sbxBuildCommit, templateId: input.sandbox.templateId, templateRepository: input.sandbox.templateRepository, templateTag: input.sandbox.templateTag, templateFlavor: input.sandbox.templateFlavor, inspectEvidenceSha256: input.sandbox.inspectEvidenceSha256, sbxVersionEvidenceSha256: input.sandbox.sbxVersionEvidenceSha256, extensionPaths: [...input.sandbox.extensionPaths], ...(input.sandbox.observedSandboxId ? { observedSandboxId: input.sandbox.observedSandboxId } : {}), observedRuntimeSha256: input.sandbox.observedRuntimeSha256 };
   const config: WorkerHostConfig = {
     version: 2, backend: "docker-sandbox", workerId: record.workerId, runId: record.runId, sessionId: record.sessionId,
@@ -66,15 +69,16 @@ export function launchWorkerHost(api: ExtensionAPI, context: ExtensionContext, i
   writeFileSync(launchManifestFile, launchManifestText, { mode: 0o600 });
   writeFileSync(configFile, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
   const hostProcessToken = randomUUID();
+  const jobIdentity = workerHostJobIdentity(record.workerId, record.runId);
   const handle = startManagedAsyncJob(api, context, {
-    jobId: record.jobId, job_name: `worker ${record.workerId}`, command: `Pi Sandbox worker host ${record.workerId}/${record.runId}`,
+    jobId: record.jobId, job_name: `worker ${record.workerId}`, command: jobIdentity.command,
     cwd: record.workspaceRoot, executable: process.execPath, args: [resolveWorkerHostScript(), configFile],
     env: { ...process.env, PI_WORKER_JOB_TOKEN: hostProcessToken, PI_WORKER_ID: record.workerId, PI_WORKER_RUN_ID: record.runId, PI_WORKER_RESULT_FILE: input.resultFile,
       PI_WORKER_WORKSPACE_ROOT: record.workspaceRoot, PI_WORKER_STATE_ROOT: record.workerRoot, PI_WORKER_SUPERVISION_ROOT: supervisionRoot, PI_WORKER_ASYNC_JOB_ROOT: config.asyncJobRoot,
       PI_WORKER_TASK_IDS: JSON.stringify(record.taskIds), PI_WORKER_ROLE: config.role, PI_WORKER_BD_PATH: config.bdPath, PI_WORKER_BEADS_ROUTE: JSON.stringify(config.beadsRoute),
       PI_WORKER_AUTHORIZATION_FILE: config.authorizationFile, PI_WORKER_PROCESS_NONCE: config.processNonce, ...(config.cacheLineage ? { PI_WORKER_CACHE_LINEAGE: JSON.stringify(config.cacheLineage) } : {}) },
     notifyOnExit: false, settleProcessGroup: true, processToken: hostProcessToken,
-    managedBy: { kind: "worker-host", workerId: record.workerId, runId: record.runId }
+    managedBy: jobIdentity.managedBy
   });
   return { handle, config, configFile };
 }

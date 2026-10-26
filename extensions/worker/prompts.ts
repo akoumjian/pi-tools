@@ -26,8 +26,8 @@ export function renderWorkerRuntimePrompt(role: WorkerRole, input: WorkerPromptI
   if (role === "review") {
     lines.push("", "Reviewed workspace:", input.reviewSubjectPath ?? "<missing reviewed workspace>", "", "Review context:", input.reviewContextPath ?? "<missing review context>", "");
     lines.push(input.resumed
-      ? "The reviewed workspace remains read-only. Use your retained writable reviewer workspace for tests, copies, experiments, and reports."
-      : "The reviewed workspace is read-only. Use your separate writable reviewer workspace for tests, copies, experiments, and retained review reports.");
+      ? "The reviewed workspace is a fresh writable disposable copy-on-write view for this run. Run tests, builds, edits, and experiments there; the read-only authoritative lower layer is unchanged, and prior review-run changes are not retained. Write retained reports and declared artifacts in your own reviewer workspace."
+      : "The reviewed workspace is a fresh writable disposable copy-on-write view of the complete subject. Run tests, builds, edits, and experiments there without copying the subject; writes stay in the private per-run upper layer and cannot mutate the authoritative lower layer. Write retained reports and declared artifacts in your own reviewer workspace.");
   }
   if (role === "integration") {
     lines.push("", "Integration context:", input.integrationContextPath!, "");

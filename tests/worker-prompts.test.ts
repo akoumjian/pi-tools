@@ -39,9 +39,9 @@ test("work resume prompt retains exact session semantics and lists additional in
 
 test("review start and resume prompts are independent and name only trusted launch paths", () => {
   const start = renderWorkerRuntimePrompt("review", { ...base, instructions: undefined, reviewSubjectPath: "/review/subject", reviewContextPath: "/review/context.json" });
-  assert.match(start, /^You are worker worker_1, run run_2, starting an independent review\./); assert.match(start, /Reviewed workspace:\n\/review\/subject/); assert.match(start, /reviewed workspace is read-only.*separate writable reviewer workspace/i); assert.doesNotMatch(start, /Assigned Beads|Parent review instructions|artifacts\//);
+  assert.match(start, /^You are worker worker_1, run run_2, starting an independent review\./); assert.match(start, /Reviewed workspace:\n\/review\/subject/); assert.match(start, /fresh writable disposable copy-on-write view.*without copying the subject/i); assert.doesNotMatch(start, /Assigned Beads|Parent review instructions|artifacts\//);
   const resume = renderWorkerRuntimePrompt("review", { ...base, resumed: true, reviewSubjectPath: "/review/subject", reviewContextPath: "/review/context.json" });
-  assert.match(resume, /resuming a prior review session/); assert.match(resume, /reviewed workspace remains read-only.*retained writable reviewer workspace/i); assert.match(resume, /Parent instructions:/); assert.doesNotMatch(resume, /fork/);
+  assert.match(resume, /resuming a prior review session/); assert.match(resume, /fresh writable disposable copy-on-write view.*prior review-run changes are not retained/i); assert.match(resume, /Parent instructions:/); assert.doesNotMatch(resume, /fork/);
 });
 
 test("integration prompts include ordinary conflict-state and retained-repository guidance", () => {
