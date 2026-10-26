@@ -21,12 +21,14 @@ import {
   listWorkers,
   markWorkerDeliveryDelivered,
   markWorkerDeliverySendStarted,
+  markWorkerCleanupRecovery,
   markWorkerRunRunning,
   openWorkerRegistry,
   pendingWorkerDeliveries,
   promoteParentRuntime,
   reconcileWorkerDeliveries,
   recoverInterruptedClaimsForParent,
+  recoverInterruptedPreparedSetAppliesForParent,
   registerParentRuntime,
   registerParentRuntimeAndRecoverClaims,
   releaseWorkerRunClaim,
@@ -126,7 +128,7 @@ test("registry stores prepared set metadata and status transitions", () => {
     storePreparedSet(f.registry, { preparedId, parentSessionFile: parent, status: "ready", order: ["repo"], repositories: [{ id: "repo", desiredCommit: "a".repeat(40) }], createdAt: "2026-01-01T00:00:00.000Z" });
     assert.equal(claimPreparedSetApply(f.registry, preparedId, parent, "1-apply", "2026-01-01T00:00:01.000Z"), true); assert.equal(claimPreparedSetApply(f.registry, preparedId, parent, "1-other", "2026-01-01T00:00:01.000Z"), false);
     recoverInterruptedClaimsForParent(f.registry, parent, 1, "2026-01-01T00:00:02.000Z"); assert.equal(claimPreparedSetApply(f.registry, preparedId, parent, "1-other", "2026-01-01T00:00:02.000Z"), false);
-    recoverInterruptedClaimsForParent(f.registry, parent, 2, "2026-01-01T00:00:03.000Z"); assert.equal(claimPreparedSetApply(f.registry, preparedId, parent, "2-apply", "2026-01-01T00:00:03.000Z"), true);
+    recoverInterruptedClaimsForParent(f.registry, parent, 2, "2026-01-01T00:00:03.000Z"); assert.equal(claimPreparedSetApply(f.registry, preparedId, parent, "2-apply", "2026-01-01T00:00:03.000Z"), false,"generic lifecycle recovery preserves prepared authority");assert.deepEqual(recoverInterruptedPreparedSetAppliesForParent(f.registry,parent,2,"2026-01-01T00:00:03.500Z",()=>false),[]);assert.equal(claimPreparedSetApply(f.registry,preparedId,parent,"2-apply","2026-01-01T00:00:03.500Z"),false,"live apply owner remains fenced");assert.deepEqual(recoverInterruptedPreparedSetAppliesForParent(f.registry,parent,2,"2026-01-01T00:00:03.750Z",()=>true),[preparedId]);assert.equal(claimPreparedSetApply(f.registry, preparedId, parent, "2-apply", "2026-01-01T00:00:03.800Z"), true);
     finishPreparedSetApply(f.registry, preparedId, parent, "2-apply", "completed", "2026-01-01T00:00:04.000Z");
     const row = f.registry.database.prepare("SELECT status,apply_nonce FROM prepared_sets WHERE prepared_id=?").get(preparedId) as { status: string; apply_nonce: string | null }; assert.equal(row.status, "completed"); assert.equal(row.apply_nonce, null);
   } finally { f.close(); }
@@ -160,7 +162,8 @@ test("runtime generations recover only stale lifecycle claims for deterministic 
     recoverInterruptedClaimsForParent(f.registry, parent, 3, "2026-01-01T00:00:03.000Z");
     assert.equal(getWorkerRun(f.registry, workerId, runId)?.claimKind, undefined); assert.equal(getWorkerRun(f.registry, workerId, runId)?.terminalIntent, "cancellation"); assert.match(getWorker(f.registry, workerId)?.recoveryError ?? "", /containment recovery/);
     f.registry.database.prepare("UPDATE workers SET status='idle',active_run_id=NULL,operation_kind='discard',operation_nonce='2-old' WHERE worker_id=?").run(workerId);
-    recoverInterruptedClaimsForParent(f.registry, parent, 3, "2026-01-01T00:00:04.000Z"); assert.equal(getWorker(f.registry, workerId)?.operationKind, undefined);
+    const preparedId=`prepared_${"d".repeat(24)}`;storePreparedSet(f.registry,{preparedId,parentSessionFile:parent,status:"ready",order:[],taskIds:["personal-test"],repositories:[],createdAt:"2026-01-01T00:00:03.500Z"});f.registry.database.prepare("UPDATE prepared_sets SET apply_nonce='2-prepared' WHERE prepared_id=?").run(preparedId);
+    recoverInterruptedClaimsForParent(f.registry, parent, 3, "2026-01-01T00:00:04.000Z"); assert.equal(getWorker(f.registry, workerId)?.operationKind, "discard","dedicated discard recovery must retain root authority");assert.equal((f.registry.database.prepare("SELECT apply_nonce FROM prepared_sets WHERE prepared_id=?").get(preparedId) as any).apply_nonce,"2-prepared","runtime registration must not steal prepared apply authority");
   } finally { f.close(); }
 });
 
@@ -311,7 +314,7 @@ test("registry applies an ordered idempotent v2 migration while mixed live opene
     migrated = openWorkerRegistry(root);
     const version = migrated.database.prepare("SELECT value FROM registry_meta WHERE key='schema_version'").get() as { value: string };
     const columns = migrated.database.prepare("PRAGMA table_info(prepared_sets)").all() as Array<{ name: string }>; const runColumns = migrated.database.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>; const deliveryColumns = migrated.database.prepare("PRAGMA table_info(deliveries)").all() as Array<{ name: string }>;
-    assert.equal(version.value, "5"); assert.equal(columns.some((column) => column.name === "apply_nonce"), true); assert.equal(runColumns.some((column) => column.name === "terminal_intent"), true); assert.equal(deliveryColumns.some((column) => column.name === "send_started_at"), true);
+    assert.equal(version.value, "9"); assert.equal(columns.some((column) => column.name === "apply_nonce"), true); assert.equal(runColumns.some((column) => column.name === "terminal_intent"), true); assert.equal(deliveryColumns.some((column) => column.name === "send_started_at"), true);
     const legacyHash = migrated.database.prepare("SELECT value FROM registry_meta WHERE key='schema_hash'").get() as { value: string };
     assert.equal(legacyHash.value, "old-live-build-fingerprint", "migration must not overwrite another live build's diagnostic hash");
     oldOpener.database.prepare("UPDATE registry_meta SET value='old-opener-still-live' WHERE key='schema_hash'").run();
@@ -319,4 +322,23 @@ test("registry applies an ordered idempotent v2 migration while mixed live opene
     assert.equal(registerParentRuntime(oldOpener, "/sessions/mixed.jsonl", "old", "2026-01-01T00:00:01.000Z"), 2);
     migrated.close(); migrated = openWorkerRegistry(root); assert.equal(registerParentRuntime(migrated, "/sessions/mixed.jsonl", "again", "2026-01-01T00:00:02.000Z"), 3);
   } finally { migrated?.close(); oldOpener?.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("v5 migration adds preservation, prepared lineage, and host-only cleanup snapshots through v9", () => {
+  const f = fixture(); let registry: ReturnType<typeof openWorkerRegistry> | undefined = f.registry;
+  try {
+    registry.database.exec("DROP TABLE preservation_records");
+    registry.database.exec("ALTER TABLE prepared_sets DROP COLUMN task_ids_json");
+    registry.database.prepare("UPDATE registry_meta SET value='5' WHERE key='schema_version'").run(); registry.database.exec("PRAGMA user_version = 5"); registry.close(); registry = undefined;
+    const migrated = openWorkerRegistry(f.root); registry = migrated;
+    const preparedColumns = migrated.database.prepare("PRAGMA table_info(prepared_sets)").all() as Array<{ name: string }>;
+    const preservation = migrated.database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='preservation_records'").get() as { sql: string } | undefined;const snapshots=migrated.database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='cleanup_snapshots'").get() as {sql:string}|undefined;const cursors=migrated.database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='cleanup_scan_cursors'").get() as {sql:string}|undefined;const observations=migrated.database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='cleanup_leftover_observations'").get() as {sql:string}|undefined;const claims=migrated.database.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='cleanup_leftover_claims'").get() as {sql:string}|undefined;
+    assert.equal(preparedColumns.some((column) => column.name === "task_ids_json"), true); assert.match(preservation?.sql ?? "", /STRICT/);assert.match(snapshots?.sql??"",/STRICT/);assert.match(cursors?.sql??"",/STRICT/);assert.match(observations?.sql??"",/STRICT/);assert.match(claims?.sql??"",/STRICT/);
+    assert.equal((migrated.database.prepare("SELECT value FROM registry_meta WHERE key='schema_version'").get() as { value: string }).value, "9");
+  } finally { try { registry?.close(); } catch {} rmSync(f.root, { recursive: true, force: true }); }
+});
+
+
+test("cleanup unit recovery preserves an existing exact error while refreshing its evidence",()=>{
+ const f=fixture();try{const workerId="worker_20260101000000_recover1",runId="run_20260101000000_recover1",parent=path.join(f.root,"parent.jsonl");createWorkerAndRun(f.registry,{workerId,parentSessionFile:parent,role:"work",status:"queued",activeRunId:runId,taskIds:["personal-test"],workspaceRoot:path.join(f.root,"workspace"),runtime:{cleanupConsent:{token:"cleanup_token",snapshotHash:"hash"}},createdAt:"2026-01-01T00:00:00.000Z",updatedAt:"2026-01-01T00:00:00.000Z"},queuedRun(workerId,runId));f.registry.database.prepare("UPDATE workers SET status='idle',active_run_id=NULL,recovery_error='first exact failure' WHERE worker_id=?").run(workerId);const owner=getWorker(f.registry,workerId)!.parentSessionFile;assert.equal(markWorkerCleanupRecovery(f.registry,workerId,owner,"later different failure","2026-01-01T00:00:01.000Z"),true);const retained=getWorker(f.registry,workerId)!;assert.equal(retained.recoveryError,"first exact failure");assert.equal((retained.runtime!.cleanupRecovery as any).phase,"precommit");assert.equal((retained.runtime!.cleanupRecovery as any).error,"first exact failure");}finally{f.close();}
 });

@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import type { DatabaseSync as SQLiteDatabaseSync, SQLInputValue } from "node:sqlite";
 
-export const WORKER_REGISTRY_SCHEMA_VERSION = 5;
+export const WORKER_REGISTRY_SCHEMA_VERSION = 9;
 export const DEFAULT_WORKER_RUNTIME_ROOT = path.join(homedir(), ".local", "share", "agent", "worker-runtime");
 
 export type WorkerRole = "work" | "review" | "integration";
@@ -235,10 +235,64 @@ CREATE TABLE IF NOT EXISTS prepared_sets (
   status TEXT NOT NULL,
   order_json TEXT NOT NULL,
   warnings_json TEXT NOT NULL DEFAULT '[]',
+  task_ids_json TEXT NOT NULL DEFAULT '[]',
   apply_nonce TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 ) STRICT;
+CREATE TABLE IF NOT EXISTS preservation_records (
+  preservation_id TEXT PRIMARY KEY,
+  worker_id TEXT NOT NULL REFERENCES workers(worker_id) ON DELETE CASCADE,
+  status TEXT NOT NULL CHECK (status IN ('pending','published','failed')),
+  destination TEXT NOT NULL,
+  temp_path TEXT NOT NULL,
+  latest_run_id TEXT,
+  items_json TEXT NOT NULL,
+  manifest_json TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS preservation_records_worker ON preservation_records(worker_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS cleanup_snapshots (
+  token TEXT PRIMARY KEY,
+  parent_session_file TEXT NOT NULL,
+  snapshot_json TEXT NOT NULL,
+  snapshot_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  consumed_at TEXT
+) STRICT;
+CREATE INDEX IF NOT EXISTS cleanup_snapshots_parent ON cleanup_snapshots(parent_session_file, created_at DESC);
+CREATE TABLE IF NOT EXISTS cleanup_scan_cursors (
+  token TEXT PRIMARY KEY,
+  parent_session_file TEXT NOT NULL,
+  state_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  consumed_at TEXT
+) STRICT;
+CREATE INDEX IF NOT EXISTS cleanup_scan_cursors_parent ON cleanup_scan_cursors(parent_session_file, created_at DESC);
+CREATE TABLE IF NOT EXISTS cleanup_leftover_observations (
+  leftover_id TEXT PRIMARY KEY,
+  record_json TEXT NOT NULL,
+  observed_at TEXT NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS cleanup_leftover_claims (
+  claim_id TEXT PRIMARY KEY,
+  source_leftover_id TEXT NOT NULL UNIQUE,
+  source_kind TEXT NOT NULL CHECK (source_kind IN ('worker_root','worker_trash','prepared_root','worker_host_log')),
+  original_id TEXT NOT NULL,
+  entry_name TEXT NOT NULL,
+  source_path TEXT NOT NULL UNIQUE,
+  trash_path TEXT NOT NULL UNIQUE,
+  root_path TEXT NOT NULL,
+  device INTEGER NOT NULL,
+  inode INTEGER NOT NULL,
+  nonce TEXT NOT NULL,
+  owner_pid INTEGER NOT NULL,
+  owner_start_token TEXT NOT NULL,
+  created_at TEXT NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS cleanup_leftover_claims_root ON cleanup_leftover_claims(root_path, trash_path);
 CREATE TABLE IF NOT EXISTS prepared_repositories (
   prepared_id TEXT NOT NULL REFERENCES prepared_sets(prepared_id) ON DELETE CASCADE,
   repository_id TEXT NOT NULL,
@@ -318,6 +372,35 @@ function migrateWorkerRegistry(database: SQLiteDatabaseSync, fromVersion: number
       // may already have been attempted or accepted. Conservatively classify it
       // as unconfirmed rather than replaying a possible duplicate.
       database.exec("UPDATE deliveries SET send_started_at=COALESCE(delivered_at,created_at) WHERE state='claimed' AND send_started_at IS NULL");
+    },
+    5: () => {
+      addColumnIfMissing(database, "prepared_sets", "task_ids_json", "TEXT NOT NULL DEFAULT '[]'");
+      database.exec(`CREATE TABLE IF NOT EXISTS preservation_records (
+        preservation_id TEXT PRIMARY KEY, worker_id TEXT NOT NULL REFERENCES workers(worker_id) ON DELETE CASCADE,
+        status TEXT NOT NULL CHECK (status IN ('pending','published','failed')), destination TEXT NOT NULL, temp_path TEXT NOT NULL,
+        latest_run_id TEXT, items_json TEXT NOT NULL, manifest_json TEXT, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      ) STRICT; CREATE INDEX IF NOT EXISTS preservation_records_worker ON preservation_records(worker_id, created_at DESC)`);
+    },
+    6: () => {
+      database.exec(`CREATE TABLE IF NOT EXISTS cleanup_snapshots (
+        token TEXT PRIMARY KEY, parent_session_file TEXT NOT NULL, snapshot_json TEXT NOT NULL, snapshot_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL, consumed_at TEXT
+      ) STRICT; CREATE INDEX IF NOT EXISTS cleanup_snapshots_parent ON cleanup_snapshots(parent_session_file, created_at DESC)`);
+    },
+    7: () => {
+      database.exec(`CREATE TABLE IF NOT EXISTS cleanup_scan_cursors (
+        token TEXT PRIMARY KEY, parent_session_file TEXT NOT NULL, state_json TEXT NOT NULL, created_at TEXT NOT NULL, consumed_at TEXT
+      ) STRICT; CREATE INDEX IF NOT EXISTS cleanup_scan_cursors_parent ON cleanup_scan_cursors(parent_session_file, created_at DESC);
+      CREATE TABLE IF NOT EXISTS cleanup_leftover_observations (leftover_id TEXT PRIMARY KEY, record_json TEXT NOT NULL, observed_at TEXT NOT NULL) STRICT`);
+    },
+    8: () => {
+      database.exec(`CREATE TABLE IF NOT EXISTS cleanup_leftover_claims (
+        claim_id TEXT PRIMARY KEY, source_leftover_id TEXT NOT NULL UNIQUE,
+        source_kind TEXT NOT NULL CHECK (source_kind IN ('worker_root','worker_trash','prepared_root','worker_host_log')),
+        original_id TEXT NOT NULL, entry_name TEXT NOT NULL, source_path TEXT NOT NULL UNIQUE, trash_path TEXT NOT NULL UNIQUE,
+        root_path TEXT NOT NULL, device INTEGER NOT NULL, inode INTEGER NOT NULL, nonce TEXT NOT NULL,
+        owner_pid INTEGER NOT NULL, owner_start_token TEXT NOT NULL, created_at TEXT NOT NULL
+      ) STRICT; CREATE INDEX IF NOT EXISTS cleanup_leftover_claims_root ON cleanup_leftover_claims(root_path, trash_path)`);
     }
   };
   for (let version = fromVersion; version < WORKER_REGISTRY_SCHEMA_VERSION; version += 1) {
@@ -479,6 +562,14 @@ export function listWorkers(registry: WorkerRegistry, input: { parentSessionFile
   const where = predicates.join(" AND ");
   const total = Number((registry.database.prepare(`SELECT COUNT(*) AS count FROM workers WHERE ${where}`).get(...values) as { count: number }).count);
   const rows = registry.database.prepare(`SELECT * FROM workers WHERE ${where} ORDER BY updated_at DESC,worker_id DESC LIMIT ? OFFSET ?`).all(...values, limit, offset) as unknown as WorkerRow[];
+  return { workers: rows.map(decodeWorker), total, ...(offset + rows.length < total ? { nextOffset: offset + rows.length } : {}) };
+}
+
+export function listAllWorkers(registry: WorkerRegistry, limitInput = 100, offsetInput = 0): { workers: WorkerRegistryRecord[]; total: number; nextOffset?: number } {
+  const limit = Math.min(1000, Math.max(1, limitInput));
+  const offset = Math.max(0, offsetInput);
+  const total = Number((registry.database.prepare("SELECT COUNT(*) AS count FROM workers").get() as { count: number }).count);
+  const rows = registry.database.prepare("SELECT * FROM workers ORDER BY parent_session_file,updated_at DESC,worker_id LIMIT ? OFFSET ?").all(limit, offset) as unknown as WorkerRow[];
   return { workers: rows.map(decodeWorker), total, ...(offset + rows.length < total ? { nextOffset: offset + rows.length } : {}) };
 }
 
@@ -683,23 +774,23 @@ export function updateWorkerRunSessionRange(registry: WorkerRegistry, workerId: 
   });
 }
 
-export function storePreparedSet(registry: WorkerRegistry, input: { preparedId: string; parentSessionFile: string; status: string; order: string[]; warnings?: string[]; repositories: Array<{ id: string } & Record<string, unknown>>; createdAt: string }): void {
+export function storePreparedSet(registry: WorkerRegistry, input: { preparedId: string; parentSessionFile: string; status: string; order: string[]; warnings?: string[]; taskIds?: string[]; repositories: Array<{ id: string } & Record<string, unknown>>; createdAt: string }): void {
   transaction(registry, () => {
-    registry.database.prepare("INSERT INTO prepared_sets(prepared_id,parent_session_file,status,order_json,warnings_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
-      .run(input.preparedId, canonicalSessionFile(input.parentSessionFile), input.status, json(input.order), json(input.warnings ?? []), input.createdAt, input.createdAt);
+    registry.database.prepare("INSERT INTO prepared_sets(prepared_id,parent_session_file,status,order_json,warnings_json,task_ids_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+      .run(input.preparedId, canonicalSessionFile(input.parentSessionFile), input.status, json(input.order), json(input.warnings ?? []), json(input.taskIds ?? []), input.createdAt, input.createdAt);
     const insert = registry.database.prepare("INSERT INTO prepared_repositories(prepared_id,repository_id,record_json) VALUES(?,?,?)");
     for (const repository of input.repositories) insert.run(input.preparedId, repository.id, json(repository));
   });
 }
 
-export type TrustedPreparedSetRecord = { version: 1; preparedId: string; parentSessionFile: string; status: "ready" | "resolution_required" | "consumed" | "completed" | "partial" | "failed" | "superseded"; order: string[]; repositories: Array<{ id: string } & Record<string, any>>; createdAt: string };
+export type TrustedPreparedSetRecord = { version: 1; preparedId: string; parentSessionFile: string; status: "ready" | "resolution_required" | "consumed" | "completed" | "partial" | "failed" | "superseded" | "discarding"; order: string[]; repositories: Array<{ id: string } & Record<string, any>>; taskIds: string[]; createdAt: string };
 
 export function readPreparedSetRecord(registry: WorkerRegistry, parentSessionFile: string, preparedId: string): TrustedPreparedSetRecord {
   return transaction(registry, () => {
-    const set = registry.database.prepare("SELECT prepared_id,parent_session_file,status,order_json,created_at FROM prepared_sets WHERE prepared_id=? AND parent_session_file=?").get(preparedId, canonicalSessionFile(parentSessionFile)) as { prepared_id: string; parent_session_file: string; status: TrustedPreparedSetRecord["status"]; order_json: string; created_at: string } | undefined;
+    const set = registry.database.prepare("SELECT prepared_id,parent_session_file,status,order_json,task_ids_json,created_at FROM prepared_sets WHERE prepared_id=? AND parent_session_file=?").get(preparedId, canonicalSessionFile(parentSessionFile)) as { prepared_id: string; parent_session_file: string; status: TrustedPreparedSetRecord["status"]; order_json: string; task_ids_json: string; created_at: string } | undefined;
     if (!set) throw new Error(`Unknown prepared set ${preparedId}.`);
     const rows = registry.database.prepare("SELECT record_json FROM prepared_repositories WHERE prepared_id=? ORDER BY repository_id").all(preparedId) as Array<{ record_json: string }>;
-    return { version: 1, preparedId: set.prepared_id, parentSessionFile: set.parent_session_file, status: set.status, order: parseJson<string[]>(set.order_json), repositories: rows.map((row) => parseJson<any>(row.record_json)), createdAt: set.created_at };
+    return { version: 1, preparedId: set.prepared_id, parentSessionFile: set.parent_session_file, status: set.status, order: parseJson<string[]>(set.order_json), taskIds: parseJson<string[]>(set.task_ids_json), repositories: rows.map((row) => parseJson<any>(row.record_json)), createdAt: set.created_at };
   });
 }
 
@@ -715,10 +806,12 @@ export function releasePreparedSetApply(registry: WorkerRegistry, preparedId: st
   transaction(registry, () => { registry.database.prepare("UPDATE prepared_sets SET apply_nonce=NULL,updated_at=? WHERE prepared_id=? AND parent_session_file=? AND apply_nonce=?").run(now, preparedId, parentSessionFile, nonce); });
 }
 
-export function updatePreparedSetStatus(registry: WorkerRegistry, preparedId: string, parentSessionFile: string, status: string, now: string): void {
+export function updatePreparedSetStatus(registry: WorkerRegistry, preparedId: string, parentSessionFile: string, status: string, now: string, expectedStatuses: string[] = ["ready","resolution_required","partial","failed"]): void {
+  if (!expectedStatuses.length || expectedStatuses.includes("discarding")) throw new Error("Prepared status transition cannot accept discarding.");
   transaction(registry, () => {
-    const result = registry.database.prepare("UPDATE prepared_sets SET status=?,updated_at=? WHERE prepared_id=? AND parent_session_file=? AND apply_nonce IS NULL").run(status, now, preparedId, parentSessionFile);
-    if (Number(result.changes) !== 1) throw new Error(`Unknown prepared set ${preparedId}.`);
+    const placeholders = expectedStatuses.map(() => "?").join(",");
+    const result = registry.database.prepare(`UPDATE prepared_sets SET status=?,updated_at=? WHERE prepared_id=? AND parent_session_file=? AND apply_nonce IS NULL AND status IN (${placeholders})`).run(status, now, preparedId, parentSessionFile, ...expectedStatuses);
+    if (Number(result.changes) !== 1) throw new Error(`Prepared set ${preparedId} changed status or authority.`);
   });
 }
 
@@ -799,10 +892,15 @@ function recoverInterruptedClaimsInTransaction(
     if (item.claim_kind === "cancellation") registry.database.prepare("UPDATE workers SET recovery_error=?,version=version+1,updated_at=? WHERE worker_id=?")
       .run("Interrupted cancellation claim is ready for exact containment recovery.", now, item.worker_id);
   }
-  registry.database.prepare("UPDATE workers SET operation_kind=NULL,operation_nonce=NULL,recovery_error=COALESCE(recovery_error,'Interrupted discard claim is ready for an exact discard retry.'),version=version+1,updated_at=? WHERE parent_session_file=? AND operation_kind='discard' AND (operation_nonce IS NULL OR operation_nonce NOT LIKE ?)")
-    .run(now, parentSessionFile, currentPrefix);
-  registry.database.prepare("UPDATE prepared_sets SET apply_nonce=NULL,updated_at=? WHERE parent_session_file=? AND apply_nonce IS NOT NULL AND apply_nonce NOT LIKE ?")
-    .run(now, parentSessionFile, currentPrefix);
+  // Discard operations and prepared apply nonces are not generic lifecycle
+  // claims. Their dedicated recovery paths preserve irreversible/root and
+  // repository authority instead of clearing it during runtime registration.
+}
+
+export type PreparedSetApplyRecoveryCandidate={preparedId:string;claimNonce:string;runtimeGeneration:number};
+/** Roll back only exact stale prepared-apply authority after its runtime owner is proved dead, retired, or missing. Repository application is idempotently revalidated by the next explicit apply. */
+export function recoverInterruptedPreparedSetAppliesForParent(registry:WorkerRegistry,parentSessionFile:string,runtimeGeneration:number,now:string,mayRecover:(candidate:PreparedSetApplyRecoveryCandidate)=>boolean):string[]{
+ return transaction(registry,()=>{const recovered:string[]=[];const rows=registry.database.prepare("SELECT prepared_id,apply_nonce FROM prepared_sets WHERE parent_session_file=? AND apply_nonce IS NOT NULL").all(canonicalSessionFile(parentSessionFile)) as Array<{prepared_id:string;apply_nonce:string}>;for(const row of rows){const match=/^(\d+)-/.exec(row.apply_nonce);if(!match)continue;const ownerGeneration=Number(match[1]);if(!Number.isSafeInteger(ownerGeneration)||ownerGeneration>=runtimeGeneration)continue;const candidate={preparedId:row.prepared_id,claimNonce:row.apply_nonce,runtimeGeneration:ownerGeneration};let allowed=false;try{allowed=mayRecover(candidate);}catch{}if(!allowed)continue;const changed=registry.database.prepare("UPDATE prepared_sets SET apply_nonce=NULL,updated_at=? WHERE prepared_id=? AND parent_session_file=? AND apply_nonce=?").run(now,row.prepared_id,canonicalSessionFile(parentSessionFile),row.apply_nonce);if(Number(changed.changes)===1)recovered.push(row.prepared_id);}return recovered;});
 }
 
 export function reconcileWorkerDeliveries(registry: WorkerRegistry, parentSessionFile: string, deliveredIds: string[]): void {
@@ -1017,6 +1115,8 @@ export function claimWorkerDiscard(registry: WorkerRegistry, workerId: string, e
   });
 }
 
+export function claimWorkerRecoveryDiscard(registry:WorkerRegistry,workerId:string,expectedVersion:number,expectedRecoveryError:string,nonce:string,now:string):void{transaction(registry,()=>{const worker=getWorker(registry,workerId),recovery=worker?.runtime?.cleanupRecovery as Record<string,unknown>|undefined;if(!worker||recovery?.phase!=="precommit"||recovery.error!==expectedRecoveryError)throw staleWorker(workerId);const changed=registry.database.prepare("UPDATE workers SET operation_kind='discard',operation_nonce=?,recovery_error=NULL,version=version+1,updated_at=? WHERE worker_id=? AND version=? AND status='idle' AND reviewed_by_worker_id IS NULL AND operation_kind IS NULL AND recovery_error=?").run(nonce,now,workerId,expectedVersion,expectedRecoveryError);if(Number(changed.changes)!==1)throw staleWorker(workerId);});}
+
 export function finalizeWorkerDiscard(registry: WorkerRegistry, workerId: string, nonce: string): void {
   transaction(registry, () => {
     const row = registry.database.prepare("SELECT latest_run_id FROM workers WHERE worker_id=? AND operation_kind='discard' AND operation_nonce=?").get(workerId, nonce) as { latest_run_id: string | null } | undefined;
@@ -1034,10 +1134,11 @@ export function finalizeWorkerDiscard(registry: WorkerRegistry, workerId: string
   });
 }
 
+function runtimeWithCleanupRecovery(runtimeJson:string,error:string,now:string):string{const runtime=parseJson<Record<string,unknown>>(runtimeJson);if(runtime.cleanupConsent&&typeof runtime.cleanupConsent==="object")runtime.cleanupRecovery={phase:"precommit",error:error.slice(0,2048),recordedAt:now};return JSON.stringify(runtime);}
 export function abandonWorkerDiscard(registry: WorkerRegistry, workerId: string, nonce: string, error: string, now: string): void {
-  transaction(registry, () => registry.database.prepare("UPDATE workers SET operation_kind=NULL,operation_nonce=NULL,recovery_error=?,version=version+1,updated_at=? WHERE worker_id=? AND operation_kind='discard' AND operation_nonce=?")
-    .run(error.slice(0, 2048), now, workerId, nonce));
+  transaction(registry, () => {const row=registry.database.prepare("SELECT runtime_json FROM workers WHERE worker_id=? AND operation_kind='discard' AND operation_nonce=?").get(workerId,nonce) as {runtime_json:string}|undefined;if(!row)return;registry.database.prepare("UPDATE workers SET operation_kind=NULL,operation_nonce=NULL,recovery_error=?,runtime_json=?,version=version+1,updated_at=? WHERE worker_id=? AND operation_kind='discard' AND operation_nonce=?").run(error.slice(0, 2048),runtimeWithCleanupRecovery(row.runtime_json,error,now),now,workerId,nonce);});
 }
+export function markWorkerCleanupRecovery(registry:WorkerRegistry,workerId:string,parentSessionFile:string,error:string,now:string):boolean{return transaction(registry,()=>{const row=registry.database.prepare("SELECT runtime_json,recovery_error FROM workers WHERE worker_id=? AND parent_session_file=? AND status='idle' AND operation_kind IS NULL").get(workerId,parentSessionFile) as {runtime_json:string;recovery_error:string|null}|undefined;if(!row)return false;const runtime=parseJson<Record<string,unknown>>(row.runtime_json);if(!runtime.cleanupConsent||typeof runtime.cleanupConsent!=="object")return false;const retainedError=row.recovery_error??error.slice(0,2048);const changed=registry.database.prepare("UPDATE workers SET recovery_error=?,runtime_json=?,version=version+1,updated_at=? WHERE worker_id=? AND parent_session_file=? AND status='idle' AND operation_kind IS NULL").run(retainedError,runtimeWithCleanupRecovery(row.runtime_json,retainedError,now),now,workerId,parentSessionFile);return Number(changed.changes)===1;});}
 
 export function countWorkers(registry: WorkerRegistry, parentSessionFile: string): { idle: number; queued: number; running: number } {
   const rows = registry.database.prepare("SELECT status,COUNT(*) AS count FROM workers WHERE parent_session_file=? GROUP BY status").all(parentSessionFile) as Array<{ status: WorkerStatus; count: number }>;

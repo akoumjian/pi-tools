@@ -394,3 +394,22 @@ test("conditional output variants preserve runtime-only boundaries", () => {
     }
   }), true, "document_parse accepts optional screenshot and warning handoffs");
 });
+
+test("worker_control cleanup inventory output is strict, bounded, and continuation-aware", () => {
+  const value = {
+    content: [{ type: "text", text: "1 workers · 1 prepared sets · 1 leftovers" }],
+    details: { inventory: {
+      workers: [{ workerId: "worker_20261025100002_aaaaaaaa", ownerSession: "/parent.jsonl", owner:{file:"/parent.jsonl",state:"unnamed",id:"parent",label:"parent"}, role: "work", class: "due", reason: "All assigned tasks are closed.",version:1,latestRunId:"run_20261025100002_aaaaaaaa", taskIds: ["personal-test"],taskFacts:[{id:"personal-test",status:"closed"}], unpreservedArtifacts: ["artifacts/report.md"], additionalUnpreservedArtifacts: 0, pendingResults: [], additionalPendingResults: 0, pendingPreservations: [], additionalPendingPreservations: 0 }],
+      prepared: [{ preparedId: "prepared_aaaaaaaaaaaaaaaaaaaaaaaa", ownerSession: "/parent.jsonl",owner:{file:"/parent.jsonl",state:"unnamed",id:"parent",label:"parent"}, status: "ready", class: "due", taskIds: ["personal-test"],taskFacts:[{id:"personal-test",status:"closed"}], reason: "All inherited tasks are closed." }],
+      leftovers: [{ leftoverId:`leftover_${"a".repeat(24)}`,kind: "worker_host_log", id: "job_20261023100002_aaaaaaaa", path: "/project/.pi/async-shell/jobs/job_20261023100002_aaaaaaaa", eligible: true, reason: "passed", device: 1, inode: 2,mtimeMs:1 }],
+      total: { workers: 1, prepared: 1, leftovers: 1 }, scan: { partial: false, examinedWorkers: 1, totalWorkers: 1, examinedFilesystemEntries: 1,roots:[{root:"/workers",examined:1,partial:false}] }, generatedAt: "2026-10-25T10:00:02.000Z", nextOffset: 20
+    } }
+  };
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, value), true);
+  const malformed = structuredClone(value) as any; malformed.details.inventory.workers[0].rawSummary = "untrusted";
+  assert.equal(Check(RetainedToolOutputSchemas.worker_control, malformed), false);
+});
+
+test("worker_control cleanup preview and apply outputs retain strict authority evidence",()=>{
+ const owner={file:"/retired.jsonl",state:"named",id:"retired",name:"Retired",label:"Retired"};const scan={partial:false,examinedWorkers:0,totalWorkers:0,examinedFilesystemEntries:0,roots:[]};const token=`cleanup_${"a".repeat(48)}`;const preview={content:[{type:"text",text:"cleanup preview"}],details:{token,snapshotHash:"b".repeat(64),createdAt:"2026-10-25T10:00:02.000Z",workers:[],prepared:[{preparedId:`prepared_${"c".repeat(24)}`,ownerSession:"/retired.jsonl",owner,status:"partial",class:"partial",taskIds:["personal-test"],taskFacts:[{id:"personal-test",status:"closed"}],reason:"Application is partial.",authority:{state:"dead",generation:1,members:[]}}],leftovers:[],scan}};assert.equal(Check(RetainedToolOutputSchemas.worker_control,preview),true);const extra=structuredClone(preview) as any;extra.details.prepared[0].authority="forged";assert.equal(Check(RetainedToolOutputSchemas.worker_control,extra),false);const applied={content:[{type:"text",text:"1/2 cleanup items discarded"}],details:{cleanup:{token,results:[{kind:"worker",id:"worker_20261025100002_aaaaaaaa",status:"failed",reason:"exact preflight failed"},{kind:"leftover",id:`leftover_${"d".repeat(24)}`,status:"discarded"}]}}};assert.equal(Check(RetainedToolOutputSchemas.worker_control,applied),true);
+});
