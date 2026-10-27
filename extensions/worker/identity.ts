@@ -9,7 +9,11 @@ export const LEGACY_WORKER_STORAGE_LAYOUT = 1 as const;
 export type WorkerStorageLayout = typeof CURRENT_WORKER_STORAGE_LAYOUT | typeof LEGACY_WORKER_STORAGE_LAYOUT;
 
 export const WORKER_RUNTIME_DIRECTORY = "worker-runtime-v10";
+export const WORKER_PREPARED_DIRECTORY = "prepared";
+export const WORKER_HOST_JOB_DIRECTORY = "worker-host-jobs";
 export function defaultWorkerRuntimeRoot(home = homedir()): string { return path.join(home, ".local", "share", "agent", WORKER_RUNTIME_DIRECTORY); }
+export function workerPreparedRoot(runtimeRoot = defaultWorkerRuntimeRoot()): string { return path.join(path.resolve(runtimeRoot), WORKER_PREPARED_DIRECTORY); }
+export function workerHostJobRoot(runtimeRoot = defaultWorkerRuntimeRoot()): string { return path.join(path.resolve(runtimeRoot), WORKER_HOST_JOB_DIRECTORY); }
 export type WorkerRoots = { stateRoot: string; workspaceRoot: string; supervisionRoot?: string };
 export type WorkerPaths = { workerDir: string; stateDir: string; supervisionDir: string; evidenceDir: string; sessionDir: string; workspaceRoot: string; reposDir: string; scratchDir: string; cacheDir: string; artifactsDir: string; tempDir: string };
 export function defaultWorkerRoots(home = homedir()): WorkerRoots {

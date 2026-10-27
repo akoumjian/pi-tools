@@ -7,7 +7,7 @@ import { openWorkerRegistry } from "../../extensions/worker/registry.js";
 
 const count=Number(process.argv[2]);
 if(!Number.isSafeInteger(count)||count<1)throw new Error("usage: cleanup-scan-stress <positive-directory-count>");
-const root=realpathSync(mkdtempSync(path.join(tmpdir(),`pi-cleanup-scan-${count}-`))),runtimeRoot=path.join(root,"runtime"),workersRoot=path.join(runtimeRoot,"workers"),preparedRoot=path.join(root,"prepared"),jobsRoot=path.join(root,"project",".pi","async-shell","jobs"),parent=path.join(root,"parent.jsonl");
+const root=realpathSync(mkdtempSync(path.join(tmpdir(),`pi-cleanup-scan-${count}-`))),runtimeRoot=path.join(root,"runtime"),workersRoot=path.join(runtimeRoot,"workers"),preparedRoot=path.join(root,"prepared"),jobsRoot=path.join(root,"worker-host-jobs","jobs"),parent=path.join(root,"parent.jsonl");
 mkdirSync(workersRoot,{recursive:true});mkdirSync(preparedRoot,{recursive:true});mkdirSync(jobsRoot,{recursive:true});writeFileSync(parent,"");
 const started=Date.now(),old=new Date("2025-01-01T00:00:00.000Z"),expected=new Set<string>();
 try{

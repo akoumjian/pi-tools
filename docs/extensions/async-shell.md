@@ -21,7 +21,7 @@ Commands:
 
 Side effects:
 
-- Maintains a per-project job registry under `.pi/async-shell/jobs/<jobId>/`.
+- Maintains ordinary direct jobs in the per-project registry `.pi/async-shell/jobs/<jobId>/`. Trusted managed-worker host jobs instead use the host-only fixed namespace `~/.local/share/agent/worker-runtime-v10/worker-host-jobs/jobs/<jobId>/`; this internal root cannot be selected by ordinary shell requests.
 - Subscribes to `message_end`, `turn_end`, and `agent_end` to flush ready completion batches at safe points.
 - Registers a custom-message renderer for the `async-shell` customType.
 
@@ -94,7 +94,7 @@ Cancel implicitly suppresses the completion notice for that job (`notifyOnExit` 
 
 The built-in Pi footer uses the extension status surface for one compact theme-aware `shN` count while the exact current session has active user `shell_start` jobs. It derives the count from the canonical attached job registry on start and terminal transitions, excludes managed worker host processes, clears at zero and session shutdown, and never adds a transcript message, provider request, assistant turn, polling timer, or second job registry. The canonical in-process map and its listener set live in one version-checked `globalThis` holder, so an uncached extension `/reload` sees pre-reload live jobs and old lifecycle owners notify the new TUI listener. The prior holder shape is upgraded in place; malformed or unknown holder versions fail loudly. The old extension shutdown removes only its own listener. Pi 0.84.4 exposes no extension theme-change event, so the status re-renders from the current theme on session start/reload, each shell lifecycle event, and the next submitted input after a theme selection. Its priority key sorts after `wN` but before verbose extension statuses; Pi may still truncate statuses at an extremely narrow terminal width.
 
-1. Each command is spawned via `spawn(shell, ["-lc", command], { cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] })`. A durable `jobId` of the form `job_<yyyymmddhhmmss>_<random8>` is created, metadata is written to `meta.json`, and stdout/stderr are streamed to `stdout.log` and `stderr.log` under `.pi/async-shell/jobs/<jobId>/`.
+1. Each command is spawned via `spawn(shell, ["-lc", command], { cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] })`. A durable `jobId` of the form `job_<yyyymmddhhmmss>_<random8>` is created, metadata is written to `meta.json`, and stdout/stderr are streamed to `stdout.log` and `stderr.log`. Ordinary direct jobs use `.pi/async-shell/jobs/<jobId>/`; only the trusted worker-host caller supplies the isolated v10 host-job root.
 2. `shell_start` then waits up to a fixed **6-second** in-band grace period for all jobs in the call to finish. Jobs that finish in-band are reported as completed in the start result and never produce a completion notice; jobs still running at the end of the grace period continue in the background. If the parent agent is interrupted during this grace period, only the wait ends early: already-created jobs remain durable and their metadata is returned. Every terminal job returned in-band is marked `reportedInBand` in the reload-stable holder before the result is released; timer, queue, flush, and reload-reconciliation paths all suppress it even if metadata persistence fails. Every started job releases its delivery barrier in a `finally`, including partial batch-start and metadata-persistence failures, and a partial-start error names every job ID that already started. `shell_cancel` remains the only tool that terminates a job; signalling proceeds even when cancellation metadata cannot be persisted.
 3. The in-band result groups one metadata entry per command:
    ```ts
@@ -170,7 +170,7 @@ Completion notice content deliberately points at log paths rather than embedding
 
 ## Setup
 
-None. The job root is created lazily under the project's `.pi/async-shell/`.
+None. The ordinary job root is created lazily under the project's `.pi/async-shell/`. Managed-worker host jobs are created lazily under the fixed v10 host-only job namespace. Ordinary retention may recognize metadata or commands already present in a project tree and consults only the v10 managed-worker registry for exact job IDs; it never opens the retained legacy registry. Managed-worker cleanup scans only the v10 host-job tree.
 
 Defaults (constants, not configurable):
 

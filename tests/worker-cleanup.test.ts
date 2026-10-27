@@ -13,7 +13,7 @@ import {
   deleteCleanupLeftover, preserveWorkerArtifacts, existingAncestorIdentityOverlap, preflightWorkerDiscard, recoverPreparedSetDiscards, scanCleanupLeftovers, unpreservedArtifacts
 } from "../extensions/worker/cleanup.js";
 import { claimWorkerDiscard, createWorkerAndRun, finalizeWorkerDiscard, getWorker, openWorkerRegistry, storePreparedSet, type NewWorkerRegistryRecord, type WorkerRegistry, type WorkerRegistryRecord, type WorkerRunRecord } from "../extensions/worker/registry.js";
-import { workerPaths, type WorkerRoots } from "../extensions/worker/identity.js";
+import { workerHostJobRoot, workerPaths, type WorkerRoots } from "../extensions/worker/identity.js";
 import { startManagedAsyncJob } from "../extensions/async-shell/index.js";
 import { matchWorkerHostJobIdentity, workerHostJobIdentity } from "../extensions/_shared/worker-host-job.js";
 
@@ -23,9 +23,9 @@ const RUN_A = "run_20261025100002_aaaaaaaa";
 
 function fixture() {
   const root = realpathSync(mkdtempSync(path.join(tmpdir(), "pi-worker-cleanup-")));
-  const runtimeRoot = path.join(root, "runtime"); const workersRoot = path.join(runtimeRoot, "workers"); const roots: WorkerRoots = { stateRoot: workersRoot, workspaceRoot: workersRoot };
+  const runtimeRoot = path.join(root, "runtime"); const workersRoot = path.join(runtimeRoot, "workers"); const roots: WorkerRoots = { stateRoot: workersRoot, workspaceRoot: workersRoot }; const hostJobRoot = workerHostJobRoot(runtimeRoot);
   const registry = openWorkerRegistry(runtimeRoot); const parent = path.join(root, "parent.jsonl"); writeFileSync(parent, "");
-  return { root, runtimeRoot, roots, registry, parent, close() { registry.close(); rmSync(root, { recursive: true, force: true }); } };
+  return { root, runtimeRoot, roots, hostJobRoot, registry, parent, close() { registry.close(); rmSync(root, { recursive: true, force: true }); } };
 }
 
 function insertSettled(registry: WorkerRegistry, roots: WorkerRoots, parent: string, input: { workerId?: string; runId?: string; role?: "work" | "review" | "integration"; artifacts?: string[]; recoveryError?: string; owner?: string; reviewedByWorkerId?: string; binding?:any; job?: { id: string; stdout: string; stderr: string } } = {}) {
@@ -86,33 +86,33 @@ test("shared worker-host identity accepts only exact current and legacy bindings
 
 test("host-log cleanup requires exact metadata identity and never removes mismatches", () => {
   const f = fixture(); try {
-    const jobId = "job_20261025100002_aaaaaaaa"; const directory = path.join(f.root, ".pi", "async-shell", "jobs", jobId); mkdirSync(directory, { recursive: true }); const stdout = path.join(directory, "stdout.log"); const stderr = path.join(directory, "stderr.log"); writeFileSync(stdout, "ok"); writeFileSync(stderr, "");
+    const jobId = "job_20261025100002_aaaaaaaa"; const directory = path.join(f.hostJobRoot, "jobs", jobId); mkdirSync(directory, { recursive: true }); const stdout = path.join(directory, "stdout.log"); const stderr = path.join(directory, "stderr.log"); writeFileSync(stdout, "ok"); writeFileSync(stderr, "");
     const worker = insertSettled(f.registry, f.roots, f.parent, { job: { id: jobId, stdout, stderr } }); const identity = workerHostJobIdentity(worker.workerId, RUN_A); writeFileSync(path.join(directory, "meta.json"), JSON.stringify({ jobId, command: identity.command, managedBy: identity.managedBy, status: "exited", stdoutLog: stdout, stderrLog: stderr }));
-    const plan = planSettledWorkerHostLogs(f.registry, worker); assert.deepEqual(plan.deletable.map((item) => item.path), [directory]);writeFileSync(path.join(directory,"meta.json"),JSON.stringify({jobId,command:identity.command,managedBy:identity.managedBy,status:"running",stdoutLog:stdout,stderrLog:stderr}));assert.throws(()=>deletePlannedWorkerHostLogs(plan),/metadata changed/);assert.equal(existsSync(directory),true);writeFileSync(path.join(directory,"meta.json"),JSON.stringify({jobId,command:identity.command,managedBy:identity.managedBy,status:"exited",stdoutLog:stdout,stderrLog:stderr}));const clean=deletePlannedWorkerHostLogs(planSettledWorkerHostLogs(f.registry,worker));assert.deepEqual(clean,[directory]); assert.equal(existsSync(directory), false);
+    const plan = planSettledWorkerHostLogs(f.registry, worker, f.hostJobRoot); assert.deepEqual(plan.deletable.map((item) => item.path), [directory]);writeFileSync(path.join(directory,"meta.json"),JSON.stringify({jobId,command:identity.command,managedBy:identity.managedBy,status:"running",stdoutLog:stdout,stderrLog:stderr}));assert.throws(()=>deletePlannedWorkerHostLogs(plan),/metadata changed/);assert.equal(existsSync(directory),true);writeFileSync(path.join(directory,"meta.json"),JSON.stringify({jobId,command:identity.command,managedBy:identity.managedBy,status:"exited",stdoutLog:stdout,stderrLog:stderr}));const clean=deletePlannedWorkerHostLogs(planSettledWorkerHostLogs(f.registry,worker,f.hostJobRoot));assert.deepEqual(clean,[directory]); assert.equal(existsSync(directory), false);
   } finally { f.close(); }
 });
 
 test("host-log cleanup retains exact legacy command compatibility", () => {
   const f = fixture(); try {
-    const jobId = "job_20261025100002_legacyaa"; const directory = path.join(f.root, ".pi", "async-shell", "jobs", jobId); mkdirSync(directory, { recursive: true });
+    const jobId = "job_20261025100002_legacyaa"; const directory = path.join(f.hostJobRoot, "jobs", jobId); mkdirSync(directory, { recursive: true });
     const stdout = path.join(directory, "stdout.log"), stderr = path.join(directory, "stderr.log"); writeFileSync(stdout, ""); writeFileSync(stderr, "");
     const worker = insertSettled(f.registry, f.roots, f.parent, { job: { id: jobId, stdout, stderr } });
     writeFileSync(path.join(directory, "meta.json"), JSON.stringify({ jobId, command: workerHostJobIdentity(worker.workerId, RUN_A, "legacy").command, status: "exited", stdoutLog: stdout, stderrLog: stderr }));
-    assert.deepEqual(deletePlannedWorkerHostLogs(planSettledWorkerHostLogs(f.registry, worker)), [directory]);
+    assert.deepEqual(deletePlannedWorkerHostLogs(planSettledWorkerHostLogs(f.registry, worker, f.hostJobRoot)), [directory]);
   } finally { f.close(); }
 });
 
 test("unknown host-log status requires a complete provably dead process identity", () => {
   const f = fixture(); try {
-    const jobId = "job_20261025100002_cccccccc"; const directory = path.join(f.root, jobId); mkdirSync(directory); const stdout = path.join(directory, "stdout.log"); const stderr = path.join(directory, "stderr.log"); writeFileSync(stdout, ""); writeFileSync(stderr, ""); const worker = insertSettled(f.registry, f.roots, f.parent, { job: { id: jobId, stdout, stderr } });
-    writeFileSync(path.join(directory, "meta.json"), JSON.stringify({ jobId, command: workerHostJobIdentity(worker.workerId, RUN_A).command, status: "unknown", stdoutLog: stdout, stderrLog: stderr })); const clean = planSettledWorkerHostLogs(f.registry, worker); assert.equal(clean.deletable.length, 0); assert.match(clean.leftovers[0]!.reason, /process identity is incomplete/); assert.equal(existsSync(directory), true);
+    const jobId = "job_20261025100002_cccccccc"; const directory = path.join(f.hostJobRoot, "jobs", jobId); mkdirSync(directory, { recursive: true }); const stdout = path.join(directory, "stdout.log"); const stderr = path.join(directory, "stderr.log"); writeFileSync(stdout, ""); writeFileSync(stderr, ""); const worker = insertSettled(f.registry, f.roots, f.parent, { job: { id: jobId, stdout, stderr } });
+    writeFileSync(path.join(directory, "meta.json"), JSON.stringify({ jobId, command: workerHostJobIdentity(worker.workerId, RUN_A).command, status: "unknown", stdoutLog: stdout, stderrLog: stderr })); const clean = planSettledWorkerHostLogs(f.registry, worker, f.hostJobRoot); assert.equal(clean.deletable.length, 0); assert.match(clean.leftovers[0]!.reason, /process identity is incomplete/); assert.equal(existsSync(directory), true);
   } finally { f.close(); }
 });
 
 test("host-log mismatch is a reported leftover", () => {
   const f = fixture(); try {
-    const jobId = "job_20261025100002_bbbbbbbb"; const directory = path.join(f.root, jobId); mkdirSync(directory); const stdout = path.join(directory, "stdout.log"); const stderr = path.join(directory, "stderr.log"); writeFileSync(stdout, ""); writeFileSync(stderr, ""); const worker = insertSettled(f.registry, f.roots, f.parent, { job: { id: jobId, stdout, stderr } });
-    writeFileSync(path.join(directory, "meta.json"), JSON.stringify({ jobId, command: "not the worker", status: "exited" })); const clean = planSettledWorkerHostLogs(f.registry, worker); assert.equal(clean.deletable.length, 0); assert.match(clean.leftovers[0]!.reason, /identity mismatch/); assert.equal(existsSync(directory), true);
+    const jobId = "job_20261025100002_bbbbbbbb"; const directory = path.join(f.hostJobRoot, "jobs", jobId); mkdirSync(directory, { recursive: true }); const stdout = path.join(directory, "stdout.log"); const stderr = path.join(directory, "stderr.log"); writeFileSync(stdout, ""); writeFileSync(stderr, ""); const worker = insertSettled(f.registry, f.roots, f.parent, { job: { id: jobId, stdout, stderr } });
+    writeFileSync(path.join(directory, "meta.json"), JSON.stringify({ jobId, command: "not the worker", status: "exited" })); const clean = planSettledWorkerHostLogs(f.registry, worker, f.hostJobRoot); assert.equal(clean.deletable.length, 0); assert.match(clean.leftovers[0]!.reason, /identity mismatch/); assert.equal(existsSync(directory), true);
   } finally { f.close(); }
 });
 
@@ -139,27 +139,27 @@ test("production-shaped managed Sandbox host metadata plans, deletes, and invent
     const api = { sendMessage() {} } as unknown as ExtensionAPI;
     const context = { cwd: f.root, sessionManager: { getSessionId: () => "cleanup-real-host" } } as ExtensionContext;
     const jobId = "job_20261025100002_realhost";
-    const directory = path.join(f.root, ".pi", "async-shell", "jobs", jobId);
+    const directory = path.join(f.hostJobRoot, "jobs", jobId);
     const worker = insertSettled(f.registry, f.roots, f.parent, { job: { id: jobId, stdout: path.join(directory, "stdout.log"), stderr: path.join(directory, "stderr.log") } });
     const identity = workerHostJobIdentity(worker.workerId, RUN_A);
     const handle = startManagedAsyncJob(api, context, {
-      jobId, job_name: `worker ${worker.workerId}`, command: identity.command, cwd: worker.workspaceRoot, executable: process.execPath, args: ["-e", "process.exit(0)"], env: { ...process.env, PI_WORKER_ID: worker.workerId, PI_WORKER_RUN_ID: RUN_A }, notifyOnExit: false, settleProcessGroup: true, processToken: "123e4567-e89b-42d3-a456-426614174401", managedBy: identity.managedBy
+      jobId, job_name: `worker ${worker.workerId}`, command: identity.command, cwd: worker.workspaceRoot, executable: process.execPath, args: ["-e", "process.exit(0)"], env: { ...process.env, PI_WORKER_ID: worker.workerId, PI_WORKER_RUN_ID: RUN_A }, notifyOnExit: false, settleProcessGroup: true, processToken: "123e4567-e89b-42d3-a456-426614174401", jobRoot: f.hostJobRoot, managedBy: identity.managedBy
     });
     const completed = await Promise.race([handle.completion, new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("managed Sandbox host fixture timed out")), 2_000))]);
     assert.equal(completed.status, "exited");
     const persisted = JSON.parse(readFileSync(path.join(directory, "meta.json"), "utf8"));
     assert.equal(persisted.command, identity.command); assert.deepEqual(persisted.managedBy, identity.managedBy);
-    assert.deepEqual(deletePlannedWorkerHostLogs(planSettledWorkerHostLogs(f.registry, worker)), [directory]); assert.equal(existsSync(directory), false);
+    assert.deepEqual(deletePlannedWorkerHostLogs(planSettledWorkerHostLogs(f.registry, worker, f.hostJobRoot)), [directory]); assert.equal(existsSync(directory), false);
 
     const orphanWorkerId = "worker_20261023100002_realhost", orphanRunId = "run_20261023100002_realhost", orphanJobId = "job_20261023100002_realhost";
     const orphanIdentity = workerHostJobIdentity(orphanWorkerId, orphanRunId);
     const orphan = startManagedAsyncJob(api, context, {
-      jobId: orphanJobId, job_name: `worker ${orphanWorkerId}`, command: orphanIdentity.command, cwd: f.root, executable: process.execPath, args: ["-e", "process.exit(0)"], env: { ...process.env, PI_WORKER_ID: orphanWorkerId, PI_WORKER_RUN_ID: orphanRunId }, notifyOnExit: false, settleProcessGroup: true, processToken: "123e4567-e89b-42d3-a456-426614174402", managedBy: orphanIdentity.managedBy
+      jobId: orphanJobId, job_name: `worker ${orphanWorkerId}`, command: orphanIdentity.command, cwd: f.root, executable: process.execPath, args: ["-e", "process.exit(0)"], env: { ...process.env, PI_WORKER_ID: orphanWorkerId, PI_WORKER_RUN_ID: orphanRunId }, notifyOnExit: false, settleProcessGroup: true, processToken: "123e4567-e89b-42d3-a456-426614174402", jobRoot: f.hostJobRoot, managedBy: orphanIdentity.managedBy
     });
     const orphanCompleted = await Promise.race([orphan.completion, new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("orphan Sandbox host fixture timed out")), 2_000))]);
     assert.equal(orphanCompleted.status, "exited");
     const old = new Date("2026-10-23T10:00:00.000Z"), now = new Date("2026-10-25T10:00:02.000Z"); utimesSync(orphanCompleted.logDir, old, old);
-    const leftovers = await scanCleanupLeftovers(f.registry, { roots: f.roots, preparedRoot: path.join(f.root, "prepared"), projectCwd: f.root, now });
+    const leftovers = await scanCleanupLeftovers(f.registry, { roots: f.roots, preparedRoot: path.join(f.root, "prepared"), hostJobRoot: f.hostJobRoot, projectCwd: f.root, now });
     const historical = leftovers.find((item) => item.path === orphanCompleted.logDir); assert.equal(historical?.kind, "worker_host_log"); assert.equal(historical?.eligible, true);
   } finally { f.close(); }
 });
@@ -169,9 +169,9 @@ test("all-session leftover scan identifies and revalidates aged orphan roots and
     const old = new Date("2026-10-23T10:00:00.000Z"); const now = new Date("2026-10-25T10:00:02.000Z");
     const orphanId = "worker_20261023100002_cccccccc"; const orphan = path.join(f.roots.stateRoot, orphanId); mkdirSync(orphan, { recursive: true }); utimesSync(orphan, old, old);
     const preparedRoot = path.join(f.root, "prepared"); const preparedId = "prepared_cccccccccccccccccccccccc"; const prepared = path.join(preparedRoot, preparedId); mkdirSync(prepared, { recursive: true }); utimesSync(prepared, old, old);
-    const jobId = "job_20261023100002_cccccccc"; const job = path.join(f.root, ".pi", "async-shell", "jobs", jobId); mkdirSync(job, { recursive: true }); const stdout = path.join(job, "stdout.log"); const stderr = path.join(job, "stderr.log"); writeFileSync(stdout, ""); writeFileSync(stderr, ""); writeFileSync(path.join(job, "meta.json"), JSON.stringify({ jobId, command: workerHostJobIdentity(orphanId, "run_20261023100002_cccccccc").command, status: "exited", stdoutLog: stdout, stderrLog: stderr })); utimesSync(job, old, old);
-    const leftovers = await scanCleanupLeftovers(f.registry, { roots: f.roots, preparedRoot, projectCwd: f.root, now }); assert.deepEqual(leftovers.map((item) => item.kind).sort(), ["prepared_root", "worker_host_log", "worker_root"]); assert.equal(leftovers.every((item) => item.eligible), true);
-    for (const leftover of leftovers) await deleteCleanupLeftover(f.registry, leftover, { roots: f.roots, preparedRoot, projectCwd: f.root, now }); assert.equal(existsSync(orphan), false); assert.equal(existsSync(prepared), false); assert.equal(existsSync(job), false);
+    const jobId = "job_20261023100002_cccccccc"; const job = path.join(f.hostJobRoot, "jobs", jobId); mkdirSync(job, { recursive: true }); const stdout = path.join(job, "stdout.log"); const stderr = path.join(job, "stderr.log"); writeFileSync(stdout, ""); writeFileSync(stderr, ""); writeFileSync(path.join(job, "meta.json"), JSON.stringify({ jobId, command: workerHostJobIdentity(orphanId, "run_20261023100002_cccccccc").command, status: "exited", stdoutLog: stdout, stderrLog: stderr })); utimesSync(job, old, old);
+    const leftovers = await scanCleanupLeftovers(f.registry, { roots: f.roots, preparedRoot, hostJobRoot: f.hostJobRoot, projectCwd: f.root, now }); assert.deepEqual(leftovers.map((item) => item.kind).sort(), ["prepared_root", "worker_host_log", "worker_root"]); assert.equal(leftovers.every((item) => item.eligible), true);
+    for (const leftover of leftovers) await deleteCleanupLeftover(f.registry, leftover, { roots: f.roots, preparedRoot, hostJobRoot: f.hostJobRoot, projectCwd: f.root, now }); assert.equal(existsSync(orphan), false); assert.equal(existsSync(prepared), false); assert.equal(existsSync(job), false);
   } finally { f.close(); }
 });
 
@@ -243,21 +243,21 @@ test("owner liveness changing after preview blocks adoption atomically",async()=
 });
 
 test("leftover inventory pages more than 32 historical host logs without whole-snapshot refusal",async()=>{
- const f=fixture();try{const old=new Date("2026-10-23T10:00:00.000Z"),now=new Date("2026-10-25T10:00:02.000Z");for(let index=0;index<40;index+=1){const suffix=index.toString(16).padStart(8,"0"),workerId=`worker_20261023100002_${suffix}`,runId=`run_20261023100002_${suffix}`,jobId=`job_20261023100002_${suffix}`,directory=path.join(f.root,".pi","async-shell","jobs",jobId);mkdirSync(directory,{recursive:true});const stdout=path.join(directory,"stdout.log"),stderr=path.join(directory,"stderr.log");writeFileSync(stdout,"");writeFileSync(stderr,"");writeFileSync(path.join(directory,"meta.json"),JSON.stringify({jobId,command:workerHostJobIdentity(workerId,runId).command,status:"exited",stdoutLog:stdout,stderrLog:stderr}));utimesSync(directory,old,old);}const first=await buildCleanupInventory(f.registry,{parentSessionFile:f.parent,allSessions:true,cwd:f.root,roots:f.roots,preparedRoot:path.join(f.root,"prepared"),limit:32,offset:0,now});assert.equal(first.leftovers.length,32);assert.equal(first.total.leftovers,32);assert.equal(first.scan.partial,true);assert.ok(first.scan.continuation);const cursor=advanceCleanupScanCursor(f.registry,f.parent,undefined,first.scan.continuation,now.toISOString())!;const scanState=loadCleanupScanCursor(f.registry,f.parent,cursor);const second=await buildCleanupInventory(f.registry,{parentSessionFile:f.parent,allSessions:true,cwd:f.root,roots:f.roots,preparedRoot:path.join(f.root,"prepared"),limit:32,offset:0,scanState,now});assert.equal(second.total.leftovers,40);assert.equal(second.leftovers.length,8);assert.equal(second.scan.partial,false);assert.equal(advanceCleanupScanCursor(f.registry,f.parent,cursor,second.scan.continuation,now.toISOString()),undefined);assert.throws(()=>loadCleanupScanCursor(f.registry,f.parent,cursor),/consumed/);assert.equal(new Set([...first.leftovers,...second.leftovers].map((item)=>item.leftoverId)).size,40);}finally{f.close();}
+ const f=fixture();try{const old=new Date("2026-10-23T10:00:00.000Z"),now=new Date("2026-10-25T10:00:02.000Z");for(let index=0;index<40;index+=1){const suffix=index.toString(16).padStart(8,"0"),workerId=`worker_20261023100002_${suffix}`,runId=`run_20261023100002_${suffix}`,jobId=`job_20261023100002_${suffix}`,directory=path.join(f.hostJobRoot,"jobs",jobId);mkdirSync(directory,{recursive:true});const stdout=path.join(directory,"stdout.log"),stderr=path.join(directory,"stderr.log");writeFileSync(stdout,"");writeFileSync(stderr,"");writeFileSync(path.join(directory,"meta.json"),JSON.stringify({jobId,command:workerHostJobIdentity(workerId,runId).command,status:"exited",stdoutLog:stdout,stderrLog:stderr}));utimesSync(directory,old,old);}const first=await buildCleanupInventory(f.registry,{parentSessionFile:f.parent,allSessions:true,cwd:f.root,roots:f.roots,preparedRoot:path.join(f.root,"prepared"),hostJobRoot:f.hostJobRoot,limit:32,offset:0,now});assert.equal(first.leftovers.length,32);assert.equal(first.total.leftovers,32);assert.equal(first.scan.partial,true);assert.ok(first.scan.continuation);const cursor=advanceCleanupScanCursor(f.registry,f.parent,undefined,first.scan.continuation,now.toISOString())!;const scanState=loadCleanupScanCursor(f.registry,f.parent,cursor);const second=await buildCleanupInventory(f.registry,{parentSessionFile:f.parent,allSessions:true,cwd:f.root,roots:f.roots,preparedRoot:path.join(f.root,"prepared"),hostJobRoot:f.hostJobRoot,limit:32,offset:0,scanState,now});assert.equal(second.total.leftovers,40);assert.equal(second.leftovers.length,8);assert.equal(second.scan.partial,false);assert.equal(advanceCleanupScanCursor(f.registry,f.parent,cursor,second.scan.continuation,now.toISOString()),undefined);assert.throws(()=>loadCleanupScanCursor(f.registry,f.parent,cursor),/consumed/);assert.equal(new Set([...first.leftovers,...second.leftovers].map((item)=>item.leftoverId)).size,40);}finally{f.close();}
 });
 
 test("interrupted cleanup trash is inventoried and explicitly recoverable",async()=>{
- const f=fixture();try{const original="worker_20261023100002_deadbeef",source=path.join(f.roots.stateRoot,original),old=new Date("2026-10-23T10:00:00.000Z"),now=new Date("2026-10-25T10:00:00.000Z");mkdirSync(source,{recursive:true});writeFileSync(path.join(source,"evidence"),"x");utimesSync(source,old,old);let leftovers=await scanCleanupLeftovers(f.registry,{roots:f.roots,preparedRoot:path.join(f.root,"prepared"),projectCwd:f.root,now});const sourceItem=leftovers.find((candidate)=>candidate.path===source)!;await assert.rejects(()=>deleteCleanupLeftover(f.registry,sourceItem,{roots:f.roots,preparedRoot:path.join(f.root,"prepared"),projectCwd:f.root,now,afterLeftoverClaim:()=>{throw new Error("simulated crash boundary")}}),/simulated crash/);const trash=path.join(f.roots.stateRoot,readdirSync(f.roots.stateRoot).find((name)=>name.startsWith(`${original}.cleanup-`))!);assert.equal(existsSync(source),false);assert.equal(Number((f.registry.database.prepare("SELECT COUNT(*) AS count FROM cleanup_leftover_claims").get() as {count:number}).count),1);leftovers=await scanCleanupLeftovers(f.registry,{roots:f.roots,preparedRoot:path.join(f.root,"prepared"),projectCwd:f.root,now});const item=leftovers.find((candidate)=>candidate.path===trash)!;assert.equal(item.kind,"cleanup_trash");assert.equal(item.eligible,true);await deleteCleanupLeftover(f.registry,item,{roots:f.roots,preparedRoot:path.join(f.root,"prepared"),projectCwd:f.root,now});assert.equal(existsSync(trash),false);assert.equal(Number((f.registry.database.prepare("SELECT COUNT(*) AS count FROM cleanup_leftover_claims").get() as {count:number}).count),0);}finally{f.close();}
+ const f=fixture();try{const original="worker_20261023100002_deadbeef",source=path.join(f.roots.stateRoot,original),old=new Date("2026-10-23T10:00:00.000Z"),now=new Date("2026-10-25T10:00:00.000Z");mkdirSync(source,{recursive:true});writeFileSync(path.join(source,"evidence"),"x");utimesSync(source,old,old);let leftovers=await scanCleanupLeftovers(f.registry,{roots:f.roots,preparedRoot:path.join(f.root,"prepared"),hostJobRoot:f.hostJobRoot,projectCwd:f.root,now});const sourceItem=leftovers.find((candidate)=>candidate.path===source)!;await assert.rejects(()=>deleteCleanupLeftover(f.registry,sourceItem,{roots:f.roots,preparedRoot:path.join(f.root,"prepared"),hostJobRoot:f.hostJobRoot,projectCwd:f.root,now,afterLeftoverClaim:()=>{throw new Error("simulated crash boundary")}}),/simulated crash/);const trash=path.join(f.roots.stateRoot,readdirSync(f.roots.stateRoot).find((name)=>name.startsWith(`${original}.cleanup-`))!);assert.equal(existsSync(source),false);assert.equal(Number((f.registry.database.prepare("SELECT COUNT(*) AS count FROM cleanup_leftover_claims").get() as {count:number}).count),1);leftovers=await scanCleanupLeftovers(f.registry,{roots:f.roots,preparedRoot:path.join(f.root,"prepared"),hostJobRoot:f.hostJobRoot,projectCwd:f.root,now});const item=leftovers.find((candidate)=>candidate.path===trash)!;assert.equal(item.kind,"cleanup_trash");assert.equal(item.eligible,true);await deleteCleanupLeftover(f.registry,item,{roots:f.roots,preparedRoot:path.join(f.root,"prepared"),hostJobRoot:f.hostJobRoot,projectCwd:f.root,now});assert.equal(existsSync(trash),false);assert.equal(Number((f.registry.database.prepare("SELECT COUNT(*) AS count FROM cleanup_leftover_claims").get() as {count:number}).count),0);}finally{f.close();}
 });
 
 
 const cleanupLeftoverCrashFixture=path.resolve(path.dirname(fileURLToPath(import.meta.url)),"fixtures","cleanup-leftover-crash.js");
 test("every leftover source kind recovers after a spawned claim crash and an actual partial tree removal",async()=>{
- const f=fixture();const preparedRoot=path.join(f.root,"prepared"),jobsRoot=path.join(f.root,".pi","async-shell","jobs"),old=new Date("2026-10-23T10:00:00.000Z"),now=new Date("2026-10-25T10:00:00.000Z");
+ const f=fixture();const preparedRoot=path.join(f.root,"prepared"),jobsRoot=path.join(f.hostJobRoot,"jobs"),old=new Date("2026-10-23T10:00:00.000Z"),now=new Date("2026-10-25T10:00:00.000Z");
  const createSource=(kind:"worker_root"|"worker_trash"|"prepared_root"|"worker_host_log",tag:string):string=>{let target:string;const suffix=createHash("sha256").update(`${kind}:${tag}`).digest("hex").slice(0,8);if(kind==="worker_root")target=path.join(f.roots.stateRoot,`worker_20261023100002_${suffix}`);else if(kind==="worker_trash")target=path.join(f.roots.workspaceRoot,`worker_20261023100002_${suffix}.discard-${"d".repeat(24)}`);else if(kind==="prepared_root")target=path.join(preparedRoot,`prepared_${createHash("sha256").update(tag).digest("hex").slice(0,24)}`);else{const jobId=`job_20261023100002_${suffix}`,workerId=`worker_20261023100002_${suffix}`,runId=`run_20261023100002_${suffix}`;target=path.join(jobsRoot,jobId);mkdirSync(target,{recursive:true});const stdout=path.join(target,"stdout.log"),stderr=path.join(target,"stderr.log");writeFileSync(stdout,"");writeFileSync(stderr,"");writeFileSync(path.join(target,"meta.json"),JSON.stringify({jobId,command:workerHostJobIdentity(workerId,runId).command,status:"exited",stdoutLog:stdout,stderrLog:stderr}));}mkdirSync(target,{recursive:true});writeFileSync(path.join(target,"evidence"),"retain until committed cleanup");utimesSync(target,old,old);return target;};
- const recover=async(source:string)=>{const inventory=await scanCleanupLeftovers(f.registry,{roots:f.roots,preparedRoot,projectCwd:f.root,now}),item=inventory.find((candidate)=>candidate.path===source)!;assert.ok(item?.eligible,`source must be eligible: ${source}`);return item;};
- try{for(const kind of ["worker_root","worker_trash","prepared_root","worker_host_log"] as const){const crashSource=createSource(kind,`c${kind[0]}`),crashItem=await recover(crashSource),inputFile=path.join(f.root,`crash-${kind}.json`);writeFileSync(inputFile,JSON.stringify({item:crashItem,roots:f.roots,preparedRoot,projectCwd:f.root,now:now.toISOString()}));const crashed=spawnSync(process.execPath,[cleanupLeftoverCrashFixture,f.runtimeRoot,inputFile],{encoding:"utf8"});assert.equal(crashed.status,73,crashed.stderr);const crashTrash=readdirSync(path.dirname(crashSource)).map((name)=>path.join(path.dirname(crashSource),name)).find((candidate)=>candidate.startsWith(`${crashSource}.cleanup-`))!;assert.equal(existsSync(crashSource),false);const claimedAfterCrash=await recover(crashTrash);assert.equal(claimedAfterCrash.kind,"cleanup_trash");await deleteCleanupLeftover(f.registry,claimedAfterCrash,{roots:f.roots,preparedRoot,projectCwd:f.root,now});assert.equal(existsSync(crashTrash),false);
- const partialSource=createSource(kind,`p${kind[0]}`),partialItem=await recover(partialSource);await assert.rejects(()=>deleteCleanupLeftover(f.registry,partialItem,{roots:f.roots,preparedRoot,projectCwd:f.root,now,removeClaimedTrash:(trash)=>{rmSync(path.join(trash,"evidence"),{force:true});throw new Error("injected after real partial removal");}}),/real partial removal/);const partialTrash=readdirSync(path.dirname(partialSource)).map((name)=>path.join(path.dirname(partialSource),name)).find((candidate)=>candidate.startsWith(`${partialSource}.cleanup-`))!;assert.equal(existsSync(path.join(partialTrash,"evidence")),false);const claimedAfterPartial=await recover(partialTrash);assert.equal(claimedAfterPartial.kind,"cleanup_trash");await deleteCleanupLeftover(f.registry,claimedAfterPartial,{roots:f.roots,preparedRoot,projectCwd:f.root,now});assert.equal(existsSync(partialTrash),false);}
+ const recover=async(source:string)=>{const inventory=await scanCleanupLeftovers(f.registry,{roots:f.roots,preparedRoot,hostJobRoot:f.hostJobRoot,projectCwd:f.root,now}),item=inventory.find((candidate)=>candidate.path===source)!;assert.ok(item?.eligible,`source must be eligible: ${source}`);return item;};
+ try{for(const kind of ["worker_root","worker_trash","prepared_root","worker_host_log"] as const){const crashSource=createSource(kind,`c${kind[0]}`),crashItem=await recover(crashSource),inputFile=path.join(f.root,`crash-${kind}.json`);writeFileSync(inputFile,JSON.stringify({item:crashItem,roots:f.roots,preparedRoot,hostJobRoot:f.hostJobRoot,projectCwd:f.root,now:now.toISOString()}));const crashed=spawnSync(process.execPath,[cleanupLeftoverCrashFixture,f.runtimeRoot,inputFile],{encoding:"utf8"});assert.equal(crashed.status,73,crashed.stderr);const crashTrash=readdirSync(path.dirname(crashSource)).map((name)=>path.join(path.dirname(crashSource),name)).find((candidate)=>candidate.startsWith(`${crashSource}.cleanup-`))!;assert.equal(existsSync(crashSource),false);const claimedAfterCrash=await recover(crashTrash);assert.equal(claimedAfterCrash.kind,"cleanup_trash");await deleteCleanupLeftover(f.registry,claimedAfterCrash,{roots:f.roots,preparedRoot,hostJobRoot:f.hostJobRoot,projectCwd:f.root,now});assert.equal(existsSync(crashTrash),false);
+ const partialSource=createSource(kind,`p${kind[0]}`),partialItem=await recover(partialSource);await assert.rejects(()=>deleteCleanupLeftover(f.registry,partialItem,{roots:f.roots,preparedRoot,hostJobRoot:f.hostJobRoot,projectCwd:f.root,now,removeClaimedTrash:(trash)=>{rmSync(path.join(trash,"evidence"),{force:true});throw new Error("injected after real partial removal");}}),/real partial removal/);const partialTrash=readdirSync(path.dirname(partialSource)).map((name)=>path.join(path.dirname(partialSource),name)).find((candidate)=>candidate.startsWith(`${partialSource}.cleanup-`))!;assert.equal(existsSync(path.join(partialTrash,"evidence")),false);const claimedAfterPartial=await recover(partialTrash);assert.equal(claimedAfterPartial.kind,"cleanup_trash");await deleteCleanupLeftover(f.registry,claimedAfterPartial,{roots:f.roots,preparedRoot,hostJobRoot:f.hostJobRoot,projectCwd:f.root,now});assert.equal(existsSync(partialTrash),false);}
  assert.equal(Number((f.registry.database.prepare("SELECT COUNT(*) AS count FROM cleanup_leftover_claims").get() as {count:number}).count),0);
  }finally{f.close();}
 });
@@ -267,9 +267,62 @@ test("prepared partial state stays non-announceable when Beads is unavailable",(
 });
 
 test("unmarked cleanup-shaped trash is visible but never eligible",async()=>{
- const f=fixture();try{const trash=path.join(f.roots.stateRoot,`worker_20261023100002_unmarked.cleanup-${"c".repeat(24)}`);mkdirSync(trash,{recursive:true});const leftovers=await scanCleanupLeftovers(f.registry,{roots:f.roots,preparedRoot:path.join(f.root,"prepared"),projectCwd:f.root});const item=leftovers.find((candidate)=>candidate.path===trash)!;assert.equal(item.kind,"cleanup_trash");assert.equal(item.eligible,false);assert.match(item.reason,/lacks exact host-owned claim/);}finally{f.close();}
+ const f=fixture();try{const trash=path.join(f.roots.stateRoot,`worker_20261023100002_unmarked.cleanup-${"c".repeat(24)}`);mkdirSync(trash,{recursive:true});const leftovers=await scanCleanupLeftovers(f.registry,{roots:f.roots,preparedRoot:path.join(f.root,"prepared"),hostJobRoot:f.hostJobRoot,projectCwd:f.root});const item=leftovers.find((candidate)=>candidate.path===trash)!;assert.equal(item.kind,"cleanup_trash");assert.equal(item.eligible,false);assert.match(item.reason,/lacks exact host-owned claim/);}finally{f.close();}
 });
 
 test("cleanup control rows are deterministically bounded without deleting workers",()=>{
  const f=fixture();try{insertSettled(f.registry,f.roots,f.parent);const before=Number((f.registry.database.prepare("SELECT COUNT(*) AS count FROM workers").get() as {count:number}).count);f.registry.database.exec("BEGIN IMMEDIATE");try{const snapshot=f.registry.database.prepare("INSERT INTO cleanup_snapshots(token,parent_session_file,snapshot_json,snapshot_hash,created_at,consumed_at) VALUES(?,?,?,?,?,?)"),cursor=f.registry.database.prepare("INSERT INTO cleanup_scan_cursors(token,parent_session_file,state_json,created_at,consumed_at) VALUES(?,?,?,?,?)"),observation=f.registry.database.prepare("INSERT INTO cleanup_leftover_observations(leftover_id,record_json,observed_at) VALUES(?,?,?)");for(let index=0;index<300;index+=1){const suffix=index.toString(16).padStart(48,"0");snapshot.run(`cleanup_${suffix}`,f.parent,"{}","a".repeat(64),`2026-01-01T00:00:${String(index%60).padStart(2,"0")}.000Z`,`2026-01-02T00:00:${String(index%60).padStart(2,"0")}.000Z`);cursor.run(`cleanup_scan_${suffix}`,f.parent,"{}",`2026-01-01T00:00:${String(index%60).padStart(2,"0")}.000Z`,`2026-01-02T00:00:${String(index%60).padStart(2,"0")}.000Z`);}for(let index=0;index<50_010;index+=1)observation.run(`leftover_${index.toString(16).padStart(24,"0")}`,"{}",`2026-01-${String(1+(index%28)).padStart(2,"0")}T00:00:00.000Z`);f.registry.database.exec("COMMIT");}catch(error){f.registry.database.exec("ROLLBACK");throw error;}advanceCleanupScanCursor(f.registry,f.parent,undefined,undefined,"2026-02-01T00:00:00.000Z");assert.ok(Number((f.registry.database.prepare("SELECT COUNT(*) AS count FROM cleanup_snapshots").get() as {count:number}).count)<=256);assert.ok(Number((f.registry.database.prepare("SELECT COUNT(*) AS count FROM cleanup_scan_cursors").get() as {count:number}).count)<=256);assert.equal(Number((f.registry.database.prepare("SELECT COUNT(*) AS count FROM cleanup_leftover_observations").get() as {count:number}).count),50_000);assert.equal(Number((f.registry.database.prepare("SELECT COUNT(*) AS count FROM workers").get() as {count:number}).count),before);}finally{f.close();}
+});
+
+test("current and legacy cleanup scanners cannot enumerate, mutate, or delete each other's prepared and host-log trees", async () => {
+  const f = fixture();
+  const legacyRoot = path.join(f.root, "worker-runtime");
+  const legacyPreparedRoot = path.join(legacyRoot, "prepared");
+  const legacyHostRoot = workerHostJobRoot(legacyRoot);
+  const legacyRoots: WorkerRoots = { stateRoot: path.join(legacyRoot, "workers"), workspaceRoot: path.join(legacyRoot, "workers") };
+  const currentPreparedRoot = path.join(f.runtimeRoot, "prepared");
+  const old = new Date("2026-10-23T10:00:00.000Z");
+  const now = new Date("2026-10-25T10:00:02.000Z");
+  const makePrepared = (root: string, id: string, value: string): string => {
+    const directory = path.join(root, id); mkdirSync(directory, { recursive: true }); writeFileSync(path.join(directory, "sentinel"), value); utimesSync(directory, old, old); return directory;
+  };
+  const makeHostLog = (root: string, suffix: string): string => {
+    const jobId = `job_20261023100002_${suffix}`, workerId = `worker_20261023100002_${suffix}`, runId = `run_20261023100002_${suffix}`;
+    const directory = path.join(root, "jobs", jobId); mkdirSync(directory, { recursive: true });
+    const stdout = path.join(directory, "stdout.log"), stderr = path.join(directory, "stderr.log"); writeFileSync(stdout, "stdout"); writeFileSync(stderr, "stderr");
+    writeFileSync(path.join(directory, "meta.json"), JSON.stringify({ jobId, command: workerHostJobIdentity(workerId, runId).command, status: "exited", stdoutLog: stdout, stderrLog: stderr }));
+    utimesSync(directory, old, old); return directory;
+  };
+  const currentPrepared = makePrepared(currentPreparedRoot, `prepared_${"3".repeat(24)}`, "current cleanup target");
+  const currentLog = makeHostLog(f.hostJobRoot, "current0");
+  const legacyPrepared = makePrepared(legacyPreparedRoot, `prepared_${"4".repeat(24)}`, "legacy cleanup target");
+  const legacyLog = makeHostLog(legacyHostRoot, "legacy00");
+  const legacySentinel = path.join(legacyPrepared, "sentinel");
+  const legacyBefore = { bytes: readFileSync(legacySentinel), stat: statSync(legacySentinel) };
+  let legacyRegistry: WorkerRegistry | undefined;
+  try {
+    chmodSync(legacyRoot, 0o000);
+    const current = await scanCleanupLeftovers(f.registry, { roots: f.roots, preparedRoot: currentPreparedRoot, hostJobRoot: f.hostJobRoot, projectCwd: f.root, now });
+    assert.deepEqual(new Set(current.filter((item) => item.eligible).map((item) => item.path)), new Set([currentPrepared, currentLog]));
+    for (const item of current.filter((candidate) => candidate.eligible)) await deleteCleanupLeftover(f.registry, item, { roots: f.roots, preparedRoot: currentPreparedRoot, hostJobRoot: f.hostJobRoot, projectCwd: f.root, now });
+    assert.equal(existsSync(currentPrepared), false); assert.equal(existsSync(currentLog), false);
+    chmodSync(legacyRoot, 0o700);
+    assert.deepEqual(readFileSync(legacySentinel), legacyBefore.bytes);
+    const legacyAfterCurrent = statSync(legacySentinel); assert.equal(legacyAfterCurrent.ino, legacyBefore.stat.ino); assert.equal(legacyAfterCurrent.mtimeMs, legacyBefore.stat.mtimeMs);
+
+    const currentProtected = makePrepared(currentPreparedRoot, `prepared_${"5".repeat(24)}`, "current must survive legacy cleanup");
+    const currentSentinel = path.join(currentProtected, "sentinel");
+    const currentBefore = { bytes: readFileSync(currentSentinel), stat: statSync(currentSentinel) };
+    legacyRegistry = openWorkerRegistry(legacyRoot);
+    const archived = await scanCleanupLeftovers(legacyRegistry, { roots: legacyRoots, preparedRoot: legacyPreparedRoot, hostJobRoot: legacyHostRoot, projectCwd: f.root, now });
+    assert.deepEqual(new Set(archived.filter((item) => item.eligible).map((item) => item.path)), new Set([legacyPrepared, legacyLog]));
+    for (const item of archived.filter((candidate) => candidate.eligible)) await deleteCleanupLeftover(legacyRegistry, item, { roots: legacyRoots, preparedRoot: legacyPreparedRoot, hostJobRoot: legacyHostRoot, projectCwd: f.root, now });
+    assert.equal(existsSync(legacyPrepared), false); assert.equal(existsSync(legacyLog), false);
+    assert.deepEqual(readFileSync(currentSentinel), currentBefore.bytes);
+    const currentAfter = statSync(currentSentinel); assert.equal(currentAfter.ino, currentBefore.stat.ino); assert.equal(currentAfter.mtimeMs, currentBefore.stat.mtimeMs);
+  } finally {
+    try { chmodSync(legacyRoot, 0o700); } catch {}
+    legacyRegistry?.close();
+    f.close();
+  }
 });

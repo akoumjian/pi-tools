@@ -456,6 +456,29 @@ function schemaCatalog(database: SQLiteDatabaseSync): string {
   return JSON.stringify(rows.map((row) => ({ type: row.type, name: row.name, table: row.tbl_name, sql: row.sql })));
 }
 
+/** Read exact current-schema job authority without initializing or mutating a registry. */
+export function readExactWorkerRunJobIds(runtimeRoot = DEFAULT_WORKER_RUNTIME_ROOT): string[] {
+  const exactRoot = path.resolve(runtimeRoot);
+  if (!existsSync(exactRoot)) return [];
+  const rootMetadata = lstatSync(exactRoot);
+  if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) throw new Error(`Managed-worker current runtime root is not an ordinary directory: ${exactRoot}.`);
+  const databasePath = path.join(exactRoot, "registry.sqlite");
+  if (!existsSync(databasePath)) {
+    if (readdirSync(exactRoot).length !== 0) throw new Error(`Managed-worker current runtime root is partial or unexpected: ${exactRoot}. No migration or repair is attempted.`);
+    return [];
+  }
+  const databaseMetadata = lstatSync(databasePath);
+  if (!databaseMetadata.isFile() || databaseMetadata.isSymbolicLink()) throw new Error(`Managed-worker current registry is not an ordinary file: ${databasePath}.`);
+  const sqlite = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite") | undefined;
+  if (!sqlite) throw new Error("Managed workers require the Node node:sqlite builtin.");
+  const database = new sqlite.DatabaseSync(databasePath, { readOnly: true });
+  try {
+    database.exec("PRAGMA busy_timeout = 5000");
+    assertExactCurrentRegistry(database, sqlite);
+    return (database.prepare("SELECT job_id FROM runs WHERE job_id IS NOT NULL ORDER BY job_id").all() as Array<{ job_id: string }>).map((row) => row.job_id);
+  } finally { database.close(); }
+}
+
 export function workerRegistryDataVersion(registry: WorkerRegistry): number {
   const row = registry.database.prepare("PRAGMA data_version").get() as { data_version: number };
   return Number(row.data_version);

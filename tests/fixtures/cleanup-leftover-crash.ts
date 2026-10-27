@@ -5,11 +5,12 @@ import type { WorkerRoots } from "../../extensions/worker/identity.js";
 
 const [runtimeRoot, inputFile] = process.argv.slice(2);
 if (!runtimeRoot || !inputFile) throw new Error("usage: cleanup-leftover-crash <runtimeRoot> <inputFile>");
-const input = JSON.parse(readFileSync(inputFile, "utf8")) as { item: CleanupLeftover; roots: WorkerRoots; preparedRoot: string; projectCwd: string; now: string };
+const input = JSON.parse(readFileSync(inputFile, "utf8")) as { item: CleanupLeftover; roots: WorkerRoots; preparedRoot: string; hostJobRoot: string; projectCwd: string; now: string };
 const registry = openWorkerRegistry(runtimeRoot);
 await deleteCleanupLeftover(registry, input.item, {
   roots: input.roots,
   preparedRoot: input.preparedRoot,
+  hostJobRoot: input.hostJobRoot,
   projectCwd: input.projectCwd,
   now: new Date(input.now),
   afterLeftoverClaim: () => process.exit(73)
