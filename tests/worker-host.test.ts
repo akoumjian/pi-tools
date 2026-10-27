@@ -57,6 +57,7 @@ test("exact Sandbox references reject writable extension paths, duplicate extens
   assert.throws(() => assertWorkerSandboxReference({ ...planned, extensionPaths: ["/worker/extensions/runtime.ts"] }), /Invalid exact/);
   assert.throws(() => assertWorkerSandboxReference({ ...planned, extensionPaths: [planned.extensionPaths[0]!, planned.extensionPaths[0]!] }), /Invalid exact/);
   assert.throws(() => assertWorkerSandboxReference({ ...planned, searxngUrl: "https://secret@example.invalid" }), /Invalid exact/);
+  assert.throws(() => assertWorkerSandboxReference({ ...planned, codingAgentDir: "/tmp/pi-worker/agent" }), /runtime paths/);
   assert.throws(() => assertWorkerSandboxReference({ ...planned, sandboxName: planned.sandboxName.slice(0, -1) }), /nonce|exact/i);
   assert.throws(() => assertWorkerSandboxReference({ ...planned, inspectEvidenceSha256: "not-a-digest" }), /inspect evidence/);
 }));
@@ -69,6 +70,7 @@ if [ "$1" = version ]; then printf 'sbx version v0.49.1 c5b19951af121b4398000296
 elif [ "$1 $2 $3" = "template ls --json" ]; then printf '%s\n' '[{"id":"${release.sandbox.template.id}","repository":"${release.sandbox.template.repository}","tag":"${release.sandbox.template.tag}","flavor":"${release.sandbox.template.flavor}","created_at":"2026-10-25T00:00:00Z","size":123}]'
 elif [ "$1" = create ]; then printf 'ID: sandbox-id-1234\nName: %s\n' "$3"; printf '%s\n' "$3" > ${JSON.stringify(state)}
 elif [ "$1" = inspect ] && [ "$3" = --json ]; then printf '{"name":"%s","id":"sandbox-id-1234","status":"running","agent":"shell","workspace":"%s"}\n' "$2" ${JSON.stringify(workerRoot)}; printf '%s' '${recordedUpdateTrailer}'
+elif [ "$1" = exec ] && printf '%s\n' "$*" | grep -q PI_WORKER_RUNTIME_ROOT_V1; then printf 'PI_WORKER_RUNTIME_ROOT_V1\n'
 elif [ "$1" = exec ]; then printf 'cpu=8\nmemoryBytes=17179869184\nruntime=%s\nresource=%s\n' '${runtimeJson}' '${release.guest.resourceManifestSha256}'
 elif [ "$1" = stop ]; then :
 elif [ "$1" = rm ]; then rm -f ${JSON.stringify(state)}
@@ -80,7 +82,7 @@ fi
   const planned = planWorkerSandbox({ workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_bbbbbbbb", creationNonce: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", workerRoot, codeRoot, mounts: [], release });
   const bareVersion=path.join(root,"sbx-bare-version");await writeFile(bareVersion,"#!/bin/sh\nprintf 'v0.49.1\\n'\n");await chmod(bareVersion,0o755);await assert.rejects(createWorkerSandboxAsync(bareVersion,planned),/recorded v0\.49\.1 contract/);
   const created = await createWorkerSandboxAsync(fake, planned); assert.match(created.createEvidenceSha256 ?? "", /^[a-f0-9]{64}$/); assert.equal(created.observedCpu, 8); assert.equal(created.observedMemoryBytes, 17_179_869_184); await settleWorkerSandboxAsync(fake, created);
-  const commands = await readFile(log, "utf8"); assert.match(commands, new RegExp(`create --name ${planned.sandboxName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`)); assert.match(commands, new RegExp(`stop ${planned.sandboxName}`)); assert.match(commands, new RegExp(`rm --force ${planned.sandboxName}`));
+  const commands = await readFile(log, "utf8"); assert.match(commands, new RegExp(`create --name ${planned.sandboxName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`)); assert.match(commands, new RegExp(`exec --user root ${planned.sandboxName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} /usr/bin/env`)); assert.match(commands, /PI_WORKER_RUNTIME_ROOT_V1/); assert.doesNotMatch(commands, /exec --user root --privileged/); assert.match(commands, new RegExp(`stop ${planned.sandboxName}`)); assert.match(commands, new RegExp(`rm --force ${planned.sandboxName}`));
   const exactFake=await readFile(fake,"utf8");await writeFile(fake,exactFake.replace("Docker Sandboxes Update Available","unexpected banner"));await assert.rejects(createWorkerSandboxAsync(fake,planned),/Sandbox inspect JSON was malformed/);
 }));
 

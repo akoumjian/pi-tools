@@ -53,7 +53,7 @@ export function readApprovedWorkerSandboxRelease(): WorkerSandboxRelease {
   if (!image || typeof image.reference !== "string" || !OCI_DIGEST.test(image.reference) || !SHA256.test(String(image.digest)) || !image.reference.endsWith(`@sha256:${image.digest}`)) throw new Error("Worker Sandbox release image must be an exact matching OCI digest reference.");
   if (!sandbox || sandbox.version !== SBX_VERSION || !/^[a-f0-9]{40}$/.test(String(sandbox.buildCommit)) || !validTemplateIdentity(sandbox.template)) throw new Error("Worker Sandbox release requires exact sbx v0.49.1 and template-store identity.");
   if (!revisions || ![revisions.pi, revisions.profile, revisions.piTools, revisions.piDocparser].every((revision) => typeof revision === "string" && /^[a-f0-9]{40}$/.test(revision))) throw new Error("Worker Sandbox release revisions must be exact 40-character commits.");
-  if (!guest || !SHA256.test(String(guest.stagedLockSha256)) || !path.posix.isAbsolute(String(guest.piCli)) || !path.posix.isAbsolute(String(guest.rpcLauncher)) || !path.posix.isAbsolute(String(guest.codingAgentDir)) || !SHA256.test(String(guest.resourceManifestSha256)) || !SHA256.test(String(guest.runtimeProvenanceSha256)) || !Array.isArray(guest.extensionPaths) || guest.extensionPaths.length < 1 || !guest.extensionPaths.every((item) => typeof item === "string" && isImmutableGuestExtensionPath(item)) || new Set(guest.extensionPaths).size !== guest.extensionPaths.length || typeof guest.searxngUrl !== "string" || !isCredentialFreeHttpUrl(guest.searxngUrl)) throw new Error("Worker Sandbox release guest paths and resource manifest are invalid.");
+  if (!guest || !SHA256.test(String(guest.stagedLockSha256)) || !path.posix.isAbsolute(String(guest.piCli)) || !path.posix.isAbsolute(String(guest.rpcLauncher)) || guest.codingAgentDir !== "/run/pi-worker/agent" || !SHA256.test(String(guest.resourceManifestSha256)) || !SHA256.test(String(guest.runtimeProvenanceSha256)) || !Array.isArray(guest.extensionPaths) || guest.extensionPaths.length < 1 || !guest.extensionPaths.every((item) => typeof item === "string" && isImmutableGuestExtensionPath(item)) || new Set(guest.extensionPaths).size !== guest.extensionPaths.length || typeof guest.searxngUrl !== "string" || !isCredentialFreeHttpUrl(guest.searxngUrl)) throw new Error("Worker Sandbox release guest paths and resource manifest are invalid.");
   const resolved = resolvePiToolsConfigReference(kit.reference, config.path);
   if (resolved instanceof URL) throw new Error("Worker Sandbox releases require a locally verified ordinary kit directory; URL kits cannot prove exact content.");
   const kitReference = realpathSync(resolved);
@@ -94,6 +94,21 @@ export async function createWorkerSandboxAsync(sbxPath: string, reference: Worke
   const listIdentity = parseObservedSandboxList(listedJson.stdout, reference.sandboxName);
   if (inspectIdentity.id && listIdentity.id && inspectIdentity.id !== listIdentity.id) throw new Error("Sandbox inspect/list ID evidence disagrees.");
   const observedSandboxId = inspectIdentity.id ?? listIdentity.id;
+  const runtimeRootScript = String.raw`set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset BASH_ENV ENV
+root=$1
+test "$(id -u)" = 0
+test "$root" = /run/pi-worker
+rm -rf "$root"
+mkdir -p "$root"
+chown 1000:1000 "$root"
+chmod 0700 "$root"
+test "$(stat -c '%u:%g:%a' "$root")" = 1000:1000:700
+printf 'PI_WORKER_RUNTIME_ROOT_V1\n'`;
+  const runtimeRoot = await execFileAsync(sbxPath, ["exec", "--user", "root", reference.sandboxName, "/usr/bin/env", "-u", "BASH_ENV", "-u", "ENV", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "/bin/sh", "-ceu", runtimeRootScript, "pi-worker-runtime-root", path.posix.dirname(reference.codingAgentDir)], { encoding: "utf8", maxBuffer: 64 * 1024, timeout: 10_000 });
+  if (runtimeRoot.stdout !== "PI_WORKER_RUNTIME_ROOT_V1\n") throw new Error("Sandbox private runtime root setup returned unexpected output.");
   const reviewOverlay = reference.reviewOverlay ? await createReviewWorkspaceOverlayAsync(sbxPath, reference.sandboxName, reference.reviewOverlay) : undefined;
   const resourceScript = "cpu=$(getconf _NPROCESSORS_ONLN); memoryKb=$(awk '/MemTotal:/ {print $2}' /proc/meminfo); runtime=$(cat /opt/pi-worker/runtime-provenance.json); resource=$(cat /opt/pi-worker/resource-manifest.sha256); printf 'cpu=%s\\nmemoryBytes=%s\\nruntime=%s\\nresource=%s\\n' \"$cpu\" \"$((memoryKb*1024))\" \"$runtime\" \"$resource\"";
   const observed = await execFileAsync(sbxPath, ["exec", "--workdir", reference.workingDirectory, reference.sandboxName, "/bin/sh", "-c", resourceScript], { encoding: "utf8", maxBuffer: 64 * 1024, timeout: 10_000 });
@@ -104,7 +119,7 @@ export async function createWorkerSandboxAsync(sbxPath: string, reference: Worke
   const observedRuntimeSha256 = createHash("sha256").update(runtimeText).digest("hex");
   if (observedRuntimeSha256 !== reference.runtimeProvenanceSha256) throw new Error("Sandbox immutable runtime provenance digest does not match the approved release.");
   const canonicalInspect = `${canonicalJson(parseSbxJson(inspected.stdout, "inspect"))}\n`;
-  const evidence = `${version.stdout}\n${version.stderr}\n${templates.stdout}\n${templates.stderr}\n${stdout}\n${stderr}\n${canonicalInspect}${inspected.stderr}\n${listedJson.stdout}\n${listedJson.stderr}\n${observed.stdout}\n${observed.stderr}`;
+  const evidence = `${version.stdout}\n${version.stderr}\n${templates.stdout}\n${templates.stderr}\n${stdout}\n${stderr}\n${canonicalInspect}${inspected.stderr}\n${listedJson.stdout}\n${listedJson.stderr}\n${runtimeRoot.stdout}\n${runtimeRoot.stderr}\n${observed.stdout}\n${observed.stderr}`;
   return { ...reference, ...(reviewOverlay ? { reviewOverlay } : {}), createEvidenceSha256: createHash("sha256").update(evidence).digest("hex"), inspectEvidenceSha256: createHash("sha256").update(canonicalInspect).digest("hex"), sbxVersionEvidenceSha256: createHash("sha256").update(version.stdout).digest("hex"), observedCpu: Number(cpu), observedMemoryBytes: Number(memory), ...(observedSandboxId ? { observedSandboxId } : {}), observedRuntimeSha256 };
 }
 
@@ -125,7 +140,7 @@ export function assertWorkerSandboxReference(value: WorkerSandboxReference): voi
   if (value.observedRuntimeSha256 !== undefined && (!SHA256.test(value.observedRuntimeSha256) || value.observedRuntimeSha256 !== value.runtimeProvenanceSha256)) throw new Error("Invalid observed runtime digest.");
   if (value.inspectEvidenceSha256 !== undefined && !SHA256.test(value.inspectEvidenceSha256)) throw new Error("Invalid Sandbox inspect evidence digest.");
   if (value.sbxVersionEvidenceSha256 !== undefined && !SHA256.test(value.sbxVersionEvidenceSha256)) throw new Error("Invalid sbx version evidence digest.");
-  if (![value.workspaceRoot, value.workingDirectory, value.codeRoot].every((source) => path.isAbsolute(source)) || (!value.reviewOverlay && !pathWithin(value.workspaceRoot, value.workingDirectory)) || (value.reviewOverlay && value.workingDirectory !== value.reviewOverlay.mergedDirectory) || ![value.piCli, value.rpcLauncher, value.codingAgentDir].every((guestPath) => path.posix.isAbsolute(guestPath) && path.posix.normalize(guestPath) === guestPath)) throw new Error("Invalid exact Worker Sandbox runtime paths.");
+  if (![value.workspaceRoot, value.workingDirectory, value.codeRoot].every((source) => path.isAbsolute(source)) || (!value.reviewOverlay && !pathWithin(value.workspaceRoot, value.workingDirectory)) || (value.reviewOverlay && value.workingDirectory !== value.reviewOverlay.mergedDirectory) || ![value.piCli, value.rpcLauncher, value.codingAgentDir].every((guestPath) => path.posix.isAbsolute(guestPath) && path.posix.normalize(guestPath) === guestPath) || value.codingAgentDir !== "/run/pi-worker/agent") throw new Error("Invalid exact Worker Sandbox runtime paths.");
   if (value.reviewOverlay) { assertReviewWorkspaceOverlay(value.reviewOverlay, false); if (value.reviewOverlay.workerId !== value.workerId || value.reviewOverlay.runId !== value.runId || !value.mounts.some((mount) => mount.source === value.reviewOverlay!.lowerDirectory && mount.readOnly === true)) throw new Error("Invalid exact Worker Sandbox review OverlayFS binding."); }
   const protectedGuestPaths = [value.piCli, value.rpcLauncher, value.codingAgentDir, ...value.extensionPaths];
   if ([value.workspaceRoot, value.codeRoot].some((source) => protectedGuestPaths.some((protectedPath) => pathsOverlap(source, protectedPath)))) throw new Error("Worker Sandbox primary mount overlaps immutable guest runtime state.");
