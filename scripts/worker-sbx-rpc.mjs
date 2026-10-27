@@ -16,7 +16,10 @@ const environment = Object.entries(manifest.guestEnvironment ?? {}).map(([key, v
 const guest = ["env", ...environment, manifest.sandbox.rpcLauncher, ...rpcArgs];
 const overlay = manifest.sandbox.reviewOverlay;
 const command = overlay === undefined ? guest : reviewOverlayLaunchCommand(overlay, guest);
-const child = spawn(manifest.sbxPath, ["exec", "--workdir", manifest.sandbox.workingDirectory, manifest.sandbox.sandboxName, ...command], { stdio: ["inherit", "inherit", "inherit"] });
+const execArgs = overlay === undefined
+  ? ["exec", "--workdir", manifest.sandbox.workingDirectory, manifest.sandbox.sandboxName, ...command]
+  : ["exec", "--user", "root", "--workdir", manifest.sandbox.workingDirectory, manifest.sandbox.sandboxName, ...command];
+const child = spawn(manifest.sbxPath, execArgs, { stdio: ["inherit", "inherit", "inherit"] });
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(signal, () => child.kill(signal));
 child.once("error", (error) => { console.error(`Worker Sandbox exec failed: ${error.message}`); process.exitCode = 1; });
 child.once("exit", (code, signal) => { process.exitCode = signal ? 128 + ({ SIGHUP: 1, SIGINT: 2, SIGTERM: 15, SIGKILL: 9 }[signal] ?? 1) : code ?? 1; });
@@ -32,7 +35,7 @@ upper=$2
 work=$3
 merged=$4
 shift 4
-test "$(id -u)" = 1000
+test "$(id -u)" = 0
 options=$(awk -v merged="$merged" '$2 == merged && $3 == "overlay" { count += 1; options = $4 } END { if (count != 1) exit 70; print options }' /proc/mounts)
 case ",$options," in *",lowerdir=$lower,"*) ;; *) exit 71 ;; esac
 case ",$options," in *",upperdir=$upper,"*) ;; *) exit 72 ;; esac

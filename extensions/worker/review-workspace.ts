@@ -77,15 +77,13 @@ case "$scratch:$upper:$work:$merged" in /run/pi-worker/review-overlays/*:/run/pi
 rm -rf "$scratch" "$merged"
 mkdir -p "$upper" "$work" "$merged"
 mount -t overlay overlay -o "lowerdir=$lower,upperdir=$upper,workdir=$work" "$merged"
-chown 1000:1000 "$merged"
-chmod u+rwx "$merged"
 test "$(find "$upper" -mindepth 1 -print -quit)" = ""
 grep -F " $merged overlay " /proc/mounts >/dev/null
 printf 'PI_REVIEW_OVERLAY_V1\nlower=%s\nscratch=%s\nupper=%s\nwork=%s\nmerged=%s\n' "$lower" "$scratch" "$upper" "$work" "$merged"`;
   const mounted = await run(["exec", "--user", "root", "--privileged", sandboxName, "/usr/bin/env", "-u", "BASH_ENV", "-u", "ENV", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "/bin/sh", "-ceu", script, "pi-review-overlay", overlay.lowerDirectory, overlay.scratchDirectory, overlay.upperDirectory, overlay.workDirectory, overlay.mergedDirectory]);
   const expected = `PI_REVIEW_OVERLAY_V1\nlower=${overlay.lowerDirectory}\nscratch=${overlay.scratchDirectory}\nupper=${overlay.upperDirectory}\nwork=${overlay.workDirectory}\nmerged=${overlay.mergedDirectory}\n`;
   if (mounted.stdout !== expected) throw new Error("Review OverlayFS setup did not return exact identity evidence.");
-  const writable = await run(["exec", "--user", "1000", "--workdir", overlay.mergedDirectory, sandboxName, "/bin/sh", "-ceu", 'test "$(id -u)" = 1000; test -d .; test -w .; printf "PI_REVIEW_OVERLAY_WRITABLE_V1\\n"']);
+  const writable = await run(["exec", "--user", "root", "--workdir", overlay.mergedDirectory, sandboxName, "/bin/sh", "-ceu", 'test "$(id -u)" = 0; test -d .; test -w .; printf "PI_REVIEW_OVERLAY_WRITABLE_V1\\n"']);
   if (writable.stdout !== "PI_REVIEW_OVERLAY_WRITABLE_V1\n") throw new Error("Review OverlayFS merged view is not writable by the reviewer identity.");
   const setupEvidenceSha256 = createHash("sha256").update(JSON.stringify({ sandboxName, args: [overlay.lowerDirectory, overlay.scratchDirectory, overlay.upperDirectory, overlay.workDirectory, overlay.mergedDirectory], mounted, writable })).digest("hex");
   const result = { ...overlay, setupEvidenceSha256 };
