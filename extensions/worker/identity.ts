@@ -8,13 +8,15 @@ export const CURRENT_WORKER_STORAGE_LAYOUT = 2 as const;
 export const LEGACY_WORKER_STORAGE_LAYOUT = 1 as const;
 export type WorkerStorageLayout = typeof CURRENT_WORKER_STORAGE_LAYOUT | typeof LEGACY_WORKER_STORAGE_LAYOUT;
 
+export const WORKER_RUNTIME_DIRECTORY = "worker-runtime-v10";
+export function defaultWorkerRuntimeRoot(home = homedir()): string { return path.join(home, ".local", "share", "agent", WORKER_RUNTIME_DIRECTORY); }
 export type WorkerRoots = { stateRoot: string; workspaceRoot: string; supervisionRoot?: string };
 export type WorkerPaths = { workerDir: string; stateDir: string; supervisionDir: string; evidenceDir: string; sessionDir: string; workspaceRoot: string; reposDir: string; scratchDir: string; cacheDir: string; artifactsDir: string; tempDir: string };
 export function defaultWorkerRoots(home = homedir()): WorkerRoots {
-  const runtimeRoot = path.join(home, ".local", "share", "agent", "worker-runtime");
+  const runtimeRoot = defaultWorkerRuntimeRoot(home);
   const workersRoot = path.join(runtimeRoot, "workers");
-  // supervisionRoot is retained only to identify and explicitly erase schema-v9
-  // split-layout workers. New workers always place host state beneath workerDir/host.
+  // supervisionRoot remains for schema compatibility and explicit cleanup of layout-1
+  // records in injected registries. New workers place host state beneath workerDir/host.
   return { stateRoot: workersRoot, workspaceRoot: workersRoot, supervisionRoot: path.join(runtimeRoot, "supervision") };
 }
 export function createWorkerId(now = new Date(), random: string = randomUUID()): string { return createScopedId("worker", now, random); }

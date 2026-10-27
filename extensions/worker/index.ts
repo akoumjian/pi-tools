@@ -1194,9 +1194,10 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   }
 
   async function discardWorker(worker: WorkerRegistryRecord, existingNonce?: string, preflightPlan?:ReturnType<typeof planSettledWorkerHostLogs>): Promise<{ hostLogs: string[] }> {
-    assertCurrentPackageGeneration(); const plan=preflightPlan??cleanupHostLogs(getRegistry(),worker); if(plan.leftovers.length)throw new Error(`Worker host logs could not be deleted safely: ${plan.leftovers.map((item)=>`${item.path}: ${item.reason}`).join("; ")}`); const nonce=existingNonce??claimNonce(); if(existingNonce===undefined)claimWorkerDiscard(getRegistry(),worker.workerId,worker.version,nonce,now().toISOString());
-    const current=getWorker(getRegistry(),worker.workerId); if(!current)throw new Error(`Worker ${worker.workerId} disappeared after discard claim.`); const paths=cleanupWorkerPaths(current); const workerTrash=`${paths.workerDir}.discard-${nonce}`; const external=externalStoragePaths(paths); const externalTrash=external.map((item)=>`${item}.discard-${nonce}`); let committed=false;
+    assertCurrentPackageGeneration(); const plan=preflightPlan??cleanupHostLogs(getRegistry(),worker); if(plan.leftovers.length)throw new Error(`Worker host logs could not be deleted safely: ${plan.leftovers.map((item)=>`${item.path}: ${item.reason}`).join("; ")}`); const nonce=existingNonce??claimNonce(); let current:WorkerRegistryRecord|undefined; let paths:WorkerPaths|undefined; let workerTrash:string|undefined; let external:string[]=[]; let externalTrash:string[]=[]; let committed=false;
     try {
+      if(existingNonce===undefined)claimWorkerDiscard(getRegistry(),worker.workerId,worker.version,nonce,now().toISOString());
+      current=getWorker(getRegistry(),worker.workerId); if(!current)throw new Error(`Worker ${worker.workerId} disappeared after discard claim.`); paths=cleanupWorkerPaths(current); workerTrash=`${paths.workerDir}.discard-${nonce}`; external=externalStoragePaths(paths); externalTrash=external.map((item)=>`${item}.discard-${nonce}`);
       const staleTrash = [...discardTrashPaths(paths.workerDir), ...external.flatMap(discardTrashPaths)];
       for (const candidate of [paths.workerDir, ...external, ...staleTrash]) prepareOwnerRemovalTree(candidate);
       for (const trash of staleTrash) removeOwnerTree(trash);
@@ -1211,10 +1212,10 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       return { hostLogs: deleted };
     } catch (error) {
       if (!committed) {
-        try { restoreDiscardPath(workerTrash, paths.workerDir); for (let index=0; index<external.length; index+=1) restoreDiscardPath(externalTrash[index]!, external[index]!); } catch {}
-        abandonWorkerDiscard(getRegistry(), current.workerId, nonce, sanitizeError(error), now().toISOString());
+        try { if(paths&&workerTrash)restoreDiscardPath(workerTrash, paths.workerDir); for (let index=0; index<external.length; index+=1) restoreDiscardPath(externalTrash[index]!, external[index]!); } catch {}
+        abandonWorkerDiscard(getRegistry(), current?.workerId??worker.workerId, nonce, sanitizeError(error), now().toISOString());
       } else {
-        getRegistry().database.prepare("UPDATE workers SET recovery_error=?,version=version+1,updated_at=? WHERE worker_id=? AND operation_kind='discard' AND operation_nonce=?").run(`Irreversible discard requires recovery: ${sanitizeError(error)}`, now().toISOString(), current.workerId, nonce);
+        getRegistry().database.prepare("UPDATE workers SET recovery_error=?,version=version+1,updated_at=? WHERE worker_id=? AND operation_kind='discard' AND operation_nonce=?").run(`Irreversible discard requires recovery: ${sanitizeError(error)}`, now().toISOString(), current!.workerId, nonce);
       }
       throw error;
     }
