@@ -37,6 +37,7 @@ import asyncShellExtension, {
 } from "../extensions/async-shell/index.js";
 import { managedWorkerEvidenceReason, readManagedWorkerHostJobIds, scanAsyncShellRetention } from "../extensions/async-shell/retention.js";
 import { workerHostJobIdentity } from "../extensions/_shared/worker-host-job.js";
+import { openWorkerRegistry } from "../extensions/worker/registry.js";
 
 type SentMessage = {
   message: unknown;
@@ -218,6 +219,17 @@ async function writeJobMeta(contextDir: string, jobId: string, meta: Record<stri
   }, null, 2)}\n`);
 }
 
+
+function writeExactManagedWorkerJobAuthority(runtimeRoot: string, jobId: string): void {
+  const registry = openWorkerRegistry(runtimeRoot);
+  try {
+    const workerId = "worker_20261024180000_registry";
+    const runId = "run_20261024180000_registry";
+    registry.database.prepare("INSERT INTO workers(worker_id,parent_session_file,role,status,latest_run_id,task_ids_json,workspace_root,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)").run(workerId, path.join(runtimeRoot, "parent.jsonl"), "work", "idle", runId, "[]", path.join(runtimeRoot, "workers", workerId, "guest", "workspace"), "2026-10-24T18:00:00.000Z", "2026-10-24T18:00:00.000Z");
+    registry.database.prepare("INSERT INTO runs(run_id,worker_id,status,task_ids_json,completion_delivery,job_id,created_at) VALUES(?,?,?,?,?,?,?)").run(runId, workerId, "settled", "[]", "steer", jobId, "2026-10-24T18:00:00.000Z");
+  } finally { registry.close(); }
+}
+
 test("async-shell pruning is exact, previewed, terminal-only, and separate from worker cleanup", async () => {
   await withTempDir(async (dir) => {
     const eligible = "job_20261024180000_prune001";
@@ -289,10 +301,7 @@ test("ordinary retention protects new, legacy-command, and exact-registry manage
 
     const runtimeRoot = path.join(dir, "worker-runtime");
     await mkdir(runtimeRoot);
-    const database = new DatabaseSync(path.join(runtimeRoot, "registry.sqlite"));
-    database.exec("CREATE TABLE runs(job_id TEXT)");
-    database.prepare("INSERT INTO runs(job_id) VALUES(?)").run(registryId);
-    database.close();
+    writeExactManagedWorkerJobAuthority(runtimeRoot, registryId);
     const registryIds = readManagedWorkerHostJobIds(runtimeRoot);
     assert.deepEqual([...registryIds], [registryId]);
     assert.equal(managedWorkerEvidenceReason({ jobId: registryId, command: "edited" }, registryIds), "managed-worker evidence; ordinary prune refused; host-log cleanup is separate");
@@ -2601,4 +2610,58 @@ test("async-shell does not register a polling wait tool", () => {
   asyncShellExtension(api);
 
   assert.equal(api.registeredTools.some((tool) => tool.name === "shell_wait"), false);
+});
+
+test("default managed-worker retention reads only the fixed v10 registry and leaves the legacy registry untouched", async () => {
+  await withTempDir(async (home) => {
+    const agent = path.join(home, ".local", "share", "agent");
+    const legacyRoot = path.join(agent, "worker-runtime");
+    const currentRoot = path.join(agent, "worker-runtime-v10");
+    await mkdir(legacyRoot, { recursive: true });
+    await mkdir(currentRoot, { recursive: true });
+    const legacyDatabaseHandle = new DatabaseSync(path.join(legacyRoot, "registry.sqlite"));
+    legacyDatabaseHandle.exec("CREATE TABLE runs(job_id TEXT)");
+    legacyDatabaseHandle.prepare("INSERT INTO runs(job_id) VALUES(?)").run("job_legacy_registry_only");
+    legacyDatabaseHandle.close();
+    writeExactManagedWorkerJobAuthority(currentRoot, "job_current_registry_only");
+    const legacyDatabase = path.join(legacyRoot, "registry.sqlite");
+    const before = await readFile(legacyDatabase);
+    const beforeMtime = (await stat(legacyDatabase)).mtimeMs;
+    const priorHome = process.env.HOME;
+    try {
+      process.env.HOME = home;
+      fs.chmodSync(legacyRoot, 0o000);
+      assert.deepEqual([...readManagedWorkerHostJobIds()], ["job_current_registry_only"]);
+    } finally {
+      if (priorHome === undefined) delete process.env.HOME; else process.env.HOME = priorHome;
+      fs.chmodSync(legacyRoot, 0o700);
+    }
+    assert.deepEqual(await readFile(legacyDatabase), before);
+    assert.equal((await stat(legacyDatabase)).mtimeMs, beforeMtime);
+  });
+});
+
+test("trusted managed host jobs use an isolated runtime root while ordinary jobs remain project-scoped", async () => {
+  await withTempDir(async (dir) => {
+    const api = createFakeApi();
+    const context = createContext(dir);
+    const hostRoot = path.join(dir, "runtime", "worker-host-jobs");
+    const identity = workerHostJobIdentity("worker_20261024180000_isolated", "run_20261024180000_isolated");
+    const managed = startManagedAsyncJob(api, context, {
+      jobId: "job_20261024180000_isolated", command: identity.command, cwd: dir,
+      executable: process.execPath, args: ["-e", "process.exit(0)"], notifyOnExit: false,
+      jobRoot: hostRoot, managedBy: identity.managedBy
+    });
+    await waitWithRefTimeout(managed.completion);
+    assert.equal(managed.snapshot().logDir, path.join(hostRoot, "jobs", managed.jobId));
+    assert.equal(existsSync(path.join(dir, ".pi", "async-shell", "jobs", managed.jobId)), false);
+
+    const ordinary = startManagedAsyncJob(api, context, {
+      jobId: "job_20261024180000_ordinary", command: "ordinary direct job", cwd: dir,
+      executable: process.execPath, args: ["-e", "process.exit(0)"], notifyOnExit: false
+    });
+    await waitWithRefTimeout(ordinary.completion);
+    assert.equal(ordinary.snapshot().logDir, path.join(dir, ".pi", "async-shell", "jobs", ordinary.jobId));
+    assert.equal(existsSync(path.join(hostRoot, "jobs", ordinary.jobId)), false);
+  });
 });

@@ -29,7 +29,7 @@ export type WorkerHostConfig = {
 export type WorkerHostProcess = { version: 2; workerId: string; runId: string; pid: number; processToken: string; processStartToken: string; nonce: string; hostConfigFile: string; startedAt: string };
 export type WorkerHostSettlement = { version: 1; workerId: string; runId: string; sessionId: string; resultFile: string; helloFile?: string; stateFile?: string; settledAt: string };
 export type LaunchWorkerHostInput = {
-  record: WorkerLaunchRecord; prompt: string; resultFile: string; runDir: string; processFile: string; processNonce: string;
+  record: WorkerLaunchRecord; prompt: string; resultFile: string; runDir: string; processFile: string; processNonce: string; hostJobRoot: string;
   timeoutMs?: number; bdPath?: string; beadsRoute?: WorkerBeadsRoute; sandbox: WorkerSandboxReference; sbxPath: string;
 };
 
@@ -78,7 +78,7 @@ export function launchWorkerHost(api: ExtensionAPI, context: ExtensionContext, i
       PI_WORKER_TASK_IDS: JSON.stringify(record.taskIds), PI_WORKER_ROLE: config.role, PI_WORKER_BD_PATH: config.bdPath, PI_WORKER_BEADS_ROUTE: JSON.stringify(config.beadsRoute),
       PI_WORKER_AUTHORIZATION_FILE: config.authorizationFile, PI_WORKER_PROCESS_NONCE: config.processNonce, ...(config.cacheLineage ? { PI_WORKER_CACHE_LINEAGE: JSON.stringify(config.cacheLineage) } : {}) },
     notifyOnExit: false, settleProcessGroup: true, processToken: hostProcessToken,
-    managedBy: jobIdentity.managedBy
+    jobRoot: input.hostJobRoot, managedBy: jobIdentity.managedBy
   });
   return { handle, config, configFile };
 }

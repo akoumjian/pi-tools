@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, realpathSync } from "node:fs";
-import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
@@ -15,7 +15,7 @@ import { normalizeWorkerSettings } from "../extensions/worker/settings.js";
 import { normalizeWorkspaceResultPaths, validateWorkerResultInput, WorkerResultValidationError } from "../extensions/worker/contract.js";
 import { resultPathMetadata } from "../extensions/worker/runtime.js";
 import { ASYNC_SHELL_ACTIVITY_STATUS_KEY, renderAsyncShellActivityStatus } from "../extensions/async-shell/index.js";
-import { createWorkerAndRun, getWorker, getWorkerRun, openWorkerRegistry, setWorkerRecoveryError, settleWorkerRun, type WorkerRegistry, type WorkerRunRecord } from "../extensions/worker/registry.js";
+import { createWorkerAndRun, getWorker, getWorkerRun, openWorkerRegistry, setWorkerRecoveryError, settleWorkerRun, storePreparedSet, type WorkerRegistry, type WorkerRunRecord } from "../extensions/worker/registry.js";
 
 const settings = {
   modelPreferences: {
@@ -578,6 +578,65 @@ async function createSnapshotMerge(root: string, name: string): Promise<{ id: st
   await writeFile(path.join(candidateRepo, `${name}.txt`), `${name}\n`); snapshotGit(candidateRepo, "add", `${name}.txt`); snapshotGit(candidateRepo, "commit", "-m", `candidate ${name}`);
   return { id: name, candidateRepo, candidateRef: "HEAD", targetRepo, targetRef: "refs/heads/main", method: "squash", commitMessage: `Apply ${name}` };
 }
+
+test("production merge, startup recovery, and cleanup inventory stay inside the v10 prepared namespace", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-worker-v10-prepared-"));
+  const agent = path.join(root, ".local", "share", "agent");
+  const legacyRoot = path.join(agent, "worker-runtime");
+  const runtimeRoot = path.join(agent, "worker-runtime-v10");
+  const legacyPrepared = path.join(legacyRoot, "prepared", `prepared_${"1".repeat(24)}`);
+  const legacySentinel = path.join(legacyPrepared, "legacy-sentinel");
+  const currentPreparedRoot = path.join(runtimeRoot, "prepared");
+  const recoveringId = `prepared_${"2".repeat(24)}`;
+  const recoveringPath = path.join(currentPreparedRoot, recoveringId);
+  const workersRoot = path.join(runtimeRoot, "workers");
+  const sessionFile = path.join(root, "parent.jsonl");
+  const tools: ToolDefinition[] = [];
+  const handlers = new Map<string, Function[]>();
+  const api = { registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, sendMessage() {} } as unknown as ExtensionAPI;
+  await mkdir(legacyPrepared, { recursive: true });
+  await writeFile(legacySentinel, "legacy prepared authority\n");
+  await writeFile(path.join(legacyRoot, "registry.sqlite"), "legacy registry sentinel\n");
+  await mkdir(recoveringPath, { recursive: true });
+  await writeFile(path.join(recoveringPath, "current-sentinel"), "recover me\n");
+  await writeFile(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: "parent", timestamp: "2026-01-01T00:00:00.000Z", cwd: root })}\n`);
+  const registry = openWorkerRegistry(runtimeRoot);
+  storePreparedSet(registry, { preparedId: recoveringId, parentSessionFile: sessionFile, status: "ready", order: [], repositories: [], createdAt: "2026-01-01T00:00:00.000Z" });
+  registry.database.prepare("UPDATE prepared_sets SET status='discarding' WHERE prepared_id=?").run(recoveringId);
+  registry.close();
+  const beforeBytes = await readFile(legacySentinel);
+  const beforeIdentity = await stat(legacySentinel);
+  const context = { cwd: root, sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "parent" }, isIdle: () => true, hasPendingMessages: () => false, ui: { notify() {} } } as unknown as ExtensionContext;
+  try {
+    await chmod(legacyRoot, 0o000);
+    registerWorkerExtension(api, { runtimeRoot, roots: { stateRoot: workersRoot, workspaceRoot: workersRoot }, codeRoot: root, targetRoot: path.join(root, "targets") });
+    for (const handler of handlers.get("session_start") ?? []) await handler({}, context);
+    assert.equal(await stat(recoveringPath).then(() => true, () => false), false, "session startup recovers only the current-root discard");
+
+    const mergeTest = tools.find((tool) => tool.name === "worker_merge_test")!;
+    const control = tools.find((tool) => tool.name === "worker_control")!;
+    const repository = await createSnapshotMerge(root, "v10-cutover");
+    const first = await mergeTest.execute!("prepare-first", { repositories: [repository] }, new AbortController().signal, undefined, context) as any;
+    const firstId = first.details.preparedId as string;
+    assert.equal(await stat(path.join(currentPreparedRoot, firstId)).then(() => true, () => false), true);
+    const second = await mergeTest.execute!("prepare-second", { repositories: [repository] }, new AbortController().signal, undefined, context) as any;
+    const secondId = second.details.preparedId as string;
+    assert.equal(await stat(path.join(currentPreparedRoot, firstId)).then(() => true, () => false), false, "supersede deletes only the prior current-root set");
+    assert.equal(await stat(path.join(currentPreparedRoot, secondId)).then(() => true, () => false), true);
+
+    const inventory = await control.execute!("inventory", { action: "cleanup_inventory", allSessions: true }, new AbortController().signal, undefined, context) as any;
+    assert.ok(inventory.details.inventory.prepared.some((item: any) => item.preparedId === secondId));
+    assert.equal(inventory.details.inventory.scan.roots.some((item: any) => String(item.root) === legacyRoot || String(item.root).startsWith(`${legacyRoot}${path.sep}`)), false);
+  } finally {
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, context);
+    await chmod(legacyRoot, 0o700).catch(() => {});
+    assert.deepEqual(await readFile(legacySentinel), beforeBytes);
+    const afterIdentity = await stat(legacySentinel);
+    assert.equal(afterIdentity.ino, beforeIdentity.ino);
+    assert.equal(afterIdentity.mtimeMs, beforeIdentity.mtimeMs);
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("worker_merge_apply snapshots require nonempty call IDs and exact prepared identities", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "pi-worker-merge-snapshot-"));

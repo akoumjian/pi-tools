@@ -1,7 +1,8 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
-import { homedir } from "node:os";
 import path from "node:path";
+import { homedir } from "node:os";
+import { defaultWorkerRuntimeRoot, workerPreparedRoot } from "./identity.js";
 import { assertTrustedGitPolicy, canonicalRepository as trustedCanonicalRepository, createTrustedGitOperation, runTrustedGit, type TrustedGitOperation } from "./trusted-git.js";
 
 export type WorkerMergeMethod = "merge" | "squash";
@@ -61,8 +62,8 @@ export type MergeRuntimeOptions = {
   trustedSet?: PreparedMergeSet;
 };
 
-export function defaultPreparedMergeRoot(home = homedir()): string {
-  return path.join(home, ".local", "share", "agent", "worker-runtime", "prepared");
+export function defaultPreparedMergeRoot(home?: string): string {
+  return workerPreparedRoot(defaultWorkerRuntimeRoot(home));
 }
 
 export function prepareWorkerMerges(parentSessionFile: string, inputs: WorkerMergeTestRepositoryInput[], options: MergeRuntimeOptions = {}): PreparedMergeSet {

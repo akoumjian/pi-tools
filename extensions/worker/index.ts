@@ -19,7 +19,7 @@ import { writeAtomicJson } from "../_shared/atomic-json.js";
 import { workerRoleInstructions } from "../_shared/role-instructions.js";
 import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
 import { WorkerControlParamsV2, WorkerMergeApplyParams, WorkerMergeTestParams, WorkerRunParamsV2, type WorkerControlInputV2, type WorkerRunInputV2 } from "./contract.js";
-import { applyPreparedWorkerMerges, consumePreparedMergeSet, defaultPreparedMergeRoot, prepareWorkerMerges, readPreparedMergeSet, restoreConsumedPreparedMergeSet } from "./merge.js";
+import { applyPreparedWorkerMerges, consumePreparedMergeSet, prepareWorkerMerges, readPreparedMergeSet, restoreConsumedPreparedMergeSet } from "./merge.js";
 import {
   abandonWorkerDiscard, activeRunsForParent, claimPreparedSetApply, claimWorkerAcceptedSettlement, clearWorkerRecoveryError, claimWorkerDiscard, claimWorkerRecoveryDiscard, markWorkerCleanupRecovery, claimWorkerDelivery, claimWorkerRun, claimWorkerTerminalIntent,
   countWorkers, createWorkerRunBatch, finalizeClaimedWorkerRun, finalizeWorkerDiscard, finalizeWorkerRunLaunch, findWorkerRunById, finishPreparedSetApply,
@@ -31,7 +31,7 @@ import {
 import { readWorkerRuntimeResult } from "./runtime.js";
 
 import { preferredWorkerModel } from "./settings.js";
-import { createWorkerId, createWorkerRunId, defaultWorkerRoots, provisionWorkerPaths, workerPaths, type WorkerPaths, type WorkerRoots } from "./identity.js";
+import { CURRENT_WORKER_STORAGE_LAYOUT, createWorkerId, createWorkerRunId, defaultWorkerRoots, provisionWorkerPaths, storedWorkerPaths, workerHostJobRoot, workerPaths, workerPreparedRoot, type WorkerPaths, type WorkerRoots } from "./identity.js";
 import { createWorkerSession, forkWorkerSession, readWorkerSessionHeader, readWorkerSessionText, verifyWorkerSession } from "./session.js";
 import { launchWorkerHost, readWorkerHostProcess, readWorkerHostSettlement, type WorkerLaunchRecord } from "./runner.js";
 import { renderWorkerRuntimePrompt } from "./prompts.js";
@@ -114,6 +114,8 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   assertCurrentPackageGeneration();
   const roots = overrides.roots ?? defaultWorkerRoots();
   const runtimeRoot = overrides.runtimeRoot ?? path.dirname(roots.stateRoot);
+  const preparedRoot = overrides.preparedRoot ?? workerPreparedRoot(runtimeRoot);
+  const hostJobRoot = workerHostJobRoot(runtimeRoot);
   const now = overrides.now ?? (() => new Date());
   const random = overrides.random ?? randomUUID;
   const readProcessStartToken = overrides.readProcessStartToken ?? asyncJobProcessStartToken;
@@ -126,7 +128,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   const sandboxRelease = overrides.sandboxRelease ?? (testLaunch ? testWorkerSandboxRelease() : undefined);
   const createSandbox = overrides.createSandbox ?? (testLaunch ? ((_sbx, reference) => ({ ...reference, createEvidenceSha256: "f".repeat(64) })) : createWorkerSandboxAsync);
   const removeSandbox = overrides.removeSandbox ?? (testLaunch ? (() => {}) : settleWorkerSandboxAsync);
-  const cleanupHostLogs = overrides.cleanupHostLogs ?? planSettledWorkerHostLogs;
+  const cleanupHostLogs = overrides.cleanupHostLogs ?? ((registry: WorkerRegistry, worker: WorkerRegistryRecord) => planSettledWorkerHostLogs(registry, worker, hostJobRoot));
   const verifyHostIdentity = overrides.waitForHostIdentity ?? waitForWorkerHostIdentity;
   const probeHostIdentity = overrides.probeHostIdentity ?? probeAsyncJobProcessIdentity;
   const signalHostIdentity = overrides.signalHostIdentity ?? signalAsyncJobProcessIdentity;
@@ -177,7 +179,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       if (!value || typeof value !== "object" || !("completion" in value)) throw new Error("Injected worker launch did not return a managed handle.");
       return value as ManagedAsyncJobHandle;
     }
-    return launchWorkerHost(api, context, { record, prompt: runtime.prompt, resultFile: runtime.resultFile, runDir: runtime.runDir, processFile: runtime.processFile, processNonce: runtime.processNonce, sandbox: runtime.sandbox, sbxPath: sbx() }).handle;
+    return launchWorkerHost(api, context, { record, prompt: runtime.prompt, resultFile: runtime.resultFile, runDir: runtime.runDir, processFile: runtime.processFile, processNonce: runtime.processNonce, sandbox: runtime.sandbox, sbxPath: sbx(), hostJobRoot }).handle;
   };
 
   api.on("session_start", (_event, context) => {
@@ -210,7 +212,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       // A pre-commit interrupted claim becomes unclaimed above; only then may old,
       // unrelated discard trash be removed without racing claimed recovery state.
       recoverAbandonedDiscardTrash(exactParent);
-      recoverPreparedSetDiscards(getRegistry(), overrides.preparedRoot ?? defaultPreparedMergeRoot());
+      recoverPreparedSetDiscards(getRegistry(), preparedRoot);
       reconcileWorkerDeliveries(getRegistry(), exactParent, sessionDeliveryIds(context));
       deliveredRecovery.clear();
       observedDataVersion = workerRegistryDataVersion(getRegistry());
@@ -379,7 +381,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       assertCurrentPackageGeneration();
       throwIfAborted(signal); const parent = requireParentSession(context);
       const resolved = params.repositories.map((request) => ({ ...request, candidateRef: request.candidateRef ?? "HEAD" }));
-      const set = prepareWorkerMerges(parent, resolved, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, sourceForCandidate: managedCandidateWarnings(parent) });
+      const set = prepareWorkerMerges(parent, resolved, { preparedRoot, targetRoot: overrides.targetRoot, sourceForCandidate: managedCandidateWarnings(parent) });
       const taskIds = [...new Set(set.repositories.flatMap((repository) => repository.source ? (getWorker(getRegistry(), repository.source.workerId)?.taskIds ?? []) : []))];
       storePreparedSet(getRegistry(), { preparedId: set.preparedId, parentSessionFile: parent, status: set.status, order: set.order, taskIds, repositories: set.repositories.map((repository) => ({ ...repository, taskIds: repository.source ? (getWorker(getRegistry(), repository.source.workerId)?.taskIds ?? []) : [] })), createdAt: set.createdAt });
       cleanupSupersededPreparedSets(set);
@@ -403,7 +405,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       throwIfAborted(signal); const parent = requireParentSession(context); const trustedSet = trustedPreparedSet(getRegistry(), parent, params.preparedId); if (!["ready", "partial", "failed"].includes(trustedSet.status)) throw new Error(`Prepared set ${params.preparedId} is not ready.`);
       const operation = mergeOperation(trustedSet.repositories);
       const nonce = claimNonce(); if (!claimPreparedSetApply(getRegistry(), params.preparedId, parent, nonce, now().toISOString())) throw new Error(`Prepared set ${params.preparedId} is already being applied or changed state.`);
-      try { const result = applyPreparedWorkerMerges(parent, params.preparedId, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, sourceForCandidate: managedCandidateWarnings(parent), trustedSet }); finishPreparedSetApply(getRegistry(), params.preparedId, parent, nonce, result.status, now().toISOString()); rememberOperationSnapshot(toolCallId, operation ? { scope: "worker_merge_apply", preparedId: result.preparedId, operation } : undefined); return resultText(`${result.status} · ${result.repositories.filter((item) => item.status === "applied").length} applied`, result); }
+      try { const result = applyPreparedWorkerMerges(parent, params.preparedId, { preparedRoot, targetRoot: overrides.targetRoot, sourceForCandidate: managedCandidateWarnings(parent), trustedSet }); finishPreparedSetApply(getRegistry(), params.preparedId, parent, nonce, result.status, now().toISOString()); rememberOperationSnapshot(toolCallId, operation ? { scope: "worker_merge_apply", preparedId: result.preparedId, operation } : undefined); return resultText(`${result.status} · ${result.repositories.filter((item) => item.status === "applied").length} applied`, result); }
       catch (error) { releasePreparedSetApply(getRegistry(), params.preparedId, parent, nonce, now().toISOString()); throw error; }
     }
   }));
@@ -411,7 +413,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   registerCommands();
 
   function cleanupSupersededPreparedSets(current: ReturnType<typeof prepareWorkerMerges>): void {
-    const root=path.resolve(overrides.preparedRoot??defaultPreparedMergeRoot());const currentTargets=current.repositories.map((item)=>`${item.targetRepo}\0${item.targetRef}`).sort().join("\n");const database=getRegistry().database;const removed:string[]=[];database.exec("BEGIN IMMEDIATE");try{const rows=database.prepare("SELECT prepared_id,status FROM prepared_sets WHERE parent_session_file=? AND prepared_id<>? AND apply_nonce IS NULL AND status IN ('ready','resolution_required','partial','failed')").all(current.parentSessionFile,current.preparedId) as Array<{prepared_id:string;status:string}>;for(const row of rows){try{const prior=readPreparedSetRecord(getRegistry(),current.parentSessionFile,row.prepared_id);const targets=prior.repositories.map((item)=>`${item.targetRepo}\0${item.targetRef}`).sort().join("\n");if(targets!==currentTargets)continue;const changed=database.prepare("UPDATE prepared_sets SET status='superseded',updated_at=? WHERE prepared_id=? AND parent_session_file=? AND status=? AND apply_nonce IS NULL").run(now().toISOString(),row.prepared_id,current.parentSessionFile,row.status);if(Number(changed.changes)===1)removed.push(row.prepared_id);}catch{}}database.exec("COMMIT");}catch(error){database.exec("ROLLBACK");throw error;}for(const preparedId of removed)rmSync(path.join(root,preparedId),{recursive:true,force:true});
+    const root=path.resolve(preparedRoot);const currentTargets=current.repositories.map((item)=>`${item.targetRepo}\0${item.targetRef}`).sort().join("\n");const database=getRegistry().database;const removed:string[]=[];database.exec("BEGIN IMMEDIATE");try{const rows=database.prepare("SELECT prepared_id,status FROM prepared_sets WHERE parent_session_file=? AND prepared_id<>? AND apply_nonce IS NULL AND status IN ('ready','resolution_required','partial','failed')").all(current.parentSessionFile,current.preparedId) as Array<{prepared_id:string;status:string}>;for(const row of rows){try{const priorRepositories=database.prepare("SELECT record_json FROM prepared_repositories WHERE prepared_id=? ORDER BY repository_id").all(row.prepared_id) as Array<{record_json:string}>;const targets=priorRepositories.map(({record_json})=>JSON.parse(record_json) as {targetRepo:string;targetRef:string}).map((item)=>`${item.targetRepo}\0${item.targetRef}`).sort().join("\n");if(targets!==currentTargets)continue;const changed=database.prepare("UPDATE prepared_sets SET status='superseded',updated_at=? WHERE prepared_id=? AND parent_session_file=? AND status=? AND apply_nonce IS NULL").run(now().toISOString(),row.prepared_id,current.parentSessionFile,row.status);if(Number(changed.changes)===1)removed.push(row.prepared_id);}catch{}}database.exec("COMMIT");}catch(error){database.exec("ROLLBACK");throw error;}for(const preparedId of removed)rmSync(path.join(root,preparedId),{recursive:true,force:true});
   }
 
   function preflightBatch(params: WorkerRunInputV2, context: ExtensionContext, parentSessionFile: string): PlannedRun[] {
@@ -421,7 +423,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         validateRunRequestBounds(request);
         if (request.action === "resume") {
           if (resumed.has(request.workerId)) throw new Error(`Worker ${request.workerId} cannot be resumed twice in one batch.`); resumed.add(request.workerId);
-          const worker = ownedWorker(request.workerId, parentSessionFile); const paths = workerPaths(roots, worker.workerId); assertWorkerStoragePaths(paths); if (worker.status !== "idle" || worker.operationKind) throw new Error(`Worker ${worker.workerId} is not idle.`);
+          const worker = ownedWorker(request.workerId, parentSessionFile); const paths = currentWorkerPaths(worker); assertWorkerStoragePaths(paths); if (worker.status !== "idle" || worker.operationKind) throw new Error(`Worker ${worker.workerId} is not idle.`);
           if (worker.runtime && typeof worker.runtime.adoptedFromSession === "string") throw new Error(`Adopted worker ${worker.workerId} may be inspected, preserved, or discarded, but not resumed.`);
           if (worker.reviewedByWorkerId) throw new Error(`Worker ${worker.workerId} is leased to active reviewer ${worker.reviewedByWorkerId}.`);
           if (worker.role === "review" && request.additionalTaskIds?.length) throw new Error("Review workers cannot receive additional Beads tasks.");
@@ -437,7 +439,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
           const pendingWorkSessionId = !worker.sessionId && role === "work" ? randomUUID() : undefined;
           const reservedRunId = createWorkerRunId(now(), random());
           pendingReservation = { paths, runId: reservedRunId };
-          const inputs = snapshotAdditionalInputs(runEvidenceDirectory(paths, reservedRunId), retainedInputs);
+          const inputs = snapshotAdditionalInputs(runInputDirectory(paths, reservedRunId), retainedInputs);
           const mounts: WorkerSandboxMount[] = inputMounts(inputs);
           let modelSelection = worker.modelSelection!;
           if (role === "review") {
@@ -445,12 +447,12 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
             const subject = reviewSubject(binding.reviewedRunId, parentSessionFile, worker.workerId); reviewedRunId = binding.reviewedRunId; reviewSubjectWorkspace = subject.worker.workspaceRoot;
             if (!modelSelection) throw new Error(`Review worker ${worker.workerId} has no model provider provenance.`);
             modelSelection = resolveModel(role, modelSelection, context, reviewedRunProvider(subject.run));
-            contextFile = writeReviewContext(runEvidenceDirectory(paths, reservedRunId), workerPaths(roots, subject.worker.workerId), request.workerId, reservedRunId, subject.worker, subject.run, inputs);
+            contextFile = writeReviewContext(runInputDirectory(paths, reservedRunId), currentWorkerPaths(subject.worker), request.workerId, reservedRunId, subject.worker, subject.run, inputs);
             mounts.splice(0, mounts.length, { source: path.dirname(contextFile), readOnly: true });
           } else if (role === "integration") {
             if (!binding || !("preparedId" in binding)) throw new Error(`Integration worker ${worker.workerId} lost its prepared-set binding.`); preparedId = binding.preparedId;
             const trustedSet = trustedPreparedSet(getRegistry(), parentSessionFile, preparedId, paths.workspaceRoot); operationRepositories = snapshotOperationRepositories(trustedSet.repositories);
-            contextFile = writeIntegrationContext(paths, runEvidenceDirectory(paths, reservedRunId), trustedSet, inputs, true); mounts.splice(0, mounts.length, { source: path.dirname(contextFile), readOnly: true });
+            contextFile = writeIntegrationContext(paths, runInputDirectory(paths, reservedRunId), trustedSet, inputs, true); mounts.splice(0, mounts.length, { source: path.dirname(contextFile), readOnly: true });
           }
           const retained = retainedWorkerRuntime(worker);
           if (role === "work") {
@@ -486,23 +488,23 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         let contextFile: string | undefined; let reviewSubjectWorkspace: string | undefined; let mounts: WorkerSandboxMount[] = [];
         try {
           const pendingWorkSessionId = role === "work" ? randomUUID() : undefined;
-          const mountedInputs = snapshotAdditionalInputs(runEvidenceDirectory(paths, reservedRunId), inputs);
+          const mountedInputs = snapshotAdditionalInputs(runInputDirectory(paths, reservedRunId), inputs);
           if (role === "review") {
             reviewedRunId = request.reviewedRunId; reviewSubjectWorkspace = subject!.worker.workspaceRoot; binding = { reviewedWorkerId: subject!.worker.workerId, reviewedRunId };
             createWorkerSession({ workspaceRoot: paths.workspaceRoot, sessionDir: paths.sessionDir, sessionId: randomUUID() });
-            contextFile = writeReviewContext(runEvidenceDirectory(paths, reservedRunId), workerPaths(roots, subject!.worker.workerId), workerId, reservedRunId, subject!.worker, subject!.run, mountedInputs);
+            contextFile = writeReviewContext(runInputDirectory(paths, reservedRunId), currentWorkerPaths(subject!.worker), workerId, reservedRunId, subject!.worker, subject!.run, mountedInputs);
             mounts = [{ source: path.dirname(contextFile), readOnly: true }];
           } else if (role === "integration") {
-            preparedId = request.preparedId; const trustedSet = integrationSet!; const moved = consumePreparedMergeSet(parentSessionFile, preparedId, workerId, paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, trustedSet }); consumedPrepared = true; binding = { preparedId };
+            preparedId = request.preparedId; const trustedSet = integrationSet!; const moved = consumePreparedMergeSet(parentSessionFile, preparedId, workerId, paths.workspaceRoot, { preparedRoot, targetRoot: overrides.targetRoot, trustedSet }); consumedPrepared = true; binding = { preparedId };
             createWorkerSession({ workspaceRoot: paths.workspaceRoot, sessionDir: paths.sessionDir, sessionId: randomUUID() });
-            contextFile = writeIntegrationContext(paths, runEvidenceDirectory(paths, reservedRunId), moved, mountedInputs, false); mounts = [{ source: path.dirname(contextFile), readOnly: true }];
+            contextFile = writeIntegrationContext(paths, runInputDirectory(paths, reservedRunId), moved, mountedInputs, false); mounts = [{ source: path.dirname(contextFile), readOnly: true }];
           }
           const plan = finishPlan({ request, role, workerId, ...(reservedRunId ? { runId: reservedRunId } : {}), paths, promptInputs: mountedInputs, taskIds: role === "review" ? subject!.run.taskIds : taskIds, modelSelection, binding,
             workerRuntime: { version: 2, inputs, ...(repositoryBaselines ? { repositoryBaselines } : {}), ...(cacheLineage ? { cacheLineage } : {}) }, newWorker: true, contextFile, reviewSubjectWorkspace, reviewedRunId, preparedId, consumedPrepared, operationRepositories: snapshotOperationRepositories(integrationSet?.repositories), pendingWorkSessionId, mounts, parentSessionFile, context });
           plans.push(plan);
         } catch (error) {
-          if (consumedPrepared && preparedId) { try { restoreConsumedPreparedMergeSet(parentSessionFile, preparedId, paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, trustedSet: trustedPreparedSet(getRegistry(), parentSessionFile, preparedId) }); } catch {} }
-          removeOwnerTree(paths.stateDir); removeOwnerTree(paths.supervisionDir); removeOwnerTree(paths.evidenceDir);
+          if (consumedPrepared && preparedId) { try { restoreConsumedPreparedMergeSet(parentSessionFile, preparedId, paths.workspaceRoot, { preparedRoot, targetRoot: overrides.targetRoot, trustedSet: trustedPreparedSet(getRegistry(), parentSessionFile, preparedId) }); } catch {} }
+          removeOwnerTree(paths.workerDir);
           throw error;
         }
       }
@@ -512,14 +514,14 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
 
   function cleanupReservedRun(paths: WorkerPaths, runId: string): void {
     removeOwnerTree(path.join(paths.supervisionDir, "runs", runId));
-    removeOwnerTree(path.join(paths.evidenceDir, "runs", runId));
+    removeOwnerTree(runInputDirectory(paths, runId, false));
     removeOwnerTree(path.join(paths.stateDir, "cache-lineage", runId));
   }
 
   function finishPlanSafely(input: Omit<PlannedRun, "runId" | "jobId" | "runRuntime"> & { runId?: string; contextFile?: string; reviewSubjectWorkspace?: string; pendingWorkSessionId?: string; promptInputs: RetainedInput[]; mounts: WorkerSandboxMount[]; parentSessionFile: string; context: ExtensionContext }): PlannedRun {
     try { return finishPlan(input); } catch (error) {
-      if (input.consumedPrepared && input.preparedId) { try { restoreConsumedPreparedMergeSet(input.parentSessionFile, input.preparedId, input.paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, trustedSet: trustedPreparedSet(getRegistry(), input.parentSessionFile, input.preparedId) }); } catch {} }
-      if (input.newWorker) { removeOwnerTree(input.paths.stateDir); removeOwnerTree(input.paths.supervisionDir); removeOwnerTree(input.paths.evidenceDir); }
+      if (input.consumedPrepared && input.preparedId) { try { restoreConsumedPreparedMergeSet(input.parentSessionFile, input.preparedId, input.paths.workspaceRoot, { preparedRoot, targetRoot: overrides.targetRoot, trustedSet: trustedPreparedSet(getRegistry(), input.parentSessionFile, input.preparedId) }); } catch {} }
+      if (input.newWorker) removeOwnerTree(input.paths.workerDir);
       else if (input.runId) cleanupReservedRun(input.paths, input.runId);
       throw error;
     }
@@ -531,6 +533,8 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const runDir = path.join(input.paths.supervisionDir, "runs", runId); mkdirSync(runDir, { recursive: true, mode: 0o700 });
     const nonce = randomUUID();
     const codeRoot = overrides.codeRoot ?? (testLaunch ? input.context.cwd : path.join(homedir(), "Code"));
+    const hostRoot = path.resolve(input.paths.supervisionDir);
+    if (input.mounts.some((mount) => { const source=path.resolve(mount.source); return source===hostRoot||source.startsWith(`${hostRoot}${path.sep}`); })) throw new Error("Worker Sandbox mounts cannot expose host-only supervision state.");
     const sandbox = planWorkerSandbox({ workerId: input.workerId, runId, creationNonce: nonce, workerRoot: input.paths.stateDir, workingDirectory: input.paths.workspaceRoot, codeRoot, mounts: input.mounts.map((mount) => ({ source: mount.source, ...(mount.readOnly ? { readOnly: true } : {}) })), ...(input.reviewSubjectWorkspace ? { reviewSubjectWorkspace: input.reviewSubjectWorkspace } : {}), ...(sandboxRelease ? { release: sandboxRelease } : {}) });
     const runtimeFingerprint = createHash("sha256").update(JSON.stringify({ imageDigest: sandbox.imageDigest, kitSha256: sandbox.kitSha256, sbxVersion: sandbox.sbxVersion, sbxBuildCommit: sandbox.sbxBuildCommit, templateId: sandbox.templateId, templateRepository: sandbox.templateRepository, templateTag: sandbox.templateTag, templateFlavor: sandbox.templateFlavor, stagedLockSha256: sandbox.stagedLockSha256, resourceManifestSha256: sandbox.resourceManifestSha256, runtimeProvenanceSha256: sandbox.runtimeProvenanceSha256, revisions: sandbox.revisions })).digest("hex");
     const roleInstructions = roleInstructionsFor(input.role);
@@ -560,8 +564,8 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
 
   function rollbackPlans(plans: PlannedRun[], parentSessionFile: string): void {
     for (const plan of [...plans].reverse()) {
-      if (plan.consumedPrepared && plan.preparedId) { try { restoreConsumedPreparedMergeSet(parentSessionFile, plan.preparedId, plan.paths.workspaceRoot, { preparedRoot: overrides.preparedRoot, targetRoot: overrides.targetRoot, trustedSet: trustedPreparedSet(getRegistry(), parentSessionFile, plan.preparedId) }); } catch {} }
-      if (plan.newWorker) { removeOwnerTree(plan.paths.stateDir); removeOwnerTree(plan.paths.supervisionDir); removeOwnerTree(plan.paths.evidenceDir); }
+      if (plan.consumedPrepared && plan.preparedId) { try { restoreConsumedPreparedMergeSet(parentSessionFile, plan.preparedId, plan.paths.workspaceRoot, { preparedRoot, targetRoot: overrides.targetRoot, trustedSet: trustedPreparedSet(getRegistry(), parentSessionFile, plan.preparedId) }); } catch {} }
+      if (plan.newWorker) removeOwnerTree(plan.paths.workerDir);
       else { removeOwnerTree(plan.runRuntime.runDir); if (plan.runRuntime.contextFile) removeOwnerTree(path.dirname(plan.runRuntime.contextFile)); }
     }
   }
@@ -639,7 +643,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       assertCurrentPackageGeneration();
       operationAdmission = beginLifecycleAdmission(item.runtime, item.workerId, item.runId, "launch", nonce);
       persistClaimedRuntime(item.runtime, item.workerId, item.runId, "launch", nonce);
-      let worker = getWorker(getRegistry(), item.workerId)!; const run = getWorkerRun(getRegistry(), item.workerId, item.runId)!; const paths = workerPaths(roots, item.workerId);
+      let worker = getWorker(getRegistry(), item.workerId)!; const run = getWorkerRun(getRegistry(), item.workerId, item.runId)!; const paths = currentWorkerPaths(worker);
       if ((!worker.sessionId || !worker.sessionFile) && worker.role === "work" && item.runtime.pendingWorkSessionId) {
         const pendingSessionId = item.runtime.pendingWorkSessionId;
         const forked = await launchSideEffect(item.workerId, item.runId, nonce, () => forkWorkerSession({ parentSessionFile: worker.parentSessionFile, workspaceRoot: worker.workspaceRoot, sessionDir: paths.sessionDir, sessionId: pendingSessionId }));
@@ -848,7 +852,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       await containWorkerRun(runtime, workerId, runId, "result settlement");
       containmentProven = true;
       if (evidenceError) throw evidenceError;
-      try { assertWorkerStoragePaths(workerPaths(roots, workerId)); }
+      try { assertWorkerStoragePaths(currentWorkerPaths(worker)); }
       catch (storageError) {
         const storageErrors: Array<{ scope: "run" | "repositories" | "artifacts"; message: string }> = [{ scope: "run", message: `Worker storage policy violation after exact Sandbox absence was proven: ${sanitizeError(storageError)}` }];
         const sessionEndLine = bestEffortSessionEndLine(worker.sessionFile, storageErrors, run.sessionStartLine);
@@ -947,7 +951,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     try {
       operationAdmission = beginLifecycleAdmission(runtime, workerId, runId, "cancellation", nonce);
       await containWorkerRun(runtime, workerId, runId, "cancellation", { signalAttached: true });
-      await reconcileTerminatedPersistedAsyncShellJobsForOwner(path.join(workerPaths(roots, workerId).stateDir, "async-shell"), { kind: "worker-run", workerId, runId }, 250);
+      await reconcileTerminatedPersistedAsyncShellJobsForOwner(path.join(cleanupWorkerPaths(worker).stateDir, "async-shell"), { kind: "worker-run", workerId, runId }, 250);
       const survivors = await waitForWorkerShellRecords(workerId, runId);
       if (survivors.length) throw new WorkerContainmentError(`Worker-owned process records remain active after Sandbox removal: ${survivors.map((job) => job.jobId).join(", ")}.`);
       const beforeFinalizationWorker = getWorker(getRegistry(), workerId); const beforeFinalizationRun = getWorkerRun(getRegistry(), workerId, runId);
@@ -1024,7 +1028,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const errors: Array<{ scope: "run" | "repositories" | "artifacts"; message: string }> = [];
     let repositories: WorkerRepositoryResult[] = [];
     try {
-      assertWorkerStoragePaths(workerPaths(roots, worker.workerId));
+      assertWorkerStoragePaths(currentWorkerPaths(worker));
       const inventory = inventoryWorkerRepositories({ workspaceRoot: worker.workspaceRoot, workerId: worker.workerId, runId: run.runId, reported, before: runtime.repositoryBefore });
       repositories = inventory.repositories;
       errors.push(...inventory.errors.map((message) => ({ scope: "repositories" as const, message: sanitizeError(message) })));
@@ -1100,7 +1104,8 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   }
 
   async function waitForWorkerShellRecords(workerId: string, runId: string): Promise<ReturnType<typeof unsettledPersistedAsyncShellJobsForOwner>> {
-    const root = path.join(workerPaths(roots, workerId).stateDir, "async-shell"); const owner = { kind: "worker-run" as const, workerId, runId };
+    const worker = getWorker(getRegistry(), workerId); if (!worker) return [];
+    const root = path.join(cleanupWorkerPaths(worker).stateDir, "async-shell"); const owner = { kind: "worker-run" as const, workerId, runId };
     let jobs = unsettledPersistedAsyncShellJobsForOwner(root, owner).filter((job) => job.status === "running" || job.status === "unknown");
     for (let attempt = 0; attempt < 80 && jobs.length; attempt += 1) { await delay(25); jobs = unsettledPersistedAsyncShellJobsForOwner(root, owner).filter((job) => job.status === "running" || job.status === "unknown"); }
     return jobs;
@@ -1145,10 +1150,12 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   }
 
   function recoverAbandonedDiscardTrash(parentSessionFile: string): void {
-    const rows = getRegistry().database.prepare("SELECT worker_id,workspace_root FROM workers WHERE parent_session_file=? AND operation_kind IS NULL").all(parentSessionFile) as Array<{ worker_id: string; workspace_root: string }>;
+    const rows = getRegistry().database.prepare("SELECT worker_id FROM workers WHERE parent_session_file=? AND operation_kind IS NULL").all(parentSessionFile) as Array<{ worker_id: string }>;
     for (const row of rows) {
-      const paths = workerPaths(roots, row.worker_id); const workspaceIsSeparate = !path.resolve(row.workspace_root).startsWith(`${path.resolve(paths.stateDir)}${path.sep}`);
-      for (const original of [paths.stateDir, ...(workspaceIsSeparate ? [row.workspace_root] : [])]) {
+      const worker = getWorker(getRegistry(), row.worker_id); if (!worker) continue;
+      let paths: WorkerPaths; try { paths = cleanupWorkerPaths(worker); } catch { continue; }
+      const originals = [paths.workerDir, ...externalStoragePaths(paths)];
+      for (const original of originals) {
         const trash = discardTrashPaths(original); if (!trash.length) continue;
         try {
           for (const candidate of trash) prepareOwnerRemovalTree(candidate);
@@ -1162,21 +1169,24 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   }
 
   function recoverInterruptedDiscardFiles(parentSessionFile: string, generation: number): void {
-    const rows = getRegistry().database.prepare("SELECT worker_id,workspace_root,operation_nonce,recovery_error FROM workers WHERE parent_session_file=? AND operation_kind='discard' AND operation_nonce IS NOT NULL").all(parentSessionFile) as Array<{ worker_id: string; workspace_root: string; operation_nonce: string; recovery_error: string | null }>;
+    const rows = getRegistry().database.prepare("SELECT worker_id,operation_nonce,recovery_error FROM workers WHERE parent_session_file=? AND operation_kind='discard' AND operation_nonce IS NOT NULL").all(parentSessionFile) as Array<{ worker_id: string; operation_nonce: string; recovery_error: string | null }>;
     for (const row of rows) {
       if (row.operation_nonce.startsWith(`${generation}-`) && !row.recovery_error?.toLowerCase().includes("irreversible discard requires recovery:")) continue;
       const worker = getWorker(getRegistry(), row.worker_id); if (!worker) continue;
-      const paths = workerPaths(roots, row.worker_id);
-      const stateTrash = `${paths.stateDir}.discard-${row.operation_nonce}`;
-      const separateWorkspace = path.resolve(row.workspace_root).startsWith(`${path.resolve(paths.stateDir)}${path.sep}`) ? undefined : `${row.workspace_root}.discard-${row.operation_nonce}`;
-      const committed = existsSync(stateTrash) || Boolean(separateWorkspace && existsSync(separateWorkspace)) || (!existsSync(paths.stateDir) && (!separateWorkspace || !existsSync(row.workspace_root)));
+      let paths: WorkerPaths; try { paths = cleanupWorkerPaths(worker); } catch (error) {
+        getRegistry().database.prepare("UPDATE workers SET recovery_error=?,version=version+1,updated_at=? WHERE worker_id=? AND operation_kind='discard' AND operation_nonce=?").run(`Interrupted irreversible discard requires recovery: ${sanitizeError(error)}`, now().toISOString(), row.worker_id, row.operation_nonce);
+        continue;
+      }
+      const workerTrash = `${paths.workerDir}.discard-${row.operation_nonce}`;
+      const external = externalStoragePaths(paths); const externalTrash = external.map((item) => `${item}.discard-${row.operation_nonce}`);
+      const committed = existsSync(workerTrash) || externalTrash.some(existsSync) || (!existsSync(paths.workerDir) && external.every((item) => !existsSync(item)));
       if (!committed) { abandonWorkerDiscard(getRegistry(), row.worker_id, row.operation_nonce, "Interrupted discard claim was rolled back before the root claim.", now().toISOString()); continue; }
       try {
         const plan = cleanupHostLogs(getRegistry(), worker);
         if (plan.leftovers.length) throw new Error(`Worker host logs remain live or unsafe: ${plan.leftovers.map((item) => `${item.path}: ${item.reason}`).join("; ")}`);
-        for (const candidate of [stateTrash, paths.stateDir, paths.supervisionDir, paths.evidenceDir, separateWorkspace, separateWorkspace ? row.workspace_root : undefined].filter((item): item is string => Boolean(item))) prepareOwnerRemovalTree(candidate);
+        for (const candidate of [workerTrash, paths.workerDir, ...externalTrash, ...external]) prepareOwnerRemovalTree(candidate);
         const deleted = deletePlannedWorkerHostLogs(plan);
-        for (const candidate of [paths.supervisionDir, paths.evidenceDir, stateTrash, paths.stateDir, separateWorkspace, separateWorkspace ? row.workspace_root : undefined].filter((item): item is string => Boolean(item))) removeOwnerTree(candidate);
+        for (const candidate of [...externalTrash, ...external, workerTrash, paths.workerDir]) removeOwnerTree(candidate);
         finalizeWorkerDiscard(getRegistry(), row.worker_id, row.operation_nonce);
         void deleted;
       } catch (error) {
@@ -1186,36 +1196,38 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   }
 
   async function discardWorker(worker: WorkerRegistryRecord, existingNonce?: string, preflightPlan?:ReturnType<typeof planSettledWorkerHostLogs>): Promise<{ hostLogs: string[] }> {
-    assertCurrentPackageGeneration();const plan=preflightPlan??cleanupHostLogs(getRegistry(),worker);if(plan.leftovers.length)throw new Error(`Worker host logs could not be deleted safely: ${plan.leftovers.map((item)=>`${item.path}: ${item.reason}`).join("; ")}`);const nonce=existingNonce??claimNonce(); if(existingNonce===undefined)claimWorkerDiscard(getRegistry(),worker.workerId,worker.version,nonce,now().toISOString());
-    const current=getWorker(getRegistry(),worker.workerId);if(!current)throw new Error(`Worker ${worker.workerId} disappeared after discard claim.`);const paths=workerPaths(roots,current.workerId);const stateTrash=`${paths.stateDir}.discard-${nonce}`;const separateWorkspace=path.resolve(paths.workspaceRoot).startsWith(`${path.resolve(paths.stateDir)}${path.sep}`)?undefined:`${paths.workspaceRoot}.discard-${nonce}`;let committed=false;
+    assertCurrentPackageGeneration(); const plan=preflightPlan??cleanupHostLogs(getRegistry(),worker); if(plan.leftovers.length)throw new Error(`Worker host logs could not be deleted safely: ${plan.leftovers.map((item)=>`${item.path}: ${item.reason}`).join("; ")}`); const nonce=existingNonce??claimNonce(); let current:WorkerRegistryRecord|undefined; let paths:WorkerPaths|undefined; let workerTrash:string|undefined; let external:string[]=[]; let externalTrash:string[]=[]; let committed=false;
     try {
-      const staleStateTrash = discardTrashPaths(paths.stateDir); const staleWorkspaceTrash = separateWorkspace ? discardTrashPaths(paths.workspaceRoot) : [];
-      for (const candidate of [paths.stateDir, paths.supervisionDir, paths.evidenceDir, separateWorkspace ? paths.workspaceRoot : undefined, ...staleStateTrash, ...staleWorkspaceTrash].filter((item): item is string => Boolean(item))) prepareOwnerRemovalTree(candidate);
-      for (const trash of [...staleStateTrash, ...staleWorkspaceTrash]) removeOwnerTree(trash);
+      if(existingNonce===undefined)claimWorkerDiscard(getRegistry(),worker.workerId,worker.version,nonce,now().toISOString());
+      current=getWorker(getRegistry(),worker.workerId); if(!current)throw new Error(`Worker ${worker.workerId} disappeared after discard claim.`); paths=cleanupWorkerPaths(current); workerTrash=`${paths.workerDir}.discard-${nonce}`; external=externalStoragePaths(paths); externalTrash=external.map((item)=>`${item}.discard-${nonce}`);
+      const staleTrash = [...discardTrashPaths(paths.workerDir), ...external.flatMap(discardTrashPaths)];
+      for (const candidate of [paths.workerDir, ...external, ...staleTrash]) prepareOwnerRemovalTree(candidate);
+      for (const trash of staleTrash) removeOwnerTree(trash);
       overrides.beforeDiscardRootClaim?.(current);
-      if (existsSync(stateTrash) || (separateWorkspace && existsSync(separateWorkspace))) throw new Error("Discard trash destination already exists.");
-      if (existsSync(paths.stateDir)) renameSync(paths.stateDir, stateTrash);
-      if (separateWorkspace && existsSync(paths.workspaceRoot)) renameSync(paths.workspaceRoot, separateWorkspace);
+      if (existsSync(workerTrash) || externalTrash.some(existsSync)) throw new Error("Discard trash destination already exists.");
+      if (existsSync(paths.workerDir)) renameSync(paths.workerDir, workerTrash);
+      for (let index=0; index<external.length; index+=1) if (existsSync(external[index]!)) renameSync(external[index]!, externalTrash[index]!);
       committed = true;
       const deleted = deletePlannedWorkerHostLogs(plan);
-      removeOwnerTree(paths.supervisionDir); removeOwnerTree(paths.evidenceDir); removeOwnerTree(stateTrash); if (separateWorkspace) removeOwnerTree(separateWorkspace);
+      for (const candidate of [...externalTrash, workerTrash]) removeOwnerTree(candidate);
       finalizeWorkerDiscard(getRegistry(), current.workerId, nonce);
       return { hostLogs: deleted };
     } catch (error) {
       if (!committed) {
-        try { restoreDiscardPath(stateTrash, paths.stateDir); if (separateWorkspace) restoreDiscardPath(separateWorkspace, paths.workspaceRoot); } catch {}
-        abandonWorkerDiscard(getRegistry(), current.workerId, nonce, sanitizeError(error), now().toISOString());
+        try { if(paths&&workerTrash)restoreDiscardPath(workerTrash, paths.workerDir); for (let index=0; index<external.length; index+=1) restoreDiscardPath(externalTrash[index]!, external[index]!); } catch {}
+        abandonWorkerDiscard(getRegistry(), current?.workerId??worker.workerId, nonce, sanitizeError(error), now().toISOString());
       } else {
-        getRegistry().database.prepare("UPDATE workers SET recovery_error=?,version=version+1,updated_at=? WHERE worker_id=? AND operation_kind='discard' AND operation_nonce=?").run(`Irreversible discard requires recovery: ${sanitizeError(error)}`, now().toISOString(), current.workerId, nonce);
+        getRegistry().database.prepare("UPDATE workers SET recovery_error=?,version=version+1,updated_at=? WHERE worker_id=? AND operation_kind='discard' AND operation_nonce=?").run(`Irreversible discard requires recovery: ${sanitizeError(error)}`, now().toISOString(), current!.workerId, nonce);
       }
       throw error;
     }
   }
+  function externalStoragePaths(paths: WorkerPaths): string[] { const parent=path.resolve(paths.workerDir); return [paths.supervisionDir,paths.workspaceRoot].map((candidate)=>path.resolve(candidate)).filter((candidate,index,all)=>candidate!==parent&&!candidate.startsWith(`${parent}${path.sep}`)&&all.indexOf(candidate)===index); }
   function restoreDiscardPath(trash:string,destination:string):void{if(!existsSync(trash))return;if(existsSync(destination)){removeOwnerTree(trash);return;}renameSync(trash,destination);}
 
   async function refreshCleanupInventory(parent: string, cwd: string): Promise<CleanupInventory> {
     const existing = cleanupInFlight.get(parent); if (existing) return existing;
-    const work = buildCleanupInventory(getRegistry(), { parentSessionFile: parent, allSessions: false, cwd, ...(overrides.bdPath?{bdPath:overrides.bdPath}:{}) }).then((inventory) => { cleanupInventoryByParent.set(parent, inventory); return inventory; }).finally(() => cleanupInFlight.delete(parent));
+    const work = buildCleanupInventory(getRegistry(), { parentSessionFile: parent, allSessions: false, cwd, hostJobRoot, preparedRoot, ...(overrides.bdPath?{bdPath:overrides.bdPath}:{}) }).then((inventory) => { cleanupInventoryByParent.set(parent, inventory); return inventory; }).finally(() => cleanupInFlight.delete(parent));
     cleanupInFlight.set(parent, work); return work;
   }
 
@@ -1224,7 +1236,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       const inventory=await refreshCleanupInventory(parent,cwd),includeOther=!otherSessionSummaries.has(scope);let otherSessions:Array<Record<string,unknown>>=[],additionalOtherSessions=0,otherSessionsPartial=false,otherSessionsNextOffset:number|undefined;
       if(includeOther){
         otherSessionSummaries.add(scope);const grouped=new Map<string,{owner:unknown;workerIds:string[];preparedIds:string[];attention:number}>();let offset=0,pages=0,complete=false;const deadline=Date.now()+10_000;
-        while(pages<10&&Date.now()<deadline){const page=await buildCleanupInventory(getRegistry(),{parentSessionFile:parent,allSessions:true,cwd,bdPath:overrides.bdPath,limit:100,offset});for(const item of page.workers)if(item.ownerSession!==parent&&["due","recovery","unknown:task_missing"].includes(item.class)){const value=grouped.get(item.ownerSession)??{owner:item.owner,workerIds:[],preparedIds:[],attention:0};if(item.class==="due")value.workerIds.push(item.workerId);else value.attention+=1;grouped.set(item.ownerSession,value);}for(const item of page.prepared)if(item.ownerSession!==parent&&["due","explicit_decision","partial"].includes(item.class)){const value=grouped.get(item.ownerSession)??{owner:item.owner,workerIds:[],preparedIds:[],attention:0};if(item.class==="due")value.preparedIds.push(item.preparedId);else value.attention+=1;grouped.set(item.ownerSession,value);}pages+=1;const more=page.total.workers>offset+page.workers.length||page.total.prepared>offset+page.prepared.length;if(!more){complete=true;break;}offset+=100;}
+        while(pages<10&&Date.now()<deadline){const page=await buildCleanupInventory(getRegistry(),{parentSessionFile:parent,allSessions:true,cwd,hostJobRoot,preparedRoot,bdPath:overrides.bdPath,limit:100,offset});for(const item of page.workers)if(item.ownerSession!==parent&&["due","recovery","unknown:task_missing"].includes(item.class)){const value=grouped.get(item.ownerSession)??{owner:item.owner,workerIds:[],preparedIds:[],attention:0};if(item.class==="due")value.workerIds.push(item.workerId);else value.attention+=1;grouped.set(item.ownerSession,value);}for(const item of page.prepared)if(item.ownerSession!==parent&&["due","explicit_decision","partial"].includes(item.class)){const value=grouped.get(item.ownerSession)??{owner:item.owner,workerIds:[],preparedIds:[],attention:0};if(item.class==="due")value.preparedIds.push(item.preparedId);else value.attention+=1;grouped.set(item.ownerSession,value);}pages+=1;const more=page.total.workers>offset+page.workers.length||page.total.prepared>offset+page.prepared.length;if(!more){complete=true;break;}offset+=100;}
         otherSessionsPartial=!complete;if(otherSessionsPartial)otherSessionsNextOffset=offset;const values=[...grouped.values()];otherSessions=values.slice(0,20).map((item)=>({...item,workerIds:item.workerIds.slice(0,8),additionalWorkers:Math.max(0,item.workerIds.length-8),preparedIds:item.preparedIds.slice(0,8),additionalPrepared:Math.max(0,item.preparedIds.length-8)}));additionalOtherSessions=Math.max(0,values.length-otherSessions.length);
       }
       const announceable=[...inventory.workers.filter((item)=>["due","recovery","unknown:task_missing"].includes(item.class)).map((item)=>({kind:"worker",id:item.workerId,class:item.class})),...inventory.prepared.filter((item)=>["due","explicit_decision","partial"].includes(item.class)).map((item)=>({kind:"prepared",id:item.preparedId,class:item.class}))];const current=new Set(announceable.map((item)=>`${scope}${item.kind}:${item.id}:${item.class}`));for(const key of [...cleanupAnnounced])if(key.startsWith(scope)&&!current.has(key))cleanupAnnounced.delete(key);const fresh=announceable.filter((item)=>!cleanupAnnounced.has(`${scope}${item.kind}:${item.id}:${item.class}`));const otherHasItems=otherSessions.some((item:any)=>item.workerIds.length||item.preparedIds.length||item.attention)||otherSessionsPartial;if((!fresh.length&&!otherHasItems)||generation!==runtimeGeneration||!currentContext?.sessionManager.getSessionFile()||realpathOrResolve(currentContext.sessionManager.getSessionFile()!)!==parent)return;for(const item of announceable)cleanupAnnounced.add(`${scope}${item.kind}:${item.id}:${item.class}`);
@@ -1237,11 +1249,11 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
   function toolResultWithFailures(summary:string,details:Record<string,unknown>,failed:boolean):AgentToolResult<any>{const result=resultText(summary,details);if(failed)(result as any).isError=true;return result;}
 
   async function control(params: WorkerControlInputV2, context: ExtensionContext): Promise<AgentToolResult<any>> {
-    assertCurrentPackageGeneration();const parent=requireParentSession(context);const db=getRegistry();const preparedRoot=overrides.preparedRoot??defaultPreparedMergeRoot();
-    if(params.action==="cleanup_inventory"){if(params.cursor&&!params.allSessions)throw new Error("Cleanup scan cursors require allSessions=true.");const scanState=params.cursor?loadCleanupScanCursor(db,parent,params.cursor):undefined;let inventory:CleanupInventory;try{inventory=await buildCleanupInventory(db,{parentSessionFile:parent,allSessions:params.allSessions??false,cwd:context.cwd,bdPath:overrides.bdPath,roots,preparedRoot,limit:params.limit,offset:params.offset,scanState});}catch(error){if(params.cursor)invalidateCleanupScanCursor(db,parent,params.cursor,now().toISOString());throw error;}if(!params.allSessions)cleanupInventoryByParent.set(parent,inventory);const nextCursor=params.allSessions?advanceCleanupScanCursor(db,parent,params.cursor,inventory.scan.continuation,now().toISOString()):undefined;const{continuation:_continuation,...publicScan}=inventory.scan;const maximum=Math.max(inventory.total.workers,inventory.total.prepared),offset=params.offset??0,limit=params.limit??20;return resultText(`${inventory.total.workers} workers · ${inventory.total.prepared} prepared sets · ${inventory.total.leftovers}${inventory.scan.partial?"+":""} leftovers`,{inventory:{workers:inventory.workers.map(publicCleanupWorker),prepared:inventory.prepared,leftovers:inventory.leftovers,total:inventory.total,scan:publicScan,generatedAt:inventory.generatedAt,...(offset+limit<maximum?{nextOffset:offset+limit}:{}),...(nextCursor?{nextCursor}:{})}});}
-    if(params.action==="cleanup_preview") { const preview=await createCleanupSnapshot(db,{parentSessionFile:parent,workerIds:params.workerIds,preparedIds:params.preparedIds,leftoverIds:params.leftoverIds,cwd:context.cwd,bdPath:overrides.bdPath,roots,preparedRoot,ownerAuthority:(owner)=>cleanupOwnerAuthority(owner,parent),now:now()});return resultText(`cleanup preview · ${preview.snapshot.workers.length} workers · ${preview.snapshot.prepared.length} prepared · ${preview.snapshot.leftovers.length} leftovers`,publicCleanupPreview(preview)); }
+    assertCurrentPackageGeneration();const parent=requireParentSession(context);const db=getRegistry();
+    if(params.action==="cleanup_inventory"){if(params.cursor&&!params.allSessions)throw new Error("Cleanup scan cursors require allSessions=true.");const scanState=params.cursor?loadCleanupScanCursor(db,parent,params.cursor):undefined;let inventory:CleanupInventory;try{inventory=await buildCleanupInventory(db,{parentSessionFile:parent,allSessions:params.allSessions??false,cwd:context.cwd,bdPath:overrides.bdPath,roots,preparedRoot,hostJobRoot,limit:params.limit,offset:params.offset,scanState});}catch(error){if(params.cursor)invalidateCleanupScanCursor(db,parent,params.cursor,now().toISOString());throw error;}if(!params.allSessions)cleanupInventoryByParent.set(parent,inventory);const nextCursor=params.allSessions?advanceCleanupScanCursor(db,parent,params.cursor,inventory.scan.continuation,now().toISOString()):undefined;const{continuation:_continuation,...publicScan}=inventory.scan;const maximum=Math.max(inventory.total.workers,inventory.total.prepared),offset=params.offset??0,limit=params.limit??20;return resultText(`${inventory.total.workers} workers · ${inventory.total.prepared} prepared sets · ${inventory.total.leftovers}${inventory.scan.partial?"+":""} leftovers`,{inventory:{workers:inventory.workers.map(publicCleanupWorker),prepared:inventory.prepared,leftovers:inventory.leftovers,total:inventory.total,scan:publicScan,generatedAt:inventory.generatedAt,...(offset+limit<maximum?{nextOffset:offset+limit}:{}),...(nextCursor?{nextCursor}:{})}});}
+    if(params.action==="cleanup_preview") { const preview=await createCleanupSnapshot(db,{parentSessionFile:parent,workerIds:params.workerIds,preparedIds:params.preparedIds,leftoverIds:params.leftoverIds,cwd:context.cwd,bdPath:overrides.bdPath,roots,preparedRoot,hostJobRoot,ownerAuthority:(owner)=>cleanupOwnerAuthority(owner,parent),now:now()});return resultText(`cleanup preview · ${preview.snapshot.workers.length} workers · ${preview.snapshot.prepared.length} prepared · ${preview.snapshot.leftovers.length} leftovers`,publicCleanupPreview(preview)); }
     if(params.action==="cleanup_apply") {
-      const loaded=loadCleanupSnapshot(db,parent,params.token);let preview:PersistedCleanupPreview;try{preview=await revalidateCleanupSnapshot(db,loaded,{cwd:context.cwd,bdPath:overrides.bdPath,roots,preparedRoot,ownerAuthority:(owner)=>cleanupOwnerAuthority(owner,parent),now:now()});}catch(error){invalidateCleanupSnapshot(db,parent,params.token,now().toISOString());throw error;}const snapshots=preview.snapshot.workers;const ids=snapshots.map((item)=>item.item.workerId);
+      const loaded=loadCleanupSnapshot(db,parent,params.token);let preview:PersistedCleanupPreview;try{preview=await revalidateCleanupSnapshot(db,loaded,{cwd:context.cwd,bdPath:overrides.bdPath,roots,preparedRoot,hostJobRoot,ownerAuthority:(owner)=>cleanupOwnerAuthority(owner,parent),now:now()});}catch(error){invalidateCleanupSnapshot(db,parent,params.token,now().toISOString());throw error;}const snapshots=preview.snapshot.workers;const ids=snapshots.map((item)=>item.item.workerId);
       for(const snap of snapshots){if(snap.item.additionalPendingResults||snap.item.additionalUnpreservedArtifacts||snap.item.additionalPendingPreservations)throw new Error(`Worker ${snap.item.workerId} cleanup evidence exceeds the exact preview bound.`);if(snap.item.taskFacts.some((fact)=>fact.status==="missing"||fact.status==="unavailable"))throw new Error(`Worker ${snap.item.workerId} has unknown Beads facts and cannot be cleanup-applied.`);}const open=ids.filter((id)=>snapshots.find((item)=>item.item.workerId===id)!.item.taskFacts.some((fact)=>fact.status!=="closed"));const artifacts=ids.filter((id)=>snapshots.find((item)=>item.item.workerId===id)!.item.unpreservedArtifacts.length>0);const pending=ids.filter((id)=>snapshots.find((item)=>item.item.workerId===id)!.item.pendingResults.some((delivery)=>delivery.state==="pending"));const claimed=ids.filter((id)=>snapshots.find((item)=>item.item.workerId===id)!.item.pendingResults.some((delivery)=>delivery.state==="claimed"));
       const openAck=exactAcknowledgements(open,params.openTaskAbandonmentAcknowledged,"Open-task abandonment");const artifactAck=exactAcknowledgements(artifacts,params.artifactLossAcknowledged,"Artifact loss");const pendingAck=exactAcknowledgements(pending,params.pendingDeliveryTakeoverAcknowledged,"Pending-delivery takeover");const claimedAck=exactAcknowledgements(claimed,params.claimedDeliveryTakeoverAcknowledged,"Claimed-delivery takeover");const recovery=ids.filter((id)=>Boolean(snapshots.find((item)=>item.item.workerId===id)!.item.recoveryError));const recoveryAck=exactAcknowledgements(recovery,params.recoveryAcknowledged,"Recovery retry");void openAck;void artifactAck;
       for(const snap of snapshots){if(snap.status!=="idle"||snap.operationKind||snap.runClaims.length)throw new Error(`Worker ${snap.item.workerId} is active or claimed.`);if(snap.item.recoveryError&&snap.item.ownerSession!==parent){const recoveryFact=snap.runtime.cleanupRecovery as Record<string,unknown>|undefined;if(recoveryFact?.phase!=="precommit"||recoveryFact.error!==snap.item.recoveryError)throw new Error(`Foreign recovery for ${snap.item.workerId} is irreversible or lacks exact pre-commit evidence.`);}if(snap.item.ownerSession!==parent&&!['dead','retired','missing'].includes(snap.authority.state))throw new Error(`Owner of ${snap.item.workerId} is live or ambiguous.`);if(snap.item.ownerSession===parent&&snap.item.pendingResults.length)throw new Error(`Current-session non-delivered result for ${snap.item.workerId} must settle through normal delivery recovery.`);}
@@ -1252,7 +1264,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       for(const reviewer of reviewerSnapshots){if(processed.has(reviewer.item.workerId))continue;const subject=snapshots.find((item)=>item.item.reviewedByWorkerId===reviewer.item.workerId);await executeGroup(reviewer,subject);}
       for(const item of singles){if(processed.has(item.item.workerId))continue;await executeGroup(item);}
       for(const item of preview.snapshot.prepared){try{if(item.status==="discarding")finishPreparedSetDiscard(db,preparedRoot,item.preparedId);else if(item.ownerSession===parent)claimPreparedSetDiscard(db,parent,item.preparedId,now().toISOString());else{if(!['dead','retired','missing'].includes(cleanupOwnerAuthority(item.ownerSession,parent).state))throw new Error("prepared owner remains live or ambiguous");adoptPreparedSetDiscard(db,{preparedId:item.preparedId,expectedOwner:item.ownerSession,newParentSessionFile:parent,now:now().toISOString(),expectedAuthority:item.authority,ownerAuthority:(owner)=>cleanupOwnerAuthority(owner,parent)});}if(item.status!=="discarding")finishPreparedSetDiscard(db,preparedRoot,item.preparedId);results.push({kind:"prepared",id:item.preparedId,status:"discarded",...(item.status==="partial"||item.class==="partial"?{warning:"Discarded a partially applied prepared set."}:{})});}catch(error){results.push({kind:"prepared",id:item.preparedId,status:"failed",reason:sanitizeError(error)});}}
-      const leftoverResults=await deleteCleanupLeftovers(db,preview.snapshot.leftovers,{roots,preparedRoot,projectCwd:context.cwd,prevalidated:true});for(const item of leftoverResults)results.push({kind:"leftover",...item});const failures=results.filter((item)=>item.status==="failed").length;return toolResultWithFailures(`${results.length-failures}/${results.length} cleanup items discarded`,{cleanup:{token:params.token,results}},failures>0);
+      const leftoverResults=await deleteCleanupLeftovers(db,preview.snapshot.leftovers,{roots,preparedRoot,hostJobRoot,projectCwd:context.cwd,prevalidated:true});for(const item of leftoverResults)results.push({kind:"leftover",...item});const failures=results.filter((item)=>item.status==="failed").length;return toolResultWithFailures(`${results.length-failures}/${results.length} cleanup items discarded`,{cleanup:{token:params.token,results}},failures>0);
     }
     if(params.action==="list") {const page=listWorkers(db,{parentSessionFile:parent,status:params.status,role:params.role,limit:params.limit,offset:params.offset});const counts=countWorkers(db,parent);const cached=new Map((cleanupInventoryByParent.get(parent)?.workers??[]).map((item)=>[item.workerId,item]));const workers=page.workers.map((worker)=>{const latest=worker.latestRunId?getWorkerRun(db,worker.workerId,worker.latestRunId):undefined;const notification=latest?publicDeliveryNotification(getWorkerDeliveryForRun(db,worker.workerId,latest.runId)):undefined;const cleanup=cached.get(worker.workerId);return{workerId:worker.workerId,role:worker.role,status:worker.status,...(worker.activeRunId?{activeRunId:worker.activeRunId}:{}),...(latest?.outcome?{latestResult:{runId:latest.runId,outcome:latest.outcome,outcomeSource:latest.outcomeSource}}:{}),...(notification?{notification}:{}),taskIds:worker.taskIds,...(worker.modelSelection?{modelSelection:worker.modelSelection}:{}),...(worker.recoveryError?{recoveryRequired:true}:{}),...(cleanup?{cleanup:{class:cleanup.class,reason:cleanup.reason,unpreservedArtifacts:cleanup.unpreservedArtifacts.slice(0,4),additionalUnpreservedArtifacts:Math.max(0,cleanup.unpreservedArtifacts.length-4),pendingPreservations:cleanup.preservations.filter((item)=>item.status==="pending").slice(0,64),additionalPendingPreservations:Math.max(0,cleanup.preservations.filter((item)=>item.status==="pending").length-64)}}:{}),lastActivityAt:worker.updatedAt};});void refreshCleanupInventory(parent,context.cwd).catch(()=>{});return resultText(`${page.total} workers · ${counts.running} running, ${counts.queued} queued, ${counts.idle} idle`,{workers,total:page.total,counts,...(page.nextOffset===undefined?{}:{nextOffset:page.nextOffset})});}
     if(params.action==="preserve"){ownedWorker(params.workerId,parent);const preserved=await preserveWorkerArtifacts(db,roots,runtimeRoot,{workerId:params.workerId,destination:params.destination,projectCwd:context.cwd,...(params.paths?{paths:params.paths}:{}),now:now()});return resultText(`preserved · ${preserved.items.length} items · ${params.workerId.slice(-8)}`,{preservation:preserved});}
@@ -1298,6 +1310,10 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const observedClaims = new Set<string>();
     for (const activeRun of activeRuns) {
       let worker = activeRun.worker; let run = activeRun.run; const runtime = run.runtime as RunRuntime;
+      if (worker.storageLayout !== CURRENT_WORKER_STORAGE_LAYOUT) {
+        deliverRecovery(worker, run, worker.recoveryError ?? `Worker ${worker.workerId} uses legacy storage layout ${worker.storageLayout}; explicit guarded cleanup is required.`);
+        continue;
+      }
       if (!runtime || runtime.version !== 4) {
         const schema = runtime && typeof runtime === "object" ? (runtime as { version?: unknown }).version ?? "unknown" : "missing";
         const message = `Unsupported retained worker runtime schema ${schema}; exact manual containment/migration is required and no downgrade will be attempted.`;
@@ -1377,7 +1393,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         await openWorkerSessionViewer(context, target, () => workerViewTarget(workerId, target.runId, parent));
       } catch (error) { context.ui.notify(sanitizeViewText(error instanceof Error ? error.message : String(error)), "error"); }
     } });
-    api.registerCommand("worker:logs", { description: "Open logs for an active/latest or exact retained worker run", handler: async (args, context) => { const [workerId, possibleRun, ...viewer] = args.trim().split(/\s+/).filter(Boolean); if (!workerId) return context.ui.notify("Usage: /worker:logs <workerId> [runId] [viewer options]", "info"); const worker = ownedWorker(workerId, requireParentSession(context)); const hasRun = possibleRun?.startsWith("run_"); const runId = (hasRun ? possibleRun : undefined) ?? worker.activeRunId ?? worker.latestRunId; const run = runId ? getWorkerRun(getRegistry(), workerId, runId) : undefined; if (!run?.jobId) return context.ui.notify("No retained run logs.", "info"); await handleAsyncShellViewerCommand(context, [run.jobId, ...(hasRun ? viewer : [possibleRun, ...viewer].filter(Boolean))].join(" ")); } });
+    api.registerCommand("worker:logs", { description: "Open logs for an active/latest or exact retained worker run", handler: async (args, context) => { const [workerId, possibleRun, ...viewer] = args.trim().split(/\s+/).filter(Boolean); if (!workerId) return context.ui.notify("Usage: /worker:logs <workerId> [runId] [viewer options]", "info"); const worker = ownedWorker(workerId, requireParentSession(context)); const hasRun = possibleRun?.startsWith("run_"); const runId = (hasRun ? possibleRun : undefined) ?? worker.activeRunId ?? worker.latestRunId; const run = runId ? getWorkerRun(getRegistry(), workerId, runId) : undefined; if (!run?.jobId) return context.ui.notify("No retained run logs.", "info"); await handleAsyncShellViewerCommand(context, [run.jobId, ...(hasRun ? viewer : [possibleRun, ...viewer].filter(Boolean))].join(" "), hostJobRoot); } });
     api.registerCommand("worker:cancel", { description: "Cancel active work while preserving retained state", handler: async (args, context) => { const workerId = args.trim(); if (!workerId) return context.ui.notify("Usage: /worker:cancel <workerId>", "info"); const result = await cancelWorker(ownedWorker(workerId, requireParentSession(context))); context.ui.notify(result === "cancelled" ? `Cancelled ${workerId}.` : result === "accepted_pending" ? `Cancellation accepted for ${workerId}; the current runtime will finish it.` : result === "superseded" ? `Cancellation for ${workerId} was superseded by a terminal result.` : "Worker is not active.", "info"); } });
     api.registerCommand("worker:discard", { description: "Discard one delivered, closed-task idle worker; early loss uses /worker:cleanup", handler: async (args, context) => { const [workerId,confirm,...extra]=args.trim().split(/\s+/).filter(Boolean);if(!workerId||confirm!=="--confirm"||extra.length)return context.ui.notify("Usage: /worker:discard <workerId> --confirm", "info");try{await control({action:"discard",workerId},context);context.ui.notify(`Discarded ${workerId}.`,"info");}catch(error){context.ui.notify(`${sanitizeError(error)} Use /worker:cleanup to preview early loss or delivery takeover.`,"error");} } });
     api.registerCommand("worker:cleanup", { description: "Page, preview, or apply the same persisted cleanup workflow as worker_control", handler: async (args, context) => {
@@ -1395,8 +1411,13 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     const run = getWorkerRun(getRegistry(), worker.workerId, runId);
     if (!run) throw new Error("Worker has no matching retained run.");
     if (!worker.sessionId || !worker.sessionFile) throw new Error("Worker has no retained Pi session.");
-    return { workerId: worker.workerId, role: worker.role, workerStatus: worker.status, runId: run.runId, runStatus: run.status, ...(run.outcome ? { outcome: run.outcome } : {}), ...(run.modelSelection ?? worker.modelSelection ? { modelSelection: run.modelSelection ?? worker.modelSelection } : {}), sessionId: worker.sessionId, sessionFile: worker.sessionFile, sessionRoot: workerPaths(roots, worker.workerId).sessionDir, workspaceRoot: worker.workspaceRoot, parentSessionFile: worker.parentSessionFile, ...(run.sessionStartLine === undefined ? {} : { sessionStartLine: run.sessionStartLine }), ...(run.sessionEndLine === undefined ? {} : { sessionEndLine: run.sessionEndLine }) };
+    return { workerId: worker.workerId, role: worker.role, workerStatus: worker.status, runId: run.runId, runStatus: run.status, ...(run.outcome ? { outcome: run.outcome } : {}), ...(run.modelSelection ?? worker.modelSelection ? { modelSelection: run.modelSelection ?? worker.modelSelection } : {}), sessionId: worker.sessionId, sessionFile: worker.sessionFile, sessionRoot: storedWorkerPaths(roots, worker).sessionDir, workspaceRoot: worker.workspaceRoot, parentSessionFile: worker.parentSessionFile, ...(run.sessionStartLine === undefined ? {} : { sessionStartLine: run.sessionStartLine }), ...(run.sessionEndLine === undefined ? {} : { sessionEndLine: run.sessionEndLine }) };
   }
+  function currentWorkerPaths(worker: WorkerRegistryRecord): WorkerPaths {
+    if (worker.storageLayout !== CURRENT_WORKER_STORAGE_LAYOUT) throw new Error(`Worker ${worker.workerId} uses legacy storage layout ${worker.storageLayout}; explicit guarded cleanup is required and resume is refused.`);
+    return storedWorkerPaths(roots, worker);
+  }
+  function cleanupWorkerPaths(worker: WorkerRegistryRecord): WorkerPaths { return storedWorkerPaths(roots, worker); }
   function ownedWorker(workerId: string, parent: string): WorkerRegistryRecord { const worker = getWorker(getRegistry(), workerId); if (!worker || worker.parentSessionFile !== parent) throw new Error(`Unknown worker ${workerId} for this parent session.`); return worker; }
   function reviewSubject(runId: string, parent: string, reviewerWorkerId?: string) {
     const found = findWorkerRunById(getRegistry(), runId); if (!found || found.worker.parentSessionFile !== parent) throw new Error(`Unknown reviewed run ${runId}.`);
@@ -1456,7 +1477,11 @@ function updateWorkerActivityStatus(registry: WorkerRegistry, context: Extension
 }
 
 export function assertWorkerStoragePaths(paths: WorkerPaths): void {
-  const state = lstatSync(paths.stateDir); if (!state.isDirectory() || state.isSymbolicLink()) throw new Error("Worker root must remain an ordinary directory.");
+  const worker = lstatSync(paths.workerDir); if (!worker.isDirectory() || worker.isSymbolicLink()) throw new Error("Worker parent must remain an ordinary directory.");
+  ensureContainedOrdinaryDirectory(paths.workerDir, paths.stateDir, "worker guest directory");
+  ensureContainedOrdinaryDirectory(paths.workerDir, paths.supervisionDir, "worker host directory");
+  if (path.dirname(paths.stateDir) !== paths.workerDir || path.basename(paths.stateDir) !== "guest" || path.dirname(paths.supervisionDir) !== paths.workerDir || path.basename(paths.supervisionDir) !== "host") throw new Error("Worker storage must use exact guarded guest/host children.");
+  if (path.resolve(paths.supervisionDir).startsWith(`${path.resolve(paths.stateDir)}${path.sep}`)) throw new Error("Worker host state cannot be nested beneath the guest-writable root.");
   ensureContainedOrdinaryDirectory(paths.stateDir, paths.sessionDir, "worker session directory");
   ensureContainedOrdinaryDirectory(paths.stateDir, path.join(paths.stateDir, "async-shell"), "worker async directory");
   ensureContainedOrdinaryDirectory(path.dirname(paths.workspaceRoot), paths.workspaceRoot, "worker workspace");
@@ -1475,7 +1500,11 @@ function prepareCacheLineageDirectory(paths: WorkerPaths, runId: string): string
   const root = path.join(paths.stateDir, "cache-lineage"); ensureContainedOrdinaryDirectory(paths.stateDir, root, "worker cache-lineage root"); const generation = path.join(root, runId);
   if (existsSync(generation)) throw new Error(`Worker cache-lineage generation already exists: ${runId}.`); mkdirSync(generation, { mode: 0o700 }); assertContainedOrdinaryDirectory(root, generation, "worker cache-lineage generation"); return generation;
 }
-function runEvidenceDirectory(paths: WorkerPaths, runId: string): string { return path.join(paths.evidenceDir, "runs", runId, "inputs"); }
+function runInputDirectory(paths: WorkerPaths, runId: string, ensure = true): string {
+  const root=path.join(paths.stateDir,"run-inputs"),directory=path.join(root,runId);
+  if (ensure) { ensureContainedOrdinaryDirectory(paths.stateDir,root,"worker run-input root"); ensureContainedOrdinaryDirectory(root,directory,"worker run-input directory"); }
+  return directory;
+}
 export function snapshotAdditionalInputs(directory: string, inputs: RetainedInput[]): RetainedInput[] {
   const root = path.join(directory, "additional"); rmSync(root, { recursive: true, force: true }); mkdirSync(root, { recursive: true, mode: 0o700 });
   const budget = { nodes: 0, bytes: 0 };

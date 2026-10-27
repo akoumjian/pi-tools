@@ -109,6 +109,8 @@ export type StartManagedAsyncJobInput = {
   notifyOnExit?: boolean;
   settleProcessGroup?: boolean;
   persistSpawnedMetadata?: (job: JobMeta) => void;
+  /** Trusted callers may isolate internal job metadata from the project registry. */
+  jobRoot?: string;
   /** Trusted callers mark parent host jobs as managed-worker evidence. */
   managedBy?: AsyncShellManagedBy;
   /** Trusted callers may bind an exact externally persisted process identity. */
@@ -781,7 +783,7 @@ function startJob(
   const shell = input.shell?.trim() || (owner ? "/bin/bash" : process.env.SHELL || "/bin/zsh");
   const jobId = input.jobId ?? createAsyncJobId();
   assertValidAsyncJobId(jobId);
-  const root = jobsRoot(context.cwd);
+  const root = input.jobRoot === undefined ? jobsRoot(context.cwd) : path.resolve(input.jobRoot);
   const jobsDirectory = path.join(root, "jobs");
   const logDir = path.join(jobsDirectory, jobId);
   if (jobs.has(jobId) || existsSync(logDir)) throw new Error(`Async shell job directory already exists: ${jobId}`);
@@ -1753,13 +1755,13 @@ function formatJobList(jobsList: JobMeta[], historyRefreshPending = false, reten
   }).join("\n\n");
 }
 
-function requireJob(context: ExtensionContext, jobId: string): JobMeta {
-  const active = activeJobForContext(context, jobId);
+function requireJob(context: ExtensionContext, jobId: string, jobRoot?: string): JobMeta {
+  const active = activeJobForContext(context, jobId, jobRoot);
   if (active !== undefined) {
     return active;
   }
 
-  const meta = readMeta(context, jobId);
+  const meta = readMeta(context, jobId, jobRoot);
   if (meta === undefined) {
     throw new Error(`Unknown async shell job: ${jobId}`);
   }
@@ -1814,18 +1816,19 @@ function isSnapshotJobMeta(value: Record<string, unknown>): boolean {
     typeof value.stdoutLog === "string" && typeof value.stderrLog === "string";
 }
 
-function activeJobForContext(context: Pick<ExtensionContext, "cwd">, jobId: string): JobRuntime | undefined {
+function activeJobForContext(context: Pick<ExtensionContext, "cwd">, jobId: string, jobRoot?: string): JobRuntime | undefined {
   const job = jobs.get(jobId);
-  return job !== undefined && isJobInContext(context, job) ? job : undefined;
+  return job !== undefined && isJobInContext(context, job, jobRoot) ? job : undefined;
 }
 
-function isJobInContext(context: Pick<ExtensionContext, "cwd">, job: Pick<JobMeta, "logDir">): boolean {
-  return path.dirname(job.logDir) === path.join(jobsRoot(context.cwd), "jobs");
+function isJobInContext(context: Pick<ExtensionContext, "cwd">, job: Pick<JobMeta, "logDir">, jobRoot?: string): boolean {
+  const root = jobRoot === undefined ? jobsRoot(context.cwd) : path.resolve(jobRoot);
+  return path.dirname(job.logDir) === path.join(root, "jobs");
 }
 
-function readMeta(context: ExtensionContext, jobId: string): JobMeta | undefined {
+function readMeta(context: ExtensionContext, jobId: string, jobRoot?: string): JobMeta | undefined {
   assertValidAsyncJobId(jobId);
-  const root = path.join(jobsRoot(context.cwd), "jobs");
+  const root = path.join(jobRoot === undefined ? jobsRoot(context.cwd) : path.resolve(jobRoot), "jobs");
   return readMetaFile(path.join(root, jobId, "meta.json"), root, jobId);
 }
 
@@ -2619,7 +2622,7 @@ export function buildAsyncShellViewerUsage(): string {
   ].join("\n");
 }
 
-export async function handleAsyncShellViewerCommand(context: ExtensionCommandContext, rawArgs: string): Promise<void> {
+export async function handleAsyncShellViewerCommand(context: ExtensionCommandContext, rawArgs: string, jobRoot?: string): Promise<void> {
   let args: AsyncShellViewerArgs;
   try {
     args = parseAsyncShellViewerArgs(rawArgs);
@@ -2638,6 +2641,10 @@ export async function handleAsyncShellViewerCommand(context: ExtensionCommandCon
   }
 
   let jobId = args.jobId;
+  if (jobRoot !== undefined && jobId === undefined) {
+    context.ui.notify("An exact managed-worker job id is required.", "error");
+    return;
+  }
   if (jobId === undefined) {
     try {
       jobId = await pickAsyncShellViewerJob(context);
@@ -2652,7 +2659,7 @@ export async function handleAsyncShellViewerCommand(context: ExtensionCommandCon
 
   let initialSnapshot: AsyncShellViewerSnapshot;
   try {
-    initialSnapshot = loadAsyncShellViewerSnapshot(context, jobId, args.stream, args.tailLines);
+    initialSnapshot = loadAsyncShellViewerSnapshot(context, jobId, args.stream, args.tailLines, jobRoot);
   } catch (error) {
     context.ui.notify(error instanceof Error ? error.message : String(error), "error");
     return;
@@ -2666,7 +2673,7 @@ export async function handleAsyncShellViewerCommand(context: ExtensionCommandCon
       initialStream: args.stream,
       tailLines: args.tailLines,
       follow: args.follow,
-      loadSnapshot: (stream, tailLines) => loadAsyncShellViewerSnapshot(context, jobId, stream, tailLines),
+      loadSnapshot: (stream, tailLines) => loadAsyncShellViewerSnapshot(context, jobId, stream, tailLines, jobRoot),
       done
     }));
   } catch (error) {
@@ -2738,9 +2745,10 @@ export function loadAsyncShellViewerSnapshot(
   context: Pick<ExtensionContext, "cwd">,
   jobId: string,
   stream: AsyncShellViewerStream,
-  tailLines: number
+  tailLines: number,
+  jobRoot?: string
 ): AsyncShellViewerSnapshot {
-  const job = requireJob(context as ExtensionContext, jobId);
+  const job = requireJob(context as ExtensionContext, jobId, jobRoot);
   const boundedTailLines = clampInteger(tailLines, 1, SHELL_TAIL_MAX_LINES);
   const selected = stream === "both" ? selectedStreams() : selectedStreams(stream);
   const streams = selected.map((selectedStream): AsyncShellViewerStreamSnapshot => {
@@ -2756,7 +2764,7 @@ export function loadAsyncShellViewerSnapshot(
 
   return {
     job: publicJob(job),
-    projectRoot: jobsRoot(context.cwd),
+    projectRoot: jobRoot === undefined ? jobsRoot(context.cwd) : path.resolve(jobRoot),
     streams,
     outputLines: buildAsyncShellViewerOutputLines(streams),
     refreshedAt: new Date().toISOString()
