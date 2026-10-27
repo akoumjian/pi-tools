@@ -112,12 +112,11 @@ fs.appendFileSync(trace,JSON.stringify(a)+"\\n");const shell=a.indexOf("/bin/sh"
   const run = async (mountTable: string) => { await writeFile(mounts, mountTable); const child = spawn(process.execPath, [path.resolve("scripts/worker-sbx-rpc.mjs"), "--mode", "rpc"], { env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH}`, PI_WORKER_SANDBOX_LAUNCH_MANIFEST: manifest }, stdio: ["ignore", "pipe", "pipe"] }); const [code, stderr] = await Promise.all([new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("exit", resolve); }), collectStream(child.stderr)]); return { code, stderr }; };
   const row = (options: string) => `overlay ${mappedMerged} overlay ${options} 0 0\n`;
   assert.equal((await run("")).code, 70, "missing mount must fail closed");
-  assert.equal((await run(row(`rw,lowerdir=${lower}-wrong,upperdir=${mappedUpper},workdir=${mappedWork},metacopy=on`))).code, 71, "wrong lower must fail closed");
-  assert.equal((await run(row(`rw,lowerdir=${lower},upperdir=${mappedUpper}-wrong,workdir=${mappedWork},metacopy=on`))).code, 72, "wrong upper must fail closed");
-  assert.equal((await run(row(`rw,lowerdir=${lower},upperdir=${mappedUpper},workdir=${mappedWork}-wrong,metacopy=on`))).code, 73, "wrong work must fail closed");
-  assert.equal((await run(row(`rw,lowerdir=${lower},upperdir=${mappedUpper},workdir=${mappedWork},metacopy=off`))).code, 74, "missing metacopy=on must fail closed");
-  const exact = await run(row(`rw,lowerdir=${lower},upperdir=${mappedUpper},workdir=${mappedWork},metacopy=on`)); assert.equal(exact.code, 0, exact.stderr); assert.equal(await readFile(launched, "utf8"), "launched");
-  const calls = (await readFile(trace, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as string[]); assert.equal(calls.length, 6); const args = calls[0]!.join(" "); assert.match(args, /^exec --workdir \/review\/subject pi-review-mount-check \/bin\/sh -ceu /); assert.match(args, /\/proc\/mounts/); assert.match(args, /lowerdir=/); assert.doesNotMatch(args, /--privileged|--user root/); assert.match(args, new RegExp(`${fakeLauncher.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} --mode rpc$`));
+  assert.equal((await run(row(`rw,lowerdir=${lower}-wrong,upperdir=${mappedUpper},workdir=${mappedWork}`))).code, 71, "wrong lower must fail closed");
+  assert.equal((await run(row(`rw,lowerdir=${lower},upperdir=${mappedUpper}-wrong,workdir=${mappedWork}`))).code, 72, "wrong upper must fail closed");
+  assert.equal((await run(row(`rw,lowerdir=${lower},upperdir=${mappedUpper},workdir=${mappedWork}-wrong`))).code, 73, "wrong work must fail closed");
+  const exact = await run(row(`rw,relatime,lowerdir=${lower},upperdir=${mappedUpper},workdir=${mappedWork},uuid=on,nouserxattr`)); assert.equal(exact.code, 0, exact.stderr); assert.equal(await readFile(launched, "utf8"), "launched");
+  const calls = (await readFile(trace, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as string[]); assert.equal(calls.length, 5); const args = calls[0]!.join(" "); assert.match(args, /^exec --workdir \/review\/subject pi-review-mount-check \/bin\/sh -ceu /); assert.match(args, /\/proc\/mounts/); assert.match(args, /lowerdir=/); assert.doesNotMatch(args, /--privileged|--user root/); assert.match(args, new RegExp(`${fakeLauncher.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} --mode rpc$`));
 }));
 
 test("packaged worker-host spawns through the real shim and fake sbx, admits typed RPC, settles, and exits on EOF", async () => temp(async (root) => {

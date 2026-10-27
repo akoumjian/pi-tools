@@ -37,7 +37,6 @@ options=$(awk -v merged="$merged" '$2 == merged && $3 == "overlay" { count += 1;
 case ",$options," in *",lowerdir=$lower,"*) ;; *) exit 71 ;; esac
 case ",$options," in *",upperdir=$upper,"*) ;; *) exit 72 ;; esac
 case ",$options," in *",workdir=$work,"*) ;; *) exit 73 ;; esac
-case ",$options," in *",metacopy=on,"*) ;; *) exit 74 ;; esac
 test -d "$lower" -a -d "$upper" -a -d "$work" -a -d "$merged"
 exec "$@"`;
   return ["/bin/sh", "-ceu", script, "pi-review-overlay-launch", value.lowerDirectory, value.upperDirectory, value.workDirectory, value.mergedDirectory, ...guest];

@@ -76,7 +76,7 @@ test -d "$lower"
 case "$scratch:$upper:$work:$merged" in /run/pi-worker/review-overlays/*:/run/pi-worker/review-overlays/*/upper:/run/pi-worker/review-overlays/*/work:/review/subject) ;; *) exit 61 ;; esac
 rm -rf "$scratch" "$merged"
 mkdir -p "$upper" "$work" "$merged"
-mount -t overlay overlay -o "lowerdir=$lower,upperdir=$upper,workdir=$work,metacopy=on" "$merged"
+mount -t overlay overlay -o "lowerdir=$lower,upperdir=$upper,workdir=$work" "$merged"
 chown 1000:1000 "$merged"
 chmod u+rwx "$merged"
 test "$(find "$upper" -mindepth 1 -print -quit)" = ""
