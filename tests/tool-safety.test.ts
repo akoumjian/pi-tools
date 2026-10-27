@@ -991,7 +991,12 @@ test("worker_control allows every valid exact-session lifecycle action without s
     { action: "runs", workerId },
     { action: "get", workerId, runId: "run_20260910193000_87654321" },
     { action: "cancel", workerId },
-    { action: "discard", workerId }
+    { action: "discard", workerId },
+    { action: "discard", workerIds: [workerId], preparedIds: [`prepared_${"a".repeat(24)}`], artifactLossAcknowledged: [workerId] },
+    { action: "cleanup_inventory" },
+    { action: "cleanup_inventory", allSessions: true },
+    { action: "cleanup_preview", workerIds: [workerId] },
+    { action: "cleanup_inventory", allSessions: true, cursor: `cleanup_scan_${"b".repeat(48)}` }
   ];
 
   for (const input of validInputs) {
@@ -1006,9 +1011,14 @@ test("worker_control allows every valid exact-session lifecycle action without s
     }
   }
 
+  const preserve = evaluateWorkerControl({ action: "preserve", workerId, destination: path.join(process.cwd(), "preserved"), paths: ["artifacts/report.md"] }, { cwd: process.cwd() } as ExtensionContext);
+  assert.equal(preserve.action, "allow");
+  const sensitivePreserve = evaluateWorkerControl({ action: "preserve", workerId, destination: path.join(process.env.HOME!, ".ssh", "archive") }, { cwd: process.cwd() } as ExtensionContext);
+  assert.equal(sensitivePreserve.action, "review");
   const discard = evaluateWorkerControl({ action: "discard", workerId });
   assert.equal(discard.risk, "medium");
   assert.equal(discard.ruleId, "worker-control-discard");
+  const cleanupApply=evaluateWorkerControl({action:"cleanup_apply",token:`cleanup_${"a".repeat(48)}`,recoveryAcknowledged:[workerId]});assert.equal(cleanupApply.action,"review");assert.equal(cleanupApply.risk,"high");assert.equal(cleanupApply.ruleId,"worker-control-cleanup-apply");
 
   const malformedInputs: unknown[] = [
     null,
@@ -1019,7 +1029,11 @@ test("worker_control allows every valid exact-session lifecycle action without s
     { action: "result", workerId, confirm: true },
     { action: "cancel" },
     { action: "discard", workerId, confirm: false },
-    { action: "discard", workerId: "wrong", confirm: true }
+    { action: "discard", workerId: "wrong", confirm: true },
+    { action: "discard", workerIds: [workerId, workerId] },
+    { action: "discard", preparedIds: ["wrong"] },
+    { action: "discard", preparedIds: [`prepared_${"a".repeat(24)}`], artifactLossAcknowledged: [workerId] },
+    { action: "preserve", workerId, destination: "relative" }
   ];
   for (const input of malformedInputs) {
     const decision = evaluateWorkerControl(input);

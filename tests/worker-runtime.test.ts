@@ -8,13 +8,13 @@ import path from "node:path";
 import test from "node:test";
 import { Check } from "typebox/value";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import workerRuntimeExtension, { readWorkerRuntimeResult } from "../extensions/worker/runtime.js";
+import workerRuntimeExtension, { executeWorkerBeadsHostRequest, executeWorkerResultHostRequest, readWorkerRuntimeResult } from "../extensions/worker/runtime.js";
 import { buildWorkerRpcArgs, type WorkerHostConfig } from "../extensions/worker/runner.js";
 
 const sha256 = (value: string): string => createHash("sha256").update(value, "utf8").digest("hex");
 
 type FakeApi = ExtensionAPI & { tools: ToolDefinition[] };
-function fakeApi(): FakeApi { const tools: ToolDefinition[] = []; return { tools, registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, on() {}, sendMessage() {} } as unknown as FakeApi; }
+function fakeApi(): FakeApi { const tools: ToolDefinition[] = []; return { tools, registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, on() {}, sendMessage() {}, requestHost(service: string, payload: unknown) { if (service === "worker_result_submit") return executeWorkerResultHostRequest(payload); if (service === "worker_beads_tasks") return executeWorkerBeadsHostRequest(payload); if (service === "worker_runtime_hello" || service === "worker_runtime_state") return Promise.resolve({ accepted: true }); throw new Error(`unexpected host service ${service}`); } } as unknown as FakeApi; }
 async function fixture(role: "work" | "review" | "integration", run: (root: string, api: FakeApi) => Promise<void>) {
   const root = await mkdtemp(path.join(tmpdir(), "pi-worker-runtime-"));
   await mkdir(path.join(root, "state", "async-shell"), { recursive: true });
@@ -23,7 +23,7 @@ async function fixture(role: "work" | "review" | "integration", run: (root: stri
   await writeFile(beadsTasksFile, JSON.stringify([{ id: "personal-test", title: "Test", status: "in_progress", priority: 1, issue_type: "task", design: "Canonical design." }]));
   const bdPath = path.join(root, "fake-bd.mjs");
   await writeFile(bdPath, `#!/usr/bin/env node
-import { readFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 const args = process.argv.slice(2);
 const tasks = JSON.parse(readFileSync(process.env.FAKE_BEADS_TASKS_FILE, "utf8"));
 if (args.includes("where")) {
@@ -37,6 +37,7 @@ if (args.includes("where")) {
   const ids = args.filter((arg) => arg.startsWith("--id=")).map((arg) => arg.slice(5));
   process.stdout.write(JSON.stringify(ids.map((id) => tasks.find((task) => task.id === id)).filter(Boolean)));
 } else if (args.includes("update")) {
+  appendFileSync(process.env.FAKE_BEADS_UPDATE_LOG, JSON.stringify(args) + "\\n");
   process.stdout.write(JSON.stringify({ ok: true }));
 } else {
   process.stderr.write("unsupported fake bd command"); process.exit(2);
@@ -45,15 +46,15 @@ if (args.includes("where")) {
   await chmod(bdPath, 0o700);
   const beadsRoute = { prefix: "personal", path: beadsDir, databasePath: path.join(beadsDir, "database") };
   const values: Record<string, string> = {
-    PI_WORKER_ID: "worker_20260101000000_aaaaaaaa", PI_WORKER_RUN_ID: "run_20260101000000_aaaaaaaa", PI_WORKER_ROLE: role,
+    PI_WORKER_ID: "worker_20260101000000_aaaaaaaa", PI_WORKER_RUN_ID: "run_20260101000000_aaaaaaaa", PI_WORKER_ROLE: role, PI_WORKER_HOST_RPC: "1",
     PI_WORKER_RESULT_FILE: path.join(root, "state", "result.json"), PI_WORKER_WORKSPACE_ROOT: root,
-    PI_WORKER_STATE_ROOT: path.join(root, "state"), PI_WORKER_ASYNC_JOB_ROOT: path.join(root, "state", "async-shell"),
+    PI_WORKER_STATE_ROOT: root, PI_WORKER_SUPERVISION_ROOT: path.join(root, "state"), PI_WORKER_ASYNC_JOB_ROOT: path.join(root, "state", "async-shell"),
     PI_WORKER_TASK_IDS: JSON.stringify(["personal-test"]), PI_WORKER_AUTHORIZATION_FILE: path.join(root, "state", "host-authorization.json"),
     PI_WORKER_PROCESS_NONCE: "test-nonce", PI_WORKER_PARENT_PID: String(process.pid),
     PI_WORKER_BD_PATH: bdPath, PI_WORKER_BEADS_ROUTE: JSON.stringify(beadsRoute), BEADS_DIR: beadsDir,
-    FAKE_BEADS_ROUTE: JSON.stringify(beadsRoute), FAKE_BEADS_TASKS_FILE: beadsTasksFile
+    FAKE_BEADS_ROUTE: JSON.stringify(beadsRoute), FAKE_BEADS_TASKS_FILE: beadsTasksFile, FAKE_BEADS_UPDATE_LOG: path.join(root, "fake-beads-updates.jsonl")
   };
-  await writeFile(values.PI_WORKER_AUTHORIZATION_FILE!, JSON.stringify({ version: 1, workerId: values.PI_WORKER_ID, runId: values.PI_WORKER_RUN_ID, processNonce: values.PI_WORKER_PROCESS_NONCE }));
+  await writeFile(values.PI_WORKER_AUTHORIZATION_FILE!, JSON.stringify({ version: 2, workerId: values.PI_WORKER_ID, runId: values.PI_WORKER_RUN_ID, processNonce: values.PI_WORKER_PROCESS_NONCE }));
   const old = new Map(Object.keys(values).map((key) => [key, process.env[key]])); Object.assign(process.env, values);
   try { const api = fakeApi(); workerRuntimeExtension(api); await run(root, api); }
   finally { for (const [key, value] of old) value === undefined ? delete process.env[key] : process.env[key] = value; await rm(root, { recursive: true, force: true }); }
@@ -70,6 +71,7 @@ test("work result submission validates and persists normalized repository and ar
     const repository = path.join(root, "repos", "project"); await mkdir(repository, { recursive: true }); execFileSync("git", ["init", "-q", repository]);
     await mkdir(path.join(root, "artifacts")); await writeFile(path.join(root, "artifacts", "report.txt"), "ok\n");
     const tool = api.tools.find((candidate) => candidate.name === "worker_result_submit")!;
+    const repositoryAsArtifact=await tool.execute!("call",{outcome:"completed",summary:"Invalid artifact.",artifacts:["repos/project"]},undefined,undefined,undefined as never);assert.equal((repositoryAsArtifact.details as {status:string}).status,"rejected");
     const result = await tool.execute!("call", { outcome: "completed", summary: "Done.", repositories: ["repos/project"], artifacts: ["artifacts/report.txt"] }, undefined, undefined, undefined as never);
     assert.equal((result.details as { status: string }).status, "accepted");
     const accepted = readWorkerRuntimeResult(path.join(root, "state", "result.json"));
@@ -94,23 +96,22 @@ test("review decisions require a retained report and cannot report repositories"
     const tool = api.tools.find((candidate) => candidate.name === "worker_result_submit")!;
     const rejected = await tool.execute!("call", { outcome: "approve", summary: "Approved." }, undefined, undefined, undefined as never);
     assert.equal((rejected.details as { status: string }).status, "rejected");
-    await mkdir(path.join(root, "reports")); await writeFile(path.join(root, "reports", "review.md"), "# Review\n");
-    const result = await tool.execute!("call", { outcome: "approve", summary: "Approved.", artifacts: ["/workspace/reports/review.md"] }, undefined, undefined, undefined as never);
+    await mkdir(path.join(root, "reports"));
+    const directoryOnly = await tool.execute!("call", { outcome: "approve", summary: "Approved.", artifacts: [path.join(root, "reports")] }, undefined, undefined, undefined as never);
+    assert.equal((directoryOnly.details as { status: string }).status, "rejected");
+    await writeFile(path.join(root, "reports", "empty.md"), "");
+    const empty = await tool.execute!("call", { outcome: "approve", summary: "Approved.", artifacts: [path.join(root, "reports", "empty.md")] }, undefined, undefined, undefined as never);
+    assert.equal((empty.details as { status: string }).status, "rejected");
+    await writeFile(path.join(root, "reports", "review.md"), "# Review\n");
+    const result = await tool.execute!("call", { outcome: "approve", summary: "Approved.", artifacts: [path.join(root, "reports", "review.md")] }, undefined, undefined, undefined as never);
     assert.equal((result.details as { status: string }).status, "accepted");
   });
 });
 
-test("worker RPC arguments use plain role instructions rather than injected skills", () => {
-  const config = {
-    version: 1, workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_aaaaaaaa", sessionId: "session", sessionFile: "/tmp/session.jsonl", sessionDir: "/tmp",
-    workspaceRoot: "/tmp/workspace", stateRoot: "/tmp/state", asyncJobRoot: "/tmp/jobs", taskIds: ["personal-test"], role: "work", resultFile: "/tmp/result", settledFile: "/tmp/settled",
-    processFile: "/tmp/process", processNonce: "nonce", hostConfigFile: "/tmp/host", authorizationFile: "/tmp/auth", prompt: "prompt",
-    provider: "openai-codex", model: "gpt", thinkingLevel: "xhigh", piCliPath: "/bin/pi", bdPath: "/bin/bd", beadsRoute: { prefix: "personal", path: "/beads", databasePath: "/beads/db" },
-    extensionPaths: ["/worker/runtime.js"], shellExecution: { kind: "native-test" }, rpcArgs: []
-  } satisfies WorkerHostConfig;
+test("worker RPC arguments use immutable extensions and complete built-in tools", () => {
+  const config = { provider: "openai-codex", model: "gpt", thinkingLevel: "xhigh", sessionFile: "/tmp/session.jsonl", sessionDir: "/tmp", sandbox: { extensionPaths: ["/opt/pi-tools/extensions/worker/runtime.ts"] } } as WorkerHostConfig;
   const args = buildWorkerRpcArgs(config);
-  assert.equal(args.includes("--skill"), false);
-  assert.equal(args.includes("--no-skills"), true);
+  assert.equal(args.includes("--skill"), false); assert.equal(args.includes("--no-skills"), true); assert.equal(args.includes("--no-builtin-tools"), false); assert.ok(args.includes("/opt/pi-tools/extensions/worker/runtime.ts"));
 });
 
 test("result submission rejects parent-directory symlink escapes with a coded non-sealing result", async () => {
@@ -136,8 +137,7 @@ test("runtime rejects a result-file parent that resolves outside trusted state",
     try {
       await symlink(outside, path.join(root, "state", "escape"));
       process.env.PI_WORKER_RESULT_FILE = path.join(root, "state", "escape", "result.json");
-      const tool = api.tools.find((candidate) => candidate.name === "worker_result_submit")!;
-      await assert.rejects(() => tool.execute!("call", { outcome: "completed", summary: "probe" }, undefined, undefined, undefined as never), /state paths must remain beneath/);
+      await assert.rejects(() => executeWorkerResultHostRequest({ outcome: "completed", summary: "probe" }), /supervision\/worker-root boundary/);
       assert.equal(existsSync(path.join(outside, "result.json")), false);
     } finally { if (prior === undefined) delete process.env.PI_WORKER_RESULT_FILE; else process.env.PI_WORKER_RESULT_FILE = prior; await rm(outside, { recursive: true, force: true }); }
   });
@@ -146,11 +146,9 @@ test("runtime rejects a result-file parent that resolves outside trusted state",
 test("durable authorization revocation blocks result submission and Beads calls", async () => {
   await fixture("work", async (root, api) => {
     await rm(process.env.PI_WORKER_AUTHORIZATION_FILE!, { force: true });
-    const result = api.tools.find((candidate) => candidate.name === "worker_result_submit")!;
-    await assert.rejects(() => result.execute!("call", { outcome: "completed", summary: "late" }, undefined, undefined, undefined as never), /revoked/);
-    const beads = api.tools.find((candidate) => candidate.name === "worker_beads_tasks")!;
-    await assert.rejects(() => beads.execute!("call", { action: "assigned" }, undefined, undefined, undefined as never), /revoked/);
-    await assert.rejects(() => beads.execute!("call", { action: "design", taskId: "personal-test" }, undefined, undefined, undefined as never), /revoked/);
+    await assert.rejects(() => executeWorkerResultHostRequest({ outcome: "completed", summary: "late" }), /revoked/);
+    await assert.rejects(() => executeWorkerBeadsHostRequest({ action: "assigned" }), /revoked/);
+    await assert.rejects(() => executeWorkerBeadsHostRequest({ action: "design", taskId: "personal-test" }), /revoked/);
     assert.equal(existsSync(path.join(root, "state", "result.json")), false);
   });
 });
@@ -165,10 +163,20 @@ test("review runtime exposes only read-only Beads branches with four-item bounds
   });
 });
 
+test("status-less Beads updates remain JSON-safe and retries cannot duplicate durable notes", async () => {
+  await fixture("work", async (root) => {
+    const result = await executeWorkerBeadsHostRequest({ action: "update", taskId: "personal-test", note: "durable status-less note" });
+    assert.deepEqual(result.details, { taskId: "personal-test", recorded: true }); assert.equal(JSON.stringify(result).includes('"status"'), false);
+    const replay = await executeWorkerBeadsHostRequest({ action: "update", taskId: "personal-test", note: "durable status-less note" }); assert.deepEqual(replay.details, result.details); assert.equal((await readFile(process.env.FAKE_BEADS_UPDATE_LOG!, "utf8")).trim().split("\n").length, 1);
+    const uncertainPayload = sha256(JSON.stringify({ taskId: "personal-test", note: "uncertain note", status: null })); await writeFile(path.join(root, "state", "beads-updates", `${uncertainPayload}.json`), JSON.stringify({ version: 1, workerId: process.env.PI_WORKER_ID, runId: process.env.PI_WORKER_RUN_ID, payloadSha256: uncertainPayload, state: "admitting" })); await assert.rejects(() => executeWorkerBeadsHostRequest({ action: "update", taskId: "personal-test", note: "uncertain note" }), /outcome is uncertain/); assert.equal((await readFile(process.env.FAKE_BEADS_UPDATE_LOG!, "utf8")).trim().split("\n").length, 1);
+    await assert.rejects(() => executeWorkerBeadsHostRequest({ action: "update", taskId: "personal-test", note: 12345 }), /strict schema/);
+  });
+});
+
 test("worker_result_submit returns the approved accepted/rejected semantic union", async () => {
   await fixture("work", async (_root, api) => {
     const tool = api.tools.find((candidate) => candidate.name === "worker_result_submit")!;
-    assert.equal(tool.description, "End the current worker run by submitting a structured result. Use it for completed work, requests for guidance, blockers, and review verdicts. The tool records the outcome, summary, optional question, and reported repository and artifact paths, then seals the run and returns control to the parent. It does not approve work, apply repositories, close tasks, or discard the worker.");
+    assert.equal(tool.description, "End the current worker run by submitting a structured result. Use it for completed work, requests for guidance, blockers, and review verdicts. The tool records the outcome, summary, optional question, repository roots, and ordinary non-repository artifact entry points, then seals the run and returns control to the parent. Completed reviewers must report a non-empty ordinary report file. It does not approve work, apply repositories, close tasks, or discard the worker.");
     const rejected = await tool.execute!("call", { outcome: "needs_input", summary: "question missing" }, undefined, undefined, undefined as never);
     assert.deepEqual((rejected.details as any).errors.map((item: any) => ({ code: item.code, path: item.path })), [{ code: "question_required", path: "question" }]);
     const accepted = await tool.execute!("call", { outcome: "completed", summary: "done" }, undefined, undefined, undefined as never);
@@ -280,4 +288,58 @@ test("Beads design continuation rejects missing, malformed, and stale full-desig
     const restartedText = restarted.content[0]!.type === "text" ? restarted.content[0]!.text : "";
     assert.equal((JSON.parse(restartedText) as { design: { sha256: string } }).design.sha256, sha256(revised));
   });
+});
+
+test("remote result submission does not retry host commit when pre-admission runtime-state publication fails", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-worker-remote-admission-"));
+  const asyncRoot = path.join(root, "async-shell"); await mkdir(asyncRoot, { recursive: true });
+  const values: Record<string, string> = {
+    PI_WORKER_HOST_RPC: "1",
+    PI_WORKER_ID: "worker_20260101000000_bbbbbbbb",
+    PI_WORKER_RUN_ID: "run_20260101000000_bbbbbbbb",
+    PI_WORKER_ROLE: "work",
+    PI_WORKER_WORKSPACE_ROOT: root,
+    PI_WORKER_ASYNC_JOB_ROOT: asyncRoot
+  };
+  const previous = new Map(Object.keys(values).map((key) => [key, process.env[key]])); Object.assign(process.env, values);
+  const services: string[] = []; const tools: ToolDefinition[] = [];
+  const api = {
+    registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, on() {}, sendMessage() {},
+    async requestHost(service: string): Promise<unknown> { services.push(service); if (service === "worker_runtime_state") throw new Error("state transport probe"); throw new Error(`unexpected host request ${service}`); }
+  } as unknown as ExtensionAPI;
+  try {
+    workerRuntimeExtension(api);
+    const tool = tools.find((candidate) => candidate.name === "worker_result_submit")!;
+    const result = await tool.execute!("call", { outcome: "completed", summary: "must not commit" }, undefined, undefined, undefined as never);
+    assert.equal((result.details as { status: string }).status, "rejected");
+    assert.ok(services.length >= 1); assert.ok(services.every((service) => service === "worker_runtime_state"), "a failed pre-admission state publication must never reach result commit");
+  } finally {
+    for (const [key, value] of previous) value === undefined ? delete process.env[key] : process.env[key] = value;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("remote conflicting result replay preserves the accepted guest admission seal", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-worker-remote-replay-")); const asyncRoot = path.join(root, "async-shell"); await mkdir(asyncRoot, { recursive: true });
+  const values: Record<string, string> = { PI_WORKER_HOST_RPC: "1", PI_WORKER_ID: "worker_20260101000000_cccccccc", PI_WORKER_RUN_ID: "run_20260101000000_cccccccc", PI_WORKER_ROLE: "work", PI_WORKER_WORKSPACE_ROOT: root, PI_WORKER_ASYNC_JOB_ROOT: asyncRoot };
+  const previous = new Map(Object.keys(values).map((key) => [key, process.env[key]])); Object.assign(process.env, values);
+  const tools: ToolDefinition[] = []; const handlers = new Map<string, Function[]>(); let submissions = 0; let stateReports = 0; let acceptedStateReports = 0;
+  const api = {
+    registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, sendMessage() {}, on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
+    async requestHost(service: string, payload: unknown): Promise<unknown> {
+      if (service === "worker_runtime_state") { const state = payload as { sequence: number; admissionState: string }; stateReports += 1; if (state.admissionState === "accepted" && ++acceptedStateReports === 1) throw new Error("accepted-state transport probe"); return { accepted: true, sequence: state.sequence }; }
+      if (service === "worker_result_submit" && submissions++ === 0) return { content: [{ type: "text", text: "accepted" }], details: { status: "accepted", outcome: "completed" } };
+      throw new Error("conflicting payload probe");
+    }
+  } as unknown as ExtensionAPI;
+  try {
+    workerRuntimeExtension(api); const tool = tools.find((candidate) => candidate.name === "worker_result_submit")!;
+    const committed = await tool.execute!("first", { outcome: "completed", summary: "first" }, undefined, undefined, undefined as never); assert.equal((committed.details as { status: string }).status, "rejected", "lost accepted-state delivery must report transport failure without reopening");
+    await handlers.get("agent_end")?.[0]?.({}); assert.ok(stateReports >= 2); assert.ok(acceptedStateReports >= 2, "a later state transition must recover the failed accepted-state delivery");
+    const conflicting = await tool.execute!("second", { outcome: "completed", summary: "different" }, undefined, undefined, undefined as never); assert.equal((conflicting.details as { status: string }).status, "rejected");
+    const guard = handlers.get("tool_call")?.[0]?.({ toolName: "shell_start" }); assert.deepEqual(guard, { block: true, reason: "Worker run is sealed during or after result admission." });
+  } finally {
+    for (const [key, value] of previous) value === undefined ? delete process.env[key] : process.env[key] = value;
+    await rm(root, { recursive: true, force: true });
+  }
 });

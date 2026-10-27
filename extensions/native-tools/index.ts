@@ -1021,12 +1021,14 @@ function searchPathArgument(cwd: string, resolvedPath: string): string {
 function runRg(rgPath: string, cwd: string, args: string[], signal?: AbortSignal): Promise<RgResult> {
   throwIfAborted(signal);
   return new Promise((resolve, reject) => {
+    const ownsProcessGroup = process.platform !== "win32";
     const child = spawn(rgPath, args, {
       cwd,
       env: ripgrepEnvironment(process.env),
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: ownsProcessGroup
     });
-    const cleanupAbort = terminateProcessOnAbort(child, signal);
+    const cleanupAbort = terminateProcessOnAbort(child, signal, { processGroup: ownsProcessGroup });
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let stdoutBytes = 0;

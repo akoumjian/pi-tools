@@ -1,8 +1,10 @@
 import { existsSync, type Dirent } from "node:fs";
 import { lstat, readFile, readdir } from "node:fs/promises";
-import { homedir } from "node:os";
 import path from "node:path";
 import { isAsyncJobExecutionAlive } from "../_shared/async-job.js";
+import { matchWorkerHostJobIdentity } from "../_shared/worker-host-job.js";
+import { defaultWorkerRuntimeRoot } from "../worker/identity.js";
+import { readExactWorkerRunJobIds } from "../worker/registry.js";
 
 export type AsyncShellRetentionKind = "eligible" | "ineligible" | "pending" | "prune" | "unknown-leftover";
 
@@ -45,8 +47,6 @@ const JOB_ID_PATTERN = /^job_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const LEFTOVER_PATTERN = /^\.(pending|prune)-(job_[A-Za-z0-9][A-Za-z0-9_-]{0,127})-([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
 const TERMINAL = new Set(["exited", "failed", "cancelled"]);
 const SCAN_BATCH_SIZE = 256;
-const DEFAULT_WORKER_RUNTIME_ROOT = path.join(homedir(), ".local", "share", "agent", "worker-runtime");
-const WORKER_HOST_COMMAND_PATTERN = /^Pi worker host (worker_[A-Za-z0-9][A-Za-z0-9_-]{0,127})\/(run_[A-Za-z0-9][A-Za-z0-9_-]{0,127})$/;
 const MANAGED_WORKER_EVIDENCE_REASON = "managed-worker evidence; ordinary prune refused; host-log cleanup is separate";
 
 export function parseAsyncShellLeftoverName(name: string): { kind: "pending" | "prune"; jobId: string } | undefined {
@@ -64,29 +64,21 @@ export function managedWorkerEvidenceReason(
   managedWorkerJobIds: ReadonlySet<string> = readManagedWorkerHostJobIds()
 ): string | undefined {
   if (typeof job.jobId === "string" && managedWorkerJobIds.has(job.jobId)) return MANAGED_WORKER_EVIDENCE_REASON;
-  if (isRecord(job.managedBy) && job.managedBy.kind === "worker-host" && typeof job.managedBy.workerId === "string" && typeof job.managedBy.runId === "string") {
-    return MANAGED_WORKER_EVIDENCE_REASON;
-  }
-  if (typeof job.command === "string" && WORKER_HOST_COMMAND_PATTERN.test(job.command)) return MANAGED_WORKER_EVIDENCE_REASON;
+  if (matchWorkerHostJobIdentity(job)) return MANAGED_WORKER_EVIDENCE_REASON;
+  // Retention is conservative: a contradictory but plausible marker/command is
+  // unsafe to prune even though cleanup's full identity matcher rejects it.
+  if (isRecord(job.managedBy) && job.managedBy.kind === "worker-host" && typeof job.managedBy.workerId === "string" && typeof job.managedBy.runId === "string") return MANAGED_WORKER_EVIDENCE_REASON;
+  if (job.command !== undefined && matchWorkerHostJobIdentity({ command: job.command })) return MANAGED_WORKER_EVIDENCE_REASON;
   return undefined;
 }
 
-export function readManagedWorkerHostJobIds(runtimeRoot = DEFAULT_WORKER_RUNTIME_ROOT): Set<string> {
+export function readManagedWorkerHostJobIds(runtimeRoot = defaultWorkerRuntimeRoot()): Set<string> {
   const ids = new Set<string>();
-  const databasePath = path.join(runtimeRoot, "registry.sqlite");
-  if (!existsSync(databasePath)) return ids;
-  const sqlite = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite") | undefined;
-  if (!sqlite) throw new Error("Managed-worker evidence protection requires node:sqlite while a worker registry exists.");
-  let database: import("node:sqlite").DatabaseSync | undefined;
   try {
-    database = new sqlite.DatabaseSync(databasePath, { readOnly: true });
-    const rows = database.prepare("SELECT job_id FROM runs WHERE job_id IS NOT NULL").all() as Array<{ job_id?: unknown }>;
-    for (const row of rows) if (typeof row.job_id === "string" && JOB_ID_PATTERN.test(row.job_id)) ids.add(row.job_id);
+    for (const jobId of readExactWorkerRunJobIds(runtimeRoot)) if (JOB_ID_PATTERN.test(jobId)) ids.add(jobId);
     return ids;
   } catch (cause) {
     throw new Error(`Managed-worker evidence registry is unavailable: ${cause instanceof Error ? cause.message : String(cause)}`);
-  } finally {
-    try { database?.close(); } catch {}
   }
 }
 

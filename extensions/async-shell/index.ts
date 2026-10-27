@@ -21,7 +21,6 @@ import {
 } from "../_shared/completion-delivery.js";
 import { registerCommandWithAliases } from "../_shared/deprecated-command.js";
 import { buildWorkspaceSandboxEnvironment, prepareWorkspaceSandboxProcess } from "../_shared/workspace-sandbox.js";
-import { prepareWorkerContainerProcess, signalWorkerContainerJob, workerContainerFromEnvironment } from "../_shared/worker-container.js";
 import { RetainedToolOutputSchemas } from "../_shared/tool-output.js";
 import { inputJsonSchemaGuideline, outputJsonSchemaGuideline } from "../_shared/tool-prompt.js";
 import { workerResultAdmissionPath } from "../_shared/worker-contract.js";
@@ -110,6 +109,8 @@ export type StartManagedAsyncJobInput = {
   notifyOnExit?: boolean;
   settleProcessGroup?: boolean;
   persistSpawnedMetadata?: (job: JobMeta) => void;
+  /** Trusted callers may isolate internal job metadata from the project registry. */
+  jobRoot?: string;
   /** Trusted callers mark parent host jobs as managed-worker evidence. */
   managedBy?: AsyncShellManagedBy;
   /** Trusted callers may bind an exact externally persisted process identity. */
@@ -333,7 +334,7 @@ const SHELL_TAIL_MAX_LINES = 500;
 const SHELL_TAIL_MIN_CHARS = 1000;
 const SHELL_TAIL_DEFAULT_MAX_CHARS = 20000;
 const SHELL_TAIL_MAX_CHARS = 120000;
-const COMPLETION_BATCH_FLUSH_DELAY_MS = 100;
+const COMPLETION_BATCH_FLUSH_DELAY_MS = 500;
 const ASYNC_SHELL_VIEWER_MAX_JOBS = 100;
 const ASYNC_SHELL_VIEWER_DEFAULT_TAIL_LINES = SHELL_TAIL_MAX_LINES;
 const ASYNC_SHELL_VIEWER_FOLLOW_INTERVAL_MS = 500;
@@ -459,7 +460,7 @@ const completionDeliveryBatches = asyncShellRuntime.completionDeliveryBatches;
 const scheduledCompletionJobIds = asyncShellRuntime.scheduledCompletionJobIds;
 const retentionSnapshots = asyncShellRuntime.retentionSnapshots;
 
-function subscribeAsyncShellActivity(listener: AsyncShellActivityListener): () => void {
+export function subscribeAsyncShellActivity(listener: AsyncShellActivityListener): () => void {
   asyncShellActivityListeners.add(listener);
   return () => asyncShellActivityListeners.delete(listener);
 }
@@ -490,6 +491,8 @@ export function getAsyncShellCompletionBarrier(
     .map((job) => job.jobId);
   return { jobIds };
 }
+
+export function hasPendingAsyncShellCompletionFollowUpForOwner(owner: AsyncShellJobOwner): boolean { return Array.from(jobs.values()).some((job) => sameJobOwner(job.owner, owner) && isAsyncShellCompletionBarrierTarget(job)); }
 
 export function isAsyncShellCompletionBarrierTarget(target: {
   status: JobStatus;
@@ -780,7 +783,7 @@ function startJob(
   const shell = input.shell?.trim() || (owner ? "/bin/bash" : process.env.SHELL || "/bin/zsh");
   const jobId = input.jobId ?? createAsyncJobId();
   assertValidAsyncJobId(jobId);
-  const root = jobsRoot(context.cwd);
+  const root = input.jobRoot === undefined ? jobsRoot(context.cwd) : path.resolve(input.jobRoot);
   const jobsDirectory = path.join(root, "jobs");
   const logDir = path.join(jobsDirectory, jobId);
   if (jobs.has(jobId) || existsSync(logDir)) throw new Error(`Async shell job directory already exists: ${jobId}`);
@@ -978,6 +981,11 @@ export function unsettledPersistedAsyncShellJobsForOwner(
     .map((entry) => readStrictWorkerJobMeta(jobsDirectory, entry.name) as JobMeta)
     .filter((job) => sameJobOwner(job.owner, owner))
     .filter((job) => !workerJobIsSettled(job));
+}
+
+export function sealAsyncShellCompletionForOwner(owner: AsyncShellJobOwner): void {
+  for (const job of jobs.values()) { if (!sameJobOwner(job.owner, owner)) continue; job.notifyOnExit = false; job.completionNotified = true; job.completionFollowUpQueued = false; pendingCompletionNotifications.delete(job.jobId); writeMeta(job); }
+  notifyAsyncShellActivity();
 }
 
 export async function cancelAsyncShellJobsForOwner(
@@ -1379,6 +1387,7 @@ function acknowledgeCompletionBatch(batch: CompletionDeliveryBatch): void {
     pendingCompletionNotifications.delete(job.jobId);
     try { writeMeta(job); } catch {}
   }
+  notifyAsyncShellActivity();
 }
 
 function detachCompletionRuntime(runtime: CompletionDeliveryRuntime): void {
@@ -1746,13 +1755,13 @@ function formatJobList(jobsList: JobMeta[], historyRefreshPending = false, reten
   }).join("\n\n");
 }
 
-function requireJob(context: ExtensionContext, jobId: string): JobMeta {
-  const active = activeJobForContext(context, jobId);
+function requireJob(context: ExtensionContext, jobId: string, jobRoot?: string): JobMeta {
+  const active = activeJobForContext(context, jobId, jobRoot);
   if (active !== undefined) {
     return active;
   }
 
-  const meta = readMeta(context, jobId);
+  const meta = readMeta(context, jobId, jobRoot);
   if (meta === undefined) {
     throw new Error(`Unknown async shell job: ${jobId}`);
   }
@@ -1807,18 +1816,19 @@ function isSnapshotJobMeta(value: Record<string, unknown>): boolean {
     typeof value.stdoutLog === "string" && typeof value.stderrLog === "string";
 }
 
-function activeJobForContext(context: Pick<ExtensionContext, "cwd">, jobId: string): JobRuntime | undefined {
+function activeJobForContext(context: Pick<ExtensionContext, "cwd">, jobId: string, jobRoot?: string): JobRuntime | undefined {
   const job = jobs.get(jobId);
-  return job !== undefined && isJobInContext(context, job) ? job : undefined;
+  return job !== undefined && isJobInContext(context, job, jobRoot) ? job : undefined;
 }
 
-function isJobInContext(context: Pick<ExtensionContext, "cwd">, job: Pick<JobMeta, "logDir">): boolean {
-  return path.dirname(job.logDir) === path.join(jobsRoot(context.cwd), "jobs");
+function isJobInContext(context: Pick<ExtensionContext, "cwd">, job: Pick<JobMeta, "logDir">, jobRoot?: string): boolean {
+  const root = jobRoot === undefined ? jobsRoot(context.cwd) : path.resolve(jobRoot);
+  return path.dirname(job.logDir) === path.join(root, "jobs");
 }
 
-function readMeta(context: ExtensionContext, jobId: string): JobMeta | undefined {
+function readMeta(context: ExtensionContext, jobId: string, jobRoot?: string): JobMeta | undefined {
   assertValidAsyncJobId(jobId);
-  const root = path.join(jobsRoot(context.cwd), "jobs");
+  const root = path.join(jobRoot === undefined ? jobsRoot(context.cwd) : path.resolve(jobRoot), "jobs");
   return readMetaFile(path.join(root, jobId, "meta.json"), root, jobId);
 }
 
@@ -1947,6 +1957,7 @@ function finishStartGracePeriod(jobsList: JobRuntime[]): void {
       job.startResultPending = false;
     }
   }
+  notifyAsyncShellActivity();
 }
 
 function releaseStartResultBarriers(api: ExtensionAPI, jobsList: JobRuntime[]): void {
@@ -1978,6 +1989,7 @@ function acknowledgeObservedJobCompletion(job: JobMeta): boolean {
     forgetCompletionDelivery(runtime.jobId);
     pendingCompletionNotifications.delete(runtime.jobId);
   }
+  notifyAsyncShellActivity();
   return true;
 }
 
@@ -1996,6 +2008,7 @@ function recordMetadataPersistenceFailure(job: JobMeta, cause: unknown, label: s
   const failure = `${label}: ${cause instanceof Error ? cause.message : String(cause)}`;
   if (!job.error?.includes(failure)) job.error = job.error ? `${job.error}; ${failure}` : failure;
   if (isTerminal(job.status)) job.status = "failed";
+
 }
 
 function forgetCompletionDelivery(jobId: string): void {
@@ -2609,7 +2622,7 @@ export function buildAsyncShellViewerUsage(): string {
   ].join("\n");
 }
 
-export async function handleAsyncShellViewerCommand(context: ExtensionCommandContext, rawArgs: string): Promise<void> {
+export async function handleAsyncShellViewerCommand(context: ExtensionCommandContext, rawArgs: string, jobRoot?: string): Promise<void> {
   let args: AsyncShellViewerArgs;
   try {
     args = parseAsyncShellViewerArgs(rawArgs);
@@ -2628,6 +2641,10 @@ export async function handleAsyncShellViewerCommand(context: ExtensionCommandCon
   }
 
   let jobId = args.jobId;
+  if (jobRoot !== undefined && jobId === undefined) {
+    context.ui.notify("An exact managed-worker job id is required.", "error");
+    return;
+  }
   if (jobId === undefined) {
     try {
       jobId = await pickAsyncShellViewerJob(context);
@@ -2642,7 +2659,7 @@ export async function handleAsyncShellViewerCommand(context: ExtensionCommandCon
 
   let initialSnapshot: AsyncShellViewerSnapshot;
   try {
-    initialSnapshot = loadAsyncShellViewerSnapshot(context, jobId, args.stream, args.tailLines);
+    initialSnapshot = loadAsyncShellViewerSnapshot(context, jobId, args.stream, args.tailLines, jobRoot);
   } catch (error) {
     context.ui.notify(error instanceof Error ? error.message : String(error), "error");
     return;
@@ -2656,7 +2673,7 @@ export async function handleAsyncShellViewerCommand(context: ExtensionCommandCon
       initialStream: args.stream,
       tailLines: args.tailLines,
       follow: args.follow,
-      loadSnapshot: (stream, tailLines) => loadAsyncShellViewerSnapshot(context, jobId, stream, tailLines),
+      loadSnapshot: (stream, tailLines) => loadAsyncShellViewerSnapshot(context, jobId, stream, tailLines, jobRoot),
       done
     }));
   } catch (error) {
@@ -2728,9 +2745,10 @@ export function loadAsyncShellViewerSnapshot(
   context: Pick<ExtensionContext, "cwd">,
   jobId: string,
   stream: AsyncShellViewerStream,
-  tailLines: number
+  tailLines: number,
+  jobRoot?: string
 ): AsyncShellViewerSnapshot {
-  const job = requireJob(context as ExtensionContext, jobId);
+  const job = requireJob(context as ExtensionContext, jobId, jobRoot);
   const boundedTailLines = clampInteger(tailLines, 1, SHELL_TAIL_MAX_LINES);
   const selected = stream === "both" ? selectedStreams() : selectedStreams(stream);
   const streams = selected.map((selectedStream): AsyncShellViewerStreamSnapshot => {
@@ -2746,7 +2764,7 @@ export function loadAsyncShellViewerSnapshot(
 
   return {
     job: publicJob(job),
-    projectRoot: jobsRoot(context.cwd),
+    projectRoot: jobRoot === undefined ? jobsRoot(context.cwd) : path.resolve(jobRoot),
     streams,
     outputLines: buildAsyncShellViewerOutputLines(streams),
     refreshedAt: new Date().toISOString()
@@ -3119,12 +3137,16 @@ function hasAccess(targetPath: string, mode: number): boolean {
 
 function assertWorkerRunAcceptsSideEffects(): void {
   if (!workerOwnerFromEnvironment()) return;
+  const inProcessState = Reflect.get(globalThis, Symbol.for("pi.worker.admission-state"));
+  if (inProcessState !== undefined && inProcessState !== "open") throw new Error("Managed worker shell_start is sealed during or after worker_result_submit admission.");
+  if (process.env.PI_WORKER_HOST_RPC === "1") {
+    if (inProcessState === undefined) throw new Error("Managed Sandbox worker runtime admission state is unavailable.");
+    return;
+  }
   const resultFile = process.env.PI_WORKER_RESULT_FILE?.trim();
   if (!resultFile) throw new Error("Managed worker shell_start requires PI_WORKER_RESULT_FILE.");
   const resolvedResultFile = path.resolve(resultFile);
-  if (existsSync(resolvedResultFile) || existsSync(workerResultAdmissionPath(resolvedResultFile))) {
-    throw new Error("Managed worker shell_start is sealed during or after worker_result_submit admission.");
-  }
+  if (existsSync(resolvedResultFile) || existsSync(workerResultAdmissionPath(resolvedResultFile))) throw new Error("Managed worker shell_start is sealed during or after worker_result_submit admission.");
 }
 
 function prepareManagedWorkerProcess(input: {
@@ -3135,30 +3157,14 @@ function prepareManagedWorkerProcess(input: {
   env: NodeJS.ProcessEnv;
   workspaceRoot: string;
 }): { executable: string; args: string[]; env: NodeJS.ProcessEnv; hostCwd?: string; cancellationEffect?: (signal: NodeJS.Signals) => void } {
-  const container = workerContainerFromEnvironment();
-  if (container) {
-    const dockerPath = process.env.PI_WORKER_DOCKER_PATH?.trim();
-    if (!dockerPath) throw new Error("Managed worker Docker execution requires PI_WORKER_DOCKER_PATH.");
-    return {
-      ...prepareWorkerContainerProcess({
-        dockerPath,
-        container,
-        jobId: input.jobId,
-        cwd: input.cwd,
-        executable: input.executable,
-        args: input.args,
-        env: input.env
-      }),
-      cancellationEffect: (signal) => signalWorkerContainerJob(dockerPath, container, input.jobId, signal)
-    };
-  }
+  if (process.env.PI_WORKER_HOST_RPC === "1") return { executable: input.executable, args: input.args, env: input.env };
   if (process.env.PI_WORKER_NATIVE_TEST_SHELL === "1") {
     if (process.platform === "darwin") return prepareWorkspaceSandboxProcess({ executable: input.executable, args: input.args, env: input.env, workspaceRoot: input.workspaceRoot });
     // Explicit test-only backend: preserve ownership metadata and process-group
     // behavior on non-macOS CI without claiming production confinement.
     return { executable: input.executable, args: input.args, env: buildWorkspaceSandboxEnvironment(input.env, input.workspaceRoot) };
   }
-  throw new Error("Managed worker shell execution requires an exact Docker container identity.");
+  throw new Error("Managed worker shell execution requires the in-Sandbox runtime.");
 }
 
 function managedWorkerShellArgs(executable: string, command: string): string[] {

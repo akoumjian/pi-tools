@@ -1,13 +1,33 @@
 #!/usr/bin/env node
+import { spawnSync } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { stream as streamAnthropic } from "@earendil-works/pi-ai/api/anthropic-messages";
-import { stream as streamOpenAICodexResponses } from "@earendil-works/pi-ai/api/openai-codex-responses";
-import { getBuiltinModel as getModel } from "@earendil-works/pi-ai/providers/all";
-import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
 
-const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+const scriptPath = fileURLToPath(import.meta.url);
+if (!process.execArgv.includes("--preserve-symlinks")) {
+  const rerun = spawnSync(process.execPath, ["--preserve-symlinks", scriptPath, ...process.argv.slice(2)], {
+    cwd: process.cwd(),
+    env: process.env,
+    stdio: "inherit"
+  });
+  if (rerun.error) throw rerun.error;
+  process.exit(rerun.status ?? 1);
+}
+
+const [
+  { stream: streamAnthropic },
+  { stream: streamOpenAICodexResponses },
+  { getBuiltinModel: getModel },
+  { discoverAndLoadExtensions }
+] = await Promise.all([
+  import("@earendil-works/pi-ai/api/anthropic-messages"),
+  import("@earendil-works/pi-ai/api/openai-codex-responses"),
+  import("@earendil-works/pi-ai/providers/all"),
+  import("@earendil-works/pi-coding-agent")
+]);
+
+const scriptDir = path.dirname(scriptPath);
 const repoRoot = path.resolve(scriptDir, "..");
 const fixedNow = "2000-01-02T12:00:00.000Z";
 process.env.TZ = "UTC";

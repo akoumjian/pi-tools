@@ -13,7 +13,7 @@ Handle sequential work directly because workers incur startup, context-transfer,
 
 Start a `work` worker for substantial self-contained assignments. Batch runs only when the assignments are independent and benefit from parallel execution.
 
-The parent remains responsible for grounding, task assignment, scope, and durable decisions.
+The parent remains responsible for grounding, task assignment, scope, and durable decisions. Every execution/resume receives a fresh immutable Docker Sandbox; only the worker's durable root and explicit read-only inputs cross runs. Never bypass a launch failure with a host-Pi or ordinary-Docker fallback.
 
 ### 2. Handle the Result
 
@@ -56,7 +56,7 @@ Applying a prepared set is sequential rather than atomic. If application is part
 
 ### 5. Finish
 
-Pushing, publication, release, grounding updates, semantic acceptance, and Beads closure remain parent-owned.
+Pushing, publication, release, grounding updates, semantic acceptance, and Beads closure remain parent-owned. Package-code upgrades require a full Pi process restart; `/reload` is not sufficient to activate new package code.
 
 Cancel only active work. Discard an idle worker only when no further review, resume, merge, or recovery access is needed.
 
@@ -66,4 +66,13 @@ Cancel only active work. Discard an idle worker only when no further review, res
 - Workers may update only assigned Beads tasks and never close them.
 - Review outcomes are advisory and never authorize repository application.
 - Workers never modify authoritative repositories, push, publish, release, or write parent grounding.
-- Worker workspaces, sessions, and run evidence remain retained until explicit discard.
+- Worker workspaces, sessions, and run evidence remain retained until explicit discard; Sandbox removal never means logical-worker discard.
+- A review subject’s authoritative lower layer and prepared/session evidence are read-only. Reviewers run tests, builds, edits, and experiments directly in the fresh disposable copy-on-write merged view; only retained reports/artifacts belong in their own worker root. Integration workers write only in their retained roots.
+
+## Retention, preservation, and explicit cleanup
+
+Treat retained workers, sessions, runs, results, repositories, and artifacts as durable evidence; settlement, age, storage pressure, or task closure never deletes them. Use `worker_control cleanup_inventory` for bounded current/all-session accounting, and follow each one-use `nextCursor` until every per-root scan is complete. For any cross-session action, open-task abandonment, artifact loss, foreign pending/claimed delivery takeover, prepared state, or physical leftover, request `cleanup_preview` with exact IDs and then call `cleanup_apply` with its one-use token and the exact acknowledgement lists shown by the preview. Never synthesize acknowledgements from memory or reuse a token. Current-session undelivered results, live/ambiguous foreign owners, unavailable Beads, claims, irreversible recovery, and changed snapshots remain blocked. An attempted pre-commit cleanup failure stays adopted; if its adopter later dies/retires/disappears, exact preview-bound recovery acknowledgement permits takeover. Request a fresh preview and provide the exact recovery acknowledgement (plus any still-required open-task/artifact consent) to retry.
+
+Use `preserve` before cleanup for non-reproducible evidence that must outlive the worker. Choose a new absolute destination outside repositories, `.git`, every `.pi` path, worker/runtime roots, and credential/configuration storage; filesystem-identity aliases of forbidden roots are also refused. Preservation rejects links and repositories by design. Narrow same-session `discard` is only for already-delivered, closed-task idle workers; use preview/apply for every earlier-loss case. Reviewer/subject lease pairs must be previewed together and are deleted reviewer first. Inspect per-item results because a cleanup batch continues after exact failures and reports partial failure as an error. Reviewer/subject adoption is one attempted authority unit: after any member is attempted, both stay adopter-owned with consent and delivery facts; release both only before any attempt. Partial prepared-set deletion returns an explicit warning, and cleanup trash is eligible only with an exact host-only out-of-tree claim deleted last. Human slash confirmation reports every success, failure, and warning plus remaining cursors.
+
+Before requesting review, ask workers to remove temporary clones, generated environments, caches, and other reproducible debris while retaining clean committed repositories, required reports, declared artifacts, and session/evidence needed for review or resume. Repository paths and artifact paths are different contracts: never report a standalone, shallow, nested, worktree, or bare Git root as an artifact (ordinary subdirectories are allowed), require completed reviewers to report a non-empty ordinary report file, never place candidate repositories under cache/tmp subtrees, and keep every declared path workspace-contained.

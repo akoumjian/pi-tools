@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { cp, mkdtemp, readFile, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -211,5 +211,47 @@ test("provider context review command renders sanitized prompt, tool declaration
     assert.match(markdown, /## Anthropic Messages request payload/);
   } finally {
     await rm(out, { recursive: true, force: true });
+  }
+});
+
+test("provider context review is path-stable with an external node_modules symlink", async () => {
+  const fixtureRoot = await mkdtemp(path.join(tmpdir(), "pi-provider-context-symlink-"));
+  const sourceRoot = process.cwd();
+  const preparedRoot = path.join(fixtureRoot, "prepared-checkout");
+  const outputRoot = path.join(fixtureRoot, "output");
+  const externalNodeModules = await realpath(path.join(sourceRoot, "node_modules"));
+  const excludedRoots = new Set([".git", ".pi", "node_modules"]);
+  try {
+    await cp(sourceRoot, preparedRoot, {
+      recursive: true,
+      filter(source) {
+        const relative = path.relative(sourceRoot, source);
+        const topLevel = relative.split(path.sep)[0];
+        return relative === "" || !excludedRoots.has(topLevel);
+      }
+    });
+    await symlink(externalNodeModules, path.join(preparedRoot, "node_modules"), "dir");
+
+    const run = spawnSync(process.execPath, ["scripts/review-provider-context.mjs", "--out", outputRoot], {
+      cwd: preparedRoot,
+      encoding: "utf8"
+    });
+    assert.equal(run.status, 0, run.stderr || run.stdout);
+
+    const generatedJson = await readFile(path.join(outputRoot, "provider-context-review.json"), "utf8");
+    const generatedMarkdown = await readFile(path.join(outputRoot, "provider-context-review.md"), "utf8");
+    assert.equal(
+      generatedJson,
+      await readFile(path.join(sourceRoot, "docs/generated/provider-context-review/provider-context-review.json"), "utf8")
+    );
+    assert.equal(
+      generatedMarkdown,
+      await readFile(path.join(sourceRoot, "docs/generated/provider-context-review/provider-context-review.md"), "utf8")
+    );
+    const generated = `${generatedJson}\n${generatedMarkdown}`;
+    assert.equal(generated.includes(externalNodeModules), false, "generated review must not expose the external dependency realpath");
+    assert.equal(generated.includes(preparedRoot), false, "generated review must not expose the prepared checkout path");
+  } finally {
+    await rm(fixtureRoot, { recursive: true, force: true });
   }
 });

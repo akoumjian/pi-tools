@@ -10,7 +10,7 @@ const RunId = Type.String({ minLength: 1, maxLength: 128, pattern: "^run_[A-Za-z
 const PreparedId = Type.String({ pattern: "^prepared_[0-9a-f]{24}$", description: "Prepared repository-set identity returned by worker_merge_test." });
 const CompletionDelivery = Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("followUp")], { default: "steer", description: "When to deliver the asynchronous result. Use `steer` as soon as it is ready. Use `followUp` for lower-priority work that can wait until the current agent run would otherwise stop. Defaults to `steer`." }));
 const RepositoryBaseline = Type.Object({
-  path: Type.String({ minLength: 1, maxLength: 4096, description: "Absolute path to a local Git repository readable by the tool and worker container." }),
+  path: Type.String({ minLength: 1, maxLength: 4096, description: "Absolute path to a local Git repository readable by the tool and worker Sandbox." }),
   revision: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "Optional Git revision to pin as the exact baseline commit. Accepts a commit, branch, tag, or other valid revision; defaults to the repository’s current HEAD." }))
 }, { additionalProperties: false });
 
@@ -19,7 +19,7 @@ export const StartWork = Type.Object({
   role: Type.Literal("work", { description: "Perform a substantial implementation, research, analysis, testing, or other self-contained assignment." }),
   taskIds: Type.Array(TaskId, { minItems: 1, maxItems: 32, uniqueItems: true, description: "One or more Beads task IDs assigned to the worker. The worker may read broader task context but may update only its assigned tasks." }),
   instructions: Type.String({ minLength: 1, maxLength: 12 * 1024, description: "Focused instructions for the assignment. State the goal, scope, important decisions or non-goals, and expected checks or result without repeating the full parent transcript." }),
-  repositoryBaselines: Type.Optional(Type.Array(RepositoryBaseline, { maxItems: 16, description: "Provenance-only local Git repositories for the parent to validate and pin at exact commits. Baseline paths are not mounted into or guaranteed reachable from the worker workspace; the worker performs any needed clones using --no-hardlinks. Up to sixteen baselines may be supplied." })),
+  repositoryBaselines: Type.Optional(Type.Array(RepositoryBaseline, { maxItems: 16, description: "Provenance-only local Git repositories for the parent to validate and pin at exact commits. Baseline paths are not mounted into or guaranteed reachable from the worker workspace; the worker performs any needed clones using `git clone --no-local --no-hardlinks`. Up to sixteen baselines may be supplied." })),
   modelSelection: Type.Optional(Type.String({ minLength: 1, maxLength: 512, description: "Optional exact provider/model:thinking override, for example openai-codex/gpt-5.6-sol:xhigh. Normally omit it to use the configured work-role selection. The override is honored exactly or the launch fails. Max thinking and Claude Fable selections are rejected." })),
   completionDelivery: CompletionDelivery
 }, { additionalProperties: false });
@@ -61,13 +61,50 @@ const ListControl = Type.Object({
 const RunsControl = Type.Object({ action: Type.Literal("runs", { description: "List the execution runs belonging to one worker, newest first." }), workerId: WorkerId, limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, default: 20, description: "Maximum number of records to return. Defaults to 20 and cannot exceed 100." })), offset: Type.Optional(Type.Integer({ minimum: 0, default: 0, description: "Number of records to skip in the stable result order. Defaults to zero." })) }, { additionalProperties: false });
 const GetControl = Type.Object({ action: Type.Literal("get", { description: "Inspect one exact active or settled run, including operational access and any submitted result." }), workerId: WorkerId, runId: RunId }, { additionalProperties: false });
 const CancelControl = Type.Object({ action: Type.Literal("cancel", { description: "Stop a worker's active run while preserving its worker, workspace, session, and retained evidence." }), workerId: WorkerId }, { additionalProperties: false });
-const DiscardControl = Type.Object({ action: Type.Literal("discard", { description: "Permanently delete an idle worker and all of its retained workspace, session, run, and evidence data." }), workerId: WorkerId }, { additionalProperties: false });
-const WorkerControlStrict = Type.Union([ListControl, RunsControl, GetControl, CancelControl, DiscardControl]);
+const LegacyDiscardControl = Type.Object({ action: Type.Literal("discard", { description: "Permanently delete one delivered, closed-task idle current-session worker. Early loss requires cleanup_preview/cleanup_apply." }), workerId: WorkerId }, { additionalProperties: false });
+const DiscardWorkerIds = Type.Array(WorkerId, { minItems: 1, maxItems: 32, uniqueItems: true });
+const DiscardPreparedIds = Type.Array(PreparedId, { minItems: 1, maxItems: 16, uniqueItems: true });
+const ArtifactLossAcknowledged = Type.Optional(Type.Array(WorkerId, { minItems: 1, maxItems: 32, uniqueItems: true, description: "Exact workers whose listed unpreserved reported artifacts may be erased." }));
+const BatchDiscardControl = Type.Union([
+  Type.Object({ action: Type.Literal("discard", { description: "Permanently discard exact delivered, closed-task idle current-session workers and optional prepared sets." }), workerIds: DiscardWorkerIds, preparedIds: Type.Optional(DiscardPreparedIds), artifactLossAcknowledged: ArtifactLossAcknowledged }, { additionalProperties: false }),
+  Type.Object({ action: Type.Literal("discard", { description: "Permanently discard exact current-session closed-task prepared sets and optional delivered, closed-task idle workers." }), preparedIds: DiscardPreparedIds, workerIds: Type.Optional(DiscardWorkerIds), artifactLossAcknowledged: ArtifactLossAcknowledged }, { additionalProperties: false })
+]);
+const PreserveControl = Type.Object({
+  action: Type.Literal("preserve", { description: "Atomically preserve selected ordinary non-Git worker artifacts outside managed worker storage." }), workerId: WorkerId,
+  destination: Type.String({ minLength: 1, maxLength: 4096, pattern: "^/" }),
+  paths: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), { minItems: 1, maxItems: 32, uniqueItems: true }))
+}, { additionalProperties: false });
+const CleanupInventoryControl=Type.Object({action:Type.Literal("cleanup_inventory",{description:"Read a bounded page of current- or all-session cleanup classes without granting mutation authority. All-session filesystem scans return a persisted one-use cursor for resumable per-root accounting."}),allSessions:Type.Optional(Type.Boolean({default:false})),limit:Type.Optional(Type.Integer({minimum:1,maximum:100,default:20})),offset:Type.Optional(Type.Integer({minimum:0,default:0})),cursor:Type.Optional(Type.String({pattern:"^cleanup_scan_[a-f0-9]{48}$"}))},{additionalProperties:false});
+const CleanupPreviewControl = Type.Object({
+  action: Type.Literal("cleanup_preview", { description: "Persist a one-use host-only cleanup snapshot for exact bounded targets selected from cleanup_inventory." }),
+  workerIds: Type.Optional(DiscardWorkerIds), preparedIds: Type.Optional(DiscardPreparedIds),
+  leftoverIds: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 96, pattern: "^leftover_[a-f0-9]{24}$" }), { minItems: 1, maxItems: 32, uniqueItems: true }))
+}, { additionalProperties: false });
+const CleanupAcknowledgements = Type.Optional(Type.Array(WorkerId, { minItems: 1, maxItems: 32, uniqueItems: true }));
+const CleanupApplyControl = Type.Object({
+  action: Type.Literal("cleanup_apply", { description: "Consume one exact cleanup snapshot with explicit per-worker loss/takeover acknowledgements." }),
+  token: Type.String({ minLength: 32, maxLength: 96, pattern: "^cleanup_[a-f0-9]{48}$" }),
+  openTaskAbandonmentAcknowledged: CleanupAcknowledgements,
+  artifactLossAcknowledged: CleanupAcknowledgements,
+  pendingDeliveryTakeoverAcknowledged: CleanupAcknowledgements,
+  claimedDeliveryTakeoverAcknowledged: CleanupAcknowledgements,
+  recoveryAcknowledged: CleanupAcknowledgements
+}, { additionalProperties: false });
+const WorkerControlStrict = Type.Union([ListControl, RunsControl, GetControl, CancelControl, LegacyDiscardControl, BatchDiscardControl, PreserveControl, CleanupInventoryControl, CleanupPreviewControl, CleanupApplyControl]);
 export const WorkerControlParamsV2 = Type.Unsafe<Static<typeof WorkerControlStrict>>({
   ...WorkerControlStrict, type: "object", required: ["action"], additionalProperties: false,
   properties: {
-    action: Type.Union([Type.Literal("list"), Type.Literal("runs"), Type.Literal("get"), Type.Literal("cancel"), Type.Literal("discard")]),
+    action: Type.Union([Type.Literal("list"), Type.Literal("runs"), Type.Literal("get"), Type.Literal("cancel"), Type.Literal("discard"), Type.Literal("preserve"), Type.Literal("cleanup_inventory"), Type.Literal("cleanup_preview"), Type.Literal("cleanup_apply")]),
     workerId: Type.Optional(WorkerId), runId: Type.Optional(RunId),
+    workerIds: Type.Optional(DiscardWorkerIds), preparedIds: Type.Optional(DiscardPreparedIds), artifactLossAcknowledged: Type.Optional(Type.Array(WorkerId, { minItems: 1, maxItems: 32, uniqueItems: true })),
+    leftoverIds: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 96, pattern: "^leftover_[a-f0-9]{24}$" }), { minItems: 1, maxItems: 32, uniqueItems: true })),
+    token: Type.Optional(Type.String({ minLength: 32, maxLength: 96, pattern: "^cleanup_[a-f0-9]{48}$" })),
+    cursor: Type.Optional(Type.String({ minLength: 32, maxLength: 96, pattern: "^cleanup_scan_[a-f0-9]{48}$" })),
+    openTaskAbandonmentAcknowledged: Type.Optional(Type.Array(WorkerId, { minItems: 1, maxItems: 32, uniqueItems: true })),
+    pendingDeliveryTakeoverAcknowledged: Type.Optional(Type.Array(WorkerId, { minItems: 1, maxItems: 32, uniqueItems: true })),
+    claimedDeliveryTakeoverAcknowledged: Type.Optional(Type.Array(WorkerId, { minItems: 1, maxItems: 32, uniqueItems: true })),
+    recoveryAcknowledged: Type.Optional(Type.Array(WorkerId, { minItems: 1, maxItems: 32, uniqueItems: true })),
+    destination: Type.Optional(Type.String({ minLength: 1, maxLength: 4096, pattern: "^/" })), paths: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), { minItems: 1, maxItems: 32, uniqueItems: true })), allSessions: Type.Optional(Type.Boolean()),
     status: Type.Optional(Type.Union([Type.Literal("idle"), Type.Literal("queued"), Type.Literal("running")], { description: "Optional current-worker filter for list." })),
     role: Type.Optional(Type.Union([Type.Literal("work"), Type.Literal("review"), Type.Literal("integration")], { description: "Optional worker-role filter for list." })),
     limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, default: 20, description: "Maximum number of records to return. Defaults to 20 and cannot exceed 100." })),
@@ -92,7 +129,7 @@ export const WorkerMergeApplyParams = Type.Object({ preparedId: PreparedId }, { 
 
 const ResultSummary = Type.String({ minLength: 1, maxLength: 2048, description: "Concise account of the result, useful progress, remaining risk, or reason the work could not continue." });
 const ResultQuestion = Type.Optional(Type.String({ minLength: 1, maxLength: 2048, description: "Specific question the parent must answer before work can continue. Required for needs_input and not allowed for other outcomes." }));
-const ResultArtifacts = Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), { maxItems: 32, description: "Files or directories that are useful result entry points. Paths may be absolute within the worker workspace or relative to the workspace; the tool stores normalized relative paths." }));
+const ResultArtifacts = Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), { maxItems: 32, description: "Ordinary non-repository files or directories that are useful result entry points. An artifact path cannot itself be a standalone, worktree, shallow, nested, or bare Git repository root; report repositories separately. Review approve/request_changes results require a non-empty regular report file. Paths may be absolute within the worker workspace or relative to the workspace; the tool stores normalized relative paths." }));
 export const WorkerWorkResultSubmitParams = Type.Object({
   outcome: Type.Union([Type.Literal("completed"), Type.Literal("needs_input"), Type.Literal("blocked")], { description: "Why this work or integration run is ending." }),
   summary: ResultSummary,
@@ -161,15 +198,14 @@ export function validateWorkerResultInput(role: WorkerRole, input: WorkerResultS
   return { outcome: input.outcome, summary, ...(question ? { question } : {}) };
 }
 
-export function normalizeWorkspaceResultPaths(workspaceRoot: string, values: string[], kind: "repository" | "artifact", stat: (value: string) => { exists: boolean; directory: boolean; file: boolean; repository: boolean }): string[] {
+export function normalizeWorkspaceResultPaths(workspaceRoot: string, values: string[], kind: "repository" | "artifact", stat: (value: string) => { exists: boolean; directory: boolean; file: boolean; repository: boolean; bytes?:number }): string[] {
   if (Buffer.byteLength(values.join("\0")) > 32 * 1024) throw new WorkerResultValidationError("unsupported_path_type", kind === "repository" ? "repositories" : "artifacts", "Combined result paths exceed 32768 UTF-8 bytes.");
   const root = realpathSync(path.resolve(workspaceRoot));
   const seen = new Set<string>();
   return values.map((value, index) => {
     const fieldPath = `${kind === "repository" ? "repositories" : "artifacts"}[${index}]`;
     if (Buffer.byteLength(value) > 4096) throw new WorkerResultValidationError("unsupported_path_type", fieldPath, `Result path exceeds 4096 UTF-8 bytes: ${value}.`);
-    const workspaceAlias = value === "/workspace" ? root : value.startsWith("/workspace/") ? path.join(root, value.slice("/workspace/".length)) : undefined;
-    const lexical = workspaceAlias ?? path.resolve(root, value);
+    const lexical = path.resolve(root, value);
     const lexicalRelative = path.relative(root, lexical);
     if (!strictlyWithin(root, lexical) || lexicalRelative === "") throw new WorkerResultValidationError("path_outside_workspace", fieldPath, `Result path is outside the workspace: ${value}.`);
     if (!existsSync(lexical)) throw new WorkerResultValidationError("path_not_found", fieldPath, `Result path does not exist: ${value}.`);
@@ -183,7 +219,8 @@ export function normalizeWorkspaceResultPaths(workspaceRoot: string, values: str
     const metadata = stat(exact);
     if (!metadata.exists) throw new WorkerResultValidationError("path_not_found", fieldPath, `Result path does not exist: ${value}.`);
     if (kind === "repository" && (!metadata.directory || !metadata.repository)) throw new WorkerResultValidationError("not_repository", fieldPath, `Repository result is not a Git repository directory: ${value}.`);
-    if (kind === "artifact" && !metadata.directory && !metadata.file) throw new WorkerResultValidationError("unsupported_path_type", fieldPath, `Artifact result must be a regular file or directory: ${value}.`);
+    if(kind==="artifact"&&metadata.repository)throw new WorkerResultValidationError("unsupported_path_type",fieldPath,`Artifact result cannot itself be a Git repository root; report it in repositories instead: ${value}.`);
+    if (kind === "artifact" && !metadata.directory && !metadata.file) throw new WorkerResultValidationError("unsupported_path_type", fieldPath, `Artifact result must be an ordinary regular file or directory: ${value}.`);
     return normalized;
   });
 }

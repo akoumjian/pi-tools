@@ -11,7 +11,7 @@ Reusable extensions for the [Pi coding agent](https://pi.dev/). The package focu
 - provider-safe resend of the current context after any failure or cancellation via `/retry`, plus bounded automatic retry of outage-class errors Pi core does not classify
 - provider-free active-context clipboard snapshots via `/context:copy`
 - robust chunked context compaction via `/compacter`
-- durable Docker-confined managed workers with exact-session lifecycle and deterministic merge preparation
+- durable Docker Sandbox managed workers with exact-session lifecycle and deterministic merge preparation
 - TUI niceties: tmux/scrollback compatibility, theme preview, compact tool renderers, file-reference picker
 
 Profile-specific assets (personal AGENTS context, auth, model defaults, themes) live in a separate consumer package or local Pi profile, not in this repository.
@@ -130,7 +130,7 @@ Each extension below documents what it does, what it provides, and how to set it
 
 **Purpose.** Durable async shell jobs instead of blocking the agent. Each `shell_start` call accepts a list of commands; finished jobs return in-band within a fixed 6 s grace period, and background jobs deliver acknowledged completion notices batched by `steer` or `followUp` priority. `notifyOnExit` defaults to true and `completionDelivery` defaults to `steer`.
 
-**Provides.** `shell_start`, `shell_status`, `shell_read`, `shell_cancel`; `/async:status`; bounded cursor-based `/async:prune` inventory and exact preview/confirm; and the interactive read-only `/async:view` selector/viewer for live or historical job output. Ordinary retention refuses explicit/new or legacy managed-worker host evidence. Host-log deletion remains a separate managed-worker cleanup task; current worker discard does not remove legacy host logs. Job lists and the picker use the latest completed storage snapshot plus exact live jobs while one deduplicated refresh runs in the background. Durable per-job logs and metadata remain under `.pi/async-shell/jobs/<jobId>/`. `shell_start` and completion notices point at `stdout_log`/`stderr_log` without embedding output samples; use `shell_read` tail mode for model inspection, or `/async:view` for provider-free human viewing. The viewer bounds reads to the existing 500-line/120 KB tail limits per stream, strips terminal control sequences for safe rendering, and closes without stopping jobs.
+**Provides.** `shell_start`, `shell_status`, `shell_read`, `shell_cancel`; `/async:status`; bounded cursor-based `/async:prune` inventory and exact preview/confirm; and the interactive read-only `/async:view` selector/viewer for live or historical job output. Ordinary retention refuses explicit/new or legacy managed-worker host evidence. Host-log deletion remains a separate managed-worker cleanup task; current worker discard does not remove legacy host logs. Job lists and the picker use the latest completed storage snapshot plus exact live jobs while one deduplicated refresh runs in the background. Durable ordinary-job logs and metadata remain under `.pi/async-shell/jobs/<jobId>/`; trusted worker-host jobs use only `~/.local/share/agent/worker-runtime-v10/worker-host-jobs/jobs/<jobId>/`, and ordinary retention consults only the v10 worker registry. `shell_start` and completion notices point at `stdout_log`/`stderr_log` without embedding output samples; use `shell_read` tail mode for model inspection, or `/async:view` for provider-free human viewing. The viewer bounds reads to the existing 500-line/120 KB tail limits per stream, strips terminal control sequences for safe rendering, and closes without stopping jobs.
 
 **Setup.** None. No polling/wait tool: continue useful work; completion notices will resume the agent.
 
@@ -144,7 +144,7 @@ Each extension below documents what it does, what it provides, and how to set it
 
 **Provides.** `worker_run`, `worker_control`, `worker_merge_test`, `worker_merge_apply`; worker-only `worker_result_submit` and `worker_beads_tasks` (including digest-fenced canonical Beads design continuation); trusted width-bounded operation hints plus compact exact-session `wN` worker activity beside direct-shell `shN`; `/worker:list`, `/worker:show`, `/worker:view`, `/worker:logs`, `/worker:cancel`, and `/worker:discard`.
 
-**Setup.** Node 22.19+, Pi, Docker Desktop or a rootful Docker Engine, the pinned worker image, central `bd`, and role model preferences in `config/worker-settings.json`.
+**Setup.** Node 22.19+, Pi, Docker Desktop or a rootful Docker Engine, Docker `sbx`, an approved immutable worker kit/image manifest, central `bd`, and role model preferences in `config/worker-settings.json`.
 
 ---
 
