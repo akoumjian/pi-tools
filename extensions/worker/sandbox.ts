@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { lstatSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 import { readPiToolsJsonConfigSource, resolvePiToolsConfigReference } from "../_shared/config.js";
@@ -38,7 +38,7 @@ export type WorkerSandboxRelease = {
 export type WorkerSandboxReference = {
   kind: "docker-sandbox"; sandboxName: string; creationNonce: string; workerId: string; runId: string;
   kitReference: string; kitSha256: string; imageReference: string; imageDigest: string; sbxVersion: "v0.49.1"; sbxBuildCommit: string; templateId: string; templateRepository: string; templateTag: string; templateFlavor: string; protocolVersion: 1; releaseOrdinal: number;
-  workspaceRoot: string; workingDirectory: string; codeRoot: string; mounts: WorkerSandboxMount[]; reviewOverlay?: ReviewWorkspaceOverlay; piCli: string; rpcLauncher: string; codingAgentDir: string;
+  workspaceRoot: string; workspaceDevice?: number; workspaceInode?: number; workspaceOwnerUid?: number; workspaceOwnerGid?: number; workingDirectory: string; codeRoot: string; mounts: WorkerSandboxMount[]; reviewOverlay?: ReviewWorkspaceOverlay; piCli: string; rpcLauncher: string; codingAgentDir: string;
   stagedLockSha256: string; resourceManifestSha256: string; runtimeProvenanceSha256: string; extensionPaths: string[]; searxngUrl: string; revisions: WorkerSandboxRelease["revisions"];
   createEvidenceSha256?: string; inspectEvidenceSha256?: string; sbxVersionEvidenceSha256?: string; observedCpu?: number; observedMemoryBytes?: number; observedSandboxId?: string; observedRuntimeSha256?: string;
 };
@@ -69,12 +69,13 @@ export function planWorkerSandbox(input: { workerId: string; runId: string; crea
   const identityHash = createHash("sha256").update(`${input.workerId}\0${input.runId}`).digest("hex").slice(0, 20);
   const sandboxName = `pi-${identityHash}-${input.creationNonce}`;
   if (!SANDBOX_NAME.test(sandboxName)) throw new Error("Invalid Worker Sandbox name.");
-  const workspaceRoot = realpathSync(input.workerRoot); const codeRoot = realpathSync(input.codeRoot);
+  const workspaceRoot = realpathSync(input.workerRoot); const workspace = statSync(workspaceRoot); const codeRoot = realpathSync(input.codeRoot);
+  if (!workspace.isDirectory() || ![workspace.dev, workspace.ino, workspace.uid, workspace.gid].every((value) => Number.isSafeInteger(value) && value >= 0)) throw new Error("Worker Sandbox root identity or host ownership is invalid.");
   const reviewOverlay = input.reviewSubjectWorkspace ? planReviewWorkspaceOverlay({ workerId: input.workerId, runId: input.runId, subjectWorkspace: input.reviewSubjectWorkspace }) : undefined;
   const workingDirectory = reviewOverlay?.mergedDirectory ?? realpathSync(input.workingDirectory ?? workspaceRoot);
   if (!reviewOverlay && !pathWithin(workspaceRoot, workingDirectory)) throw new Error("Worker Sandbox working directory must remain beneath its worker root.");
   const mounts = deduplicateMounts([...input.mounts, ...(reviewOverlay ? [{ source: reviewOverlay.lowerDirectory, readOnly: true }] : [])].map((mount) => ({ source: realpathSync(mount.source), ...(mount.readOnly ? { readOnly: true } : {}) })));
-  const reference: WorkerSandboxReference = { kind: "docker-sandbox", sandboxName, creationNonce: input.creationNonce, workerId: input.workerId, runId: input.runId, kitReference: release.kit.reference, kitSha256: release.kit.sha256, imageReference: release.image.reference, imageDigest: release.image.digest, sbxVersion: release.sandbox.version, sbxBuildCommit: release.sandbox.buildCommit, templateId: release.sandbox.template.id, templateRepository: release.sandbox.template.repository, templateTag: release.sandbox.template.tag, templateFlavor: release.sandbox.template.flavor, protocolVersion: release.protocolVersion, releaseOrdinal: release.releaseOrdinal, workspaceRoot, workingDirectory, codeRoot, mounts, ...(reviewOverlay ? { reviewOverlay } : {}), piCli: release.guest.piCli, rpcLauncher: release.guest.rpcLauncher, codingAgentDir: release.guest.codingAgentDir, stagedLockSha256: release.guest.stagedLockSha256, resourceManifestSha256: release.guest.resourceManifestSha256, runtimeProvenanceSha256: release.guest.runtimeProvenanceSha256, extensionPaths: [...release.guest.extensionPaths], searxngUrl: release.guest.searxngUrl, revisions: { ...release.revisions } };
+  const reference: WorkerSandboxReference = { kind: "docker-sandbox", sandboxName, creationNonce: input.creationNonce, workerId: input.workerId, runId: input.runId, kitReference: release.kit.reference, kitSha256: release.kit.sha256, imageReference: release.image.reference, imageDigest: release.image.digest, sbxVersion: release.sandbox.version, sbxBuildCommit: release.sandbox.buildCommit, templateId: release.sandbox.template.id, templateRepository: release.sandbox.template.repository, templateTag: release.sandbox.template.tag, templateFlavor: release.sandbox.template.flavor, protocolVersion: release.protocolVersion, releaseOrdinal: release.releaseOrdinal, workspaceRoot, workspaceDevice: Number(workspace.dev), workspaceInode: Number(workspace.ino), workspaceOwnerUid: Number(workspace.uid), workspaceOwnerGid: Number(workspace.gid), workingDirectory, codeRoot, mounts, ...(reviewOverlay ? { reviewOverlay } : {}), piCli: release.guest.piCli, rpcLauncher: release.guest.rpcLauncher, codingAgentDir: release.guest.codingAgentDir, stagedLockSha256: release.guest.stagedLockSha256, resourceManifestSha256: release.guest.resourceManifestSha256, runtimeProvenanceSha256: release.guest.runtimeProvenanceSha256, extensionPaths: [...release.guest.extensionPaths], searxngUrl: release.guest.searxngUrl, revisions: { ...release.revisions } };
   assertWorkerSandboxReference(reference); return reference;
 }
 
@@ -125,10 +126,62 @@ printf 'PI_WORKER_RUNTIME_ROOT_V1\n'`;
 
 export async function settleWorkerSandboxAsync(sbxPath: string, reference: WorkerSandboxReference): Promise<void> {
   assertWorkerSandboxReference(reference);
+  const ownership = workspaceOwnership(reference);
+  let normalizationError: unknown;
+  if (reference.reviewOverlay && ownership && process.platform === "linux") {
+    try { await normalizeReviewWorkspaceOwnership(sbxPath, reference, ownership); }
+    catch (error) { normalizationError = error; }
+  }
   try { await execFileAsync(sbxPath, ["stop", reference.sandboxName], { encoding: "utf8", maxBuffer: 1024 * 1024, timeout: 5_000 }); } catch {}
   try { await execFileAsync(sbxPath, ["rm", "--force", reference.sandboxName], { encoding: "utf8", maxBuffer: 1024 * 1024, timeout: 65_000 }); } catch {}
   const { stdout } = await execFileAsync(sbxPath, ["ls", "--json"], { encoding: "utf8", maxBuffer: 1024 * 1024, timeout: 5_000 });
   if (sandboxJsonContains(stdout, reference.sandboxName)) throw new Error(`Sandbox ${reference.sandboxName} remained after exact stop/removal.`);
+  if (!reference.reviewOverlay || !ownership) return;
+  try { verifyReviewWorkspaceHostOwnership(reference.workspaceRoot, ownership); }
+  catch (error) {
+    const normalization = normalizationError ? ` Guest normalization also failed: ${normalizationError instanceof Error ? normalizationError.message : String(normalizationError)}` : "";
+    throw new Error(`Reviewer Sandbox was removed, but retained workspace ownership requires manual repair before settlement can retry: ${error instanceof Error ? error.message : String(error)}${normalization}`);
+  }
+}
+
+type WorkspaceOwnership = { device: number; inode: number; uid: number; gid: number };
+
+function workspaceOwnership(reference: WorkerSandboxReference): WorkspaceOwnership | undefined {
+  const values = [reference.workspaceDevice, reference.workspaceInode, reference.workspaceOwnerUid, reference.workspaceOwnerGid];
+  if (values.every((value) => value === undefined)) return undefined;
+  if (!values.every((value) => Number.isSafeInteger(value) && value! >= 0)) throw new Error("Invalid exact Worker Sandbox workspace ownership.");
+  return { device: reference.workspaceDevice!, inode: reference.workspaceInode!, uid: reference.workspaceOwnerUid!, gid: reference.workspaceOwnerGid! };
+}
+
+async function normalizeReviewWorkspaceOwnership(sbxPath: string, reference: WorkerSandboxReference, ownership: WorkspaceOwnership): Promise<void> {
+  const workspaceRoot = realpathSync(reference.workspaceRoot);
+  const workspace = statSync(workspaceRoot);
+  if (workspaceRoot !== reference.workspaceRoot || !workspace.isDirectory() || Number(workspace.dev) !== ownership.device || Number(workspace.ino) !== ownership.inode) throw new Error("Reviewer workspace root identity changed before ownership normalization.");
+  const excluded = reference.mounts.map((mount) => mount.source).filter((source) => source !== workspaceRoot && pathWithin(workspaceRoot, source));
+  const script = String.raw`const fs=require("node:fs"),path=require("node:path");
+const [root,uidText,gidText,excludedText]=process.argv.slice(1),uid=Number(uidText),gid=Number(gidText),excluded=new Set(JSON.parse(excludedText));
+const rootInfo=fs.lstatSync(root),device=Number(rootInfo.dev),stack=[root];let count=0;
+while(stack.length){const current=stack.pop();if(excluded.has(current))continue;if(++count>1000000)throw new Error("reviewer workspace ownership traversal exceeded 1000000 entries");const info=fs.lstatSync(current);if(Number(info.dev)!==device)throw new Error("reviewer workspace contains an unexpected mounted filesystem");if((info.mode&0o6000)!==0)throw new Error("reviewer workspace contains setuid or setgid mode bits");if(!(info.isFile()||info.isDirectory()||info.isSymbolicLink()))throw new Error("reviewer workspace contains a special file");if(Number(info.uid)!==uid||Number(info.gid)!==gid)fs.lchownSync(current,uid,gid);const checked=fs.lstatSync(current);if(Number(checked.uid)!==uid||Number(checked.gid)!==gid)throw new Error("reviewer workspace ownership did not normalize");if(checked.isDirectory())for(const name of fs.readdirSync(current))stack.push(path.join(current,name));}
+process.stdout.write("PI_REVIEW_WORKSPACE_OWNERSHIP_V2\\nuid="+uid+"\\ngid="+gid+"\\nentries="+count+"\\n");`;
+  const normalized = await execFileAsync(sbxPath, ["exec", "--user", "root", reference.sandboxName, "/usr/bin/env", "-u", "BASH_ENV", "-u", "ENV", "PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "/usr/bin/node", "-e", script, workspaceRoot, String(ownership.uid), String(ownership.gid), JSON.stringify(excluded)], { encoding: "utf8", maxBuffer: 64 * 1024, timeout: 120_000 });
+  if (!new RegExp(`^PI_REVIEW_WORKSPACE_OWNERSHIP_V2\\nuid=${ownership.uid}\\ngid=${ownership.gid}\\nentries=[1-9][0-9]*\\n$`).test(normalized.stdout)) throw new Error("Reviewer workspace ownership normalization returned unexpected evidence.");
+}
+
+function verifyReviewWorkspaceHostOwnership(workspaceRoot: string, ownership: WorkspaceOwnership): void {
+  const exactRoot = realpathSync(workspaceRoot); const first = statSync(exactRoot);
+  if (exactRoot !== workspaceRoot || !first.isDirectory() || Number(first.dev) !== ownership.device || Number(first.ino) !== ownership.inode) throw new Error("reviewer workspace root identity changed");
+  const stack = [exactRoot]; let count = 0;
+  while (stack.length) {
+    const current = stack.pop()!; if (++count > 1_000_000) throw new Error("reviewer workspace ownership verification exceeded 1000000 entries");
+    const info = lstatSync(current);
+    if (Number(info.dev) !== ownership.device) throw new Error(`unexpected mounted filesystem at ${current}`);
+    if (Number(info.uid) !== ownership.uid || Number(info.gid) !== ownership.gid) throw new Error(`unexpected owner at ${current}`);
+    if ((info.mode & 0o6000) !== 0) throw new Error(`setuid or setgid mode bits at ${current}`);
+    if (!(info.isFile() || info.isDirectory() || info.isSymbolicLink())) throw new Error(`special file at ${current}`);
+    if (info.isDirectory()) for (const name of readdirSync(current)) stack.push(path.join(current, name));
+  }
+  const last = statSync(exactRoot);
+  if (Number(last.dev) !== ownership.device || Number(last.ino) !== ownership.inode) throw new Error("reviewer workspace root identity changed during verification");
 }
 
 export function resolveSbxPath(): string { return resolveExecutable("sbx"); }
@@ -140,6 +193,7 @@ export function assertWorkerSandboxReference(value: WorkerSandboxReference): voi
   if (value.observedRuntimeSha256 !== undefined && (!SHA256.test(value.observedRuntimeSha256) || value.observedRuntimeSha256 !== value.runtimeProvenanceSha256)) throw new Error("Invalid observed runtime digest.");
   if (value.inspectEvidenceSha256 !== undefined && !SHA256.test(value.inspectEvidenceSha256)) throw new Error("Invalid Sandbox inspect evidence digest.");
   if (value.sbxVersionEvidenceSha256 !== undefined && !SHA256.test(value.sbxVersionEvidenceSha256)) throw new Error("Invalid sbx version evidence digest.");
+  workspaceOwnership(value);
   if (![value.workspaceRoot, value.workingDirectory, value.codeRoot].every((source) => path.isAbsolute(source)) || (!value.reviewOverlay && !pathWithin(value.workspaceRoot, value.workingDirectory)) || (value.reviewOverlay && value.workingDirectory !== value.reviewOverlay.mergedDirectory) || ![value.piCli, value.rpcLauncher, value.codingAgentDir].every((guestPath) => path.posix.isAbsolute(guestPath) && path.posix.normalize(guestPath) === guestPath) || value.codingAgentDir !== "/run/pi-worker/agent") throw new Error("Invalid exact Worker Sandbox runtime paths.");
   if (value.reviewOverlay) { assertReviewWorkspaceOverlay(value.reviewOverlay, false); if (value.reviewOverlay.workerId !== value.workerId || value.reviewOverlay.runId !== value.runId || !value.mounts.some((mount) => mount.source === value.reviewOverlay!.lowerDirectory && mount.readOnly === true)) throw new Error("Invalid exact Worker Sandbox review OverlayFS binding."); }
   const protectedGuestPaths = [value.piCli, value.rpcLauncher, value.codingAgentDir, ...value.extensionPaths];

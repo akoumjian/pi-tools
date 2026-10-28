@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { existsSync, statSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -28,11 +28,13 @@ const runtimeJson = JSON.stringify({ protocolVersion: 1, stagedLockSha256: "e".r
 const release: WorkerSandboxRelease = { schemaVersion: 1, protocolVersion: 1, releaseOrdinal: 1, status: "approved", kit: { reference: "/immutable/pi-kit", sha256: "a".repeat(64) }, image: { reference: `example.invalid/pi@sha256:${"b".repeat(64)}`, digest: "b".repeat(64) }, sandbox: { version: "v0.49.1", buildCommit: "c5b19951af121b439800029695f88bf1139a0b0b", template: { id: "template-id-1234", repository: "docker.io/akoumjian/pi-worker-r1-deadbeef", tag: "loaded", flavor: "pi-managed-worker" } }, revisions, guest: { stagedLockSha256: "e".repeat(64), piCli: "/usr/local/bin/pi", rpcLauncher: "/opt/pi-worker/launch.mjs", codingAgentDir: "/run/pi-worker/agent", resourceManifestSha256: "c".repeat(64), runtimeProvenanceSha256: createHash("sha256").update(runtimeJson).digest("hex"), extensionPaths, searxngUrl: "http://host.docker.internal:18888" } };
 
 async function temp(run: (root: string) => Promise<void>) { const root = await mkdtemp(path.join(tmpdir(), "pi-worker-sbx-")); try { await run(root); } finally { await rm(root, { recursive: true, force: true }); } }
+async function withPlatform(value: NodeJS.Platform, run: () => Promise<void>): Promise<void> { const descriptor = Object.getOwnPropertyDescriptor(process, "platform"); if (!descriptor) throw new Error("process.platform descriptor is unavailable"); Object.defineProperty(process, "platform", { ...descriptor, value }); try { await run(); } finally { Object.defineProperty(process, "platform", descriptor); } }
 
 test("Sandbox planning freezes exact runtime provenance and deterministic mounts", async () => temp(async (root) => {
   const workerRoot = path.join(root, "worker"); const codeRoot = path.join(root, "Code"); const input = path.join(root, "input.txt"); await mkdir(workerRoot); await mkdir(codeRoot); await writeFile(input, "evidence\n");
   const planned = planWorkerSandbox({ workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_bbbbbbbb", creationNonce: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", workerRoot, codeRoot, mounts: [{ source: input, readOnly: true }, { source: input, readOnly: true }], release });
-  assert.equal(planned.kind, "docker-sandbox"); assert.equal(planned.imageDigest, "b".repeat(64)); assert.equal(planned.kitSha256, "a".repeat(64)); assert.deepEqual(planned.mounts, [{ source: await realpath(input), readOnly: true }]); assert.equal(planned.extensionPaths.length, 2); assert.ok(planned.sandboxName.endsWith(`-${planned.creationNonce}`)); assert.equal(planned.sandboxName.length, 60);
+  const workspace = statSync(workerRoot);
+  assert.equal(planned.kind, "docker-sandbox"); assert.equal(planned.imageDigest, "b".repeat(64)); assert.equal(planned.kitSha256, "a".repeat(64)); assert.deepEqual(planned.mounts, [{ source: await realpath(input), readOnly: true }]); assert.deepEqual([planned.workspaceDevice, planned.workspaceInode, planned.workspaceOwnerUid, planned.workspaceOwnerGid], [Number(workspace.dev), Number(workspace.ino), Number(workspace.uid), Number(workspace.gid)]); assert.equal(planned.extensionPaths.length, 2); assert.ok(planned.sandboxName.endsWith(`-${planned.creationNonce}`)); assert.equal(planned.sandboxName.length, 60);
 }));
 
 
@@ -58,6 +60,9 @@ test("exact Sandbox references reject writable extension paths, duplicate extens
   assert.throws(() => assertWorkerSandboxReference({ ...planned, extensionPaths: [planned.extensionPaths[0]!, planned.extensionPaths[0]!] }), /Invalid exact/);
   assert.throws(() => assertWorkerSandboxReference({ ...planned, searxngUrl: "https://secret@example.invalid" }), /Invalid exact/);
   assert.throws(() => assertWorkerSandboxReference({ ...planned, codingAgentDir: "/tmp/pi-worker/agent" }), /runtime paths/);
+  assert.throws(() => assertWorkerSandboxReference({ ...planned, workspaceOwnerUid: -1 }), /workspace ownership/);
+  assert.throws(() => { const partial: any = { ...planned }; delete partial.workspaceOwnerGid; assertWorkerSandboxReference(partial); }, /workspace ownership/);
+  const legacy: any = { ...planned }; delete legacy.workspaceDevice; delete legacy.workspaceInode; delete legacy.workspaceOwnerUid; delete legacy.workspaceOwnerGid; assert.doesNotThrow(() => assertWorkerSandboxReference(legacy));
   assert.throws(() => assertWorkerSandboxReference({ ...planned, sandboxName: planned.sandboxName.slice(0, -1) }), /nonce|exact/i);
   assert.throws(() => assertWorkerSandboxReference({ ...planned, inspectEvidenceSha256: "not-a-digest" }), /inspect evidence/);
 }));
@@ -84,6 +89,106 @@ fi
   const created = await createWorkerSandboxAsync(fake, planned); assert.match(created.createEvidenceSha256 ?? "", /^[a-f0-9]{64}$/); assert.equal(created.observedCpu, 8); assert.equal(created.observedMemoryBytes, 17_179_869_184); await settleWorkerSandboxAsync(fake, created);
   const commands = await readFile(log, "utf8"); assert.match(commands, new RegExp(`create --name ${planned.sandboxName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`)); assert.match(commands, new RegExp(`exec --user root ${planned.sandboxName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} /usr/bin/env`)); assert.match(commands, /PI_WORKER_RUNTIME_ROOT_V1/); assert.doesNotMatch(commands, /exec --user root --privileged/); assert.match(commands, new RegExp(`stop ${planned.sandboxName}`)); assert.match(commands, new RegExp(`rm --force ${planned.sandboxName}`));
   const exactFake=await readFile(fake,"utf8");await writeFile(fake,exactFake.replace("Docker Sandboxes Update Available","unexpected banner"));await assert.rejects(createWorkerSandboxAsync(fake,planned),/Sandbox inspect JSON was malformed/);
+}));
+
+test("reviewer ownership normalization excludes nested read-only mounts and verifies exact host ownership after removal", async () => temp(async (root) => {
+  const subject = path.join(root, "subject"), reviewer = path.join(root, "reviewer"), context = path.join(reviewer, "run-inputs", "context"), codeRoot = path.join(root, "Code"), log = path.join(root, "sbx-review.log");
+  await mkdir(subject); await mkdir(context, { recursive: true }); await mkdir(codeRoot); await writeFile(path.join(subject, "source.txt"), "authoritative\n"); await writeFile(path.join(context, "context.json"), "{}\n");
+  const planned = planWorkerSandbox({ workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_bbbbbbbb", creationNonce: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", workerRoot: reviewer, codeRoot, mounts: [{ source: context, readOnly: true }], reviewSubjectWorkspace: subject, release });
+  const owner = statSync(reviewer); assert.deepEqual([planned.workspaceOwnerUid, planned.workspaceOwnerGid], [owner.uid, owner.gid]); const fake = path.join(root, "sbx-review");
+  await writeFile(fake, `#!/bin/sh
+printf '%s\n' "$*" >> ${JSON.stringify(log)}
+if [ "$1" = exec ]; then printf 'PI_REVIEW_WORKSPACE_OWNERSHIP_V2\\nuid=${owner.uid}\\ngid=${owner.gid}\\nentries=3\\n'
+elif [ "$1" = stop ] || [ "$1" = rm ]; then :
+elif [ "$1 $2" = "ls --json" ]; then printf '[]\\n'; printf '%s' '${recordedUpdateTrailer}'
+else exit 64
+fi
+`); await chmod(fake, 0o755);
+  await withPlatform("linux", () => settleWorkerSandboxAsync(fake, planned));
+  const commands = await readFile(log, "utf8");
+  assert.match(commands, new RegExp(`exec --user root ${planned.sandboxName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} /usr/bin/env`)); assert.match(commands, /\/usr\/bin\/node -e/);
+  const nestedMount = planned.mounts.find((mount) => mount.source.endsWith("/reviewer/run-inputs/context")); assert.ok(nestedMount);
+  assert.match(commands, /lchownSync/); assert.match(commands, /contains a special file/); assert.match(commands, new RegExp(`${planned.workspaceRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} ${owner.uid} ${owner.gid}`)); assert.match(commands, new RegExp(JSON.stringify([nestedMount.source]).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.doesNotMatch(commands, /exec --user root --privileged/); assert.match(commands, new RegExp(`stop ${planned.sandboxName}`)); assert.match(commands, new RegExp(`rm --force ${planned.sandboxName}`));
+}));
+
+test("reviewer ownership-normalization failure still removes the exact Sandbox and fails closed", async () => temp(async (root) => {
+  const subject = path.join(root, "subject"), reviewer = path.join(root, "reviewer"), codeRoot = path.join(root, "Code"), log = path.join(root, "sbx-review-failure.log");
+  await mkdir(subject); await mkdir(reviewer); await mkdir(codeRoot);
+  const planned = planWorkerSandbox({ workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_bbbbbbbb", creationNonce: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", workerRoot: reviewer, codeRoot, mounts: [], reviewSubjectWorkspace: subject, release });
+  const mismatched = { ...planned, workspaceOwnerUid: planned.workspaceOwnerUid! + 1 };
+  const fake = path.join(root, "sbx-review-failure"); await writeFile(fake, `#!/bin/sh
+printf '%s\n' "$*" >> ${JSON.stringify(log)}
+if [ "$1" = exec ]; then exit 81
+elif [ "$1" = stop ] || [ "$1" = rm ]; then :
+elif [ "$1 $2" = "ls --json" ]; then printf '[]\\n'; printf '%s' '${recordedUpdateTrailer}'
+else exit 64
+fi
+`); await chmod(fake, 0o755);
+  await withPlatform("linux", () => assert.rejects(settleWorkerSandboxAsync(fake, mismatched), /Sandbox was removed.*manual repair/));
+  await withPlatform("linux", () => settleWorkerSandboxAsync(fake, planned));
+  const commands = await readFile(log, "utf8"); assert.match(commands, /^exec /m);
+  assert.match(commands, new RegExp(`stop ${planned.sandboxName}`)); assert.match(commands, new RegExp(`rm --force ${planned.sandboxName}`));
+}));
+
+test("legacy reviewer references remain exactly removable without ownership-normalization fields", async () => temp(async (root) => {
+  const subject = path.join(root, "subject"), reviewer = path.join(root, "reviewer"), codeRoot = path.join(root, "Code"), log = path.join(root, "sbx-legacy.log"); await mkdir(subject); await mkdir(reviewer); await mkdir(codeRoot);
+  const legacy: any = planWorkerSandbox({ workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_bbbbbbbb", creationNonce: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", workerRoot: reviewer, codeRoot, mounts: [], reviewSubjectWorkspace: subject, release });
+  delete legacy.workspaceDevice; delete legacy.workspaceInode; delete legacy.workspaceOwnerUid; delete legacy.workspaceOwnerGid;
+  const fake = path.join(root, "sbx-legacy"); await writeFile(fake, `#!/bin/sh
+printf '%s\\n' "$*" >> ${JSON.stringify(log)}
+if [ "$1" = stop ] || [ "$1" = rm ]; then :
+elif [ "$1 $2" = "ls --json" ]; then printf '[]\\n'; printf '%s' '${recordedUpdateTrailer}'
+else exit 64
+fi
+`); await chmod(fake, 0o755);
+  await withPlatform("linux", () => settleWorkerSandboxAsync(fake, legacy));
+  const commands = await readFile(log, "utf8"); assert.doesNotMatch(commands, /^exec /m); assert.match(commands, new RegExp(`stop ${legacy.sandboxName}`)); assert.match(commands, new RegExp(`rm --force ${legacy.sandboxName}`));
+}));
+
+test("macOS reviewer settlement skips guest chown and verifies host-visible ownership", async () => temp(async (root) => {
+  const subject = path.join(root, "subject"), reviewer = path.join(root, "reviewer"), codeRoot = path.join(root, "Code"), log = path.join(root, "sbx-darwin.log"); await mkdir(subject); await mkdir(reviewer); await mkdir(codeRoot);
+  const planned = planWorkerSandbox({ workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_bbbbbbbb", creationNonce: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", workerRoot: reviewer, codeRoot, mounts: [], reviewSubjectWorkspace: subject, release });
+  const fake = path.join(root, "sbx-darwin"); await writeFile(fake, `#!/bin/sh
+printf '%s\\n' "$*" >> ${JSON.stringify(log)}
+if [ "$1" = stop ] || [ "$1" = rm ]; then :
+elif [ "$1 $2" = "ls --json" ]; then printf '[]\\n'; printf '%s' '${recordedUpdateTrailer}'
+else exit 64
+fi
+`); await chmod(fake, 0o755);
+  await withPlatform("darwin", () => settleWorkerSandboxAsync(fake, planned));
+  const commands = await readFile(log, "utf8"); assert.doesNotMatch(commands, /^exec /m); assert.match(commands, new RegExp(`stop ${planned.sandboxName}`));
+}));
+
+test("reviewer root-identity replacement still removes the exact Sandbox and requires manual repair", async () => temp(async (root) => {
+  const subject = path.join(root, "subject"), reviewer = path.join(root, "reviewer"), moved = path.join(root, "moved-reviewer"), codeRoot = path.join(root, "Code"), log = path.join(root, "sbx-identity.log"); await mkdir(subject); await mkdir(reviewer); await mkdir(codeRoot);
+  const planned = planWorkerSandbox({ workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_bbbbbbbb", creationNonce: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", workerRoot: reviewer, codeRoot, mounts: [], reviewSubjectWorkspace: subject, release }); await rename(reviewer, moved); await mkdir(reviewer);
+  const fake = path.join(root, "sbx-identity"); await writeFile(fake, `#!/bin/sh
+printf '%s\\n' "$*" >> ${JSON.stringify(log)}
+if [ "$1" = stop ] || [ "$1" = rm ]; then :
+elif [ "$1 $2" = "ls --json" ]; then printf '[]\\n'; printf '%s' '${recordedUpdateTrailer}'
+else exit 64
+fi
+`); await chmod(fake, 0o755);
+  await withPlatform("linux", () => assert.rejects(settleWorkerSandboxAsync(fake, planned), /Sandbox was removed.*root identity changed/));
+  const commands = await readFile(log, "utf8"); assert.doesNotMatch(commands, /^exec /m); assert.match(commands, new RegExp(`stop ${planned.sandboxName}`)); assert.match(commands, new RegExp(`rm --force ${planned.sandboxName}`));
+}));
+
+test("post-removal host verification rejects special files and set-id modes", async () => temp(async (root) => {
+  for (const kind of ["special", "setid"] as const) {
+    const directory = path.join(root, kind), subject = path.join(directory, "subject"), reviewer = path.join(directory, "reviewer"), codeRoot = path.join(directory, "Code"), log = path.join(directory, "sbx.log"); await mkdir(subject, { recursive: true }); await mkdir(reviewer); await mkdir(codeRoot);
+    if (kind === "special") execFileSync("/usr/bin/mkfifo", [path.join(reviewer, "unsafe")]); else { const file = path.join(reviewer, "unsafe"); await writeFile(file, "unsafe\n"); await chmod(file, 0o4755); }
+    const planned = planWorkerSandbox({ workerId: "worker_20260101000000_aaaaaaaa", runId: `run_20260101000000_${kind === "special" ? "bbbbbbbb" : "cccccccc"}`, creationNonce: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", workerRoot: reviewer, codeRoot, mounts: [], reviewSubjectWorkspace: subject, release });
+    const fake = path.join(directory, "sbx"); await writeFile(fake, `#!/bin/sh
+printf '%s\\n' "$*" >> ${JSON.stringify(log)}
+if [ "$1" = stop ] || [ "$1" = rm ]; then :
+elif [ "$1 $2" = "ls --json" ]; then printf '[]\\n'; printf '%s' '${recordedUpdateTrailer}'
+else exit 64
+fi
+`); await chmod(fake, 0o755);
+    await withPlatform("darwin", () => assert.rejects(settleWorkerSandboxAsync(fake, planned), kind === "special" ? /special file/ : /setuid or setgid/));
+    const commands = await readFile(log, "utf8"); assert.match(commands, new RegExp(`rm --force ${planned.sandboxName}`));
+  }
 }));
 
 test("RPC arguments retain immutable explicit extensions and complete built-in tools", () => {
