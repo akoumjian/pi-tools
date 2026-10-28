@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } fr
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { forkWorkerSession, verifyWorkerSession } from "../extensions/worker/session.js";
+import { forkWorkerSession, readWorkerSessionHeader, verifyWorkerSession } from "../extensions/worker/session.js";
 
 async function withTempDir(run: (directory: string) => Promise<void>): Promise<void> {
   const directory = await mkdtemp(path.join(tmpdir(), "pi-worker-session-"));
@@ -114,5 +114,24 @@ test("retained worker session verification rejects a worker-planted parent-direc
     const forked = forkWorkerSession({ parentSessionFile: parent, workspaceRoot: workspace, sessionDir: sessions, sessionId: "worker-session" });
     const retained = path.join(directory, "retained-sessions"); await rename(sessions, retained); await symlink(retained, sessions, "dir");
     assert.throws(() => verifyWorkerSession(forked), /session directory must be an ordinary directory/);
+  });
+});
+
+test("canonical session spelling accepts only ordinary paths beneath an alias-spelled retained directory", async () => {
+  await withTempDir(async (directory) => {
+    const actualPath = path.join(directory, "actual");
+    const alias = path.join(directory, "alias");
+    await mkdir(path.join(actualPath, "sessions", "retained"), { recursive: true });
+    const actual = await realpath(actualPath);
+    const retained = path.join(actual, "sessions", "retained");
+    await symlink(actual, alias, "dir");
+    const session = path.join(retained, "session.jsonl");
+    await writeFile(session, `${JSON.stringify({ type: "session", version: 3, id: "worker-session", timestamp: new Date().toISOString(), cwd: actual })}\n`);
+    assert.equal(readWorkerSessionHeader(session, { sessionDir: path.join(alias, "sessions") }).header.id, "worker-session");
+    await symlink(retained, path.join(actual, "sessions", "linked"), "dir");
+    assert.throws(
+      () => readWorkerSessionHeader(path.join(actual, "sessions", "linked", "session.jsonl"), { sessionDir: path.join(alias, "sessions") }),
+      /must use its retained session directory's requested or canonical spelling/
+    );
   });
 });

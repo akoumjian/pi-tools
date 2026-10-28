@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -66,6 +66,58 @@ test("runtime exposes only consolidated worker tools", async () => {
   });
 });
 
+test("result admission accepts a stable host symlink in the worker-root ancestor spelling", async () => {
+  const base = await mkdtemp(path.join(tmpdir(), "pi-worker-runtime-alias-"));
+  const actual = path.join(base, "actual");
+  const alias = path.join(base, "alias");
+  const workerRoot = path.join(alias, "worker");
+  const workspaceRoot = path.join(workerRoot, "workspace");
+  const asyncJobRoot = path.join(workerRoot, "async-shell");
+  const supervisionRoot = path.join(alias, "supervision");
+  const resultFile = path.join(supervisionRoot, "result.json");
+  const authorizationFile = path.join(supervisionRoot, "authorization.json");
+  await mkdir(path.join(actual, "worker", "workspace"), { recursive: true });
+  await mkdir(path.join(actual, "worker", "async-shell"));
+  await mkdir(path.join(actual, "supervision"));
+  await symlink(actual, alias, "dir");
+  await mkdir(path.join(workspaceRoot, "reports"));
+  await writeFile(path.join(workspaceRoot, "reports", "review.md"), "# Review\n");
+  await symlink(path.join(actual, "worker", "workspace", "reports"), path.join(workspaceRoot, "linked-reports"), "dir");
+  await writeFile(authorizationFile, JSON.stringify({ version: 2, workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_aaaaaaaa", processNonce: "alias-nonce" }));
+  const values: Record<string, string> = {
+    PI_WORKER_ID: "worker_20260101000000_aaaaaaaa",
+    PI_WORKER_RUN_ID: "run_20260101000000_aaaaaaaa",
+    PI_WORKER_ROLE: "review",
+    PI_WORKER_RESULT_FILE: resultFile,
+    PI_WORKER_WORKSPACE_ROOT: workspaceRoot,
+    PI_WORKER_STATE_ROOT: workerRoot,
+    PI_WORKER_SUPERVISION_ROOT: supervisionRoot,
+    PI_WORKER_ASYNC_JOB_ROOT: asyncJobRoot,
+    PI_WORKER_AUTHORIZATION_FILE: authorizationFile,
+    PI_WORKER_PROCESS_NONCE: "alias-nonce"
+  };
+  const old = new Map(Object.keys(values).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, values);
+  try {
+    const canonicalWorkspace = await realpath(workspaceRoot);
+    const symlinked = await executeWorkerResultHostRequest({ outcome: "approve", summary: "Child symlink rejected.", artifacts: [path.join(canonicalWorkspace, "linked-reports", "review.md")] });
+    assert.deepEqual(symlinked.details, { status: "rejected", errors: [{ code: "unsupported_path_type", path: "artifacts[0]", message: `Result path may not traverse symbolic links: ${path.join(canonicalWorkspace, "linked-reports", "review.md")}.` }] });
+    const result = await executeWorkerResultHostRequest({ outcome: "approve", summary: "Alias accepted.", artifacts: [path.join(canonicalWorkspace, "reports", "review.md")] });
+    assert.deepEqual(result.details, { status: "accepted", outcome: "approve" });
+    assert.equal(readWorkerRuntimeResult(resultFile).result.outcome, "approve");
+    const linkedWorkspace = path.join(workerRoot, "linked-workspace");
+    await symlink(path.join(actual, "worker", "workspace"), linkedWorkspace, "dir");
+    process.env.PI_WORKER_WORKSPACE_ROOT = linkedWorkspace;
+    await assert.rejects(
+      executeWorkerResultHostRequest({ outcome: "approve", summary: "Symlink rejected.", artifacts: ["report.md"] }),
+      /PI_WORKER_WORKSPACE_ROOT may not traverse symbolic links/
+    );
+  } finally {
+    for (const [key, value] of old) value === undefined ? delete process.env[key] : process.env[key] = value;
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
 test("work result submission validates and persists normalized repository and artifact paths", async () => {
   await fixture("work", async (root, api) => {
     const repository = path.join(root, "repos", "project"); await mkdir(repository, { recursive: true }); execFileSync("git", ["init", "-q", repository]);
@@ -104,7 +156,7 @@ test("review decisions require a retained report and cannot report repositories"
     assert.equal((empty.details as { status: string }).status, "rejected");
     await writeFile(path.join(root, "reports", "review.md"), "# Review\n");
     const result = await tool.execute!("call", { outcome: "approve", summary: "Approved.", artifacts: [path.join(root, "reports", "review.md")] }, undefined, undefined, undefined as never);
-    assert.equal((result.details as { status: string }).status, "accepted");
+    assert.equal((result.details as { status: string }).status, "accepted", JSON.stringify(result.details));
   });
 });
 

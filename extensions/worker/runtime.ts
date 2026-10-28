@@ -102,7 +102,7 @@ export default function workerRuntimeExtension(api: ExtensionAPI): void {
     async execute(_id, params): Promise<AgentToolResult<WorkerResultDetails>> {
       if (!remoteHost) throw new Error("worker_result_submit requires the managed RPC host runtime.");
       const guest = workerGuestIdentity();
-      const validation = validateAndNormalizeWorkerResult(params, guest.workspaceRoot);
+      const validation = validateAndNormalizeWorkerResult(params, guest.requestedWorkspaceRoot);
       if (validation.errors.length) return rejectedResult(validation.errors);
       if (admissionState === "accepted") {
         try { return await requestHost<AgentToolResult<WorkerResultDetails>>("worker_result_submit", params); }
@@ -160,7 +160,7 @@ export async function executeWorkerResultHostRequest(payload: unknown): Promise<
   const identity = workerRuntimeIdentity();
   assertRuntimeAuthorization(identity, "worker_result_submit");
   const params = strictHostPayload(workerRuntimeRole() === "review" ? WorkerReviewResultSubmitParams : WorkerWorkResultSubmitParams, payload, "worker_result_submit") as WorkerResultSubmitInput;
-  const validation = validateAndNormalizeWorkerResult(params, identity.workspaceRoot);
+  const validation = validateAndNormalizeWorkerResult(params, identity.requestedWorkspaceRoot);
   if (validation.errors.length) return rejectedResult(validation.errors);
   const normalizedResult = { ...params, ...(validation.repositories.length ? { repositories: validation.repositories } : {}), ...(validation.artifacts.length ? { artifacts: validation.artifacts } : {}) } as AcceptedWorkerResult["result"];
   const payloadSha256 = createHash("sha256").update(canonicalJson(normalizedResult)).digest("hex");
@@ -207,11 +207,12 @@ async function reconcileGuestOwnedWork(identity: { owner: AsyncShellJobOwner; as
   if (active.length) throw new Error(`Owned asynchronous work could not be reconciled: ${[...new Set(active.map((job) => job.jobId))].sort().join(", ")}.`);
 }
 
-function workerGuestIdentity(): { workerId: string; runId: string; workspaceRoot: string; asyncJobRoot: string; owner: AsyncShellJobOwner } {
+function workerGuestIdentity(): { workerId: string; runId: string; workspaceRoot: string; requestedWorkspaceRoot: string; asyncJobRoot: string; owner: AsyncShellJobOwner } {
   const workerId = requiredEnvironment("PI_WORKER_ID"); const runId = requiredEnvironment("PI_WORKER_RUN_ID");
-  const workspaceRoot = realpathSync(requiredEnvironment("PI_WORKER_WORKSPACE_ROOT"));
+  const requestedWorkspaceRoot = path.resolve(requiredEnvironment("PI_WORKER_WORKSPACE_ROOT"));
+  const workspaceRoot = realpathSync(requestedWorkspaceRoot);
   const asyncJobRoot = realpathSync(requiredEnvironment("PI_WORKER_ASYNC_JOB_ROOT"));
-  return { workerId, runId, workspaceRoot, asyncJobRoot, owner: { kind: "worker-run", workerId, runId } };
+  return { workerId, runId, workspaceRoot, requestedWorkspaceRoot, asyncJobRoot, owner: { kind: "worker-run", workerId, runId } };
 }
 
 export function readWorkerRuntimeResult(resultFile: string): AcceptedWorkerResult {
@@ -531,6 +532,7 @@ function workerRuntimeIdentity(): {
   runId: string;
   resultFile: string;
   workspaceRoot: string;
+  requestedWorkspaceRoot: string;
   asyncJobRoot: string;
   authorizationFile: string;
   processNonce: string;
@@ -542,8 +544,9 @@ function workerRuntimeIdentity(): {
   if (lstatSync(requestedStateRoot).isSymbolicLink() || !lstatSync(requestedStateRoot).isDirectory()) throw new Error("PI_WORKER_STATE_ROOT must remain an ordinary directory.");
   const stateRoot = realpathSync(requestedStateRoot);
   const supervisionRoot = realpathSync(path.resolve(requiredEnvironment("PI_WORKER_SUPERVISION_ROOT")));
-  const workspaceRoot = canonicalWorkerDirectory(stateRoot, requiredEnvironment("PI_WORKER_WORKSPACE_ROOT"), "PI_WORKER_WORKSPACE_ROOT");
-  const asyncJobRoot = canonicalWorkerDirectory(stateRoot, requiredEnvironment("PI_WORKER_ASYNC_JOB_ROOT"), "PI_WORKER_ASYNC_JOB_ROOT");
+  const requestedWorkspaceRoot = path.resolve(requiredEnvironment("PI_WORKER_WORKSPACE_ROOT"));
+  const workspaceRoot = canonicalWorkerDirectory(requestedStateRoot, stateRoot, requestedWorkspaceRoot, "PI_WORKER_WORKSPACE_ROOT");
+  const asyncJobRoot = canonicalWorkerDirectory(requestedStateRoot, stateRoot, requiredEnvironment("PI_WORKER_ASYNC_JOB_ROOT"), "PI_WORKER_ASYNC_JOB_ROOT");
   const requestedResult = path.resolve(requiredEnvironment("PI_WORKER_RESULT_FILE"));
   const requestedAuthorization = path.resolve(requiredEnvironment("PI_WORKER_AUTHORIZATION_FILE"));
   if (existsSync(requestedAuthorization) && lstatSync(requestedAuthorization).isSymbolicLink()) throw new Error("PI_WORKER_AUTHORIZATION_FILE may not be a symbolic link.");
@@ -553,13 +556,13 @@ function workerRuntimeIdentity(): {
   const resultFile = path.join(realpathSync(path.dirname(requestedResult)), path.basename(requestedResult));
   if (!pathWithin(supervisionRoot, resultFile)) throw new Error("Worker runtime paths crossed the supervision/worker-root boundary.");
   if (!pathWithin(supervisionRoot, authorizationFile)) throw new Error("Worker runtime authorization identity is invalid.");
-  return { workerId, runId, resultFile, workspaceRoot, asyncJobRoot, authorizationFile, processNonce, owner: { kind: "worker-run", workerId, runId } };
+  return { workerId, runId, resultFile, workspaceRoot, requestedWorkspaceRoot, asyncJobRoot, authorizationFile, processNonce, owner: { kind: "worker-run", workerId, runId } };
 }
 
-function canonicalWorkerDirectory(stateRoot: string, value: string, label: string): string {
-  const lexical = path.resolve(value); const relative = path.relative(stateRoot, lexical);
+function canonicalWorkerDirectory(requestedStateRoot: string, stateRoot: string, value: string, label: string): string {
+  const lexical = path.resolve(value); const relative = path.relative(requestedStateRoot, lexical);
   if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error(`${label} crossed the worker-root boundary.`);
-  let current = stateRoot;
+  let current = requestedStateRoot;
   for (const component of relative ? relative.split(path.sep) : []) { current = path.join(current, component); if (lstatSync(current).isSymbolicLink()) throw new Error(`${label} may not traverse symbolic links.`); }
   if (!lstatSync(lexical).isDirectory()) throw new Error(`${label} must be an ordinary directory.`);
   const exact = realpathSync(lexical); if (exact !== stateRoot && !pathWithin(stateRoot, exact)) throw new Error(`${label} resolves outside the worker-root boundary.`);

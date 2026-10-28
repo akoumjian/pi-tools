@@ -1544,7 +1544,7 @@ function writeReviewContext(directory: string, subjectPaths: WorkerPaths, review
     if (trustedGit(source, ["rev-parse", `${repository.commit}^{commit}`]).trim() !== repository.commit) throw new Error("Review candidate commit is unavailable from its reported repository.");
     repositories.push({ ...repository, path: repository.path });
   }
-  const overlayPath = (source: string, label: string): string => { assertContainedPathWithoutSymlinks(subjectWorker.workspaceRoot, source, label); const relative = path.relative(subjectWorker.workspaceRoot, source); return path.posix.join("/review/subject", ...relative.split(path.sep)); };
+  const overlayPath = (source: string, label: string): string => { const exact = assertContainedPathWithoutSymlinks(subjectWorker.workspaceRoot, source, label); const relative = path.relative(realpathSync(subjectWorker.workspaceRoot), exact); return path.posix.join("/review/subject", ...relative.split(path.sep)); };
   const artifacts = subjectRun.artifacts.map((artifact) => overlayPath(path.resolve(subjectWorker.workspaceRoot, artifact), "review subject artifact"));
   const available = new Map(repositories.map((repository) => [repository.candidateId, repository]));
   const candidates = subjectRun.repositories.map(({ candidateId, path: reportedPath, reported, changed, dirty, eligible, issues }) => { const repository = available.get(candidateId); return { candidateId, reportedPath, reported, changed, dirty, eligible, available: Boolean(repository), ...(repository ? { path: repository.path } : {}), ...(issues ? { issues } : {}) }; });
@@ -1563,13 +1563,18 @@ function assertContainedOrdinaryDirectory(trustedRoot: string, directory: string
   assertContainedPathWithoutSymlinks(trustedRoot, directory, label);
   if (!lstatSync(directory).isDirectory()) throw new Error(`${label} must be an ordinary directory.`);
 }
-function assertContainedPathWithoutSymlinks(trustedRoot: string, candidate: string, label: string): void {
-  const root = realpathSync(trustedRoot); const lexical = path.resolve(candidate); const relative = path.relative(root, lexical);
-  if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error(`${label} must remain beneath its retained worker root.`);
-  let current = root;
-  for (const component of relative.split(path.sep)) { current = path.join(current, component); if (lstatSync(current).isSymbolicLink()) throw new Error(`${label} may not traverse symbolic links.`); }
-  const exact = realpathSync(lexical); const exactRelative = path.relative(root, exact);
-  if (exactRelative === "" || exactRelative === ".." || exactRelative.startsWith(`..${path.sep}`) || path.isAbsolute(exactRelative)) throw new Error(`${label} resolves outside its retained worker root.`);
+function assertContainedPathWithoutSymlinks(trustedRoot: string, candidate: string, label: string): string {
+  const requestedRoot = path.resolve(trustedRoot); const rootMetadata = lstatSync(requestedRoot);
+  if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) throw new Error(`${label} retained worker root must be an ordinary directory.`);
+  const root = realpathSync(requestedRoot); const requestedCandidate = path.resolve(candidate); const requestedRelative = path.relative(requestedRoot, requestedCandidate); const canonicalRelative = path.relative(root, requestedCandidate);
+  const contained = (relative: string): boolean => relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+  const requestedContained = contained(requestedRelative); const canonicalContained = contained(canonicalRelative);
+  if (!requestedContained && !canonicalContained) throw new Error(`${label} must remain beneath its retained worker root.`);
+  let current = requestedContained ? requestedRoot : root;
+  for (const component of (requestedContained ? requestedRelative : canonicalRelative).split(path.sep)) { current = path.join(current, component); if (lstatSync(current).isSymbolicLink()) throw new Error(`${label} may not traverse symbolic links.`); }
+  const exact = realpathSync(requestedCandidate); const exactRelative = path.relative(root, exact);
+  if (!contained(exactRelative)) throw new Error(`${label} resolves outside its retained worker root.`);
+  return exact;
 }
 
 function trustedPreparedSet(registry: WorkerRegistry, parentSessionFile: string, preparedId: string, consumedWorkspace?: string): ReturnType<typeof readPreparedMergeSet> {

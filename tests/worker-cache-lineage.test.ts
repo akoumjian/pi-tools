@@ -291,6 +291,28 @@ function decodeCodexRequestBody(body: BodyInit | null | undefined, headers: Head
   return JSON.parse(raw) as Record<string, unknown>;
 }
 
+test("managed-worker execution allowlist contains the complete ordinary Sandbox tool suite and no parent authority", () => {
+  assert.deepEqual(MANAGED_WORKER_TOOL_NAMES, [
+    "worker_beads_tasks",
+    "worker_result_submit",
+    "shell_start",
+    "shell_status",
+    "shell_read",
+    "shell_cancel",
+    "read_many",
+    "search_many",
+    "write_many",
+    "edit_many",
+    "apply_reviewed_mutation",
+    "searxng_search",
+    "web_fetch_many",
+    "document_parse"
+  ]);
+  for (const authority of ["worker_run", "worker_control", "worker_merge_test", "worker_merge_apply"]) {
+    assert.equal(MANAGED_WORKER_TOOL_NAMES.includes(authority as never), false, authority);
+  }
+});
+
 test("Codex lineage capture persists only the payload and effective cache-affinity header", () => {
   const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-capture-"));
   try {
@@ -396,12 +418,14 @@ test("Codex lineage restores the exact parent prefix and appends only managed-wo
     assert.equal(headers["session-id"], inheritedAffinity);
     assert.equal(headers["x-client-request-id"], "child-request-id");
 
-    assert.equal(runtime.guardTool("shell_start"), undefined);
-    assert.deepEqual(runtime.guardTool("worker_run"), {
-      block: true,
-      reason: "Managed worker tool worker_run is not authorized by the worker runtime allowlist.",
-      terminate: true
-    });
+    for (const tool of MANAGED_WORKER_TOOL_NAMES) assert.equal(runtime.guardTool(tool), undefined, tool);
+    for (const authority of ["worker_run", "worker_control", "worker_merge_test", "worker_merge_apply"]) {
+      assert.deepEqual(runtime.guardTool(authority), {
+        block: true,
+        reason: `Managed worker tool ${authority} is not authorized by the worker runtime allowlist.`,
+        terminate: true
+      });
+    }
   } finally {
     runtime?.restoreNetwork();
     rmSync(root, { recursive: true, force: true });

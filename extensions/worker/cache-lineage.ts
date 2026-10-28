@@ -32,7 +32,15 @@ export const MANAGED_WORKER_TOOL_NAMES = [
   "shell_start",
   "shell_status",
   "shell_read",
-  "shell_cancel"
+  "shell_cancel",
+  "read_many",
+  "search_many",
+  "write_many",
+  "edit_many",
+  "apply_reviewed_mutation",
+  "searxng_search",
+  "web_fetch_many",
+  "document_parse"
 ] as const;
 
 const MANAGED_WORKER_TOOL_NAME_SET = new Set<string>(MANAGED_WORKER_TOOL_NAMES);

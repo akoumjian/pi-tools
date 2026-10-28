@@ -112,17 +112,21 @@ function containedSessionFile(file: string, sessionDir?: string): { requested: s
     const rootPath = path.resolve(sessionDir);
     const rootStat = lstatSync(rootPath);
     if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) throw new Error("Worker session directory must be an ordinary directory.");
-    const relative = path.relative(rootPath, requested);
-    if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error("Worker session file must remain beneath its retained session directory.");
-    let current = rootPath;
-    for (const component of relative.split(path.sep)) {
+    const root = realpathSync(rootPath);
+    const exact = realpathSync(requested);
+    const lexicalRelative = path.relative(rootPath, requested);
+    const exactRelative = path.relative(root, exact);
+    const contained = (relative: string): boolean => relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+    if (!contained(exactRelative)) throw new Error("Worker session file resolves outside its retained session directory.");
+    const lexicalContained = contained(lexicalRelative);
+    if (!lexicalContained && requested !== exact) throw new Error("Worker session file must use its retained session directory's requested or canonical spelling.");
+    const walkRoot = lexicalContained ? rootPath : root;
+    const walkRelative = lexicalContained ? lexicalRelative : path.relative(root, requested);
+    let current = walkRoot;
+    for (const component of walkRelative.split(path.sep)) {
       current = path.join(current, component);
       if (lstatSync(current).isSymbolicLink()) throw new Error("Worker session file may not traverse symbolic links.");
     }
-    const root = realpathSync(rootPath);
-    const exact = realpathSync(requested);
-    const exactRelative = path.relative(root, exact);
-    if (exactRelative === "" || exactRelative === ".." || exactRelative.startsWith(`..${path.sep}`) || path.isAbsolute(exactRelative)) throw new Error("Worker session file resolves outside its retained session directory.");
     return { requested, exact };
   }
   return { requested, exact: realpathSync(requested) };

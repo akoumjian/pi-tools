@@ -200,19 +200,35 @@ export function validateWorkerResultInput(role: WorkerRole, input: WorkerResultS
 
 export function normalizeWorkspaceResultPaths(workspaceRoot: string, values: string[], kind: "repository" | "artifact", stat: (value: string) => { exists: boolean; directory: boolean; file: boolean; repository: boolean; bytes?:number }): string[] {
   if (Buffer.byteLength(values.join("\0")) > 32 * 1024) throw new WorkerResultValidationError("unsupported_path_type", kind === "repository" ? "repositories" : "artifacts", "Combined result paths exceed 32768 UTF-8 bytes.");
-  const root = realpathSync(path.resolve(workspaceRoot));
+  const requestedRoot = path.resolve(workspaceRoot);
+  const root = realpathSync(requestedRoot);
   const seen = new Set<string>();
   return values.map((value, index) => {
     const fieldPath = `${kind === "repository" ? "repositories" : "artifacts"}[${index}]`;
     if (Buffer.byteLength(value) > 4096) throw new WorkerResultValidationError("unsupported_path_type", fieldPath, `Result path exceeds 4096 UTF-8 bytes: ${value}.`);
-    const lexical = path.resolve(root, value);
-    const lexicalRelative = path.relative(root, lexical);
-    if (!strictlyWithin(root, lexical) || lexicalRelative === "") throw new WorkerResultValidationError("path_outside_workspace", fieldPath, `Result path is outside the workspace: ${value}.`);
-    if (!existsSync(lexical)) throw new WorkerResultValidationError("path_not_found", fieldPath, `Result path does not exist: ${value}.`);
+    const requestedCandidate = path.resolve(requestedRoot, value);
+    const requestedRelative = path.relative(requestedRoot, requestedCandidate);
+    const requestedContained = strictlyWithin(requestedRoot, requestedCandidate) && requestedRelative !== "";
+    const canonicalCandidate = path.resolve(root, value);
+    const canonicalRelative = path.relative(root, canonicalCandidate);
+    const canonicalContained = strictlyWithin(root, canonicalCandidate) && canonicalRelative !== "";
+    if (!requestedContained && !canonicalContained) throw new WorkerResultValidationError("path_outside_workspace", fieldPath, `Result path is outside the workspace: ${value}.`);
+    const lexical = requestedContained ? requestedCandidate : canonicalCandidate;
+    const walkRelative = requestedContained ? requestedRelative : canonicalRelative;
     let exact: string;
     try { exact = realpathSync(lexical); } catch { throw new WorkerResultValidationError("path_not_found", fieldPath, `Result path does not resolve: ${value}.`); }
     if (!strictlyWithin(root, exact)) throw new WorkerResultValidationError("path_outside_workspace", fieldPath, `Result path resolves outside the workspace: ${value}.`);
-    if (lstatSync(lexical).isSymbolicLink()) throw new WorkerResultValidationError("unsupported_path_type", fieldPath, `Result path cannot be a symbolic link: ${value}.`);
+    let current = requestedContained ? requestedRoot : root;
+    try {
+      for (const segment of walkRelative.split(path.sep)) {
+        current = path.join(current, segment);
+        const metadata = lstatSync(current);
+        if (metadata.isSymbolicLink()) throw new WorkerResultValidationError("unsupported_path_type", fieldPath, `Result path may not traverse symbolic links: ${value}.`);
+      }
+    } catch (error) {
+      if (error instanceof WorkerResultValidationError) throw error;
+      throw new WorkerResultValidationError("path_not_found", fieldPath, `Result path does not exist: ${value}.`);
+    }
     const normalized = path.relative(root, exact).split(path.sep).join("/");
     if (seen.has(normalized)) throw new WorkerResultValidationError("duplicate_path", fieldPath, `Duplicate result path: ${value}.`);
     seen.add(normalized);

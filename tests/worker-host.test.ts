@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
@@ -32,7 +32,7 @@ async function temp(run: (root: string) => Promise<void>) { const root = await m
 test("Sandbox planning freezes exact runtime provenance and deterministic mounts", async () => temp(async (root) => {
   const workerRoot = path.join(root, "worker"); const codeRoot = path.join(root, "Code"); const input = path.join(root, "input.txt"); await mkdir(workerRoot); await mkdir(codeRoot); await writeFile(input, "evidence\n");
   const planned = planWorkerSandbox({ workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_bbbbbbbb", creationNonce: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", workerRoot, codeRoot, mounts: [{ source: input, readOnly: true }, { source: input, readOnly: true }], release });
-  assert.equal(planned.kind, "docker-sandbox"); assert.equal(planned.imageDigest, "b".repeat(64)); assert.equal(planned.kitSha256, "a".repeat(64)); assert.deepEqual(planned.mounts, [{ source: input, readOnly: true }]); assert.equal(planned.extensionPaths.length, 2); assert.ok(planned.sandboxName.endsWith(`-${planned.creationNonce}`)); assert.equal(planned.sandboxName.length, 60);
+  assert.equal(planned.kind, "docker-sandbox"); assert.equal(planned.imageDigest, "b".repeat(64)); assert.equal(planned.kitSha256, "a".repeat(64)); assert.deepEqual(planned.mounts, [{ source: await realpath(input), readOnly: true }]); assert.equal(planned.extensionPaths.length, 2); assert.ok(planned.sandboxName.endsWith(`-${planned.creationNonce}`)); assert.equal(planned.sandboxName.length, 60);
 }));
 
 
@@ -41,7 +41,7 @@ test("review OverlayFS uses exact privileged sbx exec, private upper/work, and n
   const subject = path.join(root, "subject"), reviewer = path.join(root, "reviewer"), codeRoot = path.join(root, "Code"); await mkdir(path.join(subject, "deep"), { recursive: true }); await mkdir(reviewer); await mkdir(codeRoot); await writeFile(path.join(subject, "source.txt"), "authoritative\n"); await writeFile(path.join(subject, "deep", "untouched.txt"), "untouched\n");
   const workerId = "worker_20260101000000_aaaaaaaa", runId = "run_20260101000000_bbbbbbbb"; const overlay = planReviewWorkspaceOverlay({ workerId, runId, subjectWorkspace: subject });
   const planned = planWorkerSandbox({ workerId, runId, creationNonce: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", workerRoot: reviewer, codeRoot, mounts: [], reviewSubjectWorkspace: subject, release });
-  assert.equal(planned.workingDirectory, "/review/subject"); assert.deepEqual(planned.mounts, [{ source: subject, readOnly: true }]); assert.deepEqual(planned.reviewOverlay, overlay); assert.equal(existsSync(path.join(reviewer, "subject")), false, "planning must not recursively copy the subject");
+  assert.equal(planned.workingDirectory, "/review/subject"); assert.deepEqual(planned.mounts, [{ source: await realpath(subject), readOnly: true }]); assert.deepEqual(planned.reviewOverlay, overlay); assert.equal(existsSync(path.join(reviewer, "subject")), false, "planning must not recursively copy the subject");
   const calls: string[][] = []; const created = await createReviewWorkspaceOverlayAsync("/sbx", planned.sandboxName, overlay, async (args) => { calls.push(args); if (args.includes("--privileged")) return { stdout: `PI_REVIEW_OVERLAY_V1\nlower=${overlay.lowerDirectory}\nscratch=${overlay.scratchDirectory}\nupper=${overlay.upperDirectory}\nwork=${overlay.workDirectory}\nmerged=${overlay.mergedDirectory}\n`, stderr: "" }; return { stdout: "PI_REVIEW_OVERLAY_WRITABLE_V1\n", stderr: "" }; });
   assert.match(created.setupEvidenceSha256 ?? "", /^[a-f0-9]{64}$/); assert.deepEqual(calls[0]!.slice(0, 5), ["exec", "--user", "root", "--privileged", planned.sandboxName]); assert.deepEqual(calls[0]!.slice(5, 12), ["/usr/bin/env", "-u", "BASH_ENV", "-u", "ENV", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "/bin/sh"]); assert.ok(calls[0]!.some((argument) => argument.includes("mount -t overlay overlay"))); const privilegedScript=calls[0]!.find((argument)=>argument.includes("mount -t overlay overlay"))!; assert.match(privilegedScript,/PATH=\/usr\/sbin:\/usr\/bin:\/sbin:\/bin/); assert.match(privilegedScript,/unset BASH_ENV ENV/); assert.deepEqual(calls[1]!.slice(0, 6), ["exec", "--user", "root", "--workdir", "/review/subject", planned.sandboxName]);
   assert.equal(await readFile(path.join(subject, "source.txt"), "utf8"), "authoritative\n"); assert.equal(await readFile(path.join(subject, "deep", "untouched.txt"), "utf8"), "untouched\n");

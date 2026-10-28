@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -25,8 +25,8 @@ test("additional inputs reject sensitive roots, aliases, duplicates, and overlap
     assert.throws(() => validateAdditionalInputs({ values: [workspace], role: "work", workspaceRoot: workspace, runtimeRoot: runtime }), /sensitive/);
     assert.throws(() => validateAdditionalInputs({ values: [data, nested], role: "review", workspaceRoot: workspace, runtimeRoot: runtime }), /overlap/);
     const alias = path.join(root, "alias"); symlinkSync(data, alias); assert.throws(() => validateAdditionalInputs({ values: [data, alias], role: "work", workspaceRoot: workspace, runtimeRoot: runtime }), /Duplicate/);
-    const retained = validateAdditionalInputs({ values: [path.join(data, "a.txt")], role: "integration", workspaceRoot: workspace, runtimeRoot: runtime }); assert.equal(retained[0]?.target, path.join(data, "a.txt")); assert.equal(inputMounts(retained)[0]?.readOnly, true);
-    const more = path.join(root, "more.txt"); writeFileSync(more, "more"); const resumed = validateAdditionalInputs({ values: [more], existing: retained, role: "integration", workspaceRoot: workspace, runtimeRoot: runtime }); assert.deepEqual(resumed.map((item) => item.target), [path.join(data, "a.txt"), more]);
+    const retained = validateAdditionalInputs({ values: [path.join(data, "a.txt")], role: "integration", workspaceRoot: workspace, runtimeRoot: runtime }); assert.equal(retained[0]?.target, realpathSync(path.join(data, "a.txt"))); assert.equal(inputMounts(retained)[0]?.readOnly, true);
+    const more = path.join(root, "more.txt"); writeFileSync(more, "more"); const resumed = validateAdditionalInputs({ values: [more], existing: retained, role: "integration", workspaceRoot: workspace, runtimeRoot: runtime }); assert.deepEqual(resumed.map((item) => item.target), [realpathSync(path.join(data, "a.txt")), realpathSync(more)]);
   } finally { rmSync(root, { recursive: true, force: true }); } });
 
 test("trusted Git rejects linked candidate worktrees and gitlinks while accepting inert nested content", () => {
