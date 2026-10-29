@@ -66,10 +66,14 @@ test("worker session forks exact parent entries into the assigned workspace and 
 
 test("worker session range extraction skips large prefixes and validates the exact selected range", async () => {
   await withTempDir(async (directory) => {
-    const session = path.join(directory, "session.jsonl");
-    await writeFile(session, `header\n${"x".repeat(2 * 1024 * 1024)}\ntarget\n`);
-    assert.equal(readWorkerSessionRange(session, directory, 3, 3), "target\n");
-    assert.throws(() => readWorkerSessionRange(session, directory, 3, 4), /range is invalid/);
+    const session = path.join(directory, "session.jsonl"); const descriptor = openSync(session, "w+");
+    try {
+      const newline = Buffer.from("\n");
+      for (let line = 1; line <= 130; line += 1) writeSync(descriptor, newline, 0, 1, line * 1024 * 1024 - 1);
+      const target = Buffer.from("target\n"); writeSync(descriptor, target, 0, target.length, 130 * 1024 * 1024);
+    } finally { closeSync(descriptor); }
+    assert.equal(readWorkerSessionRange(session, directory, 131, 131), "target\n");
+    assert.throws(() => readWorkerSessionRange(session, directory, 131, 132), /range is invalid/);
     const invalid = path.join(directory, "invalid.jsonl");
     await writeFile(invalid, Buffer.from([0xff, 0x0a]));
     assert.throws(() => readWorkerSessionRange(invalid, directory, 1, 1), /not valid UTF-8/);
