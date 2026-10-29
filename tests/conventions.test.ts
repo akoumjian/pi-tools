@@ -150,6 +150,10 @@ test("pi-tools packages plain worker role instructions and one parent skill", ()
   const parentSkill = readText("skills/managed-worker-parent/SKILL.md");
   assert.match(parentSkill, /top-level `workers` and `preparedIds` are the only routine automatic cleanup candidates/);
   assert.match(parentSkill, /`attention\.\*` and `otherSessions`.*attention is never automatic discard/);
+  assert.match(parentSkill, /completed prepared audit row with a remaining filesystem.*`cleanup_preview` and `cleanup_apply`.*retaining the registry row/i);
+  assert.match(parentSkill, /completed row whose filesystem is already absent is silent only when no cleanup claim remains/i);
+  assert.match(parentSkill, /`attention\.preparedRecovery`.*bounded `recoveryLeftoverId`.*fresh `cleanup_preview`\/`cleanup_apply` retry/i);
+  assert.match(parentSkill, /both the original and claim-bound trash are authoritatively absent.*exact prepared ID.*clear only the exact unchanged stale claim.*retaining the completed registry row/i);
   for (const role of ["work", "review", "integration"]) {
     assert.ok(existsSync(path.join(packageRoot, "worker-roles", `${role}.md`)), role);
   }
