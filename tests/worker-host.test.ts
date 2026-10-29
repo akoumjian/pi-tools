@@ -260,7 +260,7 @@ test("sbx RPC shim propagates guest signal termination as nonzero", async () => 
 }));
 
 test("spawned supervisor covers ordering, every result branch, missing-result grace, mutation-drained cancellation, and EOF-to-stop escalation", async () => {
-  for (const scenario of ["missing", "review-missing", "review-repair", "ignore-eof", "cancel", "cancel-mutation", "cancel-result", "ordering", "outcome-completed", "outcome-needs_input", "outcome-blocked", "outcome-approve", "outcome-request_changes"]) await temp(async (root) => {
+  for (const scenario of ["missing", "provider-error", "review-missing", "review-repair", "ignore-eof", "cancel", "cancel-mutation", "cancel-result", "ordering", "outcome-completed", "outcome-needs_input", "outcome-blocked", "outcome-approve", "outcome-request_changes"]) await temp(async (root) => {
     const workerId="worker_20260101000000_aaaaaaaa", runId="run_20260101000000_bbbbbbbb", sessionId=`session-${scenario}`, role=scenario === "review-repair" || scenario === "review-missing" || scenario === "outcome-approve" || scenario === "outcome-request_changes" ? "review" : "work";
     const workerRoot=path.join(root,"worker"), workspaceRoot=path.join(workerRoot,"workspace"), sessionDir=path.join(workerRoot,"session"), runDir=path.join(root,"supervision",runId);
     await mkdir(workspaceRoot,{recursive:true}); await writeFile(path.join(workspaceRoot,"report.md"),"# spawned review\n"); await mkdir(sessionDir,{recursive:true}); await mkdir(path.join(workerRoot,"async-shell")); await mkdir(runDir,{recursive:true});
@@ -279,6 +279,7 @@ test("spawned supervisor covers ordering, every result branch, missing-result gr
     const [code,,stderr]=await Promise.all([new Promise<number|null>((resolve,reject)=>{host.once("error",reject);host.once("exit",resolve)}),collectStream(host.stdout),collectStream(host.stderr)]);
     const rpc=await readFile(rpcTrace,"utf8"), sbx=await readFile(sbxTrace,"utf8"); assert.match(rpc,/eof/); assert.doesNotMatch(rpc,/signal:/);
     if(scenario==="missing"){assert.notEqual(code,0);assert.match(stderr,/without worker_result_submit/);assert.doesNotMatch(sbx,/^stop /m);}
+    if(scenario==="provider-error"){assert.notEqual(code,0);assert.match(stderr,/PRIMARY_PROVIDER_RUNTIME_FAILURE/);assert.doesNotMatch(stderr,/without worker_result_submit/);assert.doesNotMatch(sbx,/^stop /m);}
     if(scenario==="review-missing"){assert.notEqual(code,0);assert.match(stderr,/without worker_result_submit/);assert.match(rpc,/review-missing-prompt:1/);assert.match(rpc,/review-missing-prompt:2/);assert.doesNotMatch(rpc,/review-missing-prompt:3/);assert.doesNotMatch(sbx,/^stop /m);}
     if(scenario==="review-repair"){assert.equal(code,0,stderr);assert.equal(JSON.parse(await readFile(resultFile,"utf8")).result.outcome,"approve");assert.match(rpc,/checked:review-repair/);}
     if(scenario==="ignore-eof"){assert.equal(existsSync(settledFile),true);assert.match(sbx,/^stop /m);assert.match(sbx,/stop:settled=yes/);assert.ok(rpc.indexOf("eof")>=0 && rpc.indexOf("eof")<rpc.indexOf("sbx-stop"));}

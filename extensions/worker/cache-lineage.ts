@@ -46,11 +46,13 @@ export const MANAGED_WORKER_TOOL_NAMES = [
 const MANAGED_WORKER_TOOL_NAME_SET = new Set<string>(MANAGED_WORKER_TOOL_NAMES);
 const CAPTURE_HOLDER_KEY = Symbol.for("@akoumjian/pi-tools/worker-cache-lineage-capture");
 const CAPTURE_HOLDER_VERSION = 3;
-const ADOPTION_VERSION = 3;
+const ADOPTION_VERSION = 4;
+const LEGACY_ADOPTION_VERSION = 3;
 const LINEAGE_SUMMARY_VERSION = 1;
 const RETIREMENT_VERSION = 1;
 const CAPTURE_HOLDER_MAX_SESSIONS = 4;
 const CACHE_LINEAGE_FATAL_ERROR_PREFIX = "Managed-worker Codex cache lineage failed closed: ";
+const WORKER_INSTRUCTIONS_DRIFT_REASON = "Managed-worker system instructions drifted after Codex lineage adoption.";
 
 type JsonObject = Record<string, unknown>;
 
@@ -355,17 +357,19 @@ export function continueWorkerCacheLineage(record: WorkerCacheLineageRecord, wor
   if (record.mode === "fresh") return undefined;
   if (!validateWorkerCacheLineageRecord(record)) throw new Error("Retained cache-lineage metadata is corrupt or unsupported.");
   let status: WorkerCacheLineageSummary; try { status = readLineageSummary(record); } catch (error) { throw new Error(`Retained cache-lineage summary is missing or corrupt: ${error instanceof Error ? error.message : String(error)}`); }
-  if (status.mode !== "eligible" && status.mode !== "adopted") throw new Error(`Retained cache-lineage summary mode ${status.mode} cannot authorize a fresh fallback.`);
+  const recoverablePreDispatchDrift = status.mode === "failed" && status.reason === WORKER_INSTRUCTIONS_DRIFT_REASON;
+  const continuationMode = recoverablePreDispatchDrift ? "adopted" : status.mode;
+  if (continuationMode !== "eligible" && continuationMode !== "adopted") throw new Error(`Retained cache-lineage summary mode ${status.mode} cannot authorize continuation.`);
   let snapshot: string; try { snapshot = readNoFollowBounded(record.snapshotFile, WORKER_CACHE_LINEAGE_MAX_BYTES); } catch (error) { throw new Error(`Retained cache-lineage snapshot is missing or unreadable: ${error instanceof Error ? error.message : String(error)}`); }
   if (sha256(snapshot) !== record.snapshotSha256) throw new Error("Retained cache-lineage snapshot integrity mismatch.");
   mkdirSync(workerStateDir, { recursive: true, mode: 0o700 });
   const clone: Extract<WorkerCacheLineageRecord, { mode: "eligible" }> = { ...record, hostGeneration, snapshotFile: path.join(workerStateDir, "cache-lineage.json"), adoptionFile: path.join(workerStateDir, "cache-lineage-adopted.json"), fallbackFile: path.join(workerStateDir, "cache-lineage-fallback.json"), retirementFile: path.join(workerStateDir, "cache-lineage-retired.json"), summaryFile: path.join(workerStateDir, "cache-lineage-summary.json") };
   writePrivateText(clone.snapshotFile, snapshot);
-  if (status.mode === "adopted") {
-    let adoption: string; try { readAdoption(record.adoptionFile, record, readWorkerSnapshot(record)); adoption = readNoFollowBounded(record.adoptionFile, 4096); } catch (error) { throw new Error(`Retained cache-lineage adoption evidence is missing or corrupt: ${error instanceof Error ? error.message : String(error)}`); }
+  if (continuationMode === "adopted") {
+    let adoption: string; try { readAdoption(record.adoptionFile, record, readWorkerSnapshot(record)); adoption = readNoFollowBounded(record.adoptionFile, WORKER_CACHE_LINEAGE_MAX_BYTES); } catch (error) { throw new Error(`Retained cache-lineage adoption evidence is missing or corrupt: ${error instanceof Error ? error.message : String(error)}`); }
     writePrivateText(clone.adoptionFile, adoption);
   }
-  writeLineageSummary(clone, status.mode);
+  writeLineageSummary(clone, continuationMode);
   return clone;
 }
 
@@ -457,6 +461,7 @@ type AdoptionState = {
   workerToolsSha256: string;
   workerInstructionsSha256: string;
   forkBoundarySha256: string;
+  forkBoundary?: JsonObject[];
   initialAssignmentSha256: string;
   preAssignmentItemsSha256: string;
   assignmentInputIndex: number;
@@ -747,8 +752,10 @@ class EligibleRuntimeController {
     if (drift) throw new Error(drift);
     if (!isJsonObject(payload)) throw new Error("Worker Codex provider payload is not an object.");
     if (payload.model !== this.record.model) throw new Error("Worker Codex payload model drifted before lineage adoption.");
-    const workerInstructions = boundedWorkerInstructions(payload.instructions);
-    const workerInstructionsSha256 = sha256(workerInstructions);
+    const workerInstructions = adoption?.forkBoundary ? undefined : boundedWorkerInstructions(payload.instructions);
+    const workerInstructionsSha256 = workerInstructions === undefined
+      ? adoption!.workerInstructionsSha256
+      : sha256(workerInstructions);
     const currentInput = asObjectArray(payload.input, "worker Codex input");
     const parentInput = asObjectArray(this.capture.data.payload.input, "captured parent Codex input");
     if (currentInput.length < parentInput.length || !equalJson(currentInput.slice(0, parentInput.length), parentInput)) {
@@ -801,27 +808,38 @@ class EligibleRuntimeController {
     const preAssignmentItems = currentInput.slice(parentInput.length, assignmentInputIndex);
     const preAssignmentItemsSha256 = sha256(stringifyBounded(preAssignmentItems, "managed-worker pre-assignment items"));
 
-    const boundary: JsonObject[] = [];
-    if (appendedTools.length > 0) boundary.push({ type: "additional_tools", role: "developer", tools: appendedTools });
-    boundary.push({
-      role: "developer",
-      content: [
-        {
-          type: "input_text",
-          text: `This is an isolated managed-worker fork. Only these worker tools are executable: ${workerToolNames.join(", ")}. Parent tool schemas remain immutable historical cache context and are not executable.`
-        },
-        { type: "input_text", text: workerInstructions }
-      ]
-    });
+    let boundary = adoption?.forkBoundary;
+    if (!boundary) {
+      if (workerInstructions === undefined) throw new Error("Worker Codex fork boundary instructions are unavailable.");
+      boundary = [];
+      if (appendedTools.length > 0) boundary.push({ type: "additional_tools", role: "developer", tools: appendedTools });
+      boundary.push({
+        role: "developer",
+        content: [
+          {
+            type: "input_text",
+            text: `This is an isolated managed-worker fork. Only these worker tools are executable: ${workerToolNames.join(", ")}. Parent tool schemas remain immutable historical cache context and are not executable.`
+          },
+          { type: "input_text", text: workerInstructions }
+        ]
+      });
+    }
     const nextAdoption: AdoptionState = {
       workerToolsSha256: sha256(stringifyBounded(workerTools, "managed-worker Codex tool schemas")),
       workerInstructionsSha256,
       forkBoundarySha256: sha256(stringifyBounded(boundary, "managed-worker Codex fork boundary")),
+      forkBoundary: boundary,
       initialAssignmentSha256,
       preAssignmentItemsSha256,
       assignmentInputIndex
     };
-    if (adoption) assertAdoptionUnchanged(adoption, nextAdoption);
+    if (adoption) {
+      assertAdoptionUnchanged(adoption, nextAdoption);
+      if (!adoption.forkBoundary) {
+        writeAdoption(this.record.adoptionFile, this.record, this.capture, nextAdoption);
+        this.adoption = nextAdoption;
+      }
+    }
 
     const suffixBeforeAssignment = currentInput
       .slice(parentInput.length, assignmentInputIndex)
@@ -989,6 +1007,7 @@ function writeAdoption(
   capture: ParentCacheLineageCapture,
   adoption: AdoptionState
 ): void {
+  if (!adoption.forkBoundary) throw new Error("Worker cache-lineage adoption is missing its immutable fork boundary.");
   const value = {
     version: ADOPTION_VERSION,
     marker: record.marker,
@@ -1001,8 +1020,9 @@ function writeAdoption(
     ...adoption
   };
   if (existsSync(file)) {
-    assertAdoptionUnchanged(readAdoption(file, record, capture), adoption);
-    return;
+    const persisted = readAdoption(file, record, capture);
+    assertAdoptionUnchanged(persisted, adoption);
+    if (persisted.forkBoundary) return;
   }
   writePrivateJson(file, value);
 }
@@ -1013,13 +1033,13 @@ function readAdoption(
   capture: ParentCacheLineageCapture
 ): AdoptionState {
   const metadata = lstatSync(file);
-  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size <= 0 || metadata.size > 4096) {
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size <= 0 || metadata.size > WORKER_CACHE_LINEAGE_MAX_BYTES) {
     throw new Error("Worker cache-lineage adoption marker is invalid.");
   }
   const value: unknown = JSON.parse(readFileSync(file, "utf8"));
   if (
     !isJsonObject(value) ||
-    value.version !== ADOPTION_VERSION ||
+    (value.version !== ADOPTION_VERSION && value.version !== LEGACY_ADOPTION_VERSION) ||
     value.marker !== record.marker ||
     value.snapshotSha256 !== record.snapshotSha256 ||
     value.provider !== record.provider ||
@@ -1034,10 +1054,17 @@ function readAdoption(
     typeof value.preAssignmentItemsSha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.preAssignmentItemsSha256) ||
     !Number.isInteger(value.assignmentInputIndex) || (value.assignmentInputIndex as number) < 0 || (value.assignmentInputIndex as number) > 1_000_000
   ) throw new Error("Worker cache-lineage adoption marker does not match its persisted lineage.");
+  const forkBoundary = value.version === ADOPTION_VERSION
+    ? asObjectArray(value.forkBoundary, "persisted managed-worker fork boundary")
+    : undefined;
+  if (forkBoundary && sha256(stringifyBounded(forkBoundary, "persisted managed-worker fork boundary")) !== value.forkBoundarySha256) {
+    throw new Error("Worker cache-lineage immutable fork boundary digest mismatch.");
+  }
   return {
     workerToolsSha256: value.workerToolsSha256,
     workerInstructionsSha256: value.workerInstructionsSha256,
     forkBoundarySha256: value.forkBoundarySha256,
+    forkBoundary,
     initialAssignmentSha256: value.initialAssignmentSha256,
     preAssignmentItemsSha256: value.preAssignmentItemsSha256,
     assignmentInputIndex: value.assignmentInputIndex as number
@@ -1047,14 +1074,15 @@ function readAdoption(
 function assertAdoptionUnchanged(expected: AdoptionState, actual: AdoptionState): void {
   const checks: Array<[keyof AdoptionState, string]> = [
     ["workerToolsSha256", "Managed-worker tool schemas drifted after Codex lineage adoption."],
-    ["workerInstructionsSha256", "Managed-worker system instructions drifted after Codex lineage adoption."],
-    ["forkBoundarySha256", "Managed-worker fork boundary drifted after Codex lineage adoption."],
+    ["workerInstructionsSha256", WORKER_INSTRUCTIONS_DRIFT_REASON],
+    ["forkBoundarySha256", "Managed-worker immutable fork boundary drifted after Codex lineage adoption."],
     ["initialAssignmentSha256", "Managed-worker initial assignment drifted after Codex lineage adoption."],
     ["preAssignmentItemsSha256", "Managed-worker pre-assignment history drifted after Codex lineage adoption."],
     ["assignmentInputIndex", "Managed-worker initial assignment position drifted after Codex lineage adoption."]
   ];
   for (const [field, message] of checks) {
-    if (expected[field] !== actual[field]) throw new Error(message);
+    if (expected[field] === actual[field]) continue;
+    throw new Error(message);
   }
 }
 

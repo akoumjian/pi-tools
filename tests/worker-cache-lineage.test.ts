@@ -398,6 +398,8 @@ test("Codex lineage restores the exact parent prefix and appends only managed-wo
       "initialAssignmentSha256",
       "preAssignmentItemsSha256"
     ]) assert.match(String(adoption[field]), /^[0-9a-f]{64}$/);
+    assert.equal(adoption.version, 4);
+    assert.ok(Array.isArray(adoption.forkBoundary));
     assert.deepEqual(summarizeWorkerCacheLineage(record), { mode: "adopted" });
     record.runtimeFingerprint = "a".repeat(64);
     const continued = continueWorkerCacheLineage(record, path.join(root, "run-two"), "run_20260924120002_bbbbbbbb");
@@ -405,7 +407,7 @@ test("Codex lineage restores the exact parent prefix and appends only managed-wo
     if (continued?.mode !== "eligible") throw new Error("Expected continued eligible lineage.");
     assert.notEqual(continued.snapshotFile, record.snapshotFile); assert.equal(continued.marker, record.marker); assert.equal(continued.runtimeFingerprint, record.runtimeFingerprint); assert.equal(continued.hostGeneration, "run_20260924120002_bbbbbbbb");
     assert.deepEqual(summarizeWorkerCacheLineage(continued), { mode: "adopted" }); assert.equal(existsSync(continued.adoptionFile), true);
-    const retainedSummary = readFileSync(record.summaryFile, "utf8"); const mutatedSummary = JSON.parse(retainedSummary); mutatedSummary.mode = "fresh"; writeFileSync(record.summaryFile, `${JSON.stringify(mutatedSummary)}\n`); assert.throws(() => continueWorkerCacheLineage(record, path.join(root, "mutated-summary"), "run_20260924120006_ffffffff"), /cannot authorize a fresh fallback/); writeFileSync(record.summaryFile, retainedSummary);
+    const retainedSummary = readFileSync(record.summaryFile, "utf8"); const mutatedSummary = JSON.parse(retainedSummary); mutatedSummary.mode = "fresh"; writeFileSync(record.summaryFile, `${JSON.stringify(mutatedSummary)}\n`); assert.throws(() => continueWorkerCacheLineage(record, path.join(root, "mutated-summary"), "run_20260924120006_ffffffff"), /cannot authorize continuation/); mutatedSummary.mode = "failed"; mutatedSummary.reason = "Managed-worker system instructions drifted after Codex lineage adoption. untrusted suffix"; writeFileSync(record.summaryFile, `${JSON.stringify(mutatedSummary)}\n`); assert.throws(() => continueWorkerCacheLineage(record, path.join(root, "mutated-failure"), "run_20260924120008_hhhhhhhh"), /cannot authorize continuation/); writeFileSync(record.summaryFile, retainedSummary);
     const retainedSnapshot = readFileSync(record.snapshotFile, "utf8"); rmSync(record.snapshotFile); assert.throws(() => continueWorkerCacheLineage(record, path.join(root, "missing-snapshot"), "run_20260924120003_cccccccc"), /snapshot is missing or unreadable/); writeFileSync(record.snapshotFile, retainedSnapshot);
     writeFileSync(record.snapshotFile, `${retainedSnapshot}corrupt`); assert.throws(() => continueWorkerCacheLineage(record, path.join(root, "corrupt-snapshot"), "run_20260924120004_dddddddd"), /snapshot integrity mismatch/); writeFileSync(record.snapshotFile, retainedSnapshot);
     const retainedAdoption = readFileSync(record.adoptionFile, "utf8"); rmSync(record.adoptionFile); assert.throws(() => continueWorkerCacheLineage(record, path.join(root, "missing-adoption"), "run_20260924120005_eeeeeeee"), /adoption evidence is missing or corrupt/); writeFileSync(record.adoptionFile, retainedAdoption);
@@ -868,19 +870,57 @@ test("Codex lineage keeps one immutable boundary across turns and persisted resu
     assert.deepEqual(resumedPayload.input.slice(0, 5), fixedPrefix);
     assert.deepEqual(resumedPayload.input.slice(5), resumeTrailing);
 
-    assert.throws(
-      () => resumed!.transformPayload(
-        workerPayload({ instructions: `${workerInstructions}\nDRIFT` , trailing: resumeTrailing }),
-        codexContext()
-      ),
-      /Managed-worker Codex cache lineage failed closed: Managed-worker system instructions drifted after Codex lineage adoption\./
-    );
-    assert.deepEqual(resumed.status(), {
-      mode: "failed",
-      reason: "Managed-worker system instructions drifted after Codex lineage adoption."
-    });
+    const driftedLocalPayload = resumed.transformPayload(
+      workerPayload({ instructions: `${workerInstructions}\nLOCAL PRE-TRANSFORM DRIFT`, trailing: resumeTrailing }),
+      codexContext()
+    ) as Record<string, any>;
+    assert.equal(driftedLocalPayload.instructions, parentPayload().instructions);
+    assert.deepEqual(driftedLocalPayload.input.slice(0, 5), fixedPrefix);
+    assert.deepEqual(driftedLocalPayload.input.slice(5), resumeTrailing);
+    assert.deepEqual(resumed.status(), { mode: "adopted" });
+
+    const failedSummary = JSON.parse(readFileSync(record.summaryFile, "utf8"));
+    failedSummary.mode = "failed";
+    failedSummary.reason = "Managed-worker system instructions drifted after Codex lineage adoption.";
+    writeFileSync(record.summaryFile, `${JSON.stringify(failedSummary)}\n`);
+    const recovered = continueWorkerCacheLineage(record, path.join(root, "recovered-resume"), "run_20260924120007_gggggggg");
+    assert.equal(recovered?.mode, "eligible");
+    assert.deepEqual(summarizeWorkerCacheLineage(recovered), { mode: "adopted" });
   } finally {
     runtime?.restoreNetwork();
+    resumed?.restoreNetwork();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex lineage upgrades a legacy hash-only adoption to an immutable persisted fork boundary", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-legacy-adoption-"));
+  let initial: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
+  let resumed: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
+  try {
+    const record = captureAndPrepare(root);
+    initial = createWorkerCacheLineageRuntime(record);
+    const first = initial.transformPayload(workerPayload(), codexContext()) as Record<string, any>;
+    completeSuccessfulResponse(initial);
+    initial.restoreNetwork();
+    initial = undefined;
+
+    const legacy = JSON.parse(readFileSync(record.adoptionFile, "utf8"));
+    legacy.version = 3;
+    delete legacy.forkBoundary;
+    writeFileSync(record.adoptionFile, `${JSON.stringify(legacy)}\n`);
+
+    resumed = createWorkerCacheLineageRuntime(record);
+    const replay = resumed.transformPayload(workerPayload(), codexContext()) as Record<string, any>;
+    assert.equal(replay.instructions, parentPayload().instructions);
+    assert.deepEqual(replay.input.slice(0, 5), first.input.slice(0, 5));
+    const upgraded = JSON.parse(readFileSync(record.adoptionFile, "utf8"));
+    assert.equal(upgraded.version, 4);
+    assert.ok(Array.isArray(upgraded.forkBoundary));
+    assert.deepEqual(upgraded.forkBoundary, first.input.slice(2, 4));
+    assert.deepEqual(resumed.status(), { mode: "adopted" });
+  } finally {
+    initial?.restoreNetwork();
     resumed?.restoreNetwork();
     rmSync(root, { recursive: true, force: true });
   }

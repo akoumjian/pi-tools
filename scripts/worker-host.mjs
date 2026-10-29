@@ -96,7 +96,9 @@ const cancellationWatcher = setInterval(() => {
 }, 25);
 cancellationWatcher.unref();
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(signal, () => { const exitCode = signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143; void stopBoundedly().then(() => process.exit(exitCode), (error) => { console.error(error); process.exit(1); }); });
+let primaryRuntimeError;
 client.onEvent((event) => {
+  primaryRuntimeError ??= terminalAssistantRuntimeError(event);
   const summary = { type: event.type };
   for (const key of ["toolName", "toolCallId", "stopReason"]) if (typeof event[key] === "string") summary[key] = event[key];
   process.stdout.write(`${JSON.stringify({ type: "worker_rpc_event", workerId: config.workerId, runId: config.runId, event: summary })}\n`);
@@ -183,6 +185,13 @@ function observePromptStart(rpcClient) {
   return { promise, acknowledge() { if (finished || promptAcknowledged) return; promptAcknowledged = true; timeout = setTimeout(() => finish(new Error("Worker RPC prompt response did not begin an agent turn.")), PROMPT_START_TIMEOUT_MS); }, fail(error) { finish(error instanceof Error ? error : new Error("Worker RPC prompt failed.")); }, sawCompaction() { return compactionObserved; } };
 }
 function isPromptResponseTimeout(error) { return error instanceof Error && error.message.startsWith("Timeout waiting for response to prompt."); }
+function terminalAssistantRuntimeError(event) {
+  if (!event || typeof event !== "object" || event.type !== "message_end" || !event.message || typeof event.message !== "object") return undefined;
+  const message = event.message;
+  if (message.role !== "assistant" || message.stopReason !== "error") return undefined;
+  const detail = typeof message.errorMessage === "string" && message.errorMessage.trim() ? message.errorMessage.trim() : "Provider/runtime assistant turn failed.";
+  return detail.length > 4_000 ? `${detail.slice(0, 3_997)}...` : detail;
+}
 function waitForResultSettlement(rpcClient, resultFile, timeoutMs) {
   return new Promise((resolve, reject) => {
     let finished = false; let checking = false; let timeout;
@@ -196,6 +205,7 @@ function waitForResultSettlement(rpcClient, resultFile, timeoutMs) {
         if (!existsSync(resultFile) && !rpcActive && runtimeState?.admissionState === "open" && runtimeState?.agentPhase === "idle" && runtimeState?.activeJobCount === 0 && !runtimeState?.pendingCompletionFollowUp) {
           idleSince ??= Date.now();
           if (Date.now() - idleSince >= SETTLED_RESULT_GRACE_MS) {
+            if (primaryRuntimeError) return finish(new Error(`Worker agent failed before result submission: ${primaryRuntimeError}`));
             if (config.role === "review" && !requestedReviewResultRepair) {
               requestedReviewResultRepair = true; idleSince = undefined;
               await requestBoundedInjectedWorkerPrompt(rpcClient, REVIEW_RESULT_REPAIR_PROMPT);
