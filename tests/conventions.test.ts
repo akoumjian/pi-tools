@@ -147,6 +147,9 @@ test("pi-tools packages plain worker role instructions and one parent skill", ()
   const manifest = packageJson();
   assert.deepEqual(manifest.pi?.skills, ["skills"]);
   assert.ok(existsSync(path.join(packageRoot, "skills", "managed-worker-parent", "SKILL.md")));
+  const parentSkill = readText("skills/managed-worker-parent/SKILL.md");
+  assert.match(parentSkill, /top-level `workers` and `preparedIds` are the only routine automatic cleanup candidates/);
+  assert.match(parentSkill, /`attention\.\*` and `otherSessions`.*attention is never automatic discard/);
   for (const role of ["work", "review", "integration"]) {
     assert.ok(existsSync(path.join(packageRoot, "worker-roles", `${role}.md`)), role);
   }

@@ -47,6 +47,7 @@ export type WorkerRunInput = WorkerRunInputV2;
 export type WorkerControlInput = WorkerControlInputV2;
 
 export const WORKER_ACTIVITY_STATUS_KEY = "00-pi-tools-worker-activity";
+const CLEANUP_NOTICE_GUIDANCE = "Top-level workers and preparedIds are the only routine automatic cleanup candidates. All attention.* and otherSessions entries require explicit review; attention is never automatic discard.";
 
 export function activeWorkerCountForContext(registry: WorkerRegistry, context: Pick<ExtensionContext, "sessionManager">): number {
   const parentSessionFile = context.sessionManager.getSessionFile();
@@ -96,6 +97,7 @@ export type WorkerExtensionDependencies = {
   probeHostIdentity?: (identity: ReturnType<typeof readWorkerHostProcess>) => AsyncJobProcessIdentityLiveness;
   beforeCreateRunBatch?: () => void | Promise<void>;
   cleanupHostLogs?: typeof planSettledWorkerHostLogs;
+  observeCleanupAnnouncement?: (announcement: Promise<void>) => void;
   beforeDiscardRootClaim?: (worker:WorkerRegistryRecord)=>void;
   signalHostIdentity?: (identity: ReturnType<typeof readWorkerHostProcess>, signal: NodeJS.Signals) => boolean;
   hostTerminationGraceAttempts?: number; hostForcedTerminationAttempts?: number; hostProbeDelayMs?: number;
@@ -255,7 +257,9 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
       // acknowledges observed delivery IDs; it never releases, retries, or sends.
       const exactParent = realpathOrResolve(parentFile);
       reconcileWorkerDeliveries(getRegistry(), exactParent, sessionDeliveryIds(context));
-      void announceCleanupAfterAgentEnd(exactParent, context.cwd);
+      const announcement = announceCleanupAfterAgentEnd(exactParent, context.cwd);
+      overrides.observeCleanupAnnouncement?.(announcement);
+      void announcement;
     } catch {}
   });
   api.on("message_end", (event, context) => {
@@ -288,8 +292,11 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
     return new Text(theme.fg(recovery || d?.outcome === "failed" ? "error" : d?.outcome === "cancelled" ? "warning" : "success", `${outcome} · ${role} · ${String(d?.workerId ?? "worker").slice(-8)} · ${counts}`), 0, 0);
   });
   api.registerMessageRenderer("worker-cleanup", (message, _options, theme) => {
-    const d = message.details as any; const workers = Array.isArray(d?.workers) ? d.workers.length : 0; const prepared = Array.isArray(d?.preparedIds) ? d.preparedIds.length : 0;
-    return new Text(theme.fg("warning", `cleanup due · ${workers} workers · ${prepared} prepared sets`), 0, 0);
+    const d = message.details as any, attention = d?.attention ?? {}; const routine = (Array.isArray(d?.workers) ? d.workers.length : 0) + (Number(d?.additionalWorkers) || 0) + (Array.isArray(d?.preparedIds) ? d.preparedIds.length : 0) + (Number(d?.additionalPrepared) || 0);
+    const currentAttention = Object.entries(attention).reduce((total, [key, value]) => total + (key.startsWith("additional") ? Number(value) || 0 : Array.isArray(value) ? value.length : 0), 0); const other = Array.isArray(d?.otherSessions) ? d.otherSessions : [];
+    const otherAttention = other.reduce((total: number, item: any) => total + (Array.isArray(item?.workerIds) ? item.workerIds.length : 0) + (Number(item?.additionalWorkers) || 0) + (Array.isArray(item?.preparedIds) ? item.preparedIds.length : 0) + (Number(item?.additionalPrepared) || 0) + (Number(item?.attention) || 0), 0); const attentionCount = currentAttention + otherAttention + (Number(d?.additionalOtherSessions) || 0) + (d?.otherSessionsPartial ? 1 : 0);
+    const label = routine ? `cleanup due · ${routine} routine candidate${routine===1?"":"s"}${attentionCount ? ` · ${attentionCount} attention` : ""}` : attentionCount ? `cleanup attention · ${attentionCount} item${attentionCount===1?"":"s"} · explicit review required` : "cleanup inventory incomplete · explicit review required";
+    return new Text(theme.fg("warning", label), 0, 0);
   });
 
   const workerRunTool = defineTool({
@@ -1240,7 +1247,7 @@ export function registerWorkerExtension(api: ExtensionAPI, overrides: WorkerExte
         otherSessionsPartial=!complete;if(otherSessionsPartial)otherSessionsNextOffset=offset;const values=[...grouped.values()];otherSessions=values.slice(0,20).map((item)=>({...item,workerIds:item.workerIds.slice(0,8),additionalWorkers:Math.max(0,item.workerIds.length-8),preparedIds:item.preparedIds.slice(0,8),additionalPrepared:Math.max(0,item.preparedIds.length-8)}));additionalOtherSessions=Math.max(0,values.length-otherSessions.length);
       }
       const announceable=[...inventory.workers.filter((item)=>["due","recovery","unknown:task_missing"].includes(item.class)).map((item)=>({kind:"worker",id:item.workerId,class:item.class})),...inventory.prepared.filter((item)=>["due","explicit_decision","partial"].includes(item.class)).map((item)=>({kind:"prepared",id:item.preparedId,class:item.class}))];const current=new Set(announceable.map((item)=>`${scope}${item.kind}:${item.id}:${item.class}`));for(const key of [...cleanupAnnounced])if(key.startsWith(scope)&&!current.has(key))cleanupAnnounced.delete(key);const fresh=announceable.filter((item)=>!cleanupAnnounced.has(`${scope}${item.kind}:${item.id}:${item.class}`));const otherHasItems=otherSessions.some((item:any)=>item.workerIds.length||item.preparedIds.length||item.attention)||otherSessionsPartial;if((!fresh.length&&!otherHasItems)||generation!==runtimeGeneration||!currentContext?.sessionManager.getSessionFile()||realpathOrResolve(currentContext.sessionManager.getSessionFile()!)!==parent)return;for(const item of announceable)cleanupAnnounced.add(`${scope}${item.kind}:${item.id}:${item.class}`);
-      const dueWorkers=inventory.workers.filter((item)=>item.class==="due"),duePrepared=inventory.prepared.filter((item)=>item.class==="due"),recovery=inventory.workers.filter((item)=>item.class==="recovery"),unknown=inventory.workers.filter((item)=>item.class==="unknown:task_missing"),partial=inventory.prepared.filter((item)=>item.class==="partial"),explicitDecision=inventory.prepared.filter((item)=>item.class==="explicit_decision");const event={event:"worker_cleanup_due",workers:dueWorkers.slice(0,16).map((item)=>({workerId:item.workerId,role:item.role,class:item.class,new:fresh.some((candidate)=>candidate.kind==="worker"&&candidate.id===item.workerId),...(item.after?{after:item.after}:{}),unpreservedArtifacts:item.unpreservedArtifacts.slice(0,4),additionalUnpreservedArtifacts:Math.max(0,item.unpreservedArtifacts.length-4)})),additionalWorkers:Math.max(0,dueWorkers.length-16),preparedIds:duePrepared.slice(0,16).map((item)=>item.preparedId),additionalPrepared:Math.max(0,duePrepared.length-16),attention:{recovery:recovery.slice(0,16).map((item)=>({workerId:item.workerId,error:item.recoveryError??item.reason})),additionalRecovery:Math.max(0,recovery.length-16),unknown:unknown.slice(0,16).map((item)=>({workerId:item.workerId,reason:item.reason})),additionalUnknown:Math.max(0,unknown.length-16),partial:partial.slice(0,16).map((item)=>item.preparedId),additionalPartial:Math.max(0,partial.length-16),explicitDecision:explicitDecision.slice(0,16).map((item)=>item.preparedId),additionalExplicitDecision:Math.max(0,explicitDecision.length-16)},beadsUnavailable:inventory.workers.filter((item)=>item.class==="unknown:beads_unavailable").length,currentSessionPartial:inventory.scan.partial,otherSessions,additionalOtherSessions,otherSessionsPartial,...(otherSessionsNextOffset===undefined?{}:{otherSessionsNextOffset})};api.sendMessage({customType:"worker-cleanup",content:JSON.stringify(event),display:true,details:event},{triggerTurn:true,deliverAs:"followUp"});
+      const dueWorkers=inventory.workers.filter((item)=>item.class==="due"),duePrepared=inventory.prepared.filter((item)=>item.class==="due"),recovery=inventory.workers.filter((item)=>item.class==="recovery"),unknown=inventory.workers.filter((item)=>item.class==="unknown:task_missing"),partial=inventory.prepared.filter((item)=>item.class==="partial"),explicitDecision=inventory.prepared.filter((item)=>item.class==="explicit_decision");const event={event:"worker_cleanup_due",guidance:CLEANUP_NOTICE_GUIDANCE,workers:dueWorkers.slice(0,16).map((item)=>({workerId:item.workerId,role:item.role,class:item.class,new:fresh.some((candidate)=>candidate.kind==="worker"&&candidate.id===item.workerId),...(item.after?{after:item.after}:{}),unpreservedArtifacts:item.unpreservedArtifacts.slice(0,4),additionalUnpreservedArtifacts:Math.max(0,item.unpreservedArtifacts.length-4)})),additionalWorkers:Math.max(0,dueWorkers.length-16),preparedIds:duePrepared.slice(0,16).map((item)=>item.preparedId),additionalPrepared:Math.max(0,duePrepared.length-16),attention:{recovery:recovery.slice(0,16).map((item)=>({workerId:item.workerId,error:item.recoveryError??item.reason})),additionalRecovery:Math.max(0,recovery.length-16),unknown:unknown.slice(0,16).map((item)=>({workerId:item.workerId,reason:item.reason})),additionalUnknown:Math.max(0,unknown.length-16),partial:partial.slice(0,16).map((item)=>item.preparedId),additionalPartial:Math.max(0,partial.length-16),explicitDecision:explicitDecision.slice(0,16).map((item)=>item.preparedId),additionalExplicitDecision:Math.max(0,explicitDecision.length-16)},beadsUnavailable:inventory.workers.filter((item)=>item.class==="unknown:beads_unavailable").length,currentSessionPartial:inventory.scan.partial,otherSessions,additionalOtherSessions,otherSessionsPartial,...(otherSessionsNextOffset===undefined?{}:{otherSessionsNextOffset})};api.sendMessage({customType:"worker-cleanup",content:JSON.stringify(event),display:true,details:event},{triggerTurn:true,deliverAs:"followUp"});
     }catch{/* advisory only */}
   }
 

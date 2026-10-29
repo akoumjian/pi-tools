@@ -153,11 +153,14 @@ export function classifyCleanupWorker(registry: WorkerRegistry, worker: WorkerRe
 }
 
 type PreparedRow = { prepared_id: string; parent_session_file: string; status: string; task_ids_json: string; apply_nonce: string | null };
-function listPreparedRows(registry: WorkerRegistry, parent: string | undefined, limit: number, offset: number): { rows: PreparedRow[]; total: number } {
-  const total = Number(((parent ? registry.database.prepare("SELECT COUNT(*) AS count FROM prepared_sets WHERE parent_session_file=?").get(parent) : registry.database.prepare("SELECT COUNT(*) AS count FROM prepared_sets").get()) as { count: number }).count);
-  const rows = (parent
-    ? registry.database.prepare("SELECT prepared_id,parent_session_file,status,task_ids_json,apply_nonce FROM prepared_sets WHERE parent_session_file=? ORDER BY updated_at DESC,prepared_id LIMIT ? OFFSET ?").all(parent, limit, offset)
-    : registry.database.prepare("SELECT prepared_id,parent_session_file,status,task_ids_json,apply_nonce FROM prepared_sets ORDER BY parent_session_file,updated_at DESC,prepared_id LIMIT ? OFFSET ?").all(limit, offset)) as PreparedRow[];
+function preparedAuditRootIsAuthoritativelyAbsent(row: PreparedRow, preparedRoot: string): boolean {
+  if (!["completed", "superseded"].includes(row.status) || row.apply_nonce !== null || !PREPARED_ID.test(row.prepared_id)) return false;
+  const root=path.resolve(preparedRoot),candidate=path.join(root,row.prepared_id);if(path.dirname(candidate)!==root||!within(candidate,root))return false;
+  try{assertNoSymlinkAncestors(root);const before=lstatSync(root);if(!before.isDirectory()||before.isSymbolicLink())return false;try{lstatSync(candidate);return false;}catch(error){if((error as NodeJS.ErrnoException).code!=="ENOENT")return false;}const after=lstatSync(root);return after.isDirectory()&&!after.isSymbolicLink()&&Number(after.dev)===Number(before.dev)&&Number(after.ino)===Number(before.ino);}catch{return false;}
+}
+function listPreparedRows(registry: WorkerRegistry, parent: string | undefined, preparedRoot: string, limit: number, offset: number): { rows: PreparedRow[]; total: number } {
+  const statement=parent?registry.database.prepare("SELECT prepared_id,parent_session_file,status,task_ids_json,apply_nonce FROM prepared_sets WHERE parent_session_file=? ORDER BY updated_at DESC,prepared_id LIMIT ? OFFSET ?"):registry.database.prepare("SELECT prepared_id,parent_session_file,status,task_ids_json,apply_nonce FROM prepared_sets ORDER BY parent_session_file,updated_at DESC,prepared_id LIMIT ? OFFSET ?");const rows:PreparedRow[]=[];let rawOffset=0,total=0;
+  while(true){const page=(parent?statement.all(parent,256,rawOffset):statement.all(256,rawOffset)) as PreparedRow[];for(const row of page){if(preparedAuditRootIsAuthoritativelyAbsent(row,preparedRoot))continue;if(total>=offset&&rows.length<limit)rows.push(row);total+=1;}rawOffset+=page.length;if(page.length<256)break;}
   return { rows, total };
 }
 function preparedTaskLineage(registry: WorkerRegistry, row: PreparedRow): { taskIds: string[]; missingRepository: boolean } {
@@ -191,7 +194,7 @@ export function classifyPreparedCleanupIds(registry:WorkerRegistry,preparedIds:s
 export async function buildCleanupInventory(registry: WorkerRegistry, input: { parentSessionFile: string; allSessions: boolean; cwd: string; bdPath?: string; now?: Date; roots?: WorkerRoots; preparedRoot?: string; hostJobRoot?: string; limit?: number; offset?: number; scanState?:CleanupScanState }): Promise<CleanupInventory> {
   const limit = Math.max(1, Math.min(100, input.limit ?? 100)); const offset = Math.max(0, input.offset ?? 0);
   const workerPage = input.allSessions ? listAllWorkers(registry, limit, offset) : listWorkers(registry, { parentSessionFile: input.parentSessionFile, limit, offset });
-  const workers = workerPage.workers; const preparedPage = listPreparedRows(registry, input.allSessions ? undefined : input.parentSessionFile, limit, offset); const prepared = preparedPage.rows;
+  const workers = workerPage.workers; const preparedPage = listPreparedRows(registry, input.allSessions ? undefined : input.parentSessionFile, input.preparedRoot ?? defaultPreparedMergeRoot(), limit, offset); const prepared = preparedPage.rows;
   const ids = [...new Set([...workers.flatMap((worker) => worker.taskIds), ...prepared.flatMap((row) => preparedTaskLineage(registry, row).taskIds)])];
   const facts = await readCleanupBeadsFacts(ids, { cwd: input.cwd, ...(input.bdPath ? { bdPath: input.bdPath } : {}) });
   const leftoverScan=input.allSessions&&input.roots?await scanCleanupLeftoversDetailed(registry,{roots:input.roots,preparedRoot:input.preparedRoot??defaultPreparedMergeRoot(),projectCwd:input.cwd,hostJobRoot:input.hostJobRoot,now:input.now,limit,state:input.scanState}):{items:[] as CleanupLeftover[],matched:0,partial:false,examined:0,roots:[] as Array<{root:string;examined:number;partial:boolean;after?:string}>,continuation:undefined};if(leftoverScan.items.length)persistCleanupLeftoverObservations(registry,leftoverScan.items,(input.now??new Date()).toISOString());
