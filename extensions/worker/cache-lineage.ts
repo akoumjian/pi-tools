@@ -357,20 +357,54 @@ export function continueWorkerCacheLineage(record: WorkerCacheLineageRecord, wor
   if (record.mode === "fresh") return undefined;
   if (!validateWorkerCacheLineageRecord(record)) throw new Error("Retained cache-lineage metadata is corrupt or unsupported.");
   let status: WorkerCacheLineageSummary; try { status = readLineageSummary(record); } catch (error) { throw new Error(`Retained cache-lineage summary is missing or corrupt: ${error instanceof Error ? error.message : String(error)}`); }
-  const recoverablePreDispatchDrift = status.mode === "failed" && status.reason === WORKER_INSTRUCTIONS_DRIFT_REASON;
-  const continuationMode = recoverablePreDispatchDrift ? "adopted" : status.mode;
-  if (continuationMode !== "eligible" && continuationMode !== "adopted") throw new Error(`Retained cache-lineage summary mode ${status.mode} cannot authorize continuation.`);
   let snapshot: string; try { snapshot = readNoFollowBounded(record.snapshotFile, WORKER_CACHE_LINEAGE_MAX_BYTES); } catch (error) { throw new Error(`Retained cache-lineage snapshot is missing or unreadable: ${error instanceof Error ? error.message : String(error)}`); }
   if (sha256(snapshot) !== record.snapshotSha256) throw new Error("Retained cache-lineage snapshot integrity mismatch.");
+  const capture = parseParentCapture(snapshot);
+  const decision = readContinuationDecision(record, status, capture);
+  if (decision.mode === "fresh") return undefined;
   mkdirSync(workerStateDir, { recursive: true, mode: 0o700 });
   const clone: Extract<WorkerCacheLineageRecord, { mode: "eligible" }> = { ...record, hostGeneration, snapshotFile: path.join(workerStateDir, "cache-lineage.json"), adoptionFile: path.join(workerStateDir, "cache-lineage-adopted.json"), fallbackFile: path.join(workerStateDir, "cache-lineage-fallback.json"), retirementFile: path.join(workerStateDir, "cache-lineage-retired.json"), summaryFile: path.join(workerStateDir, "cache-lineage-summary.json") };
   writePrivateText(clone.snapshotFile, snapshot);
-  if (continuationMode === "adopted") {
-    let adoption: string; try { readAdoption(record.adoptionFile, record, readWorkerSnapshot(record)); adoption = readNoFollowBounded(record.adoptionFile, WORKER_CACHE_LINEAGE_MAX_BYTES); } catch (error) { throw new Error(`Retained cache-lineage adoption evidence is missing or corrupt: ${error instanceof Error ? error.message : String(error)}`); }
-    writePrivateText(clone.adoptionFile, adoption);
-  }
-  writeLineageSummary(clone, continuationMode);
+  if (decision.mode === "adopted") writePrivateText(clone.adoptionFile, decision.adoption);
+  writeLineageSummary(clone, decision.mode);
   return clone;
+}
+
+function readContinuationDecision(
+  record: Extract<WorkerCacheLineageRecord, { mode: "eligible" }>,
+  status: WorkerCacheLineageSummary,
+  capture: ParentCacheLineageCapture
+): { mode: "eligible" } | { mode: "adopted"; adoption: string } | { mode: "fresh" } {
+  const hasAdoption = existsSync(record.adoptionFile);
+  const hasFallback = existsSync(record.fallbackFile);
+  const hasRetirement = existsSync(record.retirementFile);
+  if (hasRetirement || hasAdoption && hasFallback) {
+    throw new Error("Retained cache-lineage decisions conflict or cannot authorize continuation.");
+  }
+  if (hasFallback) {
+    let reason: string;
+    try { reason = readFallback(record.fallbackFile, record, capture); }
+    catch (error) { throw new Error(`Retained cache-lineage fallback evidence is missing or corrupt: ${error instanceof Error ? error.message : String(error)}`); }
+    if (status.mode !== "fresh" || status.reason !== reason) {
+      throw new Error("Retained cache-lineage fresh summary does not match its fallback evidence.");
+    }
+    return { mode: "fresh" };
+  }
+  const recoverablePreDispatchDrift = status.mode === "failed" && status.reason === WORKER_INSTRUCTIONS_DRIFT_REASON;
+  if (hasAdoption) {
+    if (status.mode !== "adopted" && !recoverablePreDispatchDrift) {
+      throw new Error(`Retained cache-lineage summary mode ${status.mode} does not match its adoption evidence.`);
+    }
+    let adoption: string;
+    try { readAdoption(record.adoptionFile, record, capture); adoption = readNoFollowBounded(record.adoptionFile, WORKER_CACHE_LINEAGE_MAX_BYTES); }
+    catch (error) { throw new Error(`Retained cache-lineage adoption evidence is missing or corrupt: ${error instanceof Error ? error.message : String(error)}`); }
+    return { mode: "adopted", adoption };
+  }
+  if (status.mode === "adopted" || recoverablePreDispatchDrift) {
+    throw new Error("Retained cache-lineage adoption evidence is missing or corrupt.");
+  }
+  if (status.mode !== "eligible") throw new Error(`Retained cache-lineage summary mode ${status.mode} cannot authorize continuation.`);
+  return { mode: "eligible" };
 }
 
 export function validateWorkerCacheLineageRecord(value: unknown): value is WorkerCacheLineageRecord {

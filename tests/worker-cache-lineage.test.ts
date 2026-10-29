@@ -407,7 +407,7 @@ test("Codex lineage restores the exact parent prefix and appends only managed-wo
     if (continued?.mode !== "eligible") throw new Error("Expected continued eligible lineage.");
     assert.notEqual(continued.snapshotFile, record.snapshotFile); assert.equal(continued.marker, record.marker); assert.equal(continued.runtimeFingerprint, record.runtimeFingerprint); assert.equal(continued.hostGeneration, "run_20260924120002_bbbbbbbb");
     assert.deepEqual(summarizeWorkerCacheLineage(continued), { mode: "adopted" }); assert.equal(existsSync(continued.adoptionFile), true);
-    const retainedSummary = readFileSync(record.summaryFile, "utf8"); const mutatedSummary = JSON.parse(retainedSummary); mutatedSummary.mode = "fresh"; writeFileSync(record.summaryFile, `${JSON.stringify(mutatedSummary)}\n`); assert.throws(() => continueWorkerCacheLineage(record, path.join(root, "mutated-summary"), "run_20260924120006_ffffffff"), /cannot authorize continuation/); mutatedSummary.mode = "failed"; mutatedSummary.reason = "Managed-worker system instructions drifted after Codex lineage adoption. untrusted suffix"; writeFileSync(record.summaryFile, `${JSON.stringify(mutatedSummary)}\n`); assert.throws(() => continueWorkerCacheLineage(record, path.join(root, "mutated-failure"), "run_20260924120008_hhhhhhhh"), /cannot authorize continuation/); writeFileSync(record.summaryFile, retainedSummary);
+    const retainedSummary = readFileSync(record.summaryFile, "utf8"); const mutatedSummary = JSON.parse(retainedSummary); mutatedSummary.mode = "fresh"; writeFileSync(record.summaryFile, `${JSON.stringify(mutatedSummary)}\n`); assert.throws(() => continueWorkerCacheLineage(record, path.join(root, "mutated-summary"), "run_20260924120006_ffffffff"), /does not match its adoption evidence/); mutatedSummary.mode = "failed"; mutatedSummary.reason = "Managed-worker system instructions drifted after Codex lineage adoption. untrusted suffix"; writeFileSync(record.summaryFile, `${JSON.stringify(mutatedSummary)}\n`); assert.throws(() => continueWorkerCacheLineage(record, path.join(root, "mutated-failure"), "run_20260924120008_hhhhhhhh"), /does not match its adoption evidence/); writeFileSync(record.summaryFile, retainedSummary);
     const retainedSnapshot = readFileSync(record.snapshotFile, "utf8"); rmSync(record.snapshotFile); assert.throws(() => continueWorkerCacheLineage(record, path.join(root, "missing-snapshot"), "run_20260924120003_cccccccc"), /snapshot is missing or unreadable/); writeFileSync(record.snapshotFile, retainedSnapshot);
     writeFileSync(record.snapshotFile, `${retainedSnapshot}corrupt`); assert.throws(() => continueWorkerCacheLineage(record, path.join(root, "corrupt-snapshot"), "run_20260924120004_dddddddd"), /snapshot integrity mismatch/); writeFileSync(record.snapshotFile, retainedSnapshot);
     const retainedAdoption = readFileSync(record.adoptionFile, "utf8"); rmSync(record.adoptionFile); assert.throws(() => continueWorkerCacheLineage(record, path.join(root, "missing-adoption"), "run_20260924120005_eeeeeeee"), /adoption evidence is missing or corrupt/); writeFileSync(record.adoptionFile, retainedAdoption);
@@ -893,6 +893,54 @@ test("Codex lineage keeps one immutable boundary across turns and persisted resu
   }
 });
 
+test("Codex lineage permits repeated resume after exact legacy drift recovery", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-repeated-legacy-recovery-"));
+  let initial: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
+  let recoveredRuntime: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
+  try {
+    const record = captureAndPrepare(root);
+    initial = createWorkerCacheLineageRuntime(record);
+    initial.transformPayload(workerPayload(), codexContext());
+    completeSuccessfulResponse(initial);
+    initial.restoreNetwork();
+    initial = undefined;
+
+    const legacy = JSON.parse(readFileSync(record.adoptionFile, "utf8"));
+    legacy.version = 3;
+    delete legacy.forkBoundary;
+    writeFileSync(record.adoptionFile, `${JSON.stringify(legacy)}\n`);
+    const failed = JSON.parse(readFileSync(record.summaryFile, "utf8"));
+    failed.mode = "failed";
+    failed.reason = "Managed-worker system instructions drifted after Codex lineage adoption.";
+    writeFileSync(record.summaryFile, `${JSON.stringify(failed)}\n`);
+
+    const recovered = continueWorkerCacheLineage(record, path.join(root, "recovered"), "run_20260924120009_iiiiiiii");
+    assert.equal(recovered?.mode, "eligible");
+    if (recovered?.mode !== "eligible") throw new Error("Expected recovered eligible lineage.");
+    assert.deepEqual(summarizeWorkerCacheLineage(recovered), { mode: "adopted" });
+    recoveredRuntime = createWorkerCacheLineageRuntime(recovered);
+    recoveredRuntime.transformPayload(workerPayload(), codexContext());
+    const upgraded = JSON.parse(readFileSync(recovered.adoptionFile, "utf8"));
+    assert.equal(upgraded.version, 4);
+    assert.ok(Array.isArray(upgraded.forkBoundary));
+    recoveredRuntime.restoreNetwork();
+    recoveredRuntime = undefined;
+
+    const repeated = continueWorkerCacheLineage(recovered, path.join(root, "repeated"), "run_20260924120010_jjjjjjjj");
+    assert.equal(repeated?.mode, "eligible");
+    if (repeated?.mode !== "eligible") throw new Error("Expected repeated eligible lineage.");
+    assert.deepEqual(summarizeWorkerCacheLineage(repeated), { mode: "adopted" });
+    assert.deepEqual(
+      JSON.parse(readFileSync(repeated.adoptionFile, "utf8")).forkBoundary,
+      upgraded.forkBoundary
+    );
+  } finally {
+    initial?.restoreNetwork();
+    recoveredRuntime?.restoreNetwork();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Codex lineage upgrades a legacy hash-only adoption to an immutable persisted fork boundary", () => {
   const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-legacy-adoption-"));
   let initial: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
@@ -1314,9 +1362,73 @@ test("Codex lineage adopts only after acceptance and rejected first requests rem
     resumed = createWorkerCacheLineageRuntime(record);
     assert.equal(resumed.status().mode, "fresh");
     assert.deepEqual(resumed.transformPayload(workerPayload(), codexContext()), workerPayload());
+    resumed.restoreNetwork();
+    resumed = undefined;
+    assert.equal(
+      continueWorkerCacheLineage(record, path.join(root, "next-run"), "run_20260924120011_kkkkkkkk"),
+      undefined,
+      "validated fallback retires the old inherited lineage and permits a fresh next run"
+    );
   } finally {
     runtime?.restoreNetwork();
     resumed?.restoreNetwork();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fresh continuation requires exact fallback evidence", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-fallback-continuation-"));
+  let runtime: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
+  try {
+    const record = captureAndPrepare(root);
+    runtime = createWorkerCacheLineageRuntime(record);
+    runtime.transformPayload(workerPayload(), codexContext());
+    runtime.observeProviderResponse(429);
+    runtime.restoreNetwork();
+    runtime = undefined;
+    const fallback = readFileSync(record.fallbackFile, "utf8");
+    const summary = readFileSync(record.summaryFile, "utf8");
+
+    rmSync(record.fallbackFile);
+    assert.throws(
+      () => continueWorkerCacheLineage(record, path.join(root, "missing"), "run_20260924120012_llllllll"),
+      /summary mode fresh cannot authorize continuation/
+    );
+    writeFileSync(record.fallbackFile, fallback);
+
+    const driftedFallback = JSON.parse(fallback);
+    driftedFallback.reason = `${driftedFallback.reason} tampered`;
+    writeFileSync(record.fallbackFile, `${JSON.stringify(driftedFallback)}\n`);
+    assert.throws(
+      () => continueWorkerCacheLineage(record, path.join(root, "drifted-fallback"), "run_20260924120013_mmmmmmmm"),
+      /fresh summary does not match its fallback evidence/
+    );
+    writeFileSync(record.fallbackFile, fallback);
+
+    const driftedSummary = JSON.parse(summary);
+    driftedSummary.reason = `${driftedSummary.reason} tampered`;
+    writeFileSync(record.summaryFile, `${JSON.stringify(driftedSummary)}\n`);
+    assert.throws(
+      () => continueWorkerCacheLineage(record, path.join(root, "drifted-summary"), "run_20260924120014_nnnnnnnn"),
+      /fresh summary does not match its fallback evidence/
+    );
+    writeFileSync(record.summaryFile, summary);
+
+    writeFileSync(record.adoptionFile, "tampered conflicting decision\n");
+    assert.throws(
+      () => continueWorkerCacheLineage(record, path.join(root, "conflicting"), "run_20260924120015_oooooooo"),
+      /decisions conflict or cannot authorize continuation/
+    );
+    rmSync(record.adoptionFile);
+
+    rmSync(record.fallbackFile);
+    symlinkSync(record.summaryFile, record.fallbackFile);
+    assert.throws(
+      () => continueWorkerCacheLineage(record, path.join(root, "symlink"), "run_20260924120016_pppppppp"),
+      /fallback evidence is missing or corrupt/
+    );
+  } finally {
+    runtime?.restoreNetwork();
     rmSync(root, { recursive: true, force: true });
   }
 });
