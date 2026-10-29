@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } fr
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { forkWorkerSession, readWorkerSessionHeader, verifyWorkerSession } from "../extensions/worker/session.js";
+import { forkWorkerSession, readWorkerSessionHeader, readWorkerSessionRange, verifyWorkerSession } from "../extensions/worker/session.js";
 
 async function withTempDir(run: (directory: string) => Promise<void>): Promise<void> {
   const directory = await mkdtemp(path.join(tmpdir(), "pi-worker-session-"));
@@ -61,6 +61,18 @@ test("worker session forks exact parent entries into the assigned workspace and 
     assert.equal(lines[0].cwd, canonicalWorkspace);
     assert.equal(lines[0].parentSession, canonicalParent);
     assert.deepEqual(lines.slice(1), parentEntries.slice(1));
+  });
+});
+
+test("worker session range extraction skips large prefixes and validates the exact selected range", async () => {
+  await withTempDir(async (directory) => {
+    const session = path.join(directory, "session.jsonl");
+    await writeFile(session, `header\n${"x".repeat(2 * 1024 * 1024)}\ntarget\n`);
+    assert.equal(readWorkerSessionRange(session, directory, 3, 3), "target\n");
+    assert.throws(() => readWorkerSessionRange(session, directory, 3, 4), /range is invalid/);
+    const invalid = path.join(directory, "invalid.jsonl");
+    await writeFile(invalid, Buffer.from([0xff, 0x0a]));
+    assert.throws(() => readWorkerSessionRange(invalid, directory, 1, 1), /not valid UTF-8/);
   });
 });
 

@@ -32,7 +32,7 @@ import { readWorkerRuntimeResult } from "./runtime.js";
 
 import { preferredWorkerModel } from "./settings.js";
 import { CURRENT_WORKER_STORAGE_LAYOUT, createWorkerId, createWorkerRunId, defaultWorkerRoots, provisionWorkerPaths, storedWorkerPaths, workerHostJobRoot, workerPaths, workerPreparedRoot, type WorkerPaths, type WorkerRoots } from "./identity.js";
-import { createWorkerSession, forkWorkerSession, readWorkerSessionHeader, readWorkerSessionText, verifyWorkerSession } from "./session.js";
+import { createWorkerSession, forkWorkerSession, readWorkerSessionHeader, readWorkerSessionRange, readWorkerSessionText, verifyWorkerSession } from "./session.js";
 import { launchWorkerHost, readWorkerHostProcess, readWorkerHostSettlement, type WorkerLaunchRecord } from "./runner.js";
 import { renderWorkerRuntimePrompt } from "./prompts.js";
 import { contextInputs, inputMounts, validateAdditionalInputs, type RetainedInput } from "./inputs.js";
@@ -1529,12 +1529,10 @@ function writeReviewContext(directory: string, subjectPaths: WorkerPaths, review
   assertContainedOrdinaryDirectory(path.dirname(subjectPaths.workspaceRoot), subjectWorker.workspaceRoot, "review subject workspace");
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const sessionFile = path.join(directory, "session.jsonl");
-  const session = readBoundedNoFollowFile(subjectWorker.sessionFile!, subjectPaths.stateDir, 128 * 1024 * 1024, "review subject session");
-  const sessionText = new TextDecoder("utf-8", { fatal: true }).decode(session); const lines = sessionText.split("\n");
-  const sourceLineCount = sessionText === "" ? 0 : lines.length - (sessionText.endsWith("\n") ? 1 : 0);
-  const startLine = subjectRun.sessionStartLine ?? 1; const endLine = subjectRun.sessionEndLine ?? sourceLineCount;
-  if (!Number.isSafeInteger(startLine) || !Number.isSafeInteger(endLine) || startLine < 1 || endLine < startLine || endLine > sourceLineCount) throw new Error("Review subject session range is invalid.");
-  const selected = lines.slice(startLine - 1, endLine).join("\n");
+  assertContainedPathWithoutSymlinks(subjectPaths.stateDir, subjectWorker.sessionFile!, "review subject session");
+  const startLine = subjectRun.sessionStartLine; const endLine = subjectRun.sessionEndLine;
+  if (typeof startLine !== "number" || typeof endLine !== "number" || !Number.isSafeInteger(startLine) || !Number.isSafeInteger(endLine) || startLine < 1 || endLine < startLine) throw new Error("Review subject session range is invalid.");
+  const selected = readWorkerSessionRange(subjectWorker.sessionFile!, subjectPaths.stateDir, startLine, endLine);
   writeFileSync(sessionFile, `${selected}${selected && !selected.endsWith("\n") ? "\n" : ""}`, { mode: 0o400 });
   const skippedRepositories: Array<{ candidateId: string; path: string; reason: string }> = [];
   const repositories: WorkerRepositoryResult[] = [];

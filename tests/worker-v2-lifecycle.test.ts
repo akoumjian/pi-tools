@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync, spawn } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, ftruncateSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -320,6 +320,19 @@ test("review snapshot rejects a worker-planted symlink in the retained subject s
     const db = f.registry(); const worker = getWorker(db, subject.workerId)!; const sessionDirectory = path.dirname(worker.sessionFile!); db.close();
     const retained = `${sessionDirectory}-retained`; renameSync(sessionDirectory, retained); symlinkSync(retained, sessionDirectory, "dir");
     await assert.rejects(() => f.call("worker_run", { runs: [{ action: "start", role: "review", reviewedRunId: subject.runId }] }), /may not traverse symbolic links/); const after=f.registry(); assert.equal(getWorker(after,subject.workerId)!.reviewedByWorkerId,undefined); assert.equal(listWorkers(after,{parentSessionFile:realpathSync(f.session.getSessionFile()!)}).total,1); after.close();
+  } finally { await f.close(); }
+});
+
+test("review extracts the registered run range from a retained session larger than 128 MiB", async () => {
+  const f = await fixture(); try {
+    const subject = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "large subject" }] })); await f.event("turn_end"); await complete(f, subject);
+    let db = f.registry(); const subjectWorker = getWorker(db, subject.workerId)!; const subjectRun = getWorkerRun(db, subject.workerId, subject.runId)!; db.close();
+    const descriptor = openSync(subjectWorker.sessionFile!, "r+"); try { ftruncateSync(descriptor, 160 * 1024 * 1024); } finally { closeSync(descriptor); }
+    const review = receipt(await f.call("worker_run", { runs: [{ action: "start", role: "review", reviewedRunId: subject.runId }] })); await f.event("turn_end");
+    db = f.registry(); const runtime = getWorkerRun(db, review.workerId, review.runId)!.runtime as any; const context = JSON.parse(readFileSync(runtime.contextFile, "utf8")); const snapshot = readFileSync(context.session.path, "utf8"); db.close();
+    assert.deepEqual(context.session.sourceRange, { startLine: subjectRun.sessionStartLine, endLine: subjectRun.sessionEndLine });
+    assert.match(snapshot, new RegExp(`result-${subject.runId}`)); assert.ok(Buffer.byteLength(snapshot) < 1024 * 1024);
+    await f.call("worker_control", { action: "cancel", workerId: review.workerId });
   } finally { await f.close(); }
 });
 

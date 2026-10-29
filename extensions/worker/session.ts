@@ -10,6 +10,7 @@ import {
 const MAX_SESSION_HEADER_BYTES = 64 * 1024;
 const MAX_RETURNED_SESSION_BYTES = 4 * 1024 * 1024;
 const MAX_SESSION_TEXT_BYTES = 128 * 1024 * 1024;
+const MAX_SESSION_RANGE_SCAN_BYTES = 1024 * 1024 * 1024;
 
 export type ForkWorkerSessionInput = {
   parentSessionFile: string;
@@ -100,6 +101,43 @@ export function readWorkerSessionText(sessionFile: string, sessionDir: string, m
     const metadata = fstatSync(descriptor);
     if (!metadata.isFile() || metadata.size > maximumBytes) throw new Error(`Worker session must be an ordinary file no larger than ${maximumBytes} bytes.`);
     return readFileSync(descriptor, "utf8");
+  } finally { closeSync(descriptor); }
+}
+
+export function readWorkerSessionRange(sessionFile: string, sessionDir: string, startLine: number, endLine: number, maximumBytes = MAX_SESSION_TEXT_BYTES): string {
+  if (!Number.isSafeInteger(startLine) || !Number.isSafeInteger(endLine) || startLine < 1 || endLine < startLine) throw new Error("Worker session range is invalid.");
+  const { requested } = containedSessionFile(sessionFile, sessionDir); const before = lstatSync(requested);
+  const descriptor = openSync(requested, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const opened = fstatSync(descriptor);
+    if (!before.isFile() || before.isSymbolicLink() || !opened.isFile() || before.dev !== opened.dev || before.ino !== opened.ino || before.size !== opened.size) throw new Error("Worker session must be an unchanged ordinary file.");
+    if (opened.size > MAX_SESSION_RANGE_SCAN_BYTES) throw new Error(`Worker session exceeds the ${MAX_SESSION_RANGE_SCAN_BYTES}-byte bounded range-scan limit.`);
+    const chunks: Buffer[] = []; let selectedBytes = 0; let line = 1; let position = 0; let atLineStart = true; let foundEnd = false;
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    const append = (value: Buffer): void => { selectedBytes += value.length; if (selectedBytes > maximumBytes) throw new Error(`Worker session selected range exceeds ${maximumBytes} bytes.`); chunks.push(Buffer.from(value)); };
+    while (position < opened.size && !foundEnd) {
+      const count = readSync(descriptor, buffer, 0, Math.min(buffer.length, opened.size - position), position);
+      if (count === 0) throw new Error("Worker session was truncated during range extraction.");
+      let offset = 0;
+      while (offset < count) {
+        const relativeNewline = buffer.subarray(offset, count).indexOf(0x0a);
+        if (relativeNewline < 0) {
+          if (line >= startLine && line <= endLine) append(buffer.subarray(offset, count));
+          atLineStart = false; break;
+        }
+        const nextOffset = offset + relativeNewline + 1;
+        if (line >= startLine && line <= endLine) append(buffer.subarray(offset, nextOffset));
+        line += 1; atLineStart = true; offset = nextOffset;
+        if (line > endLine) { foundEnd = true; break; }
+      }
+      position += count;
+    }
+    const availableLines = atLineStart ? line - 1 : line;
+    if (!foundEnd && endLine > availableLines) throw new Error("Worker session range is invalid.");
+    const after = fstatSync(descriptor); const current = lstatSync(requested);
+    if (!current.isFile() || current.isSymbolicLink() || current.dev !== opened.dev || current.ino !== opened.ino || after.dev !== opened.dev || after.ino !== opened.ino || after.size !== opened.size || current.size !== opened.size) throw new Error("Worker session changed during range extraction.");
+    try { return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks, selectedBytes)); }
+    catch { throw new Error("Worker session selected range is not valid UTF-8."); }
   } finally { closeSync(descriptor); }
 }
 
