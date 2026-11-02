@@ -104,8 +104,16 @@ test("searxng setup defaults to less common local port", () => {
   assert.equal(DEFAULT_SEARXNG_PORT, 18888);
   assert.equal(report.port, 18888);
   assert.equal(report.baseUrl, "http://127.0.0.1:18888");
-  assert.match(searxngComposeYaml(), /127\.0\.0\.1:\$\{SEARXNG_PORT:-18888\}:8080/);
-  assert.match(searxngComposeYaml(), /SEARXNG_BASE_URL=\$\{SEARXNG_BASE_URL:-http:\/\/127\.0\.0\.1:18888\/\}/);
+  const compose = searxngComposeYaml();
+  assert.match(compose, /127\.0\.0\.1:\$\{SEARXNG_PORT:-18888\}:8080/);
+  assert.match(compose, /SEARXNG_BASE_URL=\$\{SEARXNG_BASE_URL:-http:\/\/127\.0\.0\.1:18888\/\}/);
+  assert.match(compose, /\/var\/cache\/searxng:size=64m,mode=1777/);
+  assert.match(compose, /valkey-server --save "" --appendonly no/);
+  assert.match(compose, /\/data:size=16m,mode=1777/);
+  assert.equal(compose.match(/driver: local/g)?.length, 2);
+  assert.equal(compose.match(/max-size: "10m"/g)?.length, 2);
+  assert.equal(compose.match(/max-file: "3"/g)?.length, 2);
+  assert.doesNotMatch(compose, /searxng-cache|valkey-data/);
 });
 
 test("searxng status reports reachable JSON endpoint", async () => {
