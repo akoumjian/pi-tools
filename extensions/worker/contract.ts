@@ -13,6 +13,10 @@ const RepositoryBaseline = Type.Object({
   path: Type.String({ minLength: 1, maxLength: 4096, description: "Absolute path to a local Git repository readable by the tool and worker Sandbox." }),
   revision: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "Optional Git revision to pin as the exact baseline commit. Accepts a commit, branch, tag, or other valid revision; defaults to the repository’s current HEAD." }))
 }, { additionalProperties: false });
+const WorkerResources = Type.Optional(Type.Object({
+  cpus: Type.Optional(Type.Integer({ minimum: 1, maximum: 8, description: "Exact CPU count for this run, from 1 through 8. Omit to keep 1 CPU." })),
+  memoryGiB: Type.Optional(Type.Integer({ minimum: 1, maximum: 16, description: "Exact RAM allocation for this run in GiB, from 1 through 16. Omit to keep 4 GiB." }))
+}, { additionalProperties: false, minProperties: 1, description: "Optional exact per-run Sandbox resource overrides. Omit for the 1-CPU/4-GiB default." }));
 
 export const StartWork = Type.Object({
   action: Type.Literal("start", { description: "Start a new worker in the specified role." }),
@@ -21,6 +25,7 @@ export const StartWork = Type.Object({
   instructions: Type.String({ minLength: 1, maxLength: 12 * 1024, description: "Focused instructions for the assignment. State the goal, scope, important decisions or non-goals, and expected checks or result without repeating the full parent transcript." }),
   repositoryBaselines: Type.Optional(Type.Array(RepositoryBaseline, { maxItems: 16, description: "Provenance-only local Git repositories for the parent to validate and pin at exact commits. Baseline paths are not mounted into or guaranteed reachable from the worker workspace; the worker performs any needed clones using `git clone --no-local --no-hardlinks`. Up to sixteen baselines may be supplied." })),
   modelSelection: Type.Optional(Type.String({ minLength: 1, maxLength: 512, description: "Optional exact provider/model:thinking override, for example openai-codex/gpt-5.6-sol:xhigh. Normally omit it to use the configured work-role selection. The override is honored exactly or the launch fails. Max thinking and Claude Fable selections are rejected." })),
+  resources: WorkerResources,
   completionDelivery: CompletionDelivery
 }, { additionalProperties: false });
 export const StartReview = Type.Object({
@@ -29,6 +34,7 @@ export const StartReview = Type.Object({
   reviewedRunId: Type.String({ minLength: 1, maxLength: 128, pattern: "^run_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$", description: "Run to review. It must be the latest completed run of a work or integration worker. The review worker automatically receives its complete workspace, repository and artifact entry points, candidate inventories, and session." }),
   instructions: Type.Optional(Type.String({ minLength: 1, maxLength: 12 * 1024, description: "Optional review guidance. Omit for a general review. Use to emphasize risks, ask questions, supply acceptance criteria, or guide a follow-up review. The reviewer still reports material issues outside the requested focus." })),
   additionalInputs: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), { maxItems: 16, uniqueItems: true, description: "Additional files or directories outside the reviewed workspace to mount read-only for the reviewer. Use for prior review reports, datasets, specifications, reference trees, or other relevant context." })),
+  resources: WorkerResources,
   completionDelivery: CompletionDelivery
 }, { additionalProperties: false });
 export const StartIntegration = Type.Object({
@@ -38,6 +44,7 @@ export const StartIntegration = Type.Object({
   taskIds: Type.Array(TaskId, { minItems: 1, maxItems: 32, uniqueItems: true, description: "One or more Beads task IDs the integration worker may read and update." }),
   instructions: Type.Optional(Type.String({ minLength: 1, maxLength: 12 * 1024, description: "Optional guidance for resolving the conflicts. Use for decisions, priorities, constraints, or acceptance criteria the worker would not otherwise know." })),
   additionalInputs: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), { maxItems: 16, uniqueItems: true, description: "Additional files or directories to mount read-only for the integration worker. The prepared repositories and conflict details are included automatically." })),
+  resources: WorkerResources,
   completionDelivery: CompletionDelivery
 }, { additionalProperties: false });
 export const ResumeWorker = Type.Object({
@@ -46,6 +53,7 @@ export const ResumeWorker = Type.Object({
   instructions: Type.String({ minLength: 1, maxLength: 12 * 1024, description: "Instructions for continuing the worker. State the answer, feedback, settled decision, correction, or next action without repeating context retained in its session." }),
   additionalTaskIds: Type.Optional(Type.Array(TaskId, { minItems: 1, maxItems: 32, uniqueItems: true, description: "Optional additional Beads task IDs for a work or integration worker. Existing assignments remain available and cannot be removed through resume. Not allowed for review workers." })),
   additionalInputs: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), { maxItems: 16, uniqueItems: true, description: "Additional files or directories to mount read-only for the resumed run. Existing workspace contents and previously supplied context remain available automatically." })),
+  resources: WorkerResources,
   completionDelivery: CompletionDelivery
 }, { additionalProperties: false });
 export const WorkerRunParamsV2 = Type.Object({ runs: Type.Array(Type.Union([StartWork, StartReview, StartIntegration, ResumeWorker]), { minItems: 1, maxItems: 8, description: "Workers to start or resume in this call. Include one to eight entries; batch only independent assignments that benefit from parallel execution." }) }, { additionalProperties: false });

@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { buildWorkerRpcArgs, type WorkerHostConfig } from "../extensions/worker/runner.js";
-import { assertWorkerSandboxReference, createWorkerSandboxAsync, planWorkerSandbox, settleWorkerSandboxAsync, WORKER_SANDBOX_CPU_LIMIT, WORKER_SANDBOX_MEMORY_LIMIT, type WorkerSandboxRelease } from "../extensions/worker/sandbox.js";
+import { assertWorkerSandboxReference, createWorkerSandboxAsync, MAX_WORKER_SANDBOX_RESOURCES, planWorkerSandbox, resolveWorkerSandboxResources, settleWorkerSandboxAsync, WORKER_SANDBOX_CPU_LIMIT, WORKER_SANDBOX_MEMORY_LIMIT, type WorkerSandboxRelease } from "../extensions/worker/sandbox.js";
 import { createReviewWorkspaceOverlayAsync, planReviewWorkspaceOverlay } from "../extensions/worker/review-workspace.js";
 
 const revisions = { pi: "1".repeat(40), profile: "2".repeat(40), piTools: "3".repeat(40), piDocparser: "4".repeat(40) };
@@ -34,7 +34,7 @@ test("Sandbox planning freezes exact runtime provenance and deterministic mounts
   const workerRoot = path.join(root, "worker"); const codeRoot = path.join(root, "Code"); const input = path.join(root, "input.txt"); await mkdir(workerRoot); await mkdir(codeRoot); await writeFile(input, "evidence\n");
   const planned = planWorkerSandbox({ workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_bbbbbbbb", creationNonce: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", workerRoot, codeRoot, mounts: [{ source: input, readOnly: true }, { source: input, readOnly: true }], release });
   const workspace = statSync(workerRoot);
-  assert.equal(planned.kind, "docker-sandbox"); assert.equal(planned.imageDigest, "b".repeat(64)); assert.equal(planned.kitSha256, "a".repeat(64)); assert.deepEqual(planned.mounts, [{ source: await realpath(input), readOnly: true }]); assert.deepEqual([planned.workspaceDevice, planned.workspaceInode, planned.workspaceOwnerUid, planned.workspaceOwnerGid], [Number(workspace.dev), Number(workspace.ino), Number(workspace.uid), Number(workspace.gid)]); assert.equal(planned.extensionPaths.length, 2); assert.ok(planned.sandboxName.endsWith(`-${planned.creationNonce}`)); assert.equal(planned.sandboxName.length, 60);
+  assert.equal(planned.kind, "docker-sandbox"); assert.deepEqual([planned.requestedCpu, planned.requestedMemoryGiB], [1, 4]); assert.equal(planned.imageDigest, "b".repeat(64)); assert.equal(planned.kitSha256, "a".repeat(64)); assert.deepEqual(planned.mounts, [{ source: await realpath(input), readOnly: true }]); assert.deepEqual([planned.workspaceDevice, planned.workspaceInode, planned.workspaceOwnerUid, planned.workspaceOwnerGid], [Number(workspace.dev), Number(workspace.ino), Number(workspace.uid), Number(workspace.gid)]); assert.equal(planned.extensionPaths.length, 2); assert.ok(planned.sandboxName.endsWith(`-${planned.creationNonce}`)); assert.equal(planned.sandboxName.length, 60);
 }));
 
 
@@ -61,11 +61,22 @@ test("exact Sandbox references reject writable extension paths, duplicate extens
   assert.throws(() => assertWorkerSandboxReference({ ...planned, searxngUrl: "https://secret@example.invalid" }), /Invalid exact/);
   assert.throws(() => assertWorkerSandboxReference({ ...planned, codingAgentDir: "/tmp/pi-worker/agent" }), /runtime paths/);
   assert.throws(() => assertWorkerSandboxReference({ ...planned, workspaceOwnerUid: -1 }), /workspace ownership/);
+  assert.throws(() => assertWorkerSandboxReference({ ...planned, requestedCpu: 9 }), /resources/);
+  assert.throws(() => { const partial: any = { ...planned }; delete partial.requestedMemoryGiB; assertWorkerSandboxReference(partial); }, /partial/);
   assert.throws(() => { const partial: any = { ...planned }; delete partial.workspaceOwnerGid; assertWorkerSandboxReference(partial); }, /workspace ownership/);
   const legacy: any = { ...planned }; delete legacy.workspaceDevice; delete legacy.workspaceInode; delete legacy.workspaceOwnerUid; delete legacy.workspaceOwnerGid; assert.doesNotThrow(() => assertWorkerSandboxReference(legacy));
   assert.throws(() => assertWorkerSandboxReference({ ...planned, sandboxName: planned.sandboxName.slice(0, -1) }), /nonce|exact/i);
   assert.throws(() => assertWorkerSandboxReference({ ...planned, inspectEvidenceSha256: "not-a-digest" }), /inspect evidence/);
 }));
+
+test("worker Sandbox resources are exact bounded integers", () => {
+  assert.deepEqual(resolveWorkerSandboxResources(), { cpus: 1, memoryGiB: 4 });
+  assert.deepEqual(resolveWorkerSandboxResources({ cpus: 8, memoryGiB: 16 }), { cpus: 8, memoryGiB: 16 });
+  assert.deepEqual(resolveWorkerSandboxResources({ cpus: 8 }), { cpus: 8, memoryGiB: 4 });
+  assert.deepEqual(resolveWorkerSandboxResources({ memoryGiB: 16 }), { cpus: 1, memoryGiB: 16 });
+  for (const value of [{ cpus: 0, memoryGiB: 4 }, { cpus: 9, memoryGiB: 4 }, { cpus: 1, memoryGiB: 17 }, { cpus: 1.5, memoryGiB: 4 }]) assert.throws(() => resolveWorkerSandboxResources(value as any), /integer cpus/);
+  for (const value of [{}, { cpus: 1, memoryGiB: 4, extra: true }]) assert.throws(() => resolveWorkerSandboxResources(value as any), /allow only/);
+});
 
 test("Sandbox create and terminal removal use one exact name and verify absence", async () => temp(async (root) => {
   const workerRoot = path.join(root, "worker"); const codeRoot = path.join(root, "Code"); await mkdir(workerRoot); await mkdir(codeRoot); const log = path.join(root, "sbx.log"); const state = path.join(root, "state");
@@ -88,7 +99,8 @@ fi
   const bareVersion=path.join(root,"sbx-bare-version");await writeFile(bareVersion,"#!/bin/sh\nprintf 'v0.49.1\\n'\n");await chmod(bareVersion,0o755);await assert.rejects(createWorkerSandboxAsync(bareVersion,planned),/recorded v0\.49\.1 contract/);
   const created = await createWorkerSandboxAsync(fake, planned); assert.match(created.createEvidenceSha256 ?? "", /^[a-f0-9]{64}$/); assert.equal(created.observedCpu, WORKER_SANDBOX_CPU_LIMIT); assert.equal(created.observedMemoryBytes, 4 * 1024 ** 3); await settleWorkerSandboxAsync(fake, created);
   const commands = await readFile(log, "utf8"); assert.match(commands, new RegExp(`create --name ${planned.sandboxName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} --memory ${WORKER_SANDBOX_MEMORY_LIMIT} --cpus ${WORKER_SANDBOX_CPU_LIMIT}`)); assert.match(commands, new RegExp(`exec --user root ${planned.sandboxName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} /usr/bin/env`)); assert.match(commands, /PI_WORKER_RUNTIME_ROOT_V1/); assert.doesNotMatch(commands, /exec --user root --privileged/); assert.match(commands, new RegExp(`stop ${planned.sandboxName}`)); assert.match(commands, new RegExp(`rm --force ${planned.sandboxName}`));
-  const exactFake=await readFile(fake,"utf8"); const overcommitted=path.join(root,"sbx-overcommitted"); await writeFile(overcommitted,exactFake.replace("cpu=1\nmemoryBytes=4294967296","cpu=4\nmemoryBytes=8589934592")); await chmod(overcommitted,0o755); await assert.rejects(createWorkerSandboxAsync(overcommitted,planned),/configured 1-CPU\/4g limit/);
+  const exactFake=await readFile(fake,"utf8"); const overcommitted=path.join(root,"sbx-overcommitted"); await writeFile(overcommitted,exactFake.replace("cpu=1\nmemoryBytes=4294967296","cpu=4\nmemoryBytes=8589934592")); await chmod(overcommitted,0o755); await assert.rejects(createWorkerSandboxAsync(overcommitted,planned),/requested 1-CPU\/4g limit/);
+  const maximumFake=path.join(root,"sbx-maximum"); await writeFile(maximumFake,exactFake.replace("cpu=1\nmemoryBytes=4294967296","cpu=8\nmemoryBytes=17179869184")); await chmod(maximumFake,0o755); const maximumPlan=planWorkerSandbox({ workerId: "worker_20260101000000_cccccccc", runId: "run_20260101000000_dddddddd", creationNonce: "ffffffff-eeee-4ddd-8ccc-bbbbbbbbbbbb", workerRoot, codeRoot, mounts: [], resources: MAX_WORKER_SANDBOX_RESOURCES, release }); const maximumCreated=await createWorkerSandboxAsync(maximumFake,maximumPlan); assert.deepEqual([maximumCreated.observedCpu,maximumCreated.observedMemoryBytes],[8,16*1024**3]); await settleWorkerSandboxAsync(maximumFake,maximumCreated); assert.match(await readFile(log,"utf8"),new RegExp(`create --name ${maximumPlan.sandboxName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} --memory 16g --cpus 8`));
   await writeFile(fake,exactFake.replace("Docker Sandboxes Update Available","unexpected banner"));await assert.rejects(createWorkerSandboxAsync(fake,planned),/Sandbox inspect JSON was malformed/);
 }));
 

@@ -34,6 +34,8 @@ test("worker settings accept exact role model preferences", () => {
 
 test("worker_run schema exposes orthogonal action and role branches", () => {
   assert.equal(Check(WorkerRunParams, { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "Implement." }] }), true);
+  for (const resources of [{ cpus: 8, memoryGiB: 16 }, { cpus: 8 }, { memoryGiB: 16 }]) assert.equal(Check(WorkerRunParams, { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "Implement.", resources }] }), true);
+  for (const resources of [{ cpus: 9, memoryGiB: 16 }, { cpus: 8, memoryGiB: 17 }, { cpus: 1.5, memoryGiB: 4 }, {}, { cpus: 1, memoryGiB: 4, profile: "large" }]) assert.equal(Check(WorkerRunParams, { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "No.", resources }] }), false);
   assert.equal(Check(WorkerRunParams, { runs: [{ action: "start", role: "review", reviewedRunId: "run_20260101000000_aaaaaaaa" }] }), true);
   assert.equal(Check(WorkerRunParams, { runs: [{ action: "start", role: "integration", preparedId: `prepared_${"a".repeat(24)}`, taskIds: ["personal-test"] }] }), true);
   assert.equal(Check(WorkerRunParams, { runs: [{ action: "resume", workerId: "worker_20260101000000_aaaaaaaa", instructions: "Continue." }] }), true);
@@ -97,7 +99,7 @@ test("worker_run work start persists a v2 registry receipt before deferred launc
     const tool = tools.find((candidate) => candidate.name === "worker_run")!;
     const result = await tool.execute!("call", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "Implement." }] }, new AbortController().signal, undefined, context);
     const receipt = (result.details as { runs: Array<{ workerId: string; runId: string; role: string; status: string }> }).runs[0]!;
-    assert.equal(receipt.role, "work"); assert.equal(receipt.status, "queued");
+    assert.equal(receipt.role, "work"); assert.equal(receipt.status, "queued"); assert.deepEqual((receipt as any).resources, { cpus: 1, memoryGiB: 4 });
     assert.equal(Check(RetainedToolOutputSchemas.worker_run, result), true, JSON.stringify(result));
     const list = await tools.find((candidate) => candidate.name === "worker_control")!.execute!("list", { action: "list" }, new AbortController().signal, undefined, context);
     assert.equal(Check(RetainedToolOutputSchemas.worker_control, list), true, JSON.stringify(list));

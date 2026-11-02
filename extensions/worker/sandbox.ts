@@ -13,10 +13,12 @@ const SHA256 = /^[a-f0-9]{64}$/;
 const OCI_DIGEST = /@sha256:[a-f0-9]{64}$/;
 const SANDBOX_NAME = /^pi-[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const SBX_VERSION = "v0.49.1";
-export const WORKER_SANDBOX_CPU_LIMIT = 1;
-export const WORKER_SANDBOX_MEMORY_LIMIT = "4g";
-const WORKER_SANDBOX_MEMORY_LIMIT_BYTES = 4 * 1024 ** 3;
-const WORKER_SANDBOX_MIN_EFFECTIVE_MEMORY_BYTES = Math.floor(WORKER_SANDBOX_MEMORY_LIMIT_BYTES * 0.9);
+export type WorkerSandboxResources = { cpus: number; memoryGiB: number };
+export type WorkerSandboxResourceRequest = Partial<WorkerSandboxResources>;
+export const DEFAULT_WORKER_SANDBOX_RESOURCES: WorkerSandboxResources = Object.freeze({ cpus: 1, memoryGiB: 4 });
+export const MAX_WORKER_SANDBOX_RESOURCES: WorkerSandboxResources = Object.freeze({ cpus: 8, memoryGiB: 16 });
+export const WORKER_SANDBOX_CPU_LIMIT = DEFAULT_WORKER_SANDBOX_RESOURCES.cpus;
+export const WORKER_SANDBOX_MEMORY_LIMIT = `${DEFAULT_WORKER_SANDBOX_RESOURCES.memoryGiB}g`;
 const SBX_VERSION_LINE = /^sbx version (v\d+\.\d+\.\d+) ([a-f0-9]{40})\n?$/;
 const TEMPLATE_COMPONENT = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const SBX_UPDATE_BANNER = [
@@ -44,6 +46,7 @@ export type WorkerSandboxReference = {
   kitReference: string; kitSha256: string; imageReference: string; imageDigest: string; sbxVersion: "v0.49.1"; sbxBuildCommit: string; templateId: string; templateRepository: string; templateTag: string; templateFlavor: string; protocolVersion: 1; releaseOrdinal: number;
   workspaceRoot: string; workspaceDevice?: number; workspaceInode?: number; workspaceOwnerUid?: number; workspaceOwnerGid?: number; workingDirectory: string; codeRoot: string; mounts: WorkerSandboxMount[]; reviewOverlay?: ReviewWorkspaceOverlay; piCli: string; rpcLauncher: string; codingAgentDir: string;
   stagedLockSha256: string; resourceManifestSha256: string; runtimeProvenanceSha256: string; extensionPaths: string[]; searxngUrl: string; revisions: WorkerSandboxRelease["revisions"];
+  requestedCpu?: number; requestedMemoryGiB?: number;
   createEvidenceSha256?: string; inspectEvidenceSha256?: string; sbxVersionEvidenceSha256?: string; observedCpu?: number; observedMemoryBytes?: number; observedSandboxId?: string; observedRuntimeSha256?: string;
 };
 
@@ -66,10 +69,21 @@ export function readApprovedWorkerSandboxRelease(): WorkerSandboxRelease {
   return { schemaVersion: 1, protocolVersion: 1, releaseOrdinal: releaseOrdinal!, status: "approved", kit: { reference: kitReference, sha256: kit.sha256 }, image: { reference: image.reference, digest: image.digest }, sandbox: { version: SBX_VERSION, buildCommit: sandbox.buildCommit, template: { ...sandbox.template } }, revisions: { ...revisions }, guest: { ...guest, extensionPaths: [...guest.extensionPaths] } };
 }
 
-export function planWorkerSandbox(input: { workerId: string; runId: string; creationNonce: string; workerRoot: string; workingDirectory?: string; codeRoot: string; mounts: WorkerSandboxMount[]; reviewSubjectWorkspace?: string; release?: WorkerSandboxRelease }): WorkerSandboxReference {
+export function resolveWorkerSandboxResources(value?: WorkerSandboxResourceRequest): WorkerSandboxResources {
+  if (value === undefined) return { ...DEFAULT_WORKER_SANDBOX_RESOURCES };
+  const keys = !value || typeof value !== "object" || Array.isArray(value) ? [] : Object.keys(value).sort();
+  if (keys.length < 1 || keys.some((key) => key !== "cpus" && key !== "memoryGiB")) throw new Error("Worker Sandbox resources allow only cpus and memoryGiB overrides.");
+  const cpus = value.cpus ?? DEFAULT_WORKER_SANDBOX_RESOURCES.cpus;
+  const memoryGiB = value.memoryGiB ?? DEFAULT_WORKER_SANDBOX_RESOURCES.memoryGiB;
+  if (!Number.isSafeInteger(cpus) || cpus < 1 || cpus > MAX_WORKER_SANDBOX_RESOURCES.cpus || !Number.isSafeInteger(memoryGiB) || memoryGiB < 1 || memoryGiB > MAX_WORKER_SANDBOX_RESOURCES.memoryGiB) throw new Error("Worker Sandbox resources require integer cpus from 1 through 8 and integer memoryGiB from 1 through 16.");
+  return { cpus, memoryGiB };
+}
+
+export function planWorkerSandbox(input: { workerId: string; runId: string; creationNonce: string; workerRoot: string; workingDirectory?: string; codeRoot: string; mounts: WorkerSandboxMount[]; reviewSubjectWorkspace?: string; resources?: WorkerSandboxResourceRequest; release?: WorkerSandboxRelease }): WorkerSandboxReference {
   if (!isWorkerId(input.workerId) || !/^run_[A-Za-z0-9_-]+$/.test(input.runId)) throw new Error("Invalid Worker Sandbox identity.");
   if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(input.creationNonce)) throw new Error("Invalid Worker Sandbox creation nonce.");
   const release = input.release ?? readApprovedWorkerSandboxRelease();
+  const resources = resolveWorkerSandboxResources(input.resources);
   const identityHash = createHash("sha256").update(`${input.workerId}\0${input.runId}`).digest("hex").slice(0, 20);
   const sandboxName = `pi-${identityHash}-${input.creationNonce}`;
   if (!SANDBOX_NAME.test(sandboxName)) throw new Error("Invalid Worker Sandbox name.");
@@ -79,7 +93,7 @@ export function planWorkerSandbox(input: { workerId: string; runId: string; crea
   const workingDirectory = reviewOverlay?.mergedDirectory ?? realpathSync(input.workingDirectory ?? workspaceRoot);
   if (!reviewOverlay && !pathWithin(workspaceRoot, workingDirectory)) throw new Error("Worker Sandbox working directory must remain beneath its worker root.");
   const mounts = deduplicateMounts([...input.mounts, ...(reviewOverlay ? [{ source: reviewOverlay.lowerDirectory, readOnly: true }] : [])].map((mount) => ({ source: realpathSync(mount.source), ...(mount.readOnly ? { readOnly: true } : {}) })));
-  const reference: WorkerSandboxReference = { kind: "docker-sandbox", sandboxName, creationNonce: input.creationNonce, workerId: input.workerId, runId: input.runId, kitReference: release.kit.reference, kitSha256: release.kit.sha256, imageReference: release.image.reference, imageDigest: release.image.digest, sbxVersion: release.sandbox.version, sbxBuildCommit: release.sandbox.buildCommit, templateId: release.sandbox.template.id, templateRepository: release.sandbox.template.repository, templateTag: release.sandbox.template.tag, templateFlavor: release.sandbox.template.flavor, protocolVersion: release.protocolVersion, releaseOrdinal: release.releaseOrdinal, workspaceRoot, workspaceDevice: Number(workspace.dev), workspaceInode: Number(workspace.ino), workspaceOwnerUid: Number(workspace.uid), workspaceOwnerGid: Number(workspace.gid), workingDirectory, codeRoot, mounts, ...(reviewOverlay ? { reviewOverlay } : {}), piCli: release.guest.piCli, rpcLauncher: release.guest.rpcLauncher, codingAgentDir: release.guest.codingAgentDir, stagedLockSha256: release.guest.stagedLockSha256, resourceManifestSha256: release.guest.resourceManifestSha256, runtimeProvenanceSha256: release.guest.runtimeProvenanceSha256, extensionPaths: [...release.guest.extensionPaths], searxngUrl: release.guest.searxngUrl, revisions: { ...release.revisions } };
+  const reference: WorkerSandboxReference = { kind: "docker-sandbox", sandboxName, creationNonce: input.creationNonce, workerId: input.workerId, runId: input.runId, kitReference: release.kit.reference, kitSha256: release.kit.sha256, imageReference: release.image.reference, imageDigest: release.image.digest, sbxVersion: release.sandbox.version, sbxBuildCommit: release.sandbox.buildCommit, templateId: release.sandbox.template.id, templateRepository: release.sandbox.template.repository, templateTag: release.sandbox.template.tag, templateFlavor: release.sandbox.template.flavor, protocolVersion: release.protocolVersion, releaseOrdinal: release.releaseOrdinal, workspaceRoot, workspaceDevice: Number(workspace.dev), workspaceInode: Number(workspace.ino), workspaceOwnerUid: Number(workspace.uid), workspaceOwnerGid: Number(workspace.gid), workingDirectory, codeRoot, mounts, ...(reviewOverlay ? { reviewOverlay } : {}), piCli: release.guest.piCli, rpcLauncher: release.guest.rpcLauncher, codingAgentDir: release.guest.codingAgentDir, stagedLockSha256: release.guest.stagedLockSha256, resourceManifestSha256: release.guest.resourceManifestSha256, runtimeProvenanceSha256: release.guest.runtimeProvenanceSha256, extensionPaths: [...release.guest.extensionPaths], searxngUrl: release.guest.searxngUrl, revisions: { ...release.revisions }, requestedCpu: resources.cpus, requestedMemoryGiB: resources.memoryGiB };
   assertWorkerSandboxReference(reference); return reference;
 }
 
@@ -91,7 +105,11 @@ export async function createWorkerSandboxAsync(sbxPath: string, reference: Worke
   if (observedVersion.version !== reference.sbxVersion || observedVersion.buildCommit !== reference.sbxBuildCommit) throw new Error(`Docker Sandbox version mismatch: expected ${reference.sbxVersion} ${reference.sbxBuildCommit}, received ${version.stdout.trim() || "no output"}.`);
   const templates = await execFileAsync(sbxPath, ["template", "ls", "--json"], { encoding: "utf8", maxBuffer: 1024 * 1024, timeout: 5_000 });
   verifyTemplateStoreIdentity(templates.stdout, reference);
-  const args = ["create", "--name", reference.sandboxName, "--memory", WORKER_SANDBOX_MEMORY_LIMIT, "--cpus", String(WORKER_SANDBOX_CPU_LIMIT), "--pull", "never", reference.kitReference, reference.workspaceRoot, `${reference.codeRoot}:ro`, ...reference.mounts.map((mount) => `${mount.source}:ro`)];
+  const resources = referenceResources(reference, true);
+  const memoryLimit = `${resources.memoryGiB}g`;
+  const memoryLimitBytes = resources.memoryGiB * 1024 ** 3;
+  const minimumEffectiveMemoryBytes = Math.floor(memoryLimitBytes * 0.9);
+  const args = ["create", "--name", reference.sandboxName, "--memory", memoryLimit, "--cpus", String(resources.cpus), "--pull", "never", reference.kitReference, reference.workspaceRoot, `${reference.codeRoot}:ro`, ...reference.mounts.map((mount) => `${mount.source}:ro`)];
   const { stdout, stderr } = await execFileAsync(sbxPath, args, { encoding: "utf8", maxBuffer: 1024 * 1024, timeout: 120_000 });
   const inspected = await execFileAsync(sbxPath, ["inspect", reference.sandboxName, "--json"], { encoding: "utf8", maxBuffer: 1024 * 1024, timeout: 5_000 });
   const inspectIdentity = parseObservedSandboxInspect(inspected.stdout, reference.sandboxName);
@@ -120,7 +138,7 @@ printf 'PI_WORKER_RUNTIME_ROOT_V1\n'`;
   const cpu = observed.stdout.match(/^cpu=(\d+)$/m)?.[1]; const memory = observed.stdout.match(/^memoryBytes=(\d+)$/m)?.[1]; const resource = observed.stdout.match(/^resource=([a-f0-9]{64})$/m)?.[1]; const runtimeText = observed.stdout.match(/^runtime=(\{.*\})$/m)?.[1];
   const observedCpu = Number(cpu); const observedMemoryBytes = Number(memory);
   if (!cpu || !memory || !Number.isSafeInteger(observedCpu) || !Number.isSafeInteger(observedMemoryBytes) || resource !== reference.resourceManifestSha256 || !runtimeText) throw new Error("Sandbox did not report its exact approved resources and effective allocation.");
-  if (observedCpu !== WORKER_SANDBOX_CPU_LIMIT || observedMemoryBytes < WORKER_SANDBOX_MIN_EFFECTIVE_MEMORY_BYTES || observedMemoryBytes > WORKER_SANDBOX_MEMORY_LIMIT_BYTES) throw new Error(`Sandbox effective allocation violates the configured ${WORKER_SANDBOX_CPU_LIMIT}-CPU/${WORKER_SANDBOX_MEMORY_LIMIT} limit.`);
+  if (observedCpu !== resources.cpus || observedMemoryBytes < minimumEffectiveMemoryBytes || observedMemoryBytes > memoryLimitBytes) throw new Error(`Sandbox effective allocation violates the requested ${resources.cpus}-CPU/${memoryLimit} limit.`);
   const runtime = JSON.parse(runtimeText) as Record<string, unknown>; const expectedRuntime = { protocolVersion: reference.protocolVersion, stagedLockSha256: reference.stagedLockSha256, piRevision: reference.revisions.pi, profileRevision: reference.revisions.profile, piToolsRevision: reference.revisions.piTools, piDocparserRevision: reference.revisions.piDocparser, resourceManifestSha256: reference.resourceManifestSha256, extensionPaths: reference.extensionPaths };
   if (JSON.stringify(runtime) !== JSON.stringify(expectedRuntime)) throw new Error("Sandbox embedded runtime provenance does not match the approved release.");
   const observedRuntimeSha256 = createHash("sha256").update(runtimeText).digest("hex");
@@ -191,10 +209,22 @@ function verifyReviewWorkspaceHostOwnership(workspaceRoot: string, ownership: Wo
 }
 
 export function resolveSbxPath(): string { return resolveExecutable("sbx"); }
+function referenceResources(reference: WorkerSandboxReference, required: boolean): WorkerSandboxResources {
+  const absent = reference.requestedCpu === undefined && reference.requestedMemoryGiB === undefined;
+  if (absent && !required) return { ...DEFAULT_WORKER_SANDBOX_RESOURCES };
+  if (absent) throw new Error("Worker Sandbox launch requires persisted exact CPU and RAM settings.");
+  return resolveWorkerSandboxResources({ cpus: reference.requestedCpu!, memoryGiB: reference.requestedMemoryGiB! });
+}
+
 export function assertWorkerSandboxReference(value: WorkerSandboxReference): void {
   const revisions = value.revisions;
   if (value.kind !== "docker-sandbox" || !SANDBOX_NAME.test(value.sandboxName) || !isWorkerId(value.workerId) || !/^run_[A-Za-z0-9_-]+$/.test(value.runId) || !/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value.creationNonce) || !SHA256.test(value.kitSha256) || !OCI_DIGEST.test(value.imageReference) || !SHA256.test(value.imageDigest) || !value.imageReference.endsWith(`@sha256:${value.imageDigest}`) || value.protocolVersion !== 1 || !Number.isSafeInteger(value.releaseOrdinal) || value.releaseOrdinal < 1 || !SHA256.test(value.stagedLockSha256) || !SHA256.test(value.resourceManifestSha256) || !SHA256.test(value.runtimeProvenanceSha256) || value.sbxVersion !== SBX_VERSION || !/^[a-f0-9]{40}$/.test(value.sbxBuildCommit) || !TEMPLATE_COMPONENT.test(value.templateId) || !isRegistryQualifiedRepository(value.templateRepository) || !TEMPLATE_COMPONENT.test(value.templateTag) || !TEMPLATE_COMPONENT.test(value.templateFlavor) || !Array.isArray(value.extensionPaths) || value.extensionPaths.length < 1 || !value.extensionPaths.every(isImmutableGuestExtensionPath) || new Set(value.extensionPaths).size !== value.extensionPaths.length || typeof value.searxngUrl !== "string" || !isCredentialFreeHttpUrl(value.searxngUrl) || !revisions || ![revisions.pi, revisions.profile, revisions.piTools, revisions.piDocparser].every((item) => /^[a-f0-9]{40}$/.test(item))) throw new Error("Invalid exact Worker Sandbox reference.");
   if (!value.sandboxName.endsWith(`-${value.creationNonce}`)) throw new Error("Worker Sandbox name does not retain its full creation nonce.");
+  const resourcesAbsent = value.requestedCpu === undefined && value.requestedMemoryGiB === undefined;
+  if ((value.requestedCpu === undefined) !== (value.requestedMemoryGiB === undefined)) throw new Error("Invalid partial Worker Sandbox resource request.");
+  if (!resourcesAbsent) referenceResources(value, true);
+  if (value.observedCpu !== undefined && (!Number.isSafeInteger(value.observedCpu) || value.observedCpu < 1 || value.observedCpu > MAX_WORKER_SANDBOX_RESOURCES.cpus)) throw new Error("Invalid observed Sandbox CPU allocation.");
+  if (value.observedMemoryBytes !== undefined && (!Number.isSafeInteger(value.observedMemoryBytes) || value.observedMemoryBytes < 1 || value.observedMemoryBytes > MAX_WORKER_SANDBOX_RESOURCES.memoryGiB * 1024 ** 3)) throw new Error("Invalid observed Sandbox memory allocation.");
   if (value.observedSandboxId !== undefined && (value.observedSandboxId.length < 8 || value.observedSandboxId.length > 256)) throw new Error("Invalid observed Sandbox ID.");
   if (value.observedRuntimeSha256 !== undefined && (!SHA256.test(value.observedRuntimeSha256) || value.observedRuntimeSha256 !== value.runtimeProvenanceSha256)) throw new Error("Invalid observed runtime digest.");
   if (value.inspectEvidenceSha256 !== undefined && !SHA256.test(value.inspectEvidenceSha256)) throw new Error("Invalid Sandbox inspect evidence digest.");

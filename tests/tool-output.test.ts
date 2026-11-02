@@ -192,7 +192,7 @@ const samples: Record<RetainedToolName, unknown> = {
   },
   worker_run: {
     content: [text("queued · work · 12345678")],
-    details: { runs: [{ action: "start", role: "work", workerId: "worker_20260910190000_12345678", runId: "run_20260910190000_87654321", status: "queued", taskIds: ["personal-test"], completionDelivery: "steer", modelSelection: "openai-codex/gpt-test:xhigh" }] }
+    details: { runs: [{ action: "start", role: "work", workerId: "worker_20260910190000_12345678", runId: "run_20260910190000_87654321", status: "queued", taskIds: ["personal-test"], resources: { cpus: 1, memoryGiB: 4 }, completionDelivery: "steer", modelSelection: "openai-codex/gpt-test:xhigh" }] }
   },
   worker_control: {
     content: [text("1 worker")],

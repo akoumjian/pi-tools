@@ -446,10 +446,11 @@ const DocumentParseDetailsSchema = Type.Object({
 }, { additionalProperties: false });
 
 const WorkerV2RoleSchema = Type.Union([Type.Literal("work"), Type.Literal("review"), Type.Literal("integration")]);
+const WorkerResourcesV2Schema = Type.Object({ cpus: Type.Integer({ minimum: 1, maximum: 8 }), memoryGiB: Type.Integer({ minimum: 1, maximum: 16 }) }, { additionalProperties: false });
 const WorkerRunV2ReceiptSchema = Type.Object({
   action: Type.Union([Type.Literal("start"), Type.Literal("resume")]), role: WorkerV2RoleSchema,
   workerId: Type.String({ minLength: 1 }), runId: Type.String({ minLength: 1 }), status: Type.Union([Type.Literal("queued"), Type.Literal("running")]),
-  taskIds: Type.Array(Type.String()), completionDelivery: Type.Union([Type.Literal("steer"), Type.Literal("followUp")]),
+  taskIds: Type.Array(Type.String()), resources: WorkerResourcesV2Schema, completionDelivery: Type.Union([Type.Literal("steer"), Type.Literal("followUp")]),
   modelSelection: Type.Optional(Type.String()), reviewedRunId: Type.Optional(Type.String()), preparedId: Type.Optional(Type.String())
 }, { additionalProperties: false });
 const WorkerRunV2DetailsSchema = Type.Object({ runs: Type.Array(WorkerRunV2ReceiptSchema, { minItems: 1, maxItems: 8 }) }, { additionalProperties: false });
@@ -468,11 +469,11 @@ const WorkerCleanupClassSchema = Type.Union([Type.Literal("active"),Type.Literal
 const WorkerPreservationRecordSchema = Type.Object({ id: Type.String(), status: Type.Union([Type.Literal("pending"), Type.Literal("published"), Type.Literal("failed")]), destination: Type.String(), tempPath: Type.String(), latestRunId: Type.Optional(Type.String()), items: Type.Array(Type.String(), { maxItems: 32 }), error: Type.Optional(Type.String()) }, { additionalProperties: false });
 const WorkerCleanupSummarySchema = Type.Object({ class: WorkerCleanupClassSchema, reason: Type.String(), unpreservedArtifacts: Type.Array(Type.String(), { maxItems: 4 }), additionalUnpreservedArtifacts: NonNegativeIntegerSchema, pendingPreservations: Type.Array(WorkerPreservationRecordSchema, { maxItems: 64 }), additionalPendingPreservations: NonNegativeIntegerSchema }, { additionalProperties: false });
 const WorkerListItemV2Schema = Type.Object({ workerId: Type.String(), role: WorkerV2RoleSchema, status: Type.Union([Type.Literal("idle"),Type.Literal("queued"),Type.Literal("running")]), activeRunId: Type.Optional(Type.String()), latestResult: Type.Optional(Type.Object({ runId: Type.String(), outcome: WorkerOutcomeV2Schema, outcomeSource: WorkerOutcomeSourceV2Schema }, { additionalProperties: false })), notification: Type.Optional(WorkerDeliveryNotificationV2Schema), taskIds: Type.Array(Type.String()), modelSelection: Type.Optional(Type.String()), recoveryRequired: Type.Optional(Type.Literal(true)), cleanup: Type.Optional(WorkerCleanupSummarySchema), lastActivityAt: Type.String() }, { additionalProperties: false });
-const WorkerSlimRunV2Schema = Type.Object({ runId: Type.String(), status: Type.Union([Type.Literal("queued"),Type.Literal("running"),Type.Literal("settled")]), outcome: Type.Optional(WorkerOutcomeV2Schema), outcomeSource: Type.Optional(WorkerOutcomeSourceV2Schema), createdAt: Type.String(), startedAt: Type.Optional(Type.String()), settledAt: Type.Optional(Type.String()) }, { additionalProperties: false });
+const WorkerSlimRunV2Schema = Type.Object({ runId: Type.String(), status: Type.Union([Type.Literal("queued"),Type.Literal("running"),Type.Literal("settled")]), resources: Type.Optional(WorkerResourcesV2Schema), outcome: Type.Optional(WorkerOutcomeV2Schema), outcomeSource: Type.Optional(WorkerOutcomeSourceV2Schema), createdAt: Type.String(), startedAt: Type.Optional(Type.String()), settledAt: Type.Optional(Type.String()) }, { additionalProperties: false });
 const WorkerRepositoryV2Schema = Type.Object({ repositoryPath: Type.String(), commit: Type.String(), source: Type.Optional(Type.String()), reported: Type.Boolean(), changed: Type.Boolean(), dirty: Type.Boolean(), eligible: Type.Boolean(), issues: Type.Optional(Type.Array(Type.String())) }, { additionalProperties: false });
 const WorkerScopedErrorV2Schema = Type.Object({ scope: Type.Union([Type.Literal("run"),Type.Literal("repositories"),Type.Literal("artifacts")]), message: Type.String() }, { additionalProperties: false });
 const WorkerGetBaseV2Properties = {
-  workerId: Type.String(), role: WorkerV2RoleSchema, runId: Type.String(), taskIds: Type.Array(Type.String()), modelSelection: Type.Optional(Type.String()), createdAt: Type.String(),
+  workerId: Type.String(), role: WorkerV2RoleSchema, runId: Type.String(), taskIds: Type.Array(Type.String()), resources: Type.Optional(WorkerResourcesV2Schema), modelSelection: Type.Optional(Type.String()), createdAt: Type.String(),
   sessionId: Type.Optional(Type.String()), sessionFile: Type.Optional(Type.String()), sessionRange: Type.Object({ startLine: Type.Optional(NonNegativeIntegerSchema), endLine: Type.Optional(NonNegativeIntegerSchema) }, { additionalProperties: false }),
   workspaceRoot: Type.String(), binding: Type.Optional(Type.Unknown()), recoveryError: Type.Optional(Type.String()), preservations: Type.Optional(Type.Array(WorkerPreservationRecordSchema, { maxItems: 256 })), warnings: Type.Optional(Type.Array(Type.String()))
 };
