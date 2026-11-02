@@ -13,6 +13,10 @@ const SHA256 = /^[a-f0-9]{64}$/;
 const OCI_DIGEST = /@sha256:[a-f0-9]{64}$/;
 const SANDBOX_NAME = /^pi-[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const SBX_VERSION = "v0.49.1";
+export const WORKER_SANDBOX_CPU_LIMIT = 4;
+export const WORKER_SANDBOX_MEMORY_LIMIT = "8g";
+const WORKER_SANDBOX_MEMORY_LIMIT_BYTES = 8 * 1024 ** 3;
+const WORKER_SANDBOX_MIN_EFFECTIVE_MEMORY_BYTES = Math.floor(WORKER_SANDBOX_MEMORY_LIMIT_BYTES * 0.9);
 const SBX_VERSION_LINE = /^sbx version (v\d+\.\d+\.\d+) ([a-f0-9]{40})\n?$/;
 const TEMPLATE_COMPONENT = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const SBX_UPDATE_BANNER = [
@@ -87,7 +91,7 @@ export async function createWorkerSandboxAsync(sbxPath: string, reference: Worke
   if (observedVersion.version !== reference.sbxVersion || observedVersion.buildCommit !== reference.sbxBuildCommit) throw new Error(`Docker Sandbox version mismatch: expected ${reference.sbxVersion} ${reference.sbxBuildCommit}, received ${version.stdout.trim() || "no output"}.`);
   const templates = await execFileAsync(sbxPath, ["template", "ls", "--json"], { encoding: "utf8", maxBuffer: 1024 * 1024, timeout: 5_000 });
   verifyTemplateStoreIdentity(templates.stdout, reference);
-  const args = ["create", "--name", reference.sandboxName, "--pull", "never", reference.kitReference, reference.workspaceRoot, `${reference.codeRoot}:ro`, ...reference.mounts.map((mount) => `${mount.source}:ro`)];
+  const args = ["create", "--name", reference.sandboxName, "--memory", WORKER_SANDBOX_MEMORY_LIMIT, "--cpus", String(WORKER_SANDBOX_CPU_LIMIT), "--pull", "never", reference.kitReference, reference.workspaceRoot, `${reference.codeRoot}:ro`, ...reference.mounts.map((mount) => `${mount.source}:ro`)];
   const { stdout, stderr } = await execFileAsync(sbxPath, args, { encoding: "utf8", maxBuffer: 1024 * 1024, timeout: 120_000 });
   const inspected = await execFileAsync(sbxPath, ["inspect", reference.sandboxName, "--json"], { encoding: "utf8", maxBuffer: 1024 * 1024, timeout: 5_000 });
   const inspectIdentity = parseObservedSandboxInspect(inspected.stdout, reference.sandboxName);
@@ -114,14 +118,16 @@ printf 'PI_WORKER_RUNTIME_ROOT_V1\n'`;
   const resourceScript = "cpu=$(getconf _NPROCESSORS_ONLN); memoryKb=$(awk '/MemTotal:/ {print $2}' /proc/meminfo); runtime=$(cat /opt/pi-worker/runtime-provenance.json); resource=$(cat /opt/pi-worker/resource-manifest.sha256); printf 'cpu=%s\\nmemoryBytes=%s\\nruntime=%s\\nresource=%s\\n' \"$cpu\" \"$((memoryKb*1024))\" \"$runtime\" \"$resource\"";
   const observed = await execFileAsync(sbxPath, ["exec", "--workdir", reference.workingDirectory, reference.sandboxName, "/bin/sh", "-c", resourceScript], { encoding: "utf8", maxBuffer: 64 * 1024, timeout: 10_000 });
   const cpu = observed.stdout.match(/^cpu=(\d+)$/m)?.[1]; const memory = observed.stdout.match(/^memoryBytes=(\d+)$/m)?.[1]; const resource = observed.stdout.match(/^resource=([a-f0-9]{64})$/m)?.[1]; const runtimeText = observed.stdout.match(/^runtime=(\{.*\})$/m)?.[1];
-  if (!cpu || !memory || Number(cpu) < 1 || Number(memory) < 1 || resource !== reference.resourceManifestSha256 || !runtimeText) throw new Error("Sandbox did not report its exact approved resources and effective allocation.");
+  const observedCpu = Number(cpu); const observedMemoryBytes = Number(memory);
+  if (!cpu || !memory || !Number.isSafeInteger(observedCpu) || !Number.isSafeInteger(observedMemoryBytes) || resource !== reference.resourceManifestSha256 || !runtimeText) throw new Error("Sandbox did not report its exact approved resources and effective allocation.");
+  if (observedCpu !== WORKER_SANDBOX_CPU_LIMIT || observedMemoryBytes < WORKER_SANDBOX_MIN_EFFECTIVE_MEMORY_BYTES || observedMemoryBytes > WORKER_SANDBOX_MEMORY_LIMIT_BYTES) throw new Error(`Sandbox effective allocation violates the configured ${WORKER_SANDBOX_CPU_LIMIT}-CPU/${WORKER_SANDBOX_MEMORY_LIMIT} limit.`);
   const runtime = JSON.parse(runtimeText) as Record<string, unknown>; const expectedRuntime = { protocolVersion: reference.protocolVersion, stagedLockSha256: reference.stagedLockSha256, piRevision: reference.revisions.pi, profileRevision: reference.revisions.profile, piToolsRevision: reference.revisions.piTools, piDocparserRevision: reference.revisions.piDocparser, resourceManifestSha256: reference.resourceManifestSha256, extensionPaths: reference.extensionPaths };
   if (JSON.stringify(runtime) !== JSON.stringify(expectedRuntime)) throw new Error("Sandbox embedded runtime provenance does not match the approved release.");
   const observedRuntimeSha256 = createHash("sha256").update(runtimeText).digest("hex");
   if (observedRuntimeSha256 !== reference.runtimeProvenanceSha256) throw new Error("Sandbox immutable runtime provenance digest does not match the approved release.");
   const canonicalInspect = `${canonicalJson(parseSbxJson(inspected.stdout, "inspect"))}\n`;
-  const evidence = `${version.stdout}\n${version.stderr}\n${templates.stdout}\n${templates.stderr}\n${stdout}\n${stderr}\n${canonicalInspect}${inspected.stderr}\n${listedJson.stdout}\n${listedJson.stderr}\n${runtimeRoot.stdout}\n${runtimeRoot.stderr}\n${observed.stdout}\n${observed.stderr}`;
-  return { ...reference, ...(reviewOverlay ? { reviewOverlay } : {}), createEvidenceSha256: createHash("sha256").update(evidence).digest("hex"), inspectEvidenceSha256: createHash("sha256").update(canonicalInspect).digest("hex"), sbxVersionEvidenceSha256: createHash("sha256").update(version.stdout).digest("hex"), observedCpu: Number(cpu), observedMemoryBytes: Number(memory), ...(observedSandboxId ? { observedSandboxId } : {}), observedRuntimeSha256 };
+  const evidence = `${JSON.stringify(args)}\n${version.stdout}\n${version.stderr}\n${templates.stdout}\n${templates.stderr}\n${stdout}\n${stderr}\n${canonicalInspect}${inspected.stderr}\n${listedJson.stdout}\n${listedJson.stderr}\n${runtimeRoot.stdout}\n${runtimeRoot.stderr}\n${observed.stdout}\n${observed.stderr}`;
+  return { ...reference, ...(reviewOverlay ? { reviewOverlay } : {}), createEvidenceSha256: createHash("sha256").update(evidence).digest("hex"), inspectEvidenceSha256: createHash("sha256").update(canonicalInspect).digest("hex"), sbxVersionEvidenceSha256: createHash("sha256").update(version.stdout).digest("hex"), observedCpu, observedMemoryBytes, ...(observedSandboxId ? { observedSandboxId } : {}), observedRuntimeSha256 };
 }
 
 export async function settleWorkerSandboxAsync(sbxPath: string, reference: WorkerSandboxReference): Promise<void> {
