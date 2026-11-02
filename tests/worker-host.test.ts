@@ -76,7 +76,7 @@ elif [ "$1 $2 $3" = "template ls --json" ]; then printf '%s\n' '[{"id":"${releas
 elif [ "$1" = create ]; then printf 'ID: sandbox-id-1234\nName: %s\n' "$3"; printf '%s\n' "$3" > ${JSON.stringify(state)}
 elif [ "$1" = inspect ] && [ "$3" = --json ]; then printf '{"name":"%s","id":"sandbox-id-1234","status":"running","agent":"shell","workspace":"%s"}\n' "$2" ${JSON.stringify(workerRoot)}; printf '%s' '${recordedUpdateTrailer}'
 elif [ "$1" = exec ] && printf '%s\n' "$*" | grep -q PI_WORKER_RUNTIME_ROOT_V1; then printf 'PI_WORKER_RUNTIME_ROOT_V1\n'
-elif [ "$1" = exec ]; then printf 'cpu=4\nmemoryBytes=8589934592\nruntime=%s\nresource=%s\n' '${runtimeJson}' '${release.guest.resourceManifestSha256}'
+elif [ "$1" = exec ]; then printf 'cpu=1\nmemoryBytes=4294967296\nruntime=%s\nresource=%s\n' '${runtimeJson}' '${release.guest.resourceManifestSha256}'
 elif [ "$1" = stop ]; then :
 elif [ "$1" = rm ]; then rm -f ${JSON.stringify(state)}
 elif [ "$1 $2" = "ls --json" ]; then if test -e ${JSON.stringify(state)}; then n=$(cat ${JSON.stringify(state)}); printf '[{"id":"sandbox-id-1234","name":"%s","status":"running","agent":"shell","workspace":"${workerRoot}"}]\n' "$n"; printf '%s' '${recordedUpdateTrailer}'; else printf '[]\n'; printf '%s' '${recordedUpdateTrailer}'; fi
@@ -86,9 +86,9 @@ fi
 `); await chmod(fake, 0o755);
   const planned = planWorkerSandbox({ workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_bbbbbbbb", creationNonce: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", workerRoot, codeRoot, mounts: [], release });
   const bareVersion=path.join(root,"sbx-bare-version");await writeFile(bareVersion,"#!/bin/sh\nprintf 'v0.49.1\\n'\n");await chmod(bareVersion,0o755);await assert.rejects(createWorkerSandboxAsync(bareVersion,planned),/recorded v0\.49\.1 contract/);
-  const created = await createWorkerSandboxAsync(fake, planned); assert.match(created.createEvidenceSha256 ?? "", /^[a-f0-9]{64}$/); assert.equal(created.observedCpu, WORKER_SANDBOX_CPU_LIMIT); assert.equal(created.observedMemoryBytes, 8 * 1024 ** 3); await settleWorkerSandboxAsync(fake, created);
+  const created = await createWorkerSandboxAsync(fake, planned); assert.match(created.createEvidenceSha256 ?? "", /^[a-f0-9]{64}$/); assert.equal(created.observedCpu, WORKER_SANDBOX_CPU_LIMIT); assert.equal(created.observedMemoryBytes, 4 * 1024 ** 3); await settleWorkerSandboxAsync(fake, created);
   const commands = await readFile(log, "utf8"); assert.match(commands, new RegExp(`create --name ${planned.sandboxName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} --memory ${WORKER_SANDBOX_MEMORY_LIMIT} --cpus ${WORKER_SANDBOX_CPU_LIMIT}`)); assert.match(commands, new RegExp(`exec --user root ${planned.sandboxName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} /usr/bin/env`)); assert.match(commands, /PI_WORKER_RUNTIME_ROOT_V1/); assert.doesNotMatch(commands, /exec --user root --privileged/); assert.match(commands, new RegExp(`stop ${planned.sandboxName}`)); assert.match(commands, new RegExp(`rm --force ${planned.sandboxName}`));
-  const exactFake=await readFile(fake,"utf8"); const overcommitted=path.join(root,"sbx-overcommitted"); await writeFile(overcommitted,exactFake.replace("cpu=4\nmemoryBytes=8589934592","cpu=8\nmemoryBytes=17179869184")); await chmod(overcommitted,0o755); await assert.rejects(createWorkerSandboxAsync(overcommitted,planned),/configured 4-CPU\/8g limit/);
+  const exactFake=await readFile(fake,"utf8"); const overcommitted=path.join(root,"sbx-overcommitted"); await writeFile(overcommitted,exactFake.replace("cpu=1\nmemoryBytes=4294967296","cpu=4\nmemoryBytes=8589934592")); await chmod(overcommitted,0o755); await assert.rejects(createWorkerSandboxAsync(overcommitted,planned),/configured 1-CPU\/4g limit/);
   await writeFile(fake,exactFake.replace("Docker Sandboxes Update Available","unexpected banner"));await assert.rejects(createWorkerSandboxAsync(fake,planned),/Sandbox inspect JSON was malformed/);
 }));
 
