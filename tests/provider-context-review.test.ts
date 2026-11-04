@@ -5,6 +5,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { RetainedToolOutputSchemas, type RetainedToolName } from "../extensions/_shared/tool-output.js";
+import { openAICodexTools, validateProviderPayloads } from "../scripts/provider-context-payload.mjs";
 
 const retainedToolNames = [
   "shell_start",
@@ -25,29 +26,15 @@ const retainedToolNames = [
   "worker_merge_apply"
 ] as const;
 
-function anthropicWireSchema(parameters: unknown): unknown {
-  const schema = structuredClone(parameters) as Record<string, unknown>;
-  delete schema.additionalProperties;
-  delete schema.anyOf;
-  schema.required ??= [];
-  return schema;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function openAICodexTools(payload: ReviewArtifact["providerPayloads"]["openaiCodexResponses"]) {
-  if ((payload.tools?.length ?? 0) > 0) return payload.tools ?? [];
-  if (!Array.isArray(payload.input)) return [];
-  return payload.input.flatMap((item) => {
-    if (!isRecord(item) || item.type !== "additional_tools" || !Array.isArray(item.tools)) return [];
-    return item.tools.flatMap((tool) => isRecord(tool) ? [{
-      name: typeof tool.name === "string" ? tool.name : undefined,
-      description: typeof tool.description === "string" ? tool.description : undefined,
-      parameters: tool.parameters
-    }] : []);
-  });
+function credentialFreeEnv(home: string): NodeJS.ProcessEnv {
+  return {
+    PATH: process.env.PATH ?? "/usr/bin:/bin",
+    HOME: home,
+    TMPDIR: home,
+    SHELL: "/bin/bash",
+    PI_OFFLINE: "1",
+    TZ: "UTC"
+  };
 }
 
 type ReviewArtifact = {
@@ -75,7 +62,8 @@ test("provider context review command renders sanitized prompt, tool declaration
   try {
     const run = spawnSync(process.execPath, ["scripts/review-provider-context.mjs", "--out", out], {
       cwd: process.cwd(),
-      encoding: "utf8"
+      encoding: "utf8",
+      env: credentialFreeEnv(out)
     });
     assert.equal(run.status, 0, run.stderr || run.stdout);
 
@@ -95,7 +83,8 @@ test("provider context review command renders sanitized prompt, tool declaration
     );
     const rerun = spawnSync(process.execPath, ["scripts/review-provider-context.mjs", "--out", out], {
       cwd: process.cwd(),
-      encoding: "utf8"
+      encoding: "utf8",
+      env: credentialFreeEnv(out)
     });
     assert.equal(rerun.status, 0, rerun.stderr || rerun.stdout);
     assert.equal(await readFile(jsonPath, "utf8"), firstJson);
@@ -179,24 +168,19 @@ test("provider context review command renders sanitized prompt, tool declaration
       }
     }
 
-    const openaiTools = openAICodexTools(artifact.providerPayloads.openaiCodexResponses);
+    validateProviderPayloads({
+      openai: artifact.providerPayloads.openaiCodexResponses,
+      anthropic: artifact.providerPayloads.anthropicMessages,
+      systemPrompt: artifact.systemPrompt,
+      providerTools: artifact.activeTools.map(({ name, description, parameters }) => ({ name, description, parameters })),
+      networkAttempts: 0
+    });
+    const openaiTools: Array<{ name?: string; description?: string; parameters?: unknown; outputSchema?: unknown }> = openAICodexTools(artifact.providerPayloads.openaiCodexResponses);
     const anthropicTools = artifact.providerPayloads.anthropicMessages.tools ?? [];
-    assert.deepEqual(openaiTools.map((tool) => tool.name), names);
-    assert.deepEqual(anthropicTools.map((tool) => tool.name), names);
     assert.match(openaiTools.find((tool) => tool.name === "read_many")?.description ?? "", /known UTF-8 text file ranges and supported local images/);
     for (const tool of artifact.activeTools) {
       const openaiTool = openaiTools.find((candidate) => candidate.name === tool.name);
       const anthropicTool = anthropicTools.find((candidate) => candidate.name === tool.name);
-      assert.deepEqual(
-        openaiTool?.parameters,
-        tool.parameters,
-        `${tool.name} complete input schema reaches the OpenAI provider declaration`
-      );
-      assert.deepEqual(
-        anthropicTool?.input_schema,
-        anthropicWireSchema(tool.parameters),
-        `${tool.name} input schema reaches Anthropic with only Pi's expected top-level normalization`
-      );
       assert.equal(openaiTool !== undefined && "outputSchema" in openaiTool, false, `${tool.name} does not inject a nonstandard OpenAI outputSchema field`);
       assert.equal(anthropicTool !== undefined && "output_schema" in anthropicTool, false, `${tool.name} does not inject a nonstandard Anthropic output schema field`);
       assert.match(JSON.stringify(artifact.providerPayloads.openaiCodexResponses.instructions), new RegExp(`${tool.name} output: JSON Schema:`));
@@ -251,7 +235,8 @@ test("provider context review is path-stable with an external node_modules symli
 
     const run = spawnSync(process.execPath, ["scripts/review-provider-context.mjs", "--out", outputRoot], {
       cwd: preparedRoot,
-      encoding: "utf8"
+      encoding: "utf8",
+      env: credentialFreeEnv(fixtureRoot)
     });
     assert.equal(run.status, 0, run.stderr || run.stdout);
 

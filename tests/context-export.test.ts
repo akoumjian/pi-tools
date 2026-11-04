@@ -254,6 +254,65 @@ test("snapshot preserves Pi 1.5 system-message transcript updates and tool delta
   assert.deepEqual(system.toolsRemoved, [{ name: "old_tool" }]);
 });
 
+test("system TextContent arrays preserve complete raw metadata and redact only sensitive text", () => {
+  const sessionManager = SessionManager.inMemory("/context-copy-test");
+  const secret = "system-array-secret";
+  sessionManager.appendMessage({
+    role: "system",
+    content: [
+      { type: "text", text: `first ${secret}`, textSignature: "system-text-signature" },
+      { type: "text", text: "second public text" }
+    ],
+    sections: { policy: `policy ${secret}`, cleared: null },
+    toolsAdded: [{
+      name: "replacement_tool",
+      description: `description ${secret}`,
+      parameters: {
+        type: "object",
+        properties: { nested: { type: "object", properties: { value: { type: "string", description: secret } } } }
+      },
+      constrainedSampling: false
+    }],
+    toolsRemoved: [{ name: "old_tool" }],
+    timestamp: 1
+  });
+  const fake = createFakeApi([]);
+  const { context } = createContext({ sessionManager });
+
+  const raw = asRecord(buildContextCopySnapshot(fake.api, context, "raw", { TEST_API_KEY: secret }).messages[0]);
+  assert.deepEqual(raw, {
+    role: "system",
+    content: [
+      { type: "text", text: `first ${secret}`, textSignature: "system-text-signature" },
+      { type: "text", text: "second public text" }
+    ],
+    timestamp: 1,
+    sections: { policy: `policy ${secret}`, cleared: null },
+    toolsAdded: [{
+      name: "replacement_tool",
+      description: `description ${secret}`,
+      parameters: {
+        type: "object",
+        properties: { nested: { type: "object", properties: { value: { type: "string", description: secret } } } }
+      },
+      constrainedSampling: false
+    }],
+    toolsRemoved: [{ name: "old_tool" }]
+  });
+
+  const redacted = asRecord(buildContextCopySnapshot(fake.api, context, "redacted", { TEST_API_KEY: secret }).messages[0]);
+  const redactedContent = asArray(redacted.content).map(asRecord);
+  assert.equal(redactedContent[0].text, "first [REDACTED]");
+  assert.equal(redactedContent[0].textSignature, "[REDACTED]");
+  assert.equal(redactedContent[1].text, "second public text");
+  assert.deepEqual(redacted.sections, { policy: "policy [REDACTED]", cleared: null });
+  const redactedTool = asRecord(asArray(redacted.toolsAdded)[0]);
+  assert.equal(redactedTool.description, "description [REDACTED]");
+  assert.equal(redactedTool.constrainedSampling, false);
+  assert.deepEqual(redactedTool.parameters, asRecord(asArray(raw.toolsAdded)[0]).parameters, "schemas are structural data, not secret-redacted text");
+  assert.deepEqual(redacted.toolsRemoved, [{ name: "old_tool" }]);
+});
+
 test("raw snapshot preserves thinking, images, signatures, and text after explicit mode selection", () => {
   const sessionManager = SessionManager.inMemory("/context-copy-test");
   sessionManager.appendMessage({

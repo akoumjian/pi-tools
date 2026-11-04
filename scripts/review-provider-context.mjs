@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { validateProviderPayloads } from "./provider-context-payload.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
 if (!process.execArgv.includes("--preserve-symlinks")) {
@@ -275,6 +276,12 @@ async function capturePayload(streamFunction, model, apiKey, options = {}) {
   return payload;
 }
 
+let networkAttempts = 0;
+globalThis.fetch = async () => {
+  networkAttempts += 1;
+  throw new Error("Provider-context review attempted network I/O before payload validation.");
+};
+
 const openaiPayload = await capturePayload(
   streamOpenAICodexResponses,
   getModel("openai-codex", "gpt-6-luna"),
@@ -286,6 +293,7 @@ const anthropicPayload = await capturePayload(
   getModel("anthropic", "claude-sonnet-4-5"),
   "fixture-api-key"
 );
+validateProviderPayloads({ openai: openaiPayload, anthropic: anthropicPayload, systemPrompt, providerTools, networkAttempts });
 
 function installFixedClock() {
   const NativeDate = globalThis.Date;

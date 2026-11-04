@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { zstdDecompressSync } from "node:zlib";
 import test from "node:test";
-import { InMemoryCredentialStore, normalizeContext, type Context, type Model, type Tool } from "@earendil-works/pi-ai";
+import { InMemoryCredentialStore, normalizeContext, type Model, type Tool, type TranscriptContext } from "@earendil-works/pi-ai";
 import { stream as streamOpenAICodexResponses } from "@earendil-works/pi-ai/api/openai-codex-responses";
 import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
 import {
@@ -76,6 +76,63 @@ function parentPayload(): Record<string, unknown> {
     parallel_tool_calls: true,
     tools: [functionTool("parent_only"), functionTool("shell_start")],
     reasoning: { effort: "xhigh", summary: "auto" }
+  };
+}
+
+function pi15ParentPayload(options: { removeParentTool?: boolean; extraParentTool?: string } = {}): Record<string, unknown> {
+  const parentTools = [functionTool("parent_only"), functionTool("shell_start")];
+  if (options.extraParentTool) parentTools.push(functionTool(options.extraParentTool));
+  return {
+    model: route.model,
+    store: false,
+    stream: true,
+    instructions: "EXACT PARENT INSTRUCTIONS",
+    input: [
+      { type: "additional_tools", tools: parentTools },
+      ...(options.removeParentTool ? [{
+        role: "developer",
+        content: "The following tools are no longer available. Do not call them:\n- parent_only"
+      }] : []),
+      { role: "user", content: [{ type: "input_text", text: "stable parent prefix" }] }
+    ],
+    reasoning: { effort: "xhigh", summary: "auto" },
+    tool_choice: "auto",
+    parallel_tool_calls: true
+  };
+}
+
+function pi15WorkerPayload(parent: Record<string, unknown>, options: {
+  removed?: string[];
+  replaceShell?: boolean;
+  removalsBeforeAdd?: boolean;
+  extraDeveloperNotice?: string;
+} = {}): Record<string, unknown> {
+  const removed = options.removed ?? ["parent_only"];
+  const workerTools = MANAGED_WORKER_TOOL_NAMES
+    .filter((name) => name !== "shell_start" || options.replaceShell)
+    .map((name) => name === "shell_start" && options.replaceShell
+      ? { ...functionTool(name), description: "Replacement shell_start implementation" }
+      : functionTool(name));
+  const removalText = removed.length > 0
+    ? `\n\nThe following tools are no longer available. Do not call them:\n${removed.map((name) => `- ${name}`).join("\n")}`
+    : "";
+  return {
+    model: route.model,
+    store: false,
+    stream: true,
+    instructions: parent.instructions,
+    input: [
+      ...(parent.input as unknown[]),
+      { role: "assistant", content: [{ type: "output_text", text: "parent completion" }] },
+      ...(options.removalsBeforeAdd && removalText ? [{ role: "developer", content: removalText.trim() }] : []),
+      ...(options.extraDeveloperNotice ? [{ role: "developer", content: options.extraDeveloperNotice }] : []),
+      { type: "additional_tools", tools: workerTools },
+      { role: "developer", content: `${workerInstructions}${options.removalsBeforeAdd ? "" : removalText}` },
+      { role: "user", content: [{ type: "input_text", text: `initial worker assignment ${forkMarker}` }] }
+    ],
+    reasoning: { effort: "xhigh", summary: "auto" },
+    tool_choice: "auto",
+    parallel_tool_calls: true
   };
 }
 
@@ -260,10 +317,10 @@ function fakeJwt(): string {
   ].join(".");
 }
 
-async function captureAdapterPayload(model: Model<any>, context: Context): Promise<Record<string, unknown>> {
+async function captureAdapterPayload(model: Model<any>, context: TranscriptContext): Promise<Record<string, unknown>> {
   const controller = new AbortController();
   let payload: unknown;
-  const stream = streamOpenAICodexResponses(model, normalizeContext(context), {
+  const stream = streamOpenAICodexResponses(model, context, {
     apiKey: fakeJwt(),
     signal: controller.signal,
     maxRetries: 0,
@@ -434,15 +491,108 @@ test("Codex lineage restores the exact parent prefix and appends only managed-wo
   }
 });
 
+test("Pi 1.5 lineage replays parent-side removals and extracts only the true system update", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-pi15-parent-removal-"));
+  let runtime: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
+  try {
+    const parent = pi15ParentPayload({ removeParentTool: true });
+    const record = captureAndPrepare(root, true, parent);
+    runtime = createWorkerCacheLineageRuntime(record);
+    const payload = pi15WorkerPayload(parent, { removed: [], extraDeveloperNotice: "ARBITRARY_DEVELOPER_NOTICE" });
+    const transformed = runtime.transformPayload(payload, codexContext()) as Record<string, any>;
+    const serialized = JSON.stringify(transformed.input);
+    assert.equal(serialized.match(/WORKER_CWD_SENTINEL/g)?.length, 1, "worker instructions appear only at the immutable boundary");
+    assert.equal(serialized.match(/ARBITRARY_DEVELOPER_NOTICE/g)?.length, 1, "ordinary developer text remains transcript text, not worker instructions");
+    assert.equal(serialized.match(/The following tools are no longer available/g)?.length, 1, "the parent removal is neither lost nor duplicated");
+    assert.deepEqual(transformed.tool_choice.tools.map((tool: Record<string, unknown>) => tool.name), MANAGED_WORKER_TOOL_NAMES);
+    assert.equal(runtime.status().mode, "eligible");
+  } finally {
+    runtime?.restoreNetwork();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Pi 1.5 lineage permits explicit remove-then-readd schema replacement", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-pi15-replacement-"));
+  let runtime: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
+  try {
+    const parent = pi15ParentPayload();
+    const record = captureAndPrepare(root, true, parent);
+    runtime = createWorkerCacheLineageRuntime(record);
+    const payload = pi15WorkerPayload(parent, {
+      removed: ["parent_only", "shell_start"],
+      replaceShell: true,
+      removalsBeforeAdd: true
+    });
+    const transformed = runtime.transformPayload(payload, codexContext()) as Record<string, any>;
+    const boundary = (transformed.input as Record<string, any>[]).find((item) =>
+      item.type === "additional_tools" && item.tools?.some((tool: Record<string, unknown>) => tool.name === "worker_beads_tasks")
+    );
+    assert.ok(boundary);
+    assert.deepEqual(boundary.tools.map((tool: Record<string, unknown>) => tool.name), MANAGED_WORKER_TOOL_NAMES);
+    assert.equal(boundary.tools.find((tool: Record<string, unknown>) => tool.name === "shell_start")?.description, "Replacement shell_start implementation");
+    const serialized = JSON.stringify(transformed.input);
+    assert.equal(serialized.match(/WORKER_CWD_SENTINEL/g)?.length, 1);
+    assert.equal(serialized.match(/The following tools are no longer available/g)?.length, 1);
+    assert.equal(runtime.status().mode, "eligible", JSON.stringify(runtime.status()));
+  } finally {
+    runtime?.restoreNetwork();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Pi 1.5 lineage falls back when inherited parent authority is not removed", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-pi15-leaked-parent-tool-"));
+  let runtime: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
+  try {
+    const parent = pi15ParentPayload({ extraParentTool: "worker_run" });
+    const record = captureAndPrepare(root, true, parent);
+    runtime = createWorkerCacheLineageRuntime(record);
+    const payload = pi15WorkerPayload(parent, { removed: ["parent_only"] });
+    assert.deepEqual(runtime.transformPayload(payload, codexContext()), payload);
+    assert.deepEqual(runtime.status(), {
+      mode: "fresh",
+      reason: "Worker Codex effective tool set does not exactly match the managed-worker allowlist."
+    });
+    assert.equal(existsSync(record.fallbackFile), true);
+  } finally {
+    runtime?.restoreNetwork();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Pi 1.5 lineage falls back when the incremental managed-tool set is incomplete", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-pi15-missing-tool-"));
+  let runtime: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
+  try {
+    const parent = pi15ParentPayload();
+    const record = captureAndPrepare(root, true, parent);
+    runtime = createWorkerCacheLineageRuntime(record);
+    const payload = pi15WorkerPayload(parent);
+    const additionalItems = (payload.input as Record<string, any>[]).filter((item) => item.type === "additional_tools");
+    const additional = additionalItems[additionalItems.length - 1];
+    assert.ok(additional);
+    additional.tools = additional.tools.filter((tool: Record<string, unknown>) => tool.name !== "read_many");
+    assert.deepEqual(runtime.transformPayload(payload, codexContext()), payload);
+    assert.deepEqual(runtime.status(), {
+      mode: "fresh",
+      reason: "Worker Codex effective tool set does not exactly match the managed-worker allowlist."
+    });
+  } finally {
+    runtime?.restoreNetwork();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("real Codex SSE adapter sends the inherited affinity with an exact stable fork boundary", async () => {
   const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-adapter-"));
   const model = getBuiltinModel("openai-codex", "gpt-5.6-sol");
   assert.ok(model);
-  const parentContext: Context = {
+  const parentContext = normalizeContext({
     systemPrompt: "ADAPTER EXACT PARENT INSTRUCTIONS",
     messages: [{ role: "user", content: "stable adapter parent", timestamp: 1 }],
     tools: [sdkTool("parent_only"), sdkTool("shell_start")]
-  };
+  });
   const capturedParent = await captureAdapterPayload(model, parentContext);
   const originalFetch = globalThis.fetch;
   let runtime: ReturnType<typeof createWorkerCacheLineageRuntime> | undefined;
@@ -487,7 +637,7 @@ test("real Codex SSE adapter sends the inherited affinity with an exact stable f
     };
     const childContext = normalizeContext({
       messages: [
-        ...normalizeContext(parentContext).messages,
+        ...parentContext.messages,
         {
           role: "assistant",
           content: [{ type: "text", text: "parent completion" }],
@@ -532,6 +682,7 @@ test("real Codex SSE adapter sends the inherited affinity with an exact stable f
     assert.equal(adapterEvents.at(-1), "done", "the real adapter accepted the deterministic SSE response");
     assert.equal(adapterEvents.includes("error"), false);
     assert.ok(request);
+    assert.equal(runtime.status().mode, "eligible", JSON.stringify(runtime.status()));
     assert.equal(request.headers.get("session-id"), inheritedAffinity);
     assert.equal(request.headers.get("x-client-request-id"), "distinct-child-session-and-request-id");
     const body = request.body as Record<string, any>;

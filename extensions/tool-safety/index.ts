@@ -88,7 +88,7 @@ let runtimeApprovalModelOverride: ApprovalModelPreference | undefined;
 let runtimeToolSafetyEnabled = true;
 let approvalModelUnavailableWarningShown = false;
 
-const modelApprovalSystemPrompt = `You are Pi's tool safety approval judge. Your single job is to decide whether one proposed tool call should run.
+export const modelApprovalSystemPrompt = `You are Pi's tool safety approval judge. Your single job is to decide whether one proposed tool call should run.
 
 The user message provides the policy you are bound to, the runtime context for this call, and the host's pre-classification. The policy is the source of truth: apply it as written, do not invent rules, and do not relax or tighten it from outside the policy text.
 

@@ -792,33 +792,26 @@ class EligibleRuntimeController {
       throw new Error("Worker Codex input does not preserve the exact captured parent prefix.");
     }
     const rawSuffix = currentInput.slice(parentInput.length);
-    const workerInstructions = adoption?.forkBoundary
-      ? undefined
-      : boundedWorkerInstructions(resolveWorkerInstructions(payload, this.capture.data.payload, rawSuffix));
-    const workerInstructionsSha256 = workerInstructions === undefined
-      ? adoption!.workerInstructionsSha256
-      : sha256(workerInstructions);
-    const parentTools = collectPayloadTools(this.capture.data.payload, parentInput, "captured parent Codex tools");
-    const collectedWorkerTools = collectWorkerTools(payload, rawSuffix, parentTools);
-    if (collectedWorkerTools.length === 0) throw new Error("Worker Codex payload exposes no managed-worker tool schemas.");
-    const collectedWorkerToolsByName = new Map(collectedWorkerTools.map((tool) => [toolName(tool), tool]));
-    if ([...collectedWorkerToolsByName.keys()].some((name) => !MANAGED_WORKER_TOOL_NAME_SET.has(name))) {
-      throw new Error("Worker Codex payload exposes a tool outside the managed-worker allowlist.");
+    const parentReplay = replayPayloadTools(this.capture.data.payload, parentInput, "captured parent Codex tools");
+    const workerReplay = replayPayloadTools(payload, currentInput, "worker Codex tools");
+    const effectiveWorkerToolNames = [...workerReplay.tools.keys()];
+    if (
+      effectiveWorkerToolNames.length !== MANAGED_WORKER_TOOL_NAMES.length ||
+      effectiveWorkerToolNames.some((name) => !MANAGED_WORKER_TOOL_NAME_SET.has(name))
+    ) {
+      throw new Error("Worker Codex effective tool set does not exactly match the managed-worker allowlist.");
     }
-    for (const required of MANAGED_WORKER_TOOL_NAMES) {
-      if (!collectedWorkerToolsByName.has(required)) throw new Error(`Worker Codex payload is missing required tool ${required}.`);
-    }
-    const workerTools = MANAGED_WORKER_TOOL_NAMES.map((name) => collectedWorkerToolsByName.get(name)!);
     const workerToolNames = [...MANAGED_WORKER_TOOL_NAMES];
-    const parentByName = new Map(parentTools.map((tool) => [toolName(tool), tool]));
+    const workerTools = workerToolNames.map((name) => workerReplay.tools.get(name)!);
+    const suffixTouchedTools = replayToolItems(new Map(parentReplay.tools), rawSuffix, "worker Codex tools").touched;
     const appendedTools: JsonObject[] = [];
     for (const workerTool of workerTools) {
       const name = toolName(workerTool);
-      const inherited = parentByName.get(name);
-      if (inherited) {
-        if (!equalJson(inherited, workerTool)) throw new Error(`Inherited parent tool schema conflicts with managed-worker tool ${name}.`);
-      } else {
+      const inherited = parentReplay.tools.get(name);
+      if (suffixTouchedTools.has(name) || inherited === undefined) {
         appendedTools.push(workerTool);
+      } else if (!equalJson(inherited, workerTool)) {
+        throw new Error(`Inherited parent tool schema conflicts with managed-worker tool ${name}.`);
       }
     }
 
@@ -841,6 +834,19 @@ class EligibleRuntimeController {
       }
       assignmentInputIndex = markerIndexes[0]!;
     }
+    const preAssignmentSuffix = rawSuffix.slice(0, assignmentInputIndex - parentInput.length);
+    const systemUpdateIndexes = workerSystemUpdateIndexes(preAssignmentSuffix);
+    const workerInstructions = adoption?.forkBoundary
+      ? undefined
+      : boundedWorkerInstructions(resolveWorkerInstructions(
+        payload,
+        this.capture.data.payload,
+        preAssignmentSuffix,
+        systemUpdateIndexes
+      ));
+    const workerInstructionsSha256 = workerInstructions === undefined
+      ? adoption!.workerInstructionsSha256
+      : sha256(workerInstructions);
     const initialAssignment = currentInput[assignmentInputIndex]!;
     const initialAssignmentSha256 = sha256(stringifyBounded(initialAssignment, "managed-worker initial assignment"));
     const preAssignmentItems = currentInput.slice(parentInput.length, assignmentInputIndex);
@@ -879,9 +885,12 @@ class EligibleRuntimeController {
       }
     }
 
-    const suffixBeforeAssignment = currentInput
-      .slice(parentInput.length, assignmentInputIndex)
-      .filter((item) => item.type !== "additional_tools");
+    const suffixBeforeAssignment = preAssignmentSuffix.flatMap((item, index) => {
+      if (item.type === "additional_tools") return [];
+      if (!systemUpdateIndexes.has(index)) return [item];
+      const removal = systemUpdateRemoval(item);
+      return removal === undefined ? [] : [{ ...item, content: removal }];
+    });
     const suffixFromAssignment = currentInput
       .slice(assignmentInputIndex)
       .filter((item) => item.type !== "additional_tools");
@@ -982,72 +991,80 @@ function inputItemContainsMarker(item: JsonObject, marker: string): boolean {
   return markerOccurrencesInInputItem(item, marker) > 0;
 }
 
-function resolveWorkerInstructions(payload: JsonObject, parentPayload: JsonObject, suffix: JsonObject[]): unknown {
-  if (payload.instructions !== parentPayload.instructions) return payload.instructions;
-  const updates = suffix.flatMap((item) =>
-    item.role === "developer" && typeof item.content === "string" && item.content.trim()
-      ? [item.content]
-      : []
-  );
-  return updates.length > 0 ? updates.join("\n\n") : undefined;
-}
+const REMOVED_TOOLS_MARKER = "The following tools are no longer available. Do not call them:";
+const INCREMENTAL_TOOLS_NOTICE = "This is an incremental tools update.";
 
-function collectPayloadTools(payload: JsonObject, input: JsonObject[], label: string): JsonObject[] {
-  const collected = [...optionalObjectArray(payload.tools, label)];
-  for (const item of input) {
-    if (item.type === "additional_tools") collected.push(...asObjectArray(item.tools, label));
-  }
-  return uniqueToolSchemas(collected, label);
-}
-
-function collectWorkerTools(
+function resolveWorkerInstructions(
   payload: JsonObject,
+  parentPayload: JsonObject,
   suffix: JsonObject[],
-  parentTools: JsonObject[]
-): JsonObject[] {
-  const inheritedWorkerTools = parentTools.filter((tool) => MANAGED_WORKER_TOOL_NAME_SET.has(toolName(tool)));
-  const unique = new Map(
-    uniqueToolSchemas(
-      [...optionalObjectArray(payload.tools, "worker Codex tools"), ...inheritedWorkerTools],
-      "worker Codex tools"
-    ).map((tool) => [toolName(tool), tool])
-  );
-  for (const item of suffix) {
-    for (const name of removedToolNames(item)) unique.delete(name);
+  systemUpdateIndexes: Set<number>
+): unknown {
+  if (payload.instructions !== parentPayload.instructions) return payload.instructions;
+  const updates = [...systemUpdateIndexes].map((index) => {
+    const content = suffix[index]?.content;
+    if (typeof content !== "string") return "";
+    const removalIndex = content.indexOf(`\n\n${REMOVED_TOOLS_MARKER}`);
+    return content.slice(0, removalIndex < 0 ? undefined : removalIndex).trim();
+  }).filter(Boolean);
+  return updates.length === 1 ? updates[0] : undefined;
+}
+
+function workerSystemUpdateIndexes(suffix: JsonObject[]): Set<number> {
+  const indexes = new Set<number>();
+  for (let index = 1; index < suffix.length; index += 1) {
+    const previous = suffix[index - 1];
+    const item = suffix[index];
+    if (
+      previous?.type === "additional_tools" &&
+      item?.role === "developer" &&
+      typeof item.content === "string" &&
+      !item.content.startsWith(INCREMENTAL_TOOLS_NOTICE)
+    ) indexes.add(index);
+  }
+  return indexes;
+}
+
+function systemUpdateRemoval(item: JsonObject): string | undefined {
+  if (item.role !== "developer" || typeof item.content !== "string") return undefined;
+  const markerIndex = item.content.indexOf(REMOVED_TOOLS_MARKER);
+  return markerIndex < 0 ? undefined : item.content.slice(markerIndex).trim();
+}
+
+type ToolReplay = { tools: Map<string, JsonObject>; touched: Set<string> };
+
+function replayPayloadTools(payload: JsonObject, input: JsonObject[], label: string): ToolReplay {
+  const tools = new Map<string, JsonObject>();
+  for (const tool of optionalObjectArray(payload.tools, label)) tools.set(toolName(tool), tool);
+  return replayToolItems(tools, input, label);
+}
+
+function replayToolItems(tools: Map<string, JsonObject>, input: JsonObject[], label: string): ToolReplay {
+  const touched = new Set<string>();
+  for (const item of input) {
+    for (const name of removedToolNames(item)) {
+      tools.delete(name);
+      touched.add(name);
+    }
     if (item.type !== "additional_tools") continue;
-    for (const tool of asObjectArray(item.tools, "worker Codex additional_tools")) {
+    for (const tool of asObjectArray(item.tools, label)) {
       const name = toolName(tool);
-      const previous = unique.get(name);
-      if (previous && !equalJson(previous, tool)) {
-        throw new Error(`worker Codex tools contain conflicting schemas for ${name}.`);
-      }
-      unique.set(name, tool);
+      tools.set(name, tool);
+      touched.add(name);
     }
   }
-  return [...unique.values()];
+  return { tools, touched };
 }
 
 function removedToolNames(item: JsonObject): string[] {
   if (item.role !== "developer" || typeof item.content !== "string") return [];
-  const marker = "The following tools are no longer available. Do not call them:";
-  const markerIndex = item.content.indexOf(marker);
+  const markerIndex = item.content.indexOf(REMOVED_TOOLS_MARKER);
   if (markerIndex < 0) return [];
-  return item.content.slice(markerIndex + marker.length)
+  return item.content.slice(markerIndex + REMOVED_TOOLS_MARKER.length)
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => /^- [A-Za-z0-9_-]+$/.test(line))
     .map((line) => line.slice(2));
-}
-
-function uniqueToolSchemas(tools: JsonObject[], label: string): JsonObject[] {
-  const unique = new Map<string, JsonObject>();
-  for (const tool of tools) {
-    const name = toolName(tool);
-    const previous = unique.get(name);
-    if (previous && !equalJson(previous, tool)) throw new Error(`${label} contain conflicting schemas for ${name}.`);
-    unique.set(name, tool);
-  }
-  return [...unique.values()];
 }
 
 function readWorkerSnapshot(record: Extract<WorkerCacheLineageRecord, { mode: "eligible" }>): ParentCacheLineageCapture {

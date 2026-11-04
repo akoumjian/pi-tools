@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { normalizeContext, type AssistantMessage, type Context, type Message, type Model, type ToolResultMessage, type UserMessage } from "@earendil-works/pi-ai";
+import { normalizeContext, type AssistantMessage, type Message, type Model, type ToolResultMessage, type TranscriptContext, type UserMessage } from "@earendil-works/pi-ai";
 import { stream as streamAnthropic } from "@earendil-works/pi-ai/api/anthropic-messages";
 import { stream as streamOpenAICodexResponses } from "@earendil-works/pi-ai/api/openai-codex-responses";
 import { stream as streamPiMessages } from "@earendil-works/pi-ai/api/pi-messages";
@@ -189,12 +189,12 @@ function sentDetails(fake: FakeApi, index = 0): ManualRetryMarkerDetails {
   return fake.sentMessages[index].message.details as ManualRetryMarkerDetails;
 }
 
-async function captureAnthropicPayload(context: Context): Promise<unknown> {
+async function captureAnthropicPayload(context: TranscriptContext): Promise<unknown> {
   const model = getBuiltinModel("anthropic", "claude-sonnet-4-5");
   assert.ok(model);
   let payload: unknown;
   const controller = new AbortController();
-  const stream = streamAnthropic(model, normalizeContext(context), {
+  const stream = streamAnthropic(model, context, {
     apiKey: "fixture-api-key",
     signal: controller.signal,
     maxRetries: 0,
@@ -210,7 +210,7 @@ async function captureAnthropicPayload(context: Context): Promise<unknown> {
   return payload;
 }
 
-async function capturePiMessagesPayload(context: Context): Promise<unknown> {
+async function capturePiMessagesPayload(context: TranscriptContext): Promise<unknown> {
   const model: Model<"pi-messages"> = {
     id: "retry-fixture",
     name: "Retry fixture",
@@ -225,7 +225,7 @@ async function capturePiMessagesPayload(context: Context): Promise<unknown> {
   };
   let payload: unknown;
   const controller = new AbortController();
-  const stream = streamPiMessages(model, normalizeContext(context), {
+  const stream = streamPiMessages(model, context, {
     apiKey: "fixture-api-key",
     signal: controller.signal,
     maxRetries: 0,
@@ -241,7 +241,7 @@ async function capturePiMessagesPayload(context: Context): Promise<unknown> {
   return payload;
 }
 
-async function captureOpenAIPayload(context: Context): Promise<unknown> {
+async function captureOpenAIPayload(context: TranscriptContext): Promise<unknown> {
   const model = getBuiltinModel("openai-codex", "gpt-6-luna");
   assert.ok(model);
   const fakeJwt = [
@@ -251,7 +251,7 @@ async function captureOpenAIPayload(context: Context): Promise<unknown> {
   ].join(".");
   let payload: unknown;
   const controller = new AbortController();
-  const stream = streamOpenAICodexResponses(model, normalizeContext(context), {
+  const stream = streamOpenAICodexResponses(model, context, {
     apiKey: fakeJwt,
     signal: controller.signal,
     maxRetries: 0,
@@ -295,11 +295,11 @@ test("filtered provider context reaches Anthropic, OpenAI, and pi-messages paylo
   ];
   const filtered = filterManualRetryMessages(messages);
   assert.deepEqual(filtered, [messages[0]], "pi-messages and custom providers receive this filtered context directly");
-  const providerContext: Context = {
+  const providerContext = normalizeContext({
     systemPrompt: "You are a provider payload fixture.",
     messages: filtered as Message[],
     tools: []
-  };
+  });
 
   const [anthropicPayload, openAIPayload, piMessagesPayload] = await Promise.all([
     captureAnthropicPayload(providerContext),

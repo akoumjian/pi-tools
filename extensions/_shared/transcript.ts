@@ -24,8 +24,13 @@ function serializeMessage(message: Message, index: number): string {
       toolCalls.length > 0 ? `Tool calls:\n${toolCalls.join("\n")}` : undefined
     ].filter(Boolean).join("\n");
   }
-  const toolResult = message as ToolResultMessage;
-  return [`#${index} TOOL RESULT ${toolResult.toolName}${toolResult.isError ? " (error)" : ""}`, truncateText(contentToText(toolResult.content), 3000)].join("\n");
+  if (message.role === "toolResult") {
+    const toolResult: ToolResultMessage = message;
+    return [`#${index} TOOL RESULT ${toolResult.toolName}${toolResult.isError ? " (error)" : ""}`, truncateText(contentToText(toolResult.content), 3000)].join("\n");
+  }
+  if (message.role === "system") throw new Error("System transcript records must be filtered before serialization.");
+  const unsupported: never = message;
+  throw new Error(`Unsupported transcript role: ${String((unsupported as { role?: unknown }).role)}`);
 }
 
 function contentToText(content: string | (TextContent | ImageContent)[]): string {

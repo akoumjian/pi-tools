@@ -152,15 +152,19 @@ function fakeReviewResult(): MutationReviewRunResult {
   };
 }
 
-test("mutation review omits parent system records before transcript windowing", () => {
+test("mutation review removes interleaved and trailing system records before one-message windowing", () => {
   const sessionManager = SessionManager.inMemory("/repo");
-  sessionManager.appendMessage({ role: "system", content: "PARENT_SYSTEM_SECRET", timestamp: 1 });
-  sessionManager.appendMessage({ role: "user", content: "VISIBLE_PARENT_USER", timestamp: 2 });
+  sessionManager.appendMessage({ role: "system", content: "LEADING_SYSTEM_SECRET", timestamp: 1 });
+  sessionManager.appendMessage({ role: "user", content: "OLDER_PARENT_USER", timestamp: 2 });
+  sessionManager.appendMessage({ role: "system", content: "INTERLEAVED_SYSTEM_SECRET", timestamp: 3 });
+  sessionManager.appendMessage({ role: "user", content: "VISIBLE_PARENT_USER", timestamp: 4 });
+  sessionManager.appendMessage({ role: "system", content: "TRAILING_SYSTEM_SECRET", timestamp: 5 });
   const context = { cwd: "/repo", sessionManager } as unknown as ExtensionContext;
   const settings = { ...readMutationReviewSettings(), maxRecentMessages: 1, maxTranscriptChars: 10_000 };
   const serialized = buildMutationReviewParentContext(context, settings);
   assert.match(serialized, /VISIBLE_PARENT_USER/);
-  assert.doesNotMatch(serialized, /PARENT_SYSTEM_SECRET|#\d+ SYSTEM/);
+  assert.doesNotMatch(serialized, /OLDER_PARENT_USER|(?:LEADING|INTERLEAVED|TRAILING)_SYSTEM_SECRET|#\d+ SYSTEM/);
+  assert.equal((serialized.match(/#\d+ USER/g) ?? []).length, 1);
 });
 
 test("mutation review extension registers a tool_call hook and cached apply surface", () => {

@@ -52,7 +52,7 @@
   "dependencies": {
     "@mozilla/readability": "^0.6.0",
     "jsdom": "^27.0.1",
-    "pi-docparser": "git+https://github.com/maxedapps/pi-docparser.git#e4c920a2b9e5bb8b7df428b1eb5740a6c65c9f03",
+    "pi-docparser": "git+https://github.com/akoumjian/pi-docparser.git#e4c920a2b9e5bb8b7df428b1eb5740a6c65c9f03",
     "turndown": "^7.2.4",
     "typebox": "1.3.27"
   },
@@ -81,6 +81,7 @@
     "worker-roles/",
     "skills/",
     "scripts/dev-pi.mjs",
+    "scripts/provider-context-payload.mjs",
     "scripts/review-provider-context.mjs",
     "scripts/worker-rpc/",
     "scripts/worker-host.mjs",

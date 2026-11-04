@@ -187,6 +187,7 @@ test("pi-tools package files whitelist excludes tests and local runtime artifact
     "worker-roles/",
     "skills/",
     "scripts/dev-pi.mjs",
+    "scripts/provider-context-payload.mjs",
     "scripts/review-provider-context.mjs",
     "scripts/worker-rpc/",
     "scripts/worker-host.mjs",
