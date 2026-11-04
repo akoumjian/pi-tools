@@ -136,12 +136,12 @@ test("resolveExtensionModel clamps thinking to off for non-reasoning models", ()
 });
 
 test("resolveExtensionModel validates auth and missing models loudly", () => {
-  const model = fakeModel("openai-codex", "gpt-5.3-codex-spark");
+  const model = fakeModel("openai-codex", "gpt-6-luna");
   const registry = fakeRegistry([model], new Set());
 
   assert.throws(() => resolveExtensionModel({
     registry,
-    requested: "openai-codex/gpt-5.3-codex-spark",
+    requested: "openai-codex/gpt-6-luna",
     fallbackThinkingLevel: "low",
     label: "Mutation review",
     noModelMessage: "missing"

@@ -173,7 +173,7 @@ export function registerParentCacheLineageCapture(
   // so these legacy request-time files are unreferenced and safe to prune.
   rmSync(path.join(path.resolve(stateRoot), ".cache-lineage"), { recursive: true, force: true });
 
-  // Pi 0.84.4 applies ModelRuntime.transformHeaders before the Codex adapter calls
+  // Pi applies ModelRuntime.transformHeaders before the Codex adapter calls
   // onPayload. Record only small route/header metadata here; pair it with the
   // subsequently emitted payload in before_provider_request.
   api.on("before_provider_headers", (event, context) => {
@@ -786,26 +786,30 @@ class EligibleRuntimeController {
     if (drift) throw new Error(drift);
     if (!isJsonObject(payload)) throw new Error("Worker Codex provider payload is not an object.");
     if (payload.model !== this.record.model) throw new Error("Worker Codex payload model drifted before lineage adoption.");
-    const workerInstructions = adoption?.forkBoundary ? undefined : boundedWorkerInstructions(payload.instructions);
-    const workerInstructionsSha256 = workerInstructions === undefined
-      ? adoption!.workerInstructionsSha256
-      : sha256(workerInstructions);
     const currentInput = asObjectArray(payload.input, "worker Codex input");
     const parentInput = asObjectArray(this.capture.data.payload.input, "captured parent Codex input");
     if (currentInput.length < parentInput.length || !equalJson(currentInput.slice(0, parentInput.length), parentInput)) {
       throw new Error("Worker Codex input does not preserve the exact captured parent prefix.");
     }
     const rawSuffix = currentInput.slice(parentInput.length);
-    const workerTools = collectWorkerTools(payload, rawSuffix);
-    if (workerTools.length === 0) throw new Error("Worker Codex payload exposes no managed-worker tool schemas.");
-    const workerToolNames = workerTools.map(toolName);
-    if (workerToolNames.some((name) => !MANAGED_WORKER_TOOL_NAME_SET.has(name))) {
+    const workerInstructions = adoption?.forkBoundary
+      ? undefined
+      : boundedWorkerInstructions(resolveWorkerInstructions(payload, this.capture.data.payload, rawSuffix));
+    const workerInstructionsSha256 = workerInstructions === undefined
+      ? adoption!.workerInstructionsSha256
+      : sha256(workerInstructions);
+    const parentTools = collectPayloadTools(this.capture.data.payload, parentInput, "captured parent Codex tools");
+    const collectedWorkerTools = collectWorkerTools(payload, rawSuffix, parentTools);
+    if (collectedWorkerTools.length === 0) throw new Error("Worker Codex payload exposes no managed-worker tool schemas.");
+    const collectedWorkerToolsByName = new Map(collectedWorkerTools.map((tool) => [toolName(tool), tool]));
+    if ([...collectedWorkerToolsByName.keys()].some((name) => !MANAGED_WORKER_TOOL_NAME_SET.has(name))) {
       throw new Error("Worker Codex payload exposes a tool outside the managed-worker allowlist.");
     }
     for (const required of MANAGED_WORKER_TOOL_NAMES) {
-      if (!workerToolNames.includes(required)) throw new Error(`Worker Codex payload is missing required tool ${required}.`);
+      if (!collectedWorkerToolsByName.has(required)) throw new Error(`Worker Codex payload is missing required tool ${required}.`);
     }
-    const parentTools = optionalObjectArray(this.capture.data.payload.tools, "captured parent Codex tools");
+    const workerTools = MANAGED_WORKER_TOOL_NAMES.map((name) => collectedWorkerToolsByName.get(name)!);
+    const workerToolNames = [...MANAGED_WORKER_TOOL_NAMES];
     const parentByName = new Map(parentTools.map((tool) => [toolName(tool), tool]));
     const appendedTools: JsonObject[] = [];
     for (const workerTool of workerTools) {
@@ -978,18 +982,69 @@ function inputItemContainsMarker(item: JsonObject, marker: string): boolean {
   return markerOccurrencesInInputItem(item, marker) > 0;
 }
 
-function collectWorkerTools(payload: JsonObject, suffix: JsonObject[]): JsonObject[] {
-  const collected = [...optionalObjectArray(payload.tools, "worker Codex tools")];
+function resolveWorkerInstructions(payload: JsonObject, parentPayload: JsonObject, suffix: JsonObject[]): unknown {
+  if (payload.instructions !== parentPayload.instructions) return payload.instructions;
+  const updates = suffix.flatMap((item) =>
+    item.role === "developer" && typeof item.content === "string" && item.content.trim()
+      ? [item.content]
+      : []
+  );
+  return updates.length > 0 ? updates.join("\n\n") : undefined;
+}
+
+function collectPayloadTools(payload: JsonObject, input: JsonObject[], label: string): JsonObject[] {
+  const collected = [...optionalObjectArray(payload.tools, label)];
+  for (const item of input) {
+    if (item.type === "additional_tools") collected.push(...asObjectArray(item.tools, label));
+  }
+  return uniqueToolSchemas(collected, label);
+}
+
+function collectWorkerTools(
+  payload: JsonObject,
+  suffix: JsonObject[],
+  parentTools: JsonObject[]
+): JsonObject[] {
+  const inheritedWorkerTools = parentTools.filter((tool) => MANAGED_WORKER_TOOL_NAME_SET.has(toolName(tool)));
+  const unique = new Map(
+    uniqueToolSchemas(
+      [...optionalObjectArray(payload.tools, "worker Codex tools"), ...inheritedWorkerTools],
+      "worker Codex tools"
+    ).map((tool) => [toolName(tool), tool])
+  );
   for (const item of suffix) {
-    if (item.type === "additional_tools") {
-      collected.push(...asObjectArray(item.tools, "worker Codex additional_tools"));
+    for (const name of removedToolNames(item)) unique.delete(name);
+    if (item.type !== "additional_tools") continue;
+    for (const tool of asObjectArray(item.tools, "worker Codex additional_tools")) {
+      const name = toolName(tool);
+      const previous = unique.get(name);
+      if (previous && !equalJson(previous, tool)) {
+        throw new Error(`worker Codex tools contain conflicting schemas for ${name}.`);
+      }
+      unique.set(name, tool);
     }
   }
+  return [...unique.values()];
+}
+
+function removedToolNames(item: JsonObject): string[] {
+  if (item.role !== "developer" || typeof item.content !== "string") return [];
+  const marker = "The following tools are no longer available. Do not call them:";
+  const markerIndex = item.content.indexOf(marker);
+  if (markerIndex < 0) return [];
+  return item.content.slice(markerIndex + marker.length)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => /^- [A-Za-z0-9_-]+$/.test(line))
+    .map((line) => line.slice(2));
+}
+
+function uniqueToolSchemas(tools: JsonObject[], label: string): JsonObject[] {
   const unique = new Map<string, JsonObject>();
-  for (const tool of collected) {
+  for (const tool of tools) {
     const name = toolName(tool);
     const previous = unique.get(name);
-    if (previous && !equalJson(previous, tool)) throw new Error(`Worker Codex tool ${name} has conflicting schemas.`);
+    if (previous && !equalJson(previous, tool)) throw new Error(`${label} contain conflicting schemas for ${name}.`);
     unique.set(name, tool);
   }
   return [...unique.values()];

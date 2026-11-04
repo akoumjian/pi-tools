@@ -1,4 +1,4 @@
-import { Type, type TSchema } from "@earendil-works/pi-ai";
+import { Type, type TSchema } from "typebox";
 import { CompletionDeliverySchema } from "./completion-delivery.js";
 
 const NonNegativeIntegerSchema = Type.Integer({ minimum: 0 });

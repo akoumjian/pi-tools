@@ -16,6 +16,7 @@ import { normalizeWorkspaceResultPaths, validateWorkerResultInput, WorkerResultV
 import { resultPathMetadata } from "../extensions/worker/runtime.js";
 import { ASYNC_SHELL_ACTIVITY_STATUS_KEY, renderAsyncShellActivityStatus } from "../extensions/async-shell/index.js";
 import { createWorkerAndRun, getWorker, getWorkerRun, openWorkerRegistry, setWorkerRecoveryError, settleWorkerRun, storePreparedSet, type WorkerRegistry, type WorkerRunRecord } from "../extensions/worker/registry.js";
+import { extensionToolContext } from "./fixtures/extension-tool-context.js";
 
 const settings = {
   modelPreferences: {
@@ -94,7 +95,7 @@ test("worker_run work start persists a v2 registry receipt before deferred launc
       launch: () => { throw new Error("deferred launch must not run during receipt test"); }
     });
     const model = { id: "gpt-5.6-sol", name: "gpt-5.6-sol", provider: "openai-codex", api: "openai-responses", baseUrl: "https://example.invalid", reasoning: true, thinkingLevelMap: { xhigh: "xhigh" }, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 10000 } as Model<Api>;
-    const context = { cwd: root, sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "parent" }, modelRegistry: { hasConfiguredAuth: () => true, getAll: () => [model] }, isIdle: () => true, hasPendingMessages: () => false, ui: { notify() {} } } as unknown as ExtensionContext;
+    const context = extensionToolContext({ cwd: root, sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "parent" }, modelRegistry: { hasConfiguredAuth: () => true, getAll: () => [model] }, isIdle: () => true, hasPendingMessages: () => false, ui: { notify() {} } } as unknown as ExtensionContext);
     for (const handler of handlers.get("session_start") ?? []) await handler({}, context);
     const tool = tools.find((candidate) => candidate.name === "worker_run")!;
     const result = await tool.execute!("call", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "Implement." }] }, new AbortController().signal, undefined, context);
@@ -171,7 +172,7 @@ test("deferred turn_end launch rechecks generation and settles failed before lau
       launch: () => { launches += 1; throw new Error("launch must not run after generation drift"); }
     });
     const model = { id: "gpt-5.6-sol", name: "gpt-5.6-sol", provider: "openai-codex", api: "openai-responses", baseUrl: "https://example.invalid", reasoning: true, thinkingLevelMap: { xhigh: "xhigh" }, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 10000 } as Model<Api>;
-    const context = { cwd: root, sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "parent" }, modelRegistry: { hasConfiguredAuth: () => true, getAll: () => [model] }, isIdle: () => true, hasPendingMessages: () => false, ui: { notify() {} } } as unknown as ExtensionContext;
+    const context = extensionToolContext({ cwd: root, sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "parent" }, modelRegistry: { hasConfiguredAuth: () => true, getAll: () => [model] }, isIdle: () => true, hasPendingMessages: () => false, ui: { notify() {} } } as unknown as ExtensionContext);
     for (const handler of handlers.get("session_start") ?? []) await handler({}, context);
     const result = await tools.find((tool) => tool.name === "worker_run")!.execute!("generation-launch", { runs: [{ action: "start", role: "work", taskIds: ["personal-test"], instructions: "Implement." }] }, new AbortController().signal, undefined, context);
     const receipt = (result.details as { runs: Array<{ workerId: string; runId: string }> }).runs[0]!;
@@ -503,7 +504,7 @@ test("worker_run snapshots require nonempty call IDs and exact result run identi
     launch: () => { throw new Error("snapshot identity test does not launch workers"); }
   });
   const model = { id: "gpt-5.6-sol", name: "gpt-5.6-sol", provider: "openai-codex", api: "openai-responses", baseUrl: "https://example.invalid", reasoning: true, thinkingLevelMap: { xhigh: "xhigh" }, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 10000 } as Model<Api>;
-  const context = { cwd: root, sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "parent" }, modelRegistry: { hasConfiguredAuth: () => true, getAll: () => [model] }, isIdle: () => true, hasPendingMessages: () => false, ui: { notify() {} } } as unknown as ExtensionContext;
+  const context = extensionToolContext({ cwd: root, sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "parent" }, modelRegistry: { hasConfiguredAuth: () => true, getAll: () => [model] }, isIdle: () => true, hasPendingMessages: () => false, ui: { notify() {} } } as unknown as ExtensionContext);
   const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as never;
   const signal = new AbortController().signal;
   try {
@@ -608,7 +609,7 @@ test("production merge, startup recovery, and cleanup inventory stay inside the 
   registry.close();
   const beforeBytes = await readFile(legacySentinel);
   const beforeIdentity = await stat(legacySentinel);
-  const context = { cwd: root, sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "parent" }, isIdle: () => true, hasPendingMessages: () => false, ui: { notify() {} } } as unknown as ExtensionContext;
+  const context = extensionToolContext({ cwd: root, sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "parent" }, isIdle: () => true, hasPendingMessages: () => false, ui: { notify() {} } } as unknown as ExtensionContext);
   try {
     await chmod(legacyRoot, 0o000);
     registerWorkerExtension(api, { runtimeRoot, roots: { stateRoot: workersRoot, workspaceRoot: workersRoot }, codeRoot: root, targetRoot: path.join(root, "targets") });
@@ -647,7 +648,7 @@ test("worker_merge_apply snapshots require nonempty call IDs and exact prepared 
   const tools: ToolDefinition[] = []; const handlers = new Map<string, Function[]>();
   const api = { registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, sendMessage() {} } as unknown as ExtensionAPI;
   registerWorkerExtension(api, { runtimeRoot, roots: { stateRoot: workersRoot, workspaceRoot: workersRoot }, codeRoot: root, preparedRoot: path.join(root, "prepared"), targetRoot: path.join(root, "targets") });
-  const context = { cwd: root, sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "parent" }, isIdle: () => true, hasPendingMessages: () => false, ui: { notify() {} } } as unknown as ExtensionContext;
+  const context = extensionToolContext({ cwd: root, sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "parent" }, isIdle: () => true, hasPendingMessages: () => false, ui: { notify() {} } } as unknown as ExtensionContext);
   const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as never; const signal = new AbortController().signal;
   try {
     for (const handler of handlers.get("session_start") ?? []) await handler({}, context);

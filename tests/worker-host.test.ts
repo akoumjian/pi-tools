@@ -221,7 +221,7 @@ test("sbx RPC shim atomically reprovisions a sentinel-restarted ordinary sandbox
 }));
 
 test("review sbx RPC shim hermetically revalidates missing, wrong, and exact OverlayFS mounts as root without privileged exec", async () => temp(async (root) => {
-  const trace = path.join(root, "sbx-args.jsonl"), fake = path.join(root, "sbx"), fakeBin = path.join(root, "bin"), mounts = path.join(root, "mounts"); await mkdir(fakeBin);
+  const trace = path.join(root, "sbx-args.jsonl"), fake = path.join(root, "sbx.cjs"), fakeBin = path.join(root, "bin"), mounts = path.join(root, "mounts"); await mkdir(fakeBin);
   await writeFile(path.join(fakeBin, "id"), "#!/bin/sh\nprintf '0\\n'\n"); await chmod(path.join(fakeBin, "id"), 0o755);
   const launched = path.join(root, "launched"), fakeLauncher = path.join(root, "launch"); await writeFile(fakeLauncher, `#!/bin/sh\nprintf launched >> ${JSON.stringify(launched)}\n`); await chmod(fakeLauncher, 0o755);
   const lower = path.join(root, "lower"), mappedUpper = path.join(root, "upper"), mappedWork = path.join(root, "work"), mappedMerged = path.join(root, "merged"); for (const directory of [lower, mappedUpper, mappedWork, mappedMerged]) await mkdir(directory);

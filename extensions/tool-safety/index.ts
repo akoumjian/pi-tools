@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { isIP } from "node:net";
 import path from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { type Api, type Message, type Model } from "@earendil-works/pi-ai";
+import { normalizeContext, type Api, type Message, type Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
 import { abortableDialogOptions, createAbortScope, throwIfAborted } from "../_shared/cancellation.js";
 import { formatConfigPath, piToolsConfigCandidates, readPiToolsJsonConfig, readPiToolsReferencedTextConfig, removeAgentExtensionConfig, writeAgentExtensionConfig, writeAgentExtensionTextConfig, type ConfigPath, type PiToolsConfigCandidate } from "../_shared/config.js";
@@ -1674,18 +1674,10 @@ async function requestModelApproval(
     : model;
   const abort = createAbortScope(context.signal, settings.approvalTimeoutMs);
   try {
+    const transcript = buildToolSafetyApprovalTranscript(buildModelApprovalPrompt(context, event, decision));
     const response = await provider.streamSimple(
       requestModel,
-      {
-        systemPrompt: modelApprovalSystemPrompt,
-        messages: [
-          {
-            role: "user",
-            content: buildModelApprovalPrompt(context, event, decision),
-            timestamp: Date.now()
-          }
-        ]
-      },
+      transcript,
       {
         apiKey: auth.apiKey,
         headers: auth.headers,
@@ -1714,6 +1706,13 @@ async function requestModelApproval(
   } finally {
     abort.dispose();
   }
+}
+
+export function buildToolSafetyApprovalTranscript(prompt: string) {
+  return normalizeContext({
+    systemPrompt: modelApprovalSystemPrompt,
+    messages: [{ role: "user", content: prompt, timestamp: Date.now() }]
+  });
 }
 
 async function selectApprovalModel(context: ExtensionContext): Promise<ApprovalModelSelection> {

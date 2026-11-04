@@ -33,6 +33,23 @@ function anthropicWireSchema(parameters: unknown): unknown {
   return schema;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function openAICodexTools(payload: ReviewArtifact["providerPayloads"]["openaiCodexResponses"]) {
+  if ((payload.tools?.length ?? 0) > 0) return payload.tools ?? [];
+  if (!Array.isArray(payload.input)) return [];
+  return payload.input.flatMap((item) => {
+    if (!isRecord(item) || item.type !== "additional_tools" || !Array.isArray(item.tools)) return [];
+    return item.tools.flatMap((tool) => isRecord(tool) ? [{
+      name: typeof tool.name === "string" ? tool.name : undefined,
+      description: typeof tool.description === "string" ? tool.description : undefined,
+      parameters: tool.parameters
+    }] : []);
+  });
+}
+
 type ReviewArtifact = {
   renderedProjectContext: string;
   renderedSkillCatalog: string;
@@ -101,7 +118,7 @@ test("provider context review command renders sanitized prompt, tool declaration
     assert.match(artifact.systemPrompt, /SENTINEL_CHILD_ROLE_AND_CONFINEMENT/);
     assert.match(artifact.systemPrompt, /SENTINEL_SKILL_DESCRIPTION/);
     assert.doesNotMatch(artifact.systemPrompt, /Current date: 2000-01-02/);
-    assert.match(artifact.systemPrompt, /Current working directory: \/review\/workspace/);
+    assert.match(artifact.systemPrompt, /<cwd>\n\/review\/workspace\n<\/cwd>/);
     assert.doesNotMatch(artifact.systemPrompt, /<DATE>|<repo>|\/Users\//);
     assert.match(artifact.systemPrompt, /read_many use:/);
     assert.match(artifact.systemPrompt, /Use `start` with role `work`/);
@@ -162,7 +179,7 @@ test("provider context review command renders sanitized prompt, tool declaration
       }
     }
 
-    const openaiTools = artifact.providerPayloads.openaiCodexResponses.tools ?? [];
+    const openaiTools = openAICodexTools(artifact.providerPayloads.openaiCodexResponses);
     const anthropicTools = artifact.providerPayloads.anthropicMessages.tools ?? [];
     assert.deepEqual(openaiTools.map((tool) => tool.name), names);
     assert.deepEqual(anthropicTools.map((tool) => tool.name), names);

@@ -1,7 +1,13 @@
-import type { ImageContent, Message, TextContent, ToolResultMessage } from "@earendil-works/pi-ai";
+import type { ImageContent, Message, TextContent, ToolResultMessage, TranscriptContext } from "@earendil-works/pi-ai";
 
-/** Bounded transcript serialization shared by active child-review consumers. */
-export function serializeRecentMessages(messages: Message[], maxMessages: number, maxChars: number): string {
+/**
+ * Bounded transcript serialization shared by active child-review consumers.
+ * System messages are intentionally omitted before windowing: reviewer prompts
+ * provide their own trusted system instructions and must not disclose parent
+ * system records.
+ */
+export function serializeRecentMessages(transcript: TranscriptContext, maxMessages: number, maxChars: number): string {
+  const messages = transcript.messages.filter((message) => message.role !== "system");
   const recent = messages.slice(-maxMessages);
   const serialized = recent.map((message, index) => serializeMessage(message, messages.length - recent.length + index + 1)).join("\n\n---\n\n");
   return truncateText(serialized || "(no recent transcript messages)", maxChars);

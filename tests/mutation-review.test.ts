@@ -11,6 +11,7 @@ import mutationReviewExtension, {
   blockedOperationsForDecision,
   buildMutationReviewStatusText,
   buildMutationReviewSearchHints,
+  buildMutationReviewParentContext,
   buildReuseBlockReason,
   createMutationReviewToolBudgetExtension,
   extractFileMutationProposal,
@@ -43,7 +44,7 @@ function createContext(cwd: string): ExtensionContext {
   return { cwd, sessionManager: SessionManager.inMemory(cwd) } as unknown as ExtensionContext;
 }
 
-function createCommandContext(cwd = "/repo", models: Model<Api>[] = [fakeModel("openai-codex", "gpt-5.3-codex-spark")]) {
+function createCommandContext(cwd = "/repo", models: Model<Api>[] = [fakeModel("openai-codex", "gpt-6-luna")]) {
   const notifications: Array<{ message: string; type: string }> = [];
   return {
     notifications,
@@ -137,7 +138,7 @@ function fakeRegistry(models: Model<Api>[], authed: Set<string> = new Set(models
 
 function fakeReviewResult(): MutationReviewRunResult {
   return {
-    model: "openai-codex/gpt-5.3-codex-spark",
+    model: "openai-codex/gpt-6-luna",
     thinkingLevel: "low",
     toolCallCount: 2,
     durationMs: 1000,
@@ -150,6 +151,17 @@ function fakeReviewResult(): MutationReviewRunResult {
     }
   };
 }
+
+test("mutation review omits parent system records before transcript windowing", () => {
+  const sessionManager = SessionManager.inMemory("/repo");
+  sessionManager.appendMessage({ role: "system", content: "PARENT_SYSTEM_SECRET", timestamp: 1 });
+  sessionManager.appendMessage({ role: "user", content: "VISIBLE_PARENT_USER", timestamp: 2 });
+  const context = { cwd: "/repo", sessionManager } as unknown as ExtensionContext;
+  const settings = { ...readMutationReviewSettings(), maxRecentMessages: 1, maxTranscriptChars: 10_000 };
+  const serialized = buildMutationReviewParentContext(context, settings);
+  assert.match(serialized, /VISIBLE_PARENT_USER/);
+  assert.doesNotMatch(serialized, /PARENT_SYSTEM_SECRET|#\d+ SYSTEM/);
+});
 
 test("mutation review extension registers a tool_call hook and cached apply surface", () => {
   const api = createFakeApi();
@@ -225,9 +237,9 @@ test("tool_result middleware decorates partial-review execution errors with stri
 test("mutation-review status reports runtime model override and enforcement state", () => {
   setRuntimeMutationReviewModelOverride(undefined);
   setRuntimeMutationReviewEnabled(true);
-  const spark = fakeModel("openai-codex", "gpt-5.3-codex-spark");
+  const luna = fakeModel("openai-codex", "gpt-6-luna");
   const claude = fakeModel("anthropic", "claude-opus-4-7");
-  const { context } = createCommandContext("/repo", [spark, claude]);
+  const { context } = createCommandContext("/repo", [luna, claude]);
 
   const unconfiguredStatus = buildMutationReviewStatusText(context);
   assert.match(unconfiguredStatus, /Enforcement: disabled until setup/);
@@ -252,7 +264,7 @@ test("mutation-review-model command sets and resets a validated runtime reviewer
   const api = createFakeApi();
   mutationReviewExtension(api);
   const { context, notifications } = createCommandContext("/repo", [
-    fakeModel("openai-codex", "gpt-5.3-codex-spark"),
+    fakeModel("openai-codex", "gpt-6-luna"),
     fakeModel("anthropic", "claude-opus-4-7")
   ]);
   const modelCommand = api.commands.get("mutation:model");
@@ -284,7 +296,7 @@ test("mutation-review setup writes reviewer model config and reviewer guidance",
     const api = createFakeApi();
     mutationReviewExtension(api);
     const { context, notifications } = createCommandContext(dir, [
-      fakeModel("openai-codex", "gpt-5.3-codex-spark"),
+      fakeModel("openai-codex", "gpt-6-luna"),
       fakeModel("anthropic", "claude-opus-4-7")
     ]);
     const setupCommand = api.commands.get("mutation:setup");
@@ -338,7 +350,7 @@ test("mutation-review-model command rejects unavailable models without changing 
   setRuntimeMutationReviewEnabled(true);
   const api = createFakeApi();
   mutationReviewExtension(api);
-  const { context, notifications } = createCommandContext("/repo", [fakeModel("openai-codex", "gpt-5.3-codex-spark")]);
+  const { context, notifications } = createCommandContext("/repo", [fakeModel("openai-codex", "gpt-6-luna")]);
   const modelCommand = api.commands.get("mutation:model");
   assert.ok(modelCommand);
 
@@ -801,13 +813,13 @@ test("recoverMutationReviewDecisionFromText ignores ambiguous prose without a de
 });
 
 test("selectMutationReviewModel resolves configured models and auth", () => {
-  const gpt = fakeModel("openai-codex", "gpt-5.3-codex");
-  const spark = fakeModel("openai-codex", "gpt-5.3-codex-spark");
-  const registry = fakeRegistry([gpt, spark], new Set(["openai-codex/gpt-5.3-codex"]));
+  const gpt = fakeModel("openai-codex", "gpt-6-sol");
+  const luna = fakeModel("openai-codex", "gpt-6-luna");
+  const registry = fakeRegistry([gpt, luna], new Set(["openai-codex/gpt-6-sol"]));
 
-  assert.deepEqual(selectMutationReviewModel(registry, "openai-codex/gpt-5.3-codex", spark, "low"), { model: gpt, thinkingLevel: "low" });
-  assert.throws(() => selectMutationReviewModel(registry, "openai-codex/gpt-5.3-codex:max", spark, "low"), /capped at xhigh/);
-  assert.throws(() => selectMutationReviewModel(registry, "openai-codex/gpt-5.3-codex", spark, "max"), /inherited thinking level.*capped at xhigh/);
+  assert.deepEqual(selectMutationReviewModel(registry, "openai-codex/gpt-6-sol", luna, "low"), { model: gpt, thinkingLevel: "low" });
+  assert.throws(() => selectMutationReviewModel(registry, "openai-codex/gpt-6-sol:max", luna, "low"), /capped at xhigh/);
+  assert.throws(() => selectMutationReviewModel(registry, "openai-codex/gpt-6-sol", luna, "max"), /inherited thinking level.*capped at xhigh/);
   const fable = fakeModel("anthropic", "claude-fable-5");
   assert.throws(() => selectMutationReviewModel(fakeRegistry([fable]), "anthropic/claude-fable-5:xhigh", undefined, "low"), /Claude Fable/);
   const bedrockFable = fakeModel("amazon-bedrock", "us.anthropic.claude-fable-5-20260901-v1:0");
@@ -815,7 +827,7 @@ test("selectMutationReviewModel resolves configured models and auth", () => {
   assert.throws(() => selectMutationReviewModel(fakeRegistry([bedrockFable]), undefined, bedrockFable, "low"), /Claude Fable/);
   const namedFable = { ...fakeModel("amazon-bedrock", "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/profile-opaque"), name: "(Claude Fable 5)" };
   assert.throws(() => selectMutationReviewModel(fakeRegistry([namedFable]), undefined, namedFable, "low"), /Claude Fable/);
-  assert.throws(() => selectMutationReviewModel(registry, "openai-codex/gpt-5.3-codex-spark", gpt), /no configured auth/);
+  assert.throws(() => selectMutationReviewModel(registry, "openai-codex/gpt-6-luna", gpt), /no configured auth/);
   assert.throws(() => selectMutationReviewModel(registry, "missing-format", gpt), /not found/);
 });
 
@@ -828,7 +840,7 @@ test("buildReuseBlockReason tells the agent how to consolidate or apply cached m
     fingerprint: "abcdef1234567890abcdef1234567890",
     operations: []
   }, {
-    model: "openai-codex/gpt-5.3-codex",
+    model: "openai-codex/gpt-6-sol",
     thinkingLevel: "high",
     toolCallCount: 2,
     durationMs: 1000,

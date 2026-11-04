@@ -8,13 +8,14 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { SessionManager, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type ExtensionAPI, type ExtensionContext, type ExtensionToolContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { registerWorkerExtension } from "../extensions/worker/index.js";
 import { currentParentRuntime, getWorker, getWorkerRun, listWorkers, markWorkerDeliverySendStarted, openWorkerRegistry, registerParentRuntime, settleWorkerRun, storePreparedSet } from "../extensions/worker/registry.js";
 import type { ManagedAsyncJobHandle, JobMeta } from "../extensions/async-shell/index.js";
 import { prepareWorkerMerges } from "../extensions/worker/merge.js";
 import { asyncJobProcessStartToken } from "../extensions/_shared/async-job.js";
 import { workerHostJobIdentity } from "../extensions/_shared/worker-host-job.js";
+import { extensionToolContext } from "./fixtures/extension-tool-context.js";
 
 const model = (provider: string, id: string) => ({ id, name: id, provider, api: "openai-responses", baseUrl: "https://example.invalid", reasoning: true, thinkingLevelMap: { xhigh: "xhigh" }, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 10000 }) as Model<Api>;
 
@@ -35,7 +36,7 @@ const a=process.argv.slice(2);if(a[0]==='where')console.log(JSON.stringify({pref
   if (options.deferSandbox) blockSandbox();
   if (options.deferRemove) removeGate = new Promise<void>((resolve) => { releaseRemove = resolve; });
   const random = () => `${(++counter).toString(16).padStart(8, "0")}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`;
-  const baseContext = { cwd: root, hasUI: options.tui ?? false, mode: options.tui ? "tui" : "rpc", sessionManager: session, modelRegistry: { hasConfiguredAuth: (candidate: Model<Api>) => options.authenticatedProviders?.includes(candidate.provider) ?? true, getAll: () => options.models ?? [model("openai-codex", "gpt-5.6-sol"), model("anthropic", "claude-opus-5-5")] }, thinkingLevel: "xhigh", isIdle: () => true, hasPendingMessages: () => false, ui: { notify(message: string) { notifications.push(message); } } } as unknown as ExtensionContext;
+  const baseContext = extensionToolContext({ cwd: root, hasUI: options.tui ?? false, mode: options.tui ? "tui" : "rpc", sessionManager: session, modelRegistry: { hasConfiguredAuth: (candidate: Model<Api>) => options.authenticatedProviders?.includes(candidate.provider) ?? true, getAll: () => options.models ?? [model("openai-codex", "gpt-5.6-sol"), model("anthropic", "claude-opus-5-5")] }, thinkingLevel: "xhigh", isIdle: () => true, hasPendingMessages: () => false, ui: { notify(message: string) { notifications.push(message); } } } as unknown as ExtensionContext);
   const dependencies = {
     runtimeRoot, roots: { stateRoot: workersRoot, workspaceRoot: workersRoot }, codeRoot: root, preparedRoot: path.join(runtimeRoot, "prepared"), targetRoot: root, bdPath, sbxPath: "/fake/sbx", random, now: () => new Date(`2026-01-01T00:00:${String(counter).padStart(2, "0")}.000Z`),
     waitForHostIdentity: async () => {}, ...(options.probeHostIdentity ? { probeHostIdentity: options.probeHostIdentity } : {}), ...(options.signalHostIdentity ? { signalHostIdentity: options.signalHostIdentity } : {}),
@@ -55,7 +56,7 @@ const a=process.argv.slice(2);if(a[0]==='where')console.log(JSON.stringify({pref
   const instances: Array<{ tools: ToolDefinition[]; handlers: Map<string, Function[]>; commands: Map<string, any>; renderers: Map<string, Function>; call(name: string, params: any): Promise<any>; event(name: string, event?: any): Promise<void>; invalidate(): void }> = [];
   const createInstance = async () => {
     let invalidated = false;
-    const context = Object.create(baseContext) as ExtensionContext;
+    const context = Object.create(baseContext) as ExtensionToolContext;
     Object.defineProperty(context, "cwd", { get: () => { if (invalidated && options.staleOnReload) throw new Error("This extension ctx is stale after session replacement or reload."); return root; } });
     Object.defineProperty(context, "sessionManager", { get: () => { if (invalidated && options.staleOnReload) throw new Error("This extension ctx is stale after session replacement or reload."); return session; } });
     if (options.staleWarningContext) Object.defineProperty(context, "mode", { get: () => { if (invalidated) throw new Error("This extension warning context is stale."); return baseContext.mode; } });

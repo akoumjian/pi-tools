@@ -1,6 +1,6 @@
 import { existsSync, lstatSync, realpathSync } from "node:fs";
 import path from "node:path";
-import { Type, type Static } from "@earendil-works/pi-ai";
+import { Type, type Static } from "typebox";
 import { WORKER_ID_PATTERN } from "../_shared/worker-id.js";
 import type { WorkerOutcome, WorkerRole } from "./registry.js";
 

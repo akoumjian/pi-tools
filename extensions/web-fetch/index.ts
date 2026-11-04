@@ -3,7 +3,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { isIP } from "node:net";
 import path from "node:path";
 import { TextDecoder } from "node:util";
-import { Type, type Static } from "@earendil-works/pi-ai";
+import { Type, type Static } from "typebox";
 import { defineTool, type AgentToolResult, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Readability } from "@mozilla/readability";

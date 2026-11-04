@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Context, Message, Model, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
+import { normalizeContext, type AssistantMessage, type Context, type Message, type Model, type ToolResultMessage, type UserMessage } from "@earendil-works/pi-ai";
 import { stream as streamAnthropic } from "@earendil-works/pi-ai/api/anthropic-messages";
 import { stream as streamOpenAICodexResponses } from "@earendil-works/pi-ai/api/openai-codex-responses";
 import { stream as streamPiMessages } from "@earendil-works/pi-ai/api/pi-messages";
@@ -194,7 +194,7 @@ async function captureAnthropicPayload(context: Context): Promise<unknown> {
   assert.ok(model);
   let payload: unknown;
   const controller = new AbortController();
-  const stream = streamAnthropic(model, context, {
+  const stream = streamAnthropic(model, normalizeContext(context), {
     apiKey: "fixture-api-key",
     signal: controller.signal,
     maxRetries: 0,
@@ -225,7 +225,7 @@ async function capturePiMessagesPayload(context: Context): Promise<unknown> {
   };
   let payload: unknown;
   const controller = new AbortController();
-  const stream = streamPiMessages(model, context, {
+  const stream = streamPiMessages(model, normalizeContext(context), {
     apiKey: "fixture-api-key",
     signal: controller.signal,
     maxRetries: 0,
@@ -242,7 +242,7 @@ async function capturePiMessagesPayload(context: Context): Promise<unknown> {
 }
 
 async function captureOpenAIPayload(context: Context): Promise<unknown> {
-  const model = getBuiltinModel("openai-codex", "gpt-5.5");
+  const model = getBuiltinModel("openai-codex", "gpt-6-luna");
   assert.ok(model);
   const fakeJwt = [
     "e30",
@@ -251,7 +251,7 @@ async function captureOpenAIPayload(context: Context): Promise<unknown> {
   ].join(".");
   let payload: unknown;
   const controller = new AbortController();
-  const stream = streamOpenAICodexResponses(model, context, {
+  const stream = streamOpenAICodexResponses(model, normalizeContext(context), {
     apiKey: fakeJwt,
     signal: controller.signal,
     maxRetries: 0,

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { zstdDecompressSync } from "node:zlib";
 import test from "node:test";
-import { InMemoryCredentialStore, type Context, type Model, type Tool } from "@earendil-works/pi-ai";
+import { InMemoryCredentialStore, normalizeContext, type Context, type Model, type Tool } from "@earendil-works/pi-ai";
 import { stream as streamOpenAICodexResponses } from "@earendil-works/pi-ai/api/openai-codex-responses";
 import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
 import {
@@ -263,7 +263,7 @@ function fakeJwt(): string {
 async function captureAdapterPayload(model: Model<any>, context: Context): Promise<Record<string, unknown>> {
   const controller = new AbortController();
   let payload: unknown;
-  const stream = streamOpenAICodexResponses(model, context, {
+  const stream = streamOpenAICodexResponses(model, normalizeContext(context), {
     apiKey: fakeJwt(),
     signal: controller.signal,
     maxRetries: 0,
@@ -485,10 +485,9 @@ test("real Codex SSE adapter sends the inherited affinity with an exact stable f
       totalTokens: 0,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
     };
-    const childContext: Context = {
-      systemPrompt: workerInstructions,
+    const childContext = normalizeContext({
       messages: [
-        ...parentContext.messages,
+        ...normalizeContext(parentContext).messages,
         {
           role: "assistant",
           content: [{ type: "text", text: "parent completion" }],
@@ -499,10 +498,18 @@ test("real Codex SSE adapter sends the inherited affinity with an exact stable f
           stopReason: "stop",
           timestamp: 2
         },
-        { role: "user", content: `initial worker assignment ${forkMarker}`, timestamp: 3 }
-      ],
-      tools: MANAGED_WORKER_TOOL_NAMES.map(sdkTool)
-    };
+        {
+          role: "system",
+          content: workerInstructions,
+          toolsAdded: MANAGED_WORKER_TOOL_NAMES
+            .filter((name) => name !== "shell_start")
+            .map(sdkTool),
+          toolsRemoved: [{ name: "parent_only" }],
+          timestamp: 3
+        },
+        { role: "user", content: `initial worker assignment ${forkMarker}`, timestamp: 4 }
+      ]
+    });
     runtime.transformHeaders(requestHeaders, codexContext());
     const stream = streamOpenAICodexResponses(model, childContext, {
       apiKey: fakeJwt(),
@@ -528,15 +535,29 @@ test("real Codex SSE adapter sends the inherited affinity with an exact stable f
     assert.equal(request.headers.get("session-id"), inheritedAffinity);
     assert.equal(request.headers.get("x-client-request-id"), "distinct-child-session-and-request-id");
     const body = request.body as Record<string, any>;
+    const capturedParentInput = capturedParent.input as Record<string, unknown>[];
     assert.equal(body.instructions, capturedParent.instructions);
-    assert.deepEqual(body.input.slice(0, 1), capturedParent.input);
-    assert.equal(body.input[2].type, "additional_tools");
+    assert.deepEqual(body.input.slice(0, capturedParentInput.length), capturedParentInput);
+    const boundaryIndex = body.input.findIndex((item: Record<string, unknown>, index: number) =>
+      index >= capturedParentInput.length &&
+      item.type === "additional_tools" &&
+      Array.isArray(item.tools) &&
+      item.tools.some((tool: Record<string, unknown>) => tool.name === "worker_beads_tasks")
+    );
+    assert.ok(boundaryIndex >= capturedParentInput.length);
     assert.deepEqual(
-      body.input[2].tools.map((tool: Record<string, unknown>) => tool.name),
+      body.input[boundaryIndex].tools.map((tool: Record<string, unknown>) => tool.name),
       MANAGED_WORKER_TOOL_NAMES.filter((name) => name !== "shell_start")
     );
-    assert.equal(body.input[3].content[1].text, workerInstructions);
-    assert.match(body.input[4].content[0].text, new RegExp(forkMarker));
+    const assignmentIndex = body.input.findIndex((item: Record<string, unknown>) =>
+      item.role === "user" && JSON.stringify(item).includes(forkMarker)
+    );
+    assert.ok(assignmentIndex > boundaryIndex);
+    const boundaryInstructions = body.input.slice(boundaryIndex + 1, assignmentIndex)
+      .map((item: Record<string, unknown>) => JSON.stringify(item))
+      .join("\n");
+    assert.match(boundaryInstructions, /WORKER_CWD_SENTINEL/);
+    assert.match(JSON.stringify(body.input[assignmentIndex]), new RegExp(forkMarker));
     assert.deepEqual(
       body.tool_choice.tools.map((tool: Record<string, unknown>) => tool.name),
       MANAGED_WORKER_TOOL_NAMES
@@ -549,7 +570,7 @@ test("real Codex SSE adapter sends the inherited affinity with an exact stable f
   }
 });
 
-test("Pi 0.84.4 dispatches header, payload, final transport, and acceptance hooks in the proven lineage order", async () => {
+test("Pi 1.5 dispatches header, payload, final transport, and acceptance hooks in the proven lineage order", async () => {
   const root = mkdtempSync(path.join(tmpdir(), "worker-lineage-real-pi-hooks-"));
   const cwd = path.join(root, "repo");
   const agentDir = path.join(root, "agent");
@@ -704,8 +725,13 @@ test("Pi 0.84.4 dispatches header, payload, final transport, and acceptance hook
     assert.deepEqual(requests[1]!.body.input.slice(0, requests[0]!.body.input.length), requests[0]!.body.input);
     assert.equal(requests[1]!.body.previous_response_id, undefined);
     assert.equal(requests[2]!.body.previous_response_id, undefined);
-    const boundaryIndex = requests[1]!.body.input.findIndex((item: Record<string, unknown>) => item.type === "additional_tools");
-    assert.ok(boundaryIndex > requests[0]!.body.input.length);
+    const boundaryIndex = requests[1]!.body.input.findIndex((item: Record<string, unknown>, index: number) =>
+      index >= requests[0]!.body.input.length &&
+      item.type === "additional_tools" &&
+      Array.isArray(item.tools) &&
+      item.tools.some((tool: Record<string, unknown>) => tool.name === "worker_beads_tasks")
+    );
+    assert.ok(boundaryIndex >= requests[0]!.body.input.length);
     assert.deepEqual(
       requests[2]!.body.input.slice(0, boundaryIndex + 3),
       requests[1]!.body.input.slice(0, boundaryIndex + 3),
@@ -736,9 +762,11 @@ test("Pi 0.84.4 dispatches header, payload, final transport, and acceptance hook
     assert.notEqual(requests[4]!.headers.get("session-id"), parentManager.getSessionId());
     assert.equal(requests[4]!.body.previous_response_id, undefined);
     assert.equal(
-      requests[4]!.body.input.some((item: Record<string, unknown>) => item.type === "additional_tools"),
+      requests[4]!.body.input.some((item: Record<string, unknown>) =>
+        JSON.stringify(item).includes("This is an isolated managed-worker fork.")
+      ),
       false,
-      "retired lineage uses Pi's ordinary fresh post-compaction payload"
+      "retired lineage uses Pi's ordinary fresh post-compaction payload without the custom fork boundary"
     );
     assert.deepEqual(summarizeWorkerCacheLineage(record), {
       mode: "retired",

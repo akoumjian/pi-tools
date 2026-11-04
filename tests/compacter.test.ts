@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { getCurrentSystemPrompt } from "@earendil-works/pi-ai";
 import {
+  buildCompacterTranscript,
   chunkTexts,
   classifyAnthropicFailure,
   createSummarizationBudget,
@@ -43,6 +45,14 @@ test("createSummarizationBudget leaves input budget below model context", () => 
   assert.equal(budget.finalMaxTokens, 13_107);
   assert.equal(budget.intermediateMaxTokens, 4_096);
   assert.equal(budget.chunkInputTokens, 40_000);
+});
+
+test("compacter builds a normalized transcript that preserves system and user payloads", () => {
+  const transcript = buildCompacterTranscript("COMPACTION_PAYLOAD_SENTINEL");
+  assert.match(getCurrentSystemPrompt(transcript.messages), /context summarization assistant/);
+  assert.equal(transcript.messages[1]?.role, "user");
+  assert.match(JSON.stringify(transcript.messages[1]), /COMPACTION_PAYLOAD_SENTINEL/);
+  assert.equal("systemPrompt" in transcript, false);
 });
 
 test("classifyAnthropicFailure distinguishes 429 usage limits from overloads", () => {

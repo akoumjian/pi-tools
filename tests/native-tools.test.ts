@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { withFileMutationQueue, type ExtensionAPI, type ExtensionContext, type MessageRenderer, type Skill, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { withFileMutationQueue, type ExtensionAPI, type ExtensionContext, type ExtensionToolContext, type MessageRenderer, type Skill, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import asyncShellExtension from "../extensions/async-shell/index.js";
 import nativeToolsExtension, {
   buildNativeToolsStatusText,
@@ -16,6 +16,7 @@ import nativeToolsExtension, {
   searchMany,
   writeMany
 } from "../extensions/native-tools/index.js";
+import { extensionToolContext } from "./fixtures/extension-tool-context.js";
 
 type FakeApi = ExtensionAPI & {
   activeTools: string[];
@@ -43,8 +44,8 @@ const renderTheme = {
   bold: (text: string) => text
 };
 
-function createContext(cwd: string, imageSupport?: boolean): ExtensionContext {
-  return {
+function createContext(cwd: string, imageSupport?: boolean): ExtensionToolContext {
+  return extensionToolContext({
     cwd,
     sessionManager: {
       getSessionId: () => `test-session:${cwd}`
@@ -54,7 +55,7 @@ function createContext(cwd: string, imageSupport?: boolean): ExtensionContext {
       provider: "fixture",
       input: imageSupport ? ["text", "image"] : ["text"]
     }
-  } as ExtensionContext;
+  } as ExtensionContext);
 }
 
 function createFakeApi(activeTools: string[], allToolNames: string[]): FakeApi {
@@ -123,7 +124,7 @@ function renderToolResult(tool: ToolDefinition, result: unknown, expanded = fals
 
 function renderCustomMessage(api: FakeApi, customType: string, message: unknown): string {
   const renderer = required(api.messageRenderers.get(customType), `${customType} message renderer`);
-  return renderer(message as never, { expanded: false, outputPad: 0 }, renderTheme as never)?.render(200).join("\n") ?? "";
+  return renderer(message as never, { expanded: false, outputPad: 0, keyText: () => "", keyHint: (_key, description) => description }, renderTheme as never)?.render(200).join("\n") ?? "";
 }
 
 function schemaFor(tool: ToolDefinition): SchemaNode {
@@ -1133,15 +1134,28 @@ test("read_many preserves mixed text-summary and image-attachment input ordering
 
 test("read_many uses the host image pipeline's dimension and inline-size resizing", async () => {
   await withTempDir(async (dir) => {
-    const largePng = await readFile(path.join(process.cwd(), "node_modules/@earendil-works/pi-coding-agent/docs/images/interactive-mode.png"));
-    await writeFile(path.join(dir, "tall.png"), largePng);
+    const width = 10;
+    const height = 2500;
+    const rowBytes = Math.ceil((width * 3) / 4) * 4;
+    const pixelBytes = rowBytes * height;
+    const largeBmp = Buffer.alloc(54 + pixelBytes);
+    largeBmp.write("BM", 0, "ascii");
+    largeBmp.writeUInt32LE(largeBmp.length, 2);
+    largeBmp.writeUInt32LE(54, 10);
+    largeBmp.writeUInt32LE(40, 14);
+    largeBmp.writeInt32LE(width, 18);
+    largeBmp.writeInt32LE(height, 22);
+    largeBmp.writeUInt16LE(1, 26);
+    largeBmp.writeUInt16LE(24, 28);
+    largeBmp.writeUInt32LE(pixelBytes, 34);
+    await writeFile(path.join(dir, "tall.bmp"), largeBmp);
 
-    const result = await readMany(createContext(dir, true), { files: [{ path: "tall.png" }] });
+    const result = await readMany(createContext(dir, true), { files: [{ path: "tall.bmp" }] });
 
     const file = requiredImageReadFile(result.details.files[0]);
-    assert.equal(file.inputMimeType, "image/png");
+    assert.equal(file.inputMimeType, "image/bmp");
     assert.match(file.mimeType, /^image\/(png|jpeg)$/);
-    assert.match(textFromResult(result), /original 1726x2162, displayed at 1597x2000/);
+    assert.match(textFromResult(result), /original 10x2500, displayed at 8x2000/);
     assert.equal(imageBlocks(result).length, 1);
   });
 });

@@ -3,6 +3,7 @@ import type {
   ImageContent,
   Message,
   Model,
+  SystemMessage,
   TextContent,
   ThinkingContent,
   ToolCall,
@@ -287,6 +288,8 @@ function projectModel(model: Model<any>, thinkingLevel: string) {
 
 function projectMessage(message: Message, mode: ContextCopyMode, environmentSecrets: readonly string[]): unknown {
   switch (message.role) {
+    case "system":
+      return projectSystemMessage(message, mode, environmentSecrets);
     case "user":
       return projectUserMessage(message, mode, environmentSecrets);
     case "assistant":
@@ -298,6 +301,32 @@ function projectMessage(message: Message, mode: ContextCopyMode, environmentSecr
       throw new Error(`unsupported context message role: ${String((unsupported as { role?: unknown }).role)}`);
     }
   }
+}
+
+function projectSystemMessage(message: SystemMessage, mode: ContextCopyMode, environmentSecrets: readonly string[]) {
+  const result: Record<string, unknown> = {
+    role: message.role,
+    content: typeof message.content === "string"
+      ? mode === "raw" ? message.content : redactSensitiveText(message.content, environmentSecrets)
+      : message.content.map((content) => projectText(content, mode, environmentSecrets)),
+    timestamp: message.timestamp
+  };
+  if (message.sections !== undefined) {
+    result.sections = Object.fromEntries(Object.entries(message.sections).map(([name, value]) => [
+      name,
+      value === null || mode === "raw" ? value : redactSensitiveText(value, environmentSecrets)
+    ]));
+  }
+  if (message.toolsAdded !== undefined) {
+    result.toolsAdded = message.toolsAdded.map((tool) => ({
+      name: tool.name,
+      description: mode === "raw" ? tool.description : redactSensitiveText(tool.description, environmentSecrets),
+      parameters: tool.parameters,
+      ...(tool.constrainedSampling === undefined ? {} : { constrainedSampling: tool.constrainedSampling })
+    }));
+  }
+  if (message.toolsRemoved !== undefined) result.toolsRemoved = message.toolsRemoved;
+  return result;
 }
 
 function projectUserMessage(message: UserMessage, mode: ContextCopyMode, environmentSecrets: readonly string[]) {
@@ -343,7 +372,9 @@ function projectToolResultMessage(
     isError: message.isError,
     timestamp: message.timestamp
   };
-  if (message.addedToolNames !== undefined) result.addedToolNames = message.addedToolNames;
+  if (message.usage !== undefined) result.usage = message.usage;
+  if (message.durationMs !== undefined) result.durationMs = message.durationMs;
+  if (message.nestedCalls !== undefined) result.nestedCalls = mode === "raw" ? message.nestedCalls : redactUnknown(message.nestedCalls, environmentSecrets);
   return result;
 }
 

@@ -85,7 +85,7 @@ File mutations inside that root are treated as routine; mutations outside it are
 
 1. Pick a reasoning-friendly cheap-and-fast model. Example:
    ```text
-   /safety:setup openai-codex/gpt-5.3-codex-spark:medium
+   /safety:setup openai-codex/gpt-6-luna:low
    ```
    This writes `approvalModel` into your Pi profile's tool-safety settings.
 2. (Optional) Export a trusted workspace:

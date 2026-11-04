@@ -1,4 +1,4 @@
-import { Type, type Static } from "@earendil-works/pi-ai";
+import { Type, type Static } from "typebox";
 
 export const CompletionDeliverySchema = Type.Union(
   [Type.Literal("steer"), Type.Literal("followUp")],

@@ -3,7 +3,8 @@ import { constants } from "node:fs";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { Type, type Api, type AssistantMessage, type Model, type Static, type TextContent, type ToolCall } from "@earendil-works/pi-ai";
+import { normalizeContext, type Api, type AssistantMessage, type Model, type TextContent, type ToolCall } from "@earendil-works/pi-ai";
+import { Type, type Static } from "typebox";
 import {
   buildSessionContext,
   convertToLlm,
@@ -1525,7 +1526,7 @@ function buildMutationReviewDecisionRepairTask(): string {
 }
 
 function buildMutationReviewTask(context: ExtensionContext, proposal: FileMutationProposal, settings: MutationReviewSettings): string {
-  const parentContext = buildParentContext(context, settings);
+  const parentContext = buildMutationReviewParentContext(context, settings);
   return [
     "Review the proposed mutation below.",
     `Keep the ${DECISION_TOOL_NAME} summary and suggestedPath under ${settings.maxOutputTokens} tokens.`,
@@ -1566,12 +1567,12 @@ function formatMutationReviewGuidance(guidance: string | undefined): string[] {
   ];
 }
 
-function buildParentContext(context: ExtensionContext, settings: MutationReviewSettings): string {
+export function buildMutationReviewParentContext(context: ExtensionContext, settings: MutationReviewSettings): string {
   const entries = context.sessionManager.getEntries();
   const leafId = context.sessionManager.getLeafId();
   const sessionContext = buildSessionContext(entries, leafId);
-  const messages = convertToLlm(sessionContext.messages);
-  return serializeRecentMessages(messages, settings.maxRecentMessages, settings.maxTranscriptChars);
+  const transcript = normalizeContext({ messages: convertToLlm(sessionContext.messages) });
+  return serializeRecentMessages(transcript, settings.maxRecentMessages, settings.maxTranscriptChars);
 }
 
 function formatProposalSummary(proposal: FileMutationProposal): string {

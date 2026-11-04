@@ -3,13 +3,14 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import { getCurrentSystemPrompt, type Api, type Model } from "@earendil-works/pi-ai";
 import { SessionManager, type ExtensionAPI, type ExtensionContext, type ToolCallEvent } from "@earendil-works/pi-coding-agent";
 import toolSafetyExtension, {
   applyModelApproval,
   applyReviewCriteria,
   buildHumanReviewConfirmOptions,
   buildHumanReviewPrompt,
+  buildToolSafetyApprovalTranscript,
   buildToolSafetyStatusText,
   configuredApprovalModel,
   configuredToolSafetyReviewCriteria,
@@ -106,7 +107,7 @@ function createToolSafetyApi(): FakeToolSafetyApi {
   } as unknown as FakeToolSafetyApi;
 }
 
-function fakeToolSafetyCommandContext(models: Model<Api>[] = [fakeModel("openai-codex", "gpt-5.3-codex-spark")]) {
+function fakeToolSafetyCommandContext(models: Model<Api>[] = [fakeModel("openai-codex", "gpt-6-luna")]) {
   const notifications: Array<{ message: string; type: string }> = [];
   return {
     notifications,
@@ -175,28 +176,36 @@ function refreshingFakeRegistry(initialModels: Model<Api>[], refreshedModels: Mo
   };
 }
 
+test("tool-safety builds a normalized transcript preserving judge instructions and review payload", () => {
+  const transcript = buildToolSafetyApprovalTranscript("TOOL_REVIEW_PAYLOAD_SENTINEL");
+  assert.match(getCurrentSystemPrompt(transcript.messages), /tool safety approval judge/);
+  assert.equal(transcript.messages[1]?.role, "user");
+  assert.match(JSON.stringify(transcript.messages[1]), /TOOL_REVIEW_PAYLOAD_SENTINEL/);
+  assert.equal("systemPrompt" in transcript, false);
+});
+
 test("tool-safety approval model parsing preserves default low thinking for string config", () => {
-  const model = fakeModel("openai-codex", "gpt-5.3-codex-spark");
-  const preference = parseApprovalModelPreference("openai-codex/gpt-5.3-codex-spark");
-  assert.deepEqual(preference, { model: "openai-codex/gpt-5.3-codex-spark" });
+  const model = fakeModel("openai-codex", "gpt-6-luna");
+  const preference = parseApprovalModelPreference("openai-codex/gpt-6-luna");
+  assert.deepEqual(preference, { model: "openai-codex/gpt-6-luna" });
 
   const selection = resolveApprovalModelPreference(preference, fakeRegistry([model]));
   assert.deepEqual(selection, {
     model,
-    modelName: "openai-codex/gpt-5.3-codex-spark",
+    modelName: "openai-codex/gpt-6-luna",
     thinkingLevel: "low"
   });
 });
 
 test("tool-safety approval model supports inline thinking suffixes", () => {
-  const model = fakeModel("openai-codex", "gpt-5.3-codex-spark");
-  const preference = parseApprovalModelPreference("openai-codex/gpt-5.3-codex-spark:high");
-  assert.deepEqual(preference, { model: "openai-codex/gpt-5.3-codex-spark", thinkingLevel: "high" });
+  const model = fakeModel("openai-codex", "gpt-6-luna");
+  const preference = parseApprovalModelPreference("openai-codex/gpt-6-luna:high");
+  assert.deepEqual(preference, { model: "openai-codex/gpt-6-luna", thinkingLevel: "high" });
 
   const selection = resolveApprovalModelPreference(preference, fakeRegistry([model]));
   assert.deepEqual(selection, {
     model,
-    modelName: "openai-codex/gpt-5.3-codex-spark",
+    modelName: "openai-codex/gpt-6-luna",
     thinkingLevel: "high"
   });
 });
@@ -257,9 +266,9 @@ test("file mutations outside the project are reviewed when no trusted workspace 
 test("tool-safety status reports config model and runtime overrides", () => {
   setRuntimeApprovalModelPreference(undefined);
   setRuntimeToolSafetyEnabled(true);
-  const spark = fakeModel("openai-codex", "gpt-5.3-codex-spark");
+  const luna = fakeModel("openai-codex", "gpt-6-luna");
   const claude = fakeModel("anthropic", "claude-opus-4-7");
-  const registry = fakeRegistry([spark, claude]);
+  const registry = fakeRegistry([luna, claude]);
 
   const initialStatus = buildToolSafetyStatusText({ modelRegistry: registry } as never);
   assert.match(initialStatus, /Enforcement: enabled/);
@@ -284,7 +293,7 @@ test("tool-safety warns once per session start when the approval model remains u
   toolSafetyExtension(api);
   const handler = api.handlers.get("session_start")?.[0];
   assert.ok(handler);
-  const { context, notifications } = fakeToolSafetyCommandContext([fakeModel("openai-codex", "gpt-5.3-codex-spark")]);
+  const { context, notifications } = fakeToolSafetyCommandContext([fakeModel("openai-codex", "gpt-6-luna")]);
 
   try {
     await handler({ type: "session_start", reason: "startup" }, { ...context, hasUI: true });
@@ -310,7 +319,7 @@ test("tool-safety refreshes a stale registry before warning that the approval mo
   const handler = api.handlers.get("session_start")?.[0];
   assert.ok(handler);
   const reviewModel = fakeModel("openai", "review-model");
-  const registry = refreshingFakeRegistry([fakeModel("openai-codex", "gpt-5.3-codex-spark")], [reviewModel]);
+  const registry = refreshingFakeRegistry([fakeModel("openai-codex", "gpt-6-luna")], [reviewModel]);
   const notifications: Array<{ message: string; type: string }> = [];
   const context = {
     modelRegistry: registry,
@@ -389,7 +398,7 @@ test("tool-safety-model command sets and resets a validated runtime approval mod
   const api = createToolSafetyApi();
   toolSafetyExtension(api);
   const { context, notifications } = fakeToolSafetyCommandContext([
-    fakeModel("openai-codex", "gpt-5.3-codex-spark"),
+    fakeModel("openai-codex", "gpt-6-luna"),
     fakeModel("anthropic", "claude-opus-4-7")
   ]);
   const modelCommand = api.commands.get("safety:model");
@@ -418,7 +427,7 @@ test("tool-safety-model command rejects unavailable models without changing the 
   setRuntimeToolSafetyEnabled(true);
   const api = createToolSafetyApi();
   toolSafetyExtension(api);
-  const { context, notifications } = fakeToolSafetyCommandContext([fakeModel("openai-codex", "gpt-5.3-codex-spark")]);
+  const { context, notifications } = fakeToolSafetyCommandContext([fakeModel("openai-codex", "gpt-6-luna")]);
   const modelCommand = api.commands.get("safety:model");
   assert.ok(modelCommand);
 
@@ -947,7 +956,7 @@ test("safety model allow is no longer downgraded to human review by host risk", 
       risk: "high",
       confidence: "high",
       reason: "The user explicitly requested this exact local installer command.",
-      model: "openai-codex/gpt-5.3-codex-spark",
+      model: "openai-codex/gpt-6-luna",
       raw: "{}"
     }
   );

@@ -1,5 +1,5 @@
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { type Api, type AssistantMessage, type Model, type Provider, type ProviderHeaders, type SimpleStreamOptions } from "@earendil-works/pi-ai";
+import { normalizeContext, type Api, type AssistantMessage, type Model, type Provider, type ProviderHeaders, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import {
   convertToLlm,
   estimateTokens,
@@ -453,10 +453,8 @@ async function completePrompt(promptText: string, options: CompletionOptions, ma
   }
 
   stats.modelCalls += 1;
-  const response = await options.provider.streamSimple(options.model, {
-    systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
-    messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }]
-  }, completionOptions).result();
+  const transcript = buildCompacterTranscript(promptText);
+  const response = await options.provider.streamSimple(options.model, transcript, completionOptions).result();
 
   if (response.stopReason === "error") {
     throw new Error(formatSummarizationFailure(response, options.model));
@@ -806,6 +804,13 @@ function isStringArray(value: unknown): value is string[] {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+export function buildCompacterTranscript(promptText: string) {
+  return normalizeContext({
+    systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
+    messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }]
+  });
 }
 
 export function estimateMessagesForTesting(messages: AgentMessage[]): number {

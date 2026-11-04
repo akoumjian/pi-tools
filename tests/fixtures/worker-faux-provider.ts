@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall, getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai";
 
 const PROVIDER = "worker-faux";
 const MODEL = "worker-faux-1";
@@ -38,13 +38,13 @@ export default function workerFauxProviderExtension(api: ExtensionAPI): void {
   faux.setResponses([
     (context) => {
       const serialized = JSON.stringify(context.messages);
-      const toolNames = (context.tools ?? []).map((tool) => tool.name).sort();
+      const toolNames = getCurrentTools(context.messages).map((tool) => tool.name).sort();
       const checks = {
         exactParentContext: serialized.includes("PARENT_EXACT_MARKER"),
         workerPrompt: serialized.includes("WORKER_PROMPT_MARKER"),
         gitOptionalLocksDisabled: process.env.GIT_OPTIONAL_LOCKS === "0",
         requiredGitMutationLocks,
-        projectPoisonAbsent: !(context.systemPrompt ?? "").includes("WORKSPACE_SYSTEM_POISON") && !serialized.includes("WORKSPACE_SYSTEM_POISON"),
+        projectPoisonAbsent: !getCurrentSystemPrompt(context.messages).includes("WORKSPACE_SYSTEM_POISON") && !serialized.includes("WORKSPACE_SYSTEM_POISON"),
         exactTools: JSON.stringify(toolNames) === JSON.stringify(["shell_cancel", "shell_read", "shell_start", "shell_status", "worker_beads_tasks", "worker_result_submit"])
       };
       const passed = Object.values(checks).every(Boolean);

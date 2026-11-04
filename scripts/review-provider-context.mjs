@@ -19,11 +19,13 @@ const [
   { stream: streamAnthropic },
   { stream: streamOpenAICodexResponses },
   { getBuiltinModel: getModel },
+  { normalizeContext },
   { discoverAndLoadExtensions }
 ] = await Promise.all([
   import("@earendil-works/pi-ai/api/anthropic-messages"),
   import("@earendil-works/pi-ai/api/openai-codex-responses"),
   import("@earendil-works/pi-ai/providers/all"),
+  import("@earendil-works/pi-ai"),
   import("@earendil-works/pi-coding-agent")
 ]);
 
@@ -238,14 +240,14 @@ const messages = [
     content: [{ type: "toolCall", id: "call_fixture_read_many", name: "read_many", arguments: { files: [{ path: "fixture.txt" }] } }],
     api: "openai-codex-responses",
     provider: "openai-codex",
-    model: "gpt-5.5",
+    model: "gpt-6-luna",
     usage,
     stopReason: "toolUse",
     timestamp: 0
   },
   internalToolResult
 ];
-const context = { systemPrompt, messages, tools: providerTools };
+const context = normalizeContext({ systemPrompt, messages, tools: providerTools });
 const fakeJwt = [
   "e30",
   Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acct_fixture" } })).toString("base64url"),
@@ -275,7 +277,7 @@ async function capturePayload(streamFunction, model, apiKey, options = {}) {
 
 const openaiPayload = await capturePayload(
   streamOpenAICodexResponses,
-  getModel("openai-codex", "gpt-5.5"),
+  getModel("openai-codex", "gpt-6-luna"),
   fakeJwt,
   { transport: "sse" }
 );

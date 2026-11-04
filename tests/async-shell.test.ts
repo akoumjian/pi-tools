@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import test from "node:test";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ExtensionToolContext, Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import asyncShellExtension, {
   ASYNC_SHELL_ACTIVITY_STATUS_KEY,
@@ -38,6 +38,7 @@ import asyncShellExtension, {
 import { managedWorkerEvidenceReason, readManagedWorkerHostJobIds, scanAsyncShellRetention } from "../extensions/async-shell/retention.js";
 import { workerHostJobIdentity } from "../extensions/_shared/worker-host-job.js";
 import { openWorkerRegistry } from "../extensions/worker/registry.js";
+import { extensionToolContext } from "./fixtures/extension-tool-context.js";
 
 type SentMessage = {
   message: unknown;
@@ -52,15 +53,15 @@ type FakeApi = ExtensionAPI & {
   emit(event: string, data: unknown, context: ExtensionContext): Promise<void>;
 };
 
-function createContext(cwd: string, isIdle: boolean | (() => boolean) = true): ExtensionContext {
-  return {
+function createContext(cwd: string, isIdle: boolean | (() => boolean) = true): ExtensionToolContext {
+  return extensionToolContext({
     cwd,
     sessionManager: {
       getSessionId: () => `test-session:${cwd}`
     },
     isIdle: typeof isIdle === "function" ? isIdle : () => isIdle,
     hasPendingMessages: () => false
-  } as ExtensionContext;
+  } as ExtensionContext);
 }
 
 function createFakeApi(): FakeApi {
@@ -574,7 +575,7 @@ test("async-shell activity status is compact, themed, exact-session scoped, and 
         theme,
         setStatus(key: string, text: string | undefined): void { statuses.push({ key, text }); }
       }
-    } as unknown as ExtensionContext;
+    } as unknown as ExtensionToolContext;
 
     assert.equal(renderAsyncShellActivityStatus(0, theme), undefined);
     assert.equal(renderAsyncShellActivityStatus(3, theme), "<warning>sh3</warning>");
@@ -628,7 +629,7 @@ test("async-shell activity status is compact, themed, exact-session scoped, and 
     const otherSession = {
       ...context,
       sessionManager: { getSessionId: () => "other-session" }
-    } as ExtensionContext;
+    } as unknown as ExtensionContext;
     assert.equal(activeAsyncShellJobCount(otherSession), 0, "activity never crosses session identity");
 
     await run;
@@ -661,7 +662,7 @@ test("async-shell activity survives a fresh module reload and old completion cle
         theme: plainTheme,
         setStatus(_key: string, text: string | undefined): void { originalStatuses.push(text); }
       }
-    } as unknown as ExtensionContext;
+    } as unknown as ExtensionToolContext;
     await originalApi.emit("session_start", { reason: "startup" }, context);
     const shellStart = required(originalApi.registeredTools.find((candidate) => candidate.name === "shell_start"), "shell_start tool");
     const running = shellStart.execute(
@@ -685,7 +686,7 @@ test("async-shell activity survives a fresh module reload and old completion cle
         theme: plainTheme,
         setStatus(_key: string, text: string | undefined): void { freshStatuses.push(text); }
       }
-    } as ExtensionContext;
+    } as unknown as ExtensionContext;
     await freshApi.emit("session_start", { reason: "reload" }, freshContext);
     assert.equal(freshModule.activeAsyncShellJobCount(freshContext), 1, "the fresh module reuses the canonical live job map");
     assert.equal(freshStatuses.at(-1), "sh1");
@@ -887,14 +888,14 @@ test("async-shell activity listener failures do not block another live listener"
       mode: "tui",
       hasUI: true,
       sessionManager: { getSessionId: () => "listener-failure-session" }
-    } as ExtensionContext;
+    } as unknown as ExtensionToolContext;
     const throwingContext = {
       ...base,
       ui: {
         theme: plainTheme,
         setStatus(_key: string, text: string | undefined): void { if (text !== undefined) throw new Error("display failed"); }
       }
-    } as ExtensionContext;
+    } as unknown as ExtensionContext;
     const observed: Array<string | undefined> = [];
     const observingContext = {
       ...base,
@@ -902,7 +903,7 @@ test("async-shell activity listener failures do not block another live listener"
         theme: plainTheme,
         setStatus(_key: string, text: string | undefined): void { observed.push(text); }
       }
-    } as ExtensionContext;
+    } as ExtensionToolContext;
     await throwingApi.emit("session_start", { reason: "startup" }, throwingContext);
     await observingApi.emit("session_start", { reason: "startup" }, observingContext);
     const shellStart = required(observingApi.registeredTools.find((candidate) => candidate.name === "shell_start"), "shell_start tool");
@@ -1960,7 +1961,7 @@ test("shell_cancel transitions a running job to cancelled and suppresses complet
         theme: plainTheme,
         setStatus(_key: string, text: string | undefined): void { statuses.push(text); }
       }
-    } as unknown as ExtensionContext;
+    } as unknown as ExtensionToolContext;
     await api.emit("session_start", { reason: "startup" }, context);
     const shellStart = required(api.registeredTools.find((tool) => tool.name === "shell_start"), "shell_start tool");
     const shellCancel = required(api.registeredTools.find((tool) => tool.name === "shell_cancel"), "shell_cancel tool");

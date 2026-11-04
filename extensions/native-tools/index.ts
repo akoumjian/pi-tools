@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { Type, type Static } from "@earendil-works/pi-ai";
+import { Type, type Static } from "typebox";
 import {
   createReadToolDefinition,
   defineTool,
@@ -11,6 +11,7 @@ import {
   type BuildSystemPromptOptions,
   type ExtensionAPI,
   type ExtensionContext,
+  type ExtensionToolContext,
   type Skill
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
@@ -858,7 +859,7 @@ function escapeXml(text: string): string {
 }
 
 export async function readMany(
-  context: ExtensionContext,
+  context: ExtensionToolContext,
   input: ReadManyInput,
   signal?: AbortSignal,
   limits: ReadManyLimits = DEFAULT_READ_MANY_LIMITS
@@ -1448,7 +1449,7 @@ function validateReadManyLimits(limits: ReadManyLimits): void {
 }
 
 async function readImageOne(
-  context: ExtensionContext,
+  context: ExtensionToolContext,
   prepared: PreparedReadFile,
   signal?: AbortSignal
 ): Promise<ReadImageFileResult> {

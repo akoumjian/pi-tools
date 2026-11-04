@@ -230,6 +230,30 @@ test("redacted snapshot includes active prompt, tools, messages, and safe placeh
   assert.match(String(asRecord(asArray(projectedResult.content)[0]).text), /Bearer \[REDACTED\]/);
 });
 
+test("snapshot preserves Pi 1.5 system-message transcript updates and tool deltas", () => {
+  const sessionManager = SessionManager.inMemory("/context-copy-test");
+  sessionManager.appendMessage({
+    role: "system",
+    content: "Updated instructions with api_key=system-secret",
+    sections: { policy: "Keep system-secret safe" },
+    toolsAdded: [{ name: "nested_read", description: "Use system-secret carefully", parameters: { type: "object", properties: { token: { type: "string" } } } }],
+    toolsRemoved: [{ name: "old_tool" }],
+    timestamp: 1
+  });
+  sessionManager.appendMessage({ role: "user", content: "continue", timestamp: 2 });
+  const fake = createFakeApi([]);
+  const { context } = createContext({ sessionManager });
+  const snapshot = buildContextCopySnapshot(fake.api, context, "redacted", { TEST_API_KEY: "system-secret" });
+  const system = asRecord(snapshot.messages[0]);
+  assert.equal(system.role, "system");
+  assert.match(String(system.content), /\[REDACTED\]/);
+  assert.equal(asRecord(system.sections).policy, "Keep [REDACTED] safe");
+  const added = asRecord(asArray(system.toolsAdded)[0]);
+  assert.match(String(added.description), /\[REDACTED\]/);
+  assert.ok(asRecord(asRecord(asRecord(added.parameters).properties).token));
+  assert.deepEqual(system.toolsRemoved, [{ name: "old_tool" }]);
+});
+
 test("raw snapshot preserves thinking, images, signatures, and text after explicit mode selection", () => {
   const sessionManager = SessionManager.inMemory("/context-copy-test");
   sessionManager.appendMessage({

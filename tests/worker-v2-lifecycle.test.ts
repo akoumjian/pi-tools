@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { SessionManager, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type ExtensionAPI, type ExtensionContext, type ExtensionToolContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Check } from "typebox/value";
 import { registerWorkerExtension } from "../extensions/worker/index.js";
 import { createWorkerAndRun, getWorker, getWorkerRun, listWorkers, openWorkerRegistry, registerParentRuntime, storePreparedSet } from "../extensions/worker/registry.js";
@@ -17,6 +17,7 @@ import { workerHostJobIdentity } from "../extensions/_shared/worker-host-job.js"
 import { RetainedToolOutputSchemas } from "../extensions/_shared/tool-output.js";
 import { prepareWorkerMerges } from "../extensions/worker/merge.js";
 import { loadCleanupSnapshot, planSettledWorkerHostLogs, removeCompletedPreparedAuditFilesystem } from "../extensions/worker/cleanup.js";
+import { extensionToolContext } from "./fixtures/extension-tool-context.js";
 
 const model = (provider: string, id: string) => ({ id, name: id, provider, api: "openai-responses", baseUrl: "https://example.invalid", reasoning: true, thinkingLevelMap: { xhigh: "xhigh" }, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 10000 }) as Model<Api>;
 
@@ -34,7 +35,7 @@ const a=process.argv.slice(2);if(a[0]==='where')console.log(JSON.stringify({pref
   const messages: any[] = []; const messageAttempts: any[] = []; const notifications: string[] = []; const launches: Launch[] = []; const created: string[] = []; const removed: string[] = []; const cleanupAnnouncements: Promise<void>[] = [];
   let releaseSandbox = () => {}; const sandboxGate = options.deferSandbox ? new Promise<void>((resolve) => { releaseSandbox = resolve; }) : undefined; let removeFailures = 0; let cleanupHostLogRaces = 0; let discardRootFailures = 0; let preparedAuditDeleteFailures = 0; let preparedAuditClaimDeleteFailures = 0; let counter = 0;
   const random = () => `${(++counter).toString(16).padStart(8, "0")}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`;
-  const baseContext = { cwd: root, hasUI: options.tui ?? false, mode: options.tui ? "tui" : "rpc", sessionManager: session, modelRegistry: { hasConfiguredAuth: () => true, getAll: () => [model("openai-codex", "gpt-5.6-sol"), model("anthropic", "claude-opus-5-5")] }, thinkingLevel: "xhigh", isIdle: () => true, hasPendingMessages: () => false, ui: { notify(message: string) { notifications.push(message); } } } as unknown as ExtensionContext;
+  const baseContext = extensionToolContext({ cwd: root, hasUI: options.tui ?? false, mode: options.tui ? "tui" : "rpc", sessionManager: session, modelRegistry: { hasConfiguredAuth: () => true, getAll: () => [model("openai-codex", "gpt-5.6-sol"), model("anthropic", "claude-opus-5-5")] }, thinkingLevel: "xhigh", isIdle: () => true, hasPendingMessages: () => false, ui: { notify(message: string) { notifications.push(message); } } } as unknown as ExtensionContext);
   const dependencies = {
     runtimeRoot, roots: { stateRoot: workersRoot, workspaceRoot: workersRoot }, codeRoot: root, preparedRoot: path.join(runtimeRoot, "prepared"), targetRoot: root, bdPath, sbxPath: "/fake/sbx", ...(options.sandboxRelease ? { sandboxRelease: options.sandboxRelease } : {}), random, now: () => new Date(`2026-01-01T00:00:${String(counter).padStart(2, "0")}.000Z`),
     waitForHostIdentity: async () => {}, cancellationResultGraceMs: 20, cancellationEofGraceMs: 20,
@@ -52,7 +53,7 @@ const a=process.argv.slice(2);if(a[0]==='where')console.log(JSON.stringify({pref
   };
   const instances: Array<{ tools: ToolDefinition[]; handlers: Map<string, Function[]>; commands: Map<string, any>; renderers: Map<string, Function>; call(name: string, params: any): Promise<any>; event(name: string, event?: any): Promise<void> }> = [];
   const createInstance = async () => {
-    const context = Object.create(baseContext) as ExtensionContext; Object.defineProperty(context, "sessionManager", { get: () => activeSession });
+    const context = Object.create(baseContext) as ExtensionToolContext; Object.defineProperty(context, "sessionManager", { get: () => activeSession });
     const tools: ToolDefinition[] = []; const handlers = new Map<string, Function[]>(); const commands = new Map<string, any>(); const renderers = new Map<string, Function>();
     const api = { registerTool(tool: ToolDefinition) { tools.push(tool); }, registerCommand(name: string, command: any) { commands.set(name, command); }, registerMessageRenderer(name: string, renderer: Function) { renderers.set(name, renderer); }, on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); }, sendMessage(message: any) { messageAttempts.push(message); messages.push(message); } } as unknown as ExtensionAPI;
     registerWorkerExtension(api, dependencies);
