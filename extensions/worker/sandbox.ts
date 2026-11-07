@@ -6,12 +6,12 @@ import { promisify } from "node:util";
 import { readPiToolsJsonConfigSource, resolvePiToolsConfigReference } from "../_shared/config.js";
 import { resolveExecutable } from "../_shared/executable.js";
 import { resolveWorkerSandboxPlatform, selectWorkerSandboxRelease } from "../_shared/worker-platform.js";
+import { assertLocalWorkerImage, loadLocalWorkerImage, type LocalWorkerImage } from "../_shared/worker-local-image.js";
 import { isWorkerId } from "../_shared/worker-id.js";
 import { assertReviewWorkspaceLowerIdentity, assertReviewWorkspaceOverlay, createReviewWorkspaceOverlayAsync, planReviewWorkspaceOverlay, type ReviewWorkspaceOverlay } from "./review-workspace.js";
 
 const execFileAsync = promisify(execFile);
 const SHA256 = /^[a-f0-9]{64}$/;
-const OCI_DIGEST = /@sha256:[a-f0-9]{64}$/;
 const SANDBOX_NAME = /^pi-[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const SBX_VERSION = "v0.49.1";
 export type WorkerSandboxResources = { cpus: number; memoryGiB: number };
@@ -36,14 +36,14 @@ const SBX_UPDATE_BANNER = [
 export type WorkerSandboxMount = { source: string; readOnly?: boolean };
 export type WorkerSandboxRelease = {
   schemaVersion: 2; protocolVersion: 1; releaseOrdinal: number; status: "approved";
-  kit: { reference: string; sha256: string }; image: { reference: string; digest: string };
+  kit: { reference: string; sha256: string }; image: LocalWorkerImage;
   sandbox: { version: "v0.49.1"; buildCommit: string };
   revisions: { pi: string; profile: string; piTools: string; piDocparser: string };
   guest: { stagedLockSha256: string; piCli: string; rpcLauncher: string; codingAgentDir: string; resourceManifestSha256: string; runtimeProvenanceSha256: string; extensionPaths: string[]; searxngUrl: string };
 };
 export type WorkerSandboxReference = {
   kind: "docker-sandbox"; sandboxName: string; creationNonce: string; workerId: string; runId: string;
-  kitReference: string; kitSha256: string; imageReference: string; imageDigest: string; sbxVersion: "v0.49.1"; sbxBuildCommit: string; protocolVersion: 1; releaseOrdinal: number;
+  kitReference: string; kitSha256: string; imageReference: string; imageDigest: string; imageArchive: string; imageArchiveSha256: string; sbxVersion: "v0.49.1"; sbxBuildCommit: string; protocolVersion: 1; releaseOrdinal: number;
   workspaceRoot: string; workspaceDevice?: number; workspaceInode?: number; workspaceOwnerUid?: number; workspaceOwnerGid?: number; workingDirectory: string; codeRoot: string; mounts: WorkerSandboxMount[]; reviewOverlay?: ReviewWorkspaceOverlay; piCli: string; rpcLauncher: string; codingAgentDir: string;
   stagedLockSha256: string; resourceManifestSha256: string; runtimeProvenanceSha256: string; extensionPaths: string[]; searxngUrl: string; revisions: WorkerSandboxRelease["revisions"];
   requestedCpu?: number; requestedMemoryGiB?: number;
@@ -58,7 +58,9 @@ export function readApprovedWorkerSandboxRelease(): WorkerSandboxRelease {
   if (value.schemaVersion !== 2 || value.protocolVersion !== 1 || !Number.isSafeInteger(releaseOrdinal) || releaseOrdinal! < 1 || value.status !== "approved") throw new Error(`Worker Sandbox runtime for ${platform} is not an approved schemaVersion 2 release.`);
   const kit = value.kit; const image = value.image; const sandbox = value.sandbox; const revisions = value.revisions; const guest = value.guest;
   if (!kit || typeof kit.reference !== "string" || !SHA256.test(String(kit.sha256))) throw new Error("Worker Sandbox release requires an exact kit reference and SHA-256.");
-  if (!image || typeof image.reference !== "string" || !OCI_DIGEST.test(image.reference) || !SHA256.test(String(image.digest)) || !image.reference.endsWith(`@sha256:${image.digest}`)) throw new Error("Worker Sandbox release image must be an exact matching OCI digest reference.");
+  assertLocalWorkerImage(image);
+  const archive = resolvePiToolsConfigReference(image.archive.reference, config.path);
+  if (archive instanceof URL) throw new Error("Worker image archives must be local files; downloads are forbidden.");
   if (!sandbox || sandbox.version !== SBX_VERSION || !/^[a-f0-9]{40}$/.test(String(sandbox.buildCommit)) || Object.hasOwn(sandbox, "template")) throw new Error("Worker Sandbox release requires exact sbx v0.49.1 identity without template-store state.");
   if (!revisions || ![revisions.pi, revisions.profile, revisions.piTools, revisions.piDocparser].every((revision) => typeof revision === "string" && /^[a-f0-9]{40}$/.test(revision))) throw new Error("Worker Sandbox release revisions must be exact 40-character commits.");
   if (!guest || !SHA256.test(String(guest.stagedLockSha256)) || !path.posix.isAbsolute(String(guest.piCli)) || !path.posix.isAbsolute(String(guest.rpcLauncher)) || guest.codingAgentDir !== "/run/pi-worker/agent" || !SHA256.test(String(guest.resourceManifestSha256)) || !SHA256.test(String(guest.runtimeProvenanceSha256)) || !Array.isArray(guest.extensionPaths) || guest.extensionPaths.length < 1 || !guest.extensionPaths.every((item) => typeof item === "string" && isImmutableGuestExtensionPath(item)) || new Set(guest.extensionPaths).size !== guest.extensionPaths.length || typeof guest.searxngUrl !== "string" || !isCredentialFreeHttpUrl(guest.searxngUrl)) throw new Error("Worker Sandbox release guest paths and resource manifest are invalid.");
@@ -67,7 +69,7 @@ export function readApprovedWorkerSandboxRelease(): WorkerSandboxRelease {
   const kitReference = realpathSync(resolved);
   if (hashDirectory(kitReference) !== kit.sha256) throw new Error("Worker Sandbox kit content does not match the approved SHA-256.");
   assertKitImageReference(kitReference, image.reference);
-  return { schemaVersion: 2, protocolVersion: 1, releaseOrdinal: releaseOrdinal!, status: "approved", kit: { reference: kitReference, sha256: kit.sha256 }, image: { reference: image.reference, digest: image.digest }, sandbox: { version: SBX_VERSION, buildCommit: sandbox.buildCommit }, revisions: { ...revisions }, guest: { ...guest, extensionPaths: [...guest.extensionPaths] } };
+  return { schemaVersion: 2, protocolVersion: 1, releaseOrdinal: releaseOrdinal!, status: "approved", kit: { reference: kitReference, sha256: kit.sha256 }, image: { ...image, archive: { reference: archive, sha256: image.archive.sha256 } }, sandbox: { version: SBX_VERSION, buildCommit: sandbox.buildCommit }, revisions: { ...revisions }, guest: { ...guest, extensionPaths: [...guest.extensionPaths] } };
 }
 
 export function resolveWorkerSandboxResources(value?: WorkerSandboxResourceRequest): WorkerSandboxResources {
@@ -94,7 +96,7 @@ export function planWorkerSandbox(input: { workerId: string; runId: string; crea
   const workingDirectory = reviewOverlay?.mergedDirectory ?? realpathSync(input.workingDirectory ?? workspaceRoot);
   if (!reviewOverlay && !pathWithin(workspaceRoot, workingDirectory)) throw new Error("Worker Sandbox working directory must remain beneath its worker root.");
   const mounts = deduplicateMounts([...input.mounts, ...(reviewOverlay ? [{ source: reviewOverlay.lowerDirectory, readOnly: true }] : [])].map((mount) => ({ source: realpathSync(mount.source), ...(mount.readOnly ? { readOnly: true } : {}) })));
-  const reference: WorkerSandboxReference = { kind: "docker-sandbox", sandboxName, creationNonce: input.creationNonce, workerId: input.workerId, runId: input.runId, kitReference: release.kit.reference, kitSha256: release.kit.sha256, imageReference: release.image.reference, imageDigest: release.image.digest, sbxVersion: release.sandbox.version, sbxBuildCommit: release.sandbox.buildCommit, protocolVersion: release.protocolVersion, releaseOrdinal: release.releaseOrdinal, workspaceRoot, workspaceDevice: Number(workspace.dev), workspaceInode: Number(workspace.ino), workspaceOwnerUid: Number(workspace.uid), workspaceOwnerGid: Number(workspace.gid), workingDirectory, codeRoot, mounts, ...(reviewOverlay ? { reviewOverlay } : {}), piCli: release.guest.piCli, rpcLauncher: release.guest.rpcLauncher, codingAgentDir: release.guest.codingAgentDir, stagedLockSha256: release.guest.stagedLockSha256, resourceManifestSha256: release.guest.resourceManifestSha256, runtimeProvenanceSha256: release.guest.runtimeProvenanceSha256, extensionPaths: [...release.guest.extensionPaths], searxngUrl: release.guest.searxngUrl, revisions: { ...release.revisions }, requestedCpu: resources.cpus, requestedMemoryGiB: resources.memoryGiB };
+  const reference: WorkerSandboxReference = { kind: "docker-sandbox", sandboxName, creationNonce: input.creationNonce, workerId: input.workerId, runId: input.runId, kitReference: release.kit.reference, kitSha256: release.kit.sha256, imageReference: release.image.reference, imageDigest: release.image.digest, imageArchive: release.image.archive.reference, imageArchiveSha256: release.image.archive.sha256, sbxVersion: release.sandbox.version, sbxBuildCommit: release.sandbox.buildCommit, protocolVersion: release.protocolVersion, releaseOrdinal: release.releaseOrdinal, workspaceRoot, workspaceDevice: Number(workspace.dev), workspaceInode: Number(workspace.ino), workspaceOwnerUid: Number(workspace.uid), workspaceOwnerGid: Number(workspace.gid), workingDirectory, codeRoot, mounts, ...(reviewOverlay ? { reviewOverlay } : {}), piCli: release.guest.piCli, rpcLauncher: release.guest.rpcLauncher, codingAgentDir: release.guest.codingAgentDir, stagedLockSha256: release.guest.stagedLockSha256, resourceManifestSha256: release.guest.resourceManifestSha256, runtimeProvenanceSha256: release.guest.runtimeProvenanceSha256, extensionPaths: [...release.guest.extensionPaths], searxngUrl: release.guest.searxngUrl, revisions: { ...release.revisions }, requestedCpu: resources.cpus, requestedMemoryGiB: resources.memoryGiB };
   assertWorkerSandboxReference(reference); return reference;
 }
 
@@ -106,11 +108,12 @@ export async function createWorkerSandboxAsync(sbxPath: string, reference: Worke
   const version = await execFileAsync(sbxPath, ["version"], { encoding: "utf8", maxBuffer: 64 * 1024, timeout: 5_000 });
   const observedVersion = parseSbxVersion(version.stdout);
   if (observedVersion.version !== reference.sbxVersion || observedVersion.buildCommit !== reference.sbxBuildCommit) throw new Error(`Docker Sandbox version mismatch: expected ${reference.sbxVersion} ${reference.sbxBuildCommit}, received ${version.stdout.trim() || "no output"}.`);
+  await loadLocalWorkerImage(sbxPath, reference.imageArchive, reference.imageArchiveSha256);
   const resources = referenceResources(reference, true);
   const memoryLimit = `${resources.memoryGiB}g`;
   const memoryLimitBytes = resources.memoryGiB * 1024 ** 3;
   const minimumEffectiveMemoryBytes = Math.floor(memoryLimitBytes * 0.9);
-  const args = ["create", "--name", reference.sandboxName, "--memory", memoryLimit, "--cpus", String(resources.cpus), "--pull", "always", reference.kitReference, reference.workspaceRoot, `${reference.codeRoot}:ro`, ...reference.mounts.map((mount) => `${mount.source}:ro`)];
+  const args = ["create", "--name", reference.sandboxName, "--memory", memoryLimit, "--cpus", String(resources.cpus), "--pull", "never", reference.kitReference, reference.workspaceRoot, `${reference.codeRoot}:ro`, ...reference.mounts.map((mount) => `${mount.source}:ro`)];
   const { stdout, stderr } = await execFileAsync(sbxPath, args, { encoding: "utf8", maxBuffer: 1024 * 1024, timeout: 120_000 });
   const inspected = await execFileAsync(sbxPath, ["inspect", reference.sandboxName, "--json"], { encoding: "utf8", maxBuffer: 1024 * 1024, timeout: 5_000 });
   const inspectIdentity = parseObservedSandboxInspect(inspected.stdout, reference.sandboxName);
@@ -220,8 +223,10 @@ function referenceResources(reference: WorkerSandboxReference, required: boolean
 }
 
 export function assertWorkerSandboxReference(value: WorkerSandboxReference): void {
+  assertLocalWorkerImage({ reference: value.imageReference, digest: value.imageDigest, archive: { reference: value.imageArchive, sha256: value.imageArchiveSha256 } });
+  if (!path.isAbsolute(value.imageArchive)) throw new Error("Worker image archives require an absolute local path.");
   const revisions = value.revisions;
-  if (value.kind !== "docker-sandbox" || !SANDBOX_NAME.test(value.sandboxName) || !isWorkerId(value.workerId) || !/^run_[A-Za-z0-9_-]+$/.test(value.runId) || !/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value.creationNonce) || !SHA256.test(value.kitSha256) || !OCI_DIGEST.test(value.imageReference) || !SHA256.test(value.imageDigest) || !value.imageReference.endsWith(`@sha256:${value.imageDigest}`) || value.protocolVersion !== 1 || !Number.isSafeInteger(value.releaseOrdinal) || value.releaseOrdinal < 1 || !SHA256.test(value.stagedLockSha256) || !SHA256.test(value.resourceManifestSha256) || !SHA256.test(value.runtimeProvenanceSha256) || value.sbxVersion !== SBX_VERSION || !/^[a-f0-9]{40}$/.test(value.sbxBuildCommit) || !Array.isArray(value.extensionPaths) || value.extensionPaths.length < 1 || !value.extensionPaths.every(isImmutableGuestExtensionPath) || new Set(value.extensionPaths).size !== value.extensionPaths.length || typeof value.searxngUrl !== "string" || !isCredentialFreeHttpUrl(value.searxngUrl) || !revisions || ![revisions.pi, revisions.profile, revisions.piTools, revisions.piDocparser].every((item) => /^[a-f0-9]{40}$/.test(item))) throw new Error("Invalid exact Worker Sandbox reference.");
+  if (value.kind !== "docker-sandbox" || !SANDBOX_NAME.test(value.sandboxName) || !isWorkerId(value.workerId) || !/^run_[A-Za-z0-9_-]+$/.test(value.runId) || !/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value.creationNonce) || !SHA256.test(value.kitSha256) || value.protocolVersion !== 1 || !Number.isSafeInteger(value.releaseOrdinal) || value.releaseOrdinal < 1 || !SHA256.test(value.stagedLockSha256) || !SHA256.test(value.resourceManifestSha256) || !SHA256.test(value.runtimeProvenanceSha256) || value.sbxVersion !== SBX_VERSION || !/^[a-f0-9]{40}$/.test(value.sbxBuildCommit) || !Array.isArray(value.extensionPaths) || value.extensionPaths.length < 1 || !value.extensionPaths.every(isImmutableGuestExtensionPath) || new Set(value.extensionPaths).size !== value.extensionPaths.length || typeof value.searxngUrl !== "string" || !isCredentialFreeHttpUrl(value.searxngUrl) || !revisions || ![revisions.pi, revisions.profile, revisions.piTools, revisions.piDocparser].every((item) => /^[a-f0-9]{40}$/.test(item))) throw new Error("Invalid exact Worker Sandbox reference.");
   if (!value.sandboxName.endsWith(`-${value.creationNonce}`)) throw new Error("Worker Sandbox name does not retain its full creation nonce.");
   const resourcesAbsent = value.requestedCpu === undefined && value.requestedMemoryGiB === undefined;
   if ((value.requestedCpu === undefined) !== (value.requestedMemoryGiB === undefined)) throw new Error("Invalid partial Worker Sandbox resource request.");
@@ -269,5 +274,5 @@ function parseSbxVersion(output: string): { version: string; buildCommit: string
 function parseSbxJson(output: string, label: string): unknown { const suffix=`\n${SBX_UPDATE_BANNER}\n\n`; const prefix=output.slice(0, -suffix.length); const json=output.endsWith(suffix) && prefix.endsWith("\n") ? prefix : output; try { return JSON.parse(json); } catch { throw new Error(`Sandbox ${label} JSON was malformed or had unrecognized stdout contamination.`); } }
 function deduplicateMounts(mounts: WorkerSandboxMount[]): WorkerSandboxMount[] { const seen = new Set<string>(); const result: WorkerSandboxMount[] = []; for (const mount of mounts) { const key = `${mount.source}\0${mount.readOnly ? "ro" : "rw"}`; if (seen.has(key)) continue; seen.add(key); result.push(mount); } return result; }
 function revalidateWorkerSandboxKit(reference: WorkerSandboxReference): void { const exact = realpathSync(reference.kitReference); if (exact !== reference.kitReference || hashDirectory(exact) !== reference.kitSha256) throw new Error("Worker Sandbox kit changed after planning."); assertKitImageReference(exact, reference.imageReference); }
-function assertKitImageReference(directory: string, expected: string): void { const spec = readFileSync(path.join(directory, "spec.yaml"), "utf8"); const images = [...spec.matchAll(/^\s{2}image:\s*([^#\s]+)\s*(?:#.*)?$/gm)].map((match) => match[1]!); if (images.length !== 1 || images[0] !== expected) throw new Error("Worker Sandbox kit image does not match the approved immutable OCI reference."); }
+function assertKitImageReference(directory: string, expected: string): void { const spec = readFileSync(path.join(directory, "spec.yaml"), "utf8"); const images = [...spec.matchAll(/^\s{2}image:\s*([^#\s]+)\s*(?:#.*)?$/gm)].map((match) => match[1]!); if (images.length !== 1 || images[0] !== expected) throw new Error("Worker Sandbox kit image does not match the approved archive-bound local reference."); }
 function hashDirectory(directory: string): string { const files: string[] = []; const visit = (current: string) => { for (const entry of readdirSync(current, { withFileTypes: true })) { const value = path.join(current, entry.name); if (entry.isSymbolicLink()) throw new Error(`Worker Sandbox kit may not contain symlinks: ${value}`); if (entry.isDirectory()) visit(value); else if (entry.isFile()) files.push(value); else throw new Error(`Worker Sandbox kit contains unsupported entry: ${value}`); } }; visit(directory); const hash = createHash("sha256"); for (const file of files.sort()) { if (!statSync(file).isFile()) throw new Error(`Worker Sandbox kit entry changed type: ${file}`); hash.update(path.relative(directory, file)); hash.update("\0"); hash.update(readFileSync(file)); hash.update("\0"); } return hash.digest("hex"); }

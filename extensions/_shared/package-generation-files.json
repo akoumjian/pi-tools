@@ -21,6 +21,7 @@
     "extensions/_shared/worker-host-job.ts",
     "extensions/_shared/worker-id.ts",
     "extensions/_shared/worker-job-settlement.js",
+    "extensions/_shared/worker-local-image.js",
     "extensions/_shared/worker-platform.js",
     "extensions/_shared/worker-rpc-prompt.js",
     "extensions/_shared/workspace-sandbox.ts",

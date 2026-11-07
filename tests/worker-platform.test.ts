@@ -16,13 +16,13 @@ test("approved loader verifies the selected Kit and never substitutes an approve
     process.env.PI_TOOLS_CONFIG_DIR = root;
     const entry = (arch: string, digest: string) => {
       mkdirSync(path.join(root, arch));
-      const image = `example.invalid/worker@sha256:${digest}`;
+      const image = `pi-managed-worker:sha256-${digest}`;
       const spec = `sandbox:\n  image: ${image}\n`;
       writeFileSync(path.join(root, arch, "spec.yaml"), spec);
       return {
         schemaVersion: 2, protocolVersion: 1, releaseOrdinal: 9, status: "approved",
         kit: { reference: arch, sha256: createHash("sha256").update(`spec.yaml\0${spec}\0`).digest("hex") },
-        image: { reference: image, digest },
+        image: { reference: image, digest, archive: { reference: `${arch}.tar`, sha256: digest } },
         sandbox: { version: "v0.49.1", buildCommit: "1".repeat(40) },
         revisions: { pi: "1".repeat(40), profile: "2".repeat(40), piTools: "3".repeat(40), piDocparser: "4".repeat(40) },
         guest: { stagedLockSha256: digest, piCli: "/usr/local/bin/pi", rpcLauncher: "/opt/pi-worker/launch.mjs", codingAgentDir: "/run/pi-worker/agent", resourceManifestSha256: digest, runtimeProvenanceSha256: digest, extensionPaths: ["/opt/pi-tools/extensions/worker/runtime.ts"], searxngUrl: "http://host.docker.internal:18888" },
@@ -37,6 +37,7 @@ test("approved loader verifies the selected Kit and never substitutes an approve
       Object.defineProperty(process, "arch", { ...beforeArch, value: arch });
       const actual = readApprovedWorkerSandboxRelease();
       assert.equal(actual.image.digest, expected.image.digest);
+      assert.equal(actual.image.archive.reference, path.join(root, expected.image.archive.reference));
       assert.equal(actual.kit.reference, path.join(root, expected.kit.reference));
       assert.deepEqual(actual.guest, expected.guest);
     }
