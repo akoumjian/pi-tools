@@ -99,6 +99,7 @@ export function planWorkerSandbox(input: { workerId: string; runId: string; crea
 }
 
 export async function createWorkerSandboxAsync(sbxPath: string, reference: WorkerSandboxReference): Promise<WorkerSandboxReference> {
+  const expectedPlatform = resolveWorkerSandboxPlatform();
   assertWorkerSandboxReference(reference);
   revalidateWorkerSandboxKit(reference);
   if (reference.reviewOverlay) assertReviewWorkspaceLowerIdentity(reference.reviewOverlay);
@@ -133,7 +134,6 @@ printf 'PI_WORKER_RUNTIME_ROOT_V1\n'`;
   const runtimeRoot = await execFileAsync(sbxPath, ["exec", "--user", "root", reference.sandboxName, "/usr/bin/env", "-u", "BASH_ENV", "-u", "ENV", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "/bin/sh", "-ceu", runtimeRootScript, "pi-worker-runtime-root", path.posix.dirname(reference.codingAgentDir)], { encoding: "utf8", maxBuffer: 64 * 1024, timeout: 10_000 });
   if (runtimeRoot.stdout !== "PI_WORKER_RUNTIME_ROOT_V1\n") throw new Error("Sandbox private runtime root setup returned unexpected output.");
   const reviewOverlay = reference.reviewOverlay ? await createReviewWorkspaceOverlayAsync(sbxPath, reference.sandboxName, reference.reviewOverlay) : undefined;
-  const expectedPlatform = resolveWorkerSandboxPlatform();
   const resourceScript = "node -e 'console.log(\"platform=\" + process.platform + \"/\" + (process.arch === \"x64\" ? \"amd64\" : process.arch))'; cpu=$(getconf _NPROCESSORS_ONLN); memoryKb=$(awk '/MemTotal:/ {print $2}' /proc/meminfo); runtime=$(cat /opt/pi-worker/runtime-provenance.json); resource=$(cat /opt/pi-worker/resource-manifest.sha256); printf 'cpu=%s\\nmemoryBytes=%s\\nruntime=%s\\nresource=%s\\n' \"$cpu\" \"$((memoryKb*1024))\" \"$runtime\" \"$resource\"";
   const observed = await execFileAsync(sbxPath, ["exec", "--workdir", reference.workingDirectory, reference.sandboxName, "/bin/sh", "-c", resourceScript], { encoding: "utf8", maxBuffer: 64 * 1024, timeout: 10_000 });
   const cpu = observed.stdout.match(/^cpu=(\d+)$/m)?.[1]; const memory = observed.stdout.match(/^memoryBytes=(\d+)$/m)?.[1]; const resource = observed.stdout.match(/^resource=([a-f0-9]{64})$/m)?.[1]; const runtimeText = observed.stdout.match(/^runtime=(\{.*\})$/m)?.[1];
