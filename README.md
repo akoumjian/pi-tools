@@ -142,6 +142,8 @@ Each extension below documents what it does, what it provides, and how to set it
 
 **Purpose.** Run durable sandboxed work, independent review, and conflict integration while the parent retains grounding, acceptance, validation, authoritative mutation, publication, and task closure.
 
+The profile's `worker-sandbox-runtime.json` must use schema 3 with independent `platforms["linux/arm64"]` and/or `platforms["linux/amd64"]` release entries. Native Apple Silicon/macOS and Linux ARM64 select ARM64; Linux x64 selects AMD64. Each selected entry still requires the complete approved schema-2 release, immutable image/Kit hashes, and exact runtime provenance. Unsupported hosts, unavailable/unapproved native releases, and observed guest architecture mismatches fail clearly; no architecture is substituted. Upgrade the profile and tools together, then fully restart Pi.
+
 **Provides.** `worker_run`, `worker_control`, `worker_merge_test`, `worker_merge_apply`; worker-only `worker_result_submit` and `worker_beads_tasks` (including digest-fenced canonical Beads design continuation); trusted width-bounded operation hints plus compact exact-session `wN` worker activity beside direct-shell `shN`; `/worker:list`, `/worker:show`, `/worker:view`, `/worker:logs`, `/worker:cancel`, and `/worker:discard`.
 
 **Setup.** Node 22.19+, Pi, Docker Desktop or a rootful Docker Engine, Docker `sbx`, an approved immutable worker kit/image manifest, central `bd`, and role model preferences in `config/worker-settings.json`.

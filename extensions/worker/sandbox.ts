@@ -5,6 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { readPiToolsJsonConfigSource, resolvePiToolsConfigReference } from "../_shared/config.js";
 import { resolveExecutable } from "../_shared/executable.js";
+import { resolveWorkerSandboxPlatform, selectWorkerSandboxRelease } from "../_shared/worker-platform.js";
 import { isWorkerId } from "../_shared/worker-id.js";
 import { assertReviewWorkspaceLowerIdentity, assertReviewWorkspaceOverlay, createReviewWorkspaceOverlayAsync, planReviewWorkspaceOverlay, type ReviewWorkspaceOverlay } from "./review-workspace.js";
 
@@ -52,7 +53,7 @@ export type WorkerSandboxReference = {
 export function readApprovedWorkerSandboxRelease(): WorkerSandboxRelease {
   const config = readPiToolsJsonConfigSource("worker-sandbox-runtime.json", import.meta.url);
   if (!config) throw new Error("Managed workers require worker-sandbox-runtime.json from an approved profile release.");
-  const value = config.data as Partial<WorkerSandboxRelease>; const releaseOrdinal = value.releaseOrdinal;
+  const value = selectWorkerSandboxRelease(config.data) as Partial<WorkerSandboxRelease>; const releaseOrdinal = value.releaseOrdinal;
   if (value.schemaVersion !== 2 || value.protocolVersion !== 1 || !Number.isSafeInteger(releaseOrdinal) || releaseOrdinal! < 1 || value.status !== "approved") throw new Error("Worker Sandbox runtime is not an approved schemaVersion 2 release.");
   const kit = value.kit; const image = value.image; const sandbox = value.sandbox; const revisions = value.revisions; const guest = value.guest;
   if (!kit || typeof kit.reference !== "string" || !SHA256.test(String(kit.sha256))) throw new Error("Worker Sandbox release requires an exact kit reference and SHA-256.");
@@ -131,9 +132,12 @@ printf 'PI_WORKER_RUNTIME_ROOT_V1\n'`;
   const runtimeRoot = await execFileAsync(sbxPath, ["exec", "--user", "root", reference.sandboxName, "/usr/bin/env", "-u", "BASH_ENV", "-u", "ENV", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "/bin/sh", "-ceu", runtimeRootScript, "pi-worker-runtime-root", path.posix.dirname(reference.codingAgentDir)], { encoding: "utf8", maxBuffer: 64 * 1024, timeout: 10_000 });
   if (runtimeRoot.stdout !== "PI_WORKER_RUNTIME_ROOT_V1\n") throw new Error("Sandbox private runtime root setup returned unexpected output.");
   const reviewOverlay = reference.reviewOverlay ? await createReviewWorkspaceOverlayAsync(sbxPath, reference.sandboxName, reference.reviewOverlay) : undefined;
-  const resourceScript = "cpu=$(getconf _NPROCESSORS_ONLN); memoryKb=$(awk '/MemTotal:/ {print $2}' /proc/meminfo); runtime=$(cat /opt/pi-worker/runtime-provenance.json); resource=$(cat /opt/pi-worker/resource-manifest.sha256); printf 'cpu=%s\\nmemoryBytes=%s\\nruntime=%s\\nresource=%s\\n' \"$cpu\" \"$((memoryKb*1024))\" \"$runtime\" \"$resource\"";
+  const expectedPlatform = resolveWorkerSandboxPlatform();
+  const resourceScript = "node -e 'console.log(\"platform=\" + process.platform + \"/\" + (process.arch === \"x64\" ? \"amd64\" : process.arch))'; cpu=$(getconf _NPROCESSORS_ONLN); memoryKb=$(awk '/MemTotal:/ {print $2}' /proc/meminfo); runtime=$(cat /opt/pi-worker/runtime-provenance.json); resource=$(cat /opt/pi-worker/resource-manifest.sha256); printf 'cpu=%s\\nmemoryBytes=%s\\nruntime=%s\\nresource=%s\\n' \"$cpu\" \"$((memoryKb*1024))\" \"$runtime\" \"$resource\"";
   const observed = await execFileAsync(sbxPath, ["exec", "--workdir", reference.workingDirectory, reference.sandboxName, "/bin/sh", "-c", resourceScript], { encoding: "utf8", maxBuffer: 64 * 1024, timeout: 10_000 });
   const cpu = observed.stdout.match(/^cpu=(\d+)$/m)?.[1]; const memory = observed.stdout.match(/^memoryBytes=(\d+)$/m)?.[1]; const resource = observed.stdout.match(/^resource=([a-f0-9]{64})$/m)?.[1]; const runtimeText = observed.stdout.match(/^runtime=(\{.*\})$/m)?.[1];
+  const observedPlatform = observed.stdout.match(/^platform=(\S+)$/m)?.[1];
+  if (observedPlatform !== expectedPlatform) throw new Error(`Sandbox native platform mismatch: expected ${expectedPlatform}, received ${observedPlatform ?? "no platform evidence"}.`);
   const observedCpu = Number(cpu); const observedMemoryBytes = Number(memory);
   if (!cpu || !memory || !Number.isSafeInteger(observedCpu) || !Number.isSafeInteger(observedMemoryBytes) || resource !== reference.resourceManifestSha256 || !runtimeText) throw new Error("Sandbox did not report its exact approved resources and effective allocation.");
   if (observedCpu !== resources.cpus || observedMemoryBytes < minimumEffectiveMemoryBytes || observedMemoryBytes > memoryLimitBytes) throw new Error(`Sandbox effective allocation violates the requested ${resources.cpus}-CPU/${memoryLimit} limit.`);
