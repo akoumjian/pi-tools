@@ -53,8 +53,9 @@ export type WorkerSandboxReference = {
 export function readApprovedWorkerSandboxRelease(): WorkerSandboxRelease {
   const config = readPiToolsJsonConfigSource("worker-sandbox-runtime.json", import.meta.url);
   if (!config) throw new Error("Managed workers require worker-sandbox-runtime.json from an approved profile release.");
-  const value = selectWorkerSandboxRelease(config.data) as Partial<WorkerSandboxRelease>; const releaseOrdinal = value.releaseOrdinal;
-  if (value.schemaVersion !== 2 || value.protocolVersion !== 1 || !Number.isSafeInteger(releaseOrdinal) || releaseOrdinal! < 1 || value.status !== "approved") throw new Error("Worker Sandbox runtime is not an approved schemaVersion 2 release.");
+  const platform = resolveWorkerSandboxPlatform();
+  const value = selectWorkerSandboxRelease(config.data, platform) as Partial<WorkerSandboxRelease>; const releaseOrdinal = value.releaseOrdinal;
+  if (value.schemaVersion !== 2 || value.protocolVersion !== 1 || !Number.isSafeInteger(releaseOrdinal) || releaseOrdinal! < 1 || value.status !== "approved") throw new Error(`Worker Sandbox runtime for ${platform} is not an approved schemaVersion 2 release.`);
   const kit = value.kit; const image = value.image; const sandbox = value.sandbox; const revisions = value.revisions; const guest = value.guest;
   if (!kit || typeof kit.reference !== "string" || !SHA256.test(String(kit.sha256))) throw new Error("Worker Sandbox release requires an exact kit reference and SHA-256.");
   if (!image || typeof image.reference !== "string" || !OCI_DIGEST.test(image.reference) || !SHA256.test(String(image.digest)) || !image.reference.endsWith(`@sha256:${image.digest}`)) throw new Error("Worker Sandbox release image must be an exact matching OCI digest reference.");
