@@ -86,9 +86,9 @@ export function planWorkerSandbox(input: { workerId: string; runId: string; crea
   if (!isWorkerId(input.workerId) || !/^run_[A-Za-z0-9_-]+$/.test(input.runId)) throw new Error("Invalid Worker Sandbox identity.");
   if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(input.creationNonce)) throw new Error("Invalid Worker Sandbox creation nonce.");
   const release = input.release ?? readApprovedWorkerSandboxRelease();
+  assertLocalWorkerImage(release.image);
   const resources = resolveWorkerSandboxResources(input.resources);
-  const identityHash = createHash("sha256").update(`${input.workerId}\0${input.runId}`).digest("hex").slice(0, 20);
-  const sandboxName = `pi-${identityHash}-${input.creationNonce}`;
+  const sandboxName = workerSandboxName(input.workerId, input.runId, input.creationNonce);
   if (!SANDBOX_NAME.test(sandboxName)) throw new Error("Invalid Worker Sandbox name.");
   const workspaceRoot = realpathSync(input.workerRoot); const workspace = statSync(workspaceRoot); const codeRoot = realpathSync(input.codeRoot);
   if (!workspace.isDirectory() || ![workspace.dev, workspace.ino, workspace.uid, workspace.gid].every((value) => Number.isSafeInteger(value) && value >= 0)) throw new Error("Worker Sandbox root identity or host ownership is invalid.");
@@ -155,7 +155,10 @@ printf 'PI_WORKER_RUNTIME_ROOT_V1\n'`;
 }
 
 export async function settleWorkerSandboxAsync(sbxPath: string, reference: WorkerSandboxReference): Promise<void> {
-  assertWorkerSandboxReference(reference);
+  // Retained runtime-v4 records from before local archives have the same exact
+  // containment identity but a registry-shaped image. Removal must stay able
+  // to stop that exact Sandbox without making the legacy image launchable.
+  assertWorkerSandboxRemovalReference(reference);
   const ownership = workspaceOwnership(reference);
   let normalizationError: unknown;
   if (reference.reviewOverlay && ownership && process.platform === "linux") {
@@ -225,9 +228,13 @@ function referenceResources(reference: WorkerSandboxReference, required: boolean
 export function assertWorkerSandboxReference(value: WorkerSandboxReference): void {
   assertLocalWorkerImage({ reference: value.imageReference, digest: value.imageDigest, archive: { reference: value.imageArchive, sha256: value.imageArchiveSha256 } });
   if (!path.isAbsolute(value.imageArchive)) throw new Error("Worker image archives require an absolute local path.");
+  assertWorkerSandboxRemovalReference(value);
+}
+
+function assertWorkerSandboxRemovalReference(value: WorkerSandboxReference): void {
   const revisions = value.revisions;
   if (value.kind !== "docker-sandbox" || !SANDBOX_NAME.test(value.sandboxName) || !isWorkerId(value.workerId) || !/^run_[A-Za-z0-9_-]+$/.test(value.runId) || !/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value.creationNonce) || !SHA256.test(value.kitSha256) || value.protocolVersion !== 1 || !Number.isSafeInteger(value.releaseOrdinal) || value.releaseOrdinal < 1 || !SHA256.test(value.stagedLockSha256) || !SHA256.test(value.resourceManifestSha256) || !SHA256.test(value.runtimeProvenanceSha256) || value.sbxVersion !== SBX_VERSION || !/^[a-f0-9]{40}$/.test(value.sbxBuildCommit) || !Array.isArray(value.extensionPaths) || value.extensionPaths.length < 1 || !value.extensionPaths.every(isImmutableGuestExtensionPath) || new Set(value.extensionPaths).size !== value.extensionPaths.length || typeof value.searxngUrl !== "string" || !isCredentialFreeHttpUrl(value.searxngUrl) || !revisions || ![revisions.pi, revisions.profile, revisions.piTools, revisions.piDocparser].every((item) => /^[a-f0-9]{40}$/.test(item))) throw new Error("Invalid exact Worker Sandbox reference.");
-  if (!value.sandboxName.endsWith(`-${value.creationNonce}`)) throw new Error("Worker Sandbox name does not retain its full creation nonce.");
+  if (value.sandboxName !== workerSandboxName(value.workerId, value.runId, value.creationNonce)) throw new Error("Worker Sandbox name does not retain its exact worker/run identity and full creation nonce.");
   const resourcesAbsent = value.requestedCpu === undefined && value.requestedMemoryGiB === undefined;
   if ((value.requestedCpu === undefined) !== (value.requestedMemoryGiB === undefined)) throw new Error("Invalid partial Worker Sandbox resource request.");
   if (!resourcesAbsent) referenceResources(value, true);
@@ -265,6 +272,7 @@ function observedIdentity(row: Record<string, unknown>, sandboxName: string, lab
 }
 function canonicalJson(value: unknown): string { if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`; if (value && typeof value === "object") return `{${Object.keys(value as Record<string, unknown>).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`).join(",")}}`; return JSON.stringify(value); }
 
+function workerSandboxName(workerId: string, runId: string, creationNonce: string): string { const identityHash = createHash("sha256").update(`${workerId}\0${runId}`).digest("hex").slice(0, 20); return `pi-${identityHash}-${creationNonce}`; }
 function pathWithin(root: string, candidate: string): boolean { const relative = path.relative(root, candidate); return relative === "" || relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative); }
 function pathsOverlap(left: string, right: string): boolean { const a = path.resolve(left); const b = path.resolve(right); return a === b || a.startsWith(`${b}${path.sep}`) || b.startsWith(`${a}${path.sep}`); }
 function isImmutableGuestExtensionPath(value: string): boolean { return path.posix.isAbsolute(value) && path.posix.normalize(value) === value && value.startsWith("/opt/"); }

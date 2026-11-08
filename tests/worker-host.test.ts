@@ -117,6 +117,43 @@ fi
   await writeFile(path.join(exactRelease.kit.reference,"spec.yaml"),`name: pi-worker\nservices:\n  image: ${exactRelease.image.reference}\n`); await writeFile(fake,exactFake.replace("Docker Sandboxes Update Available","unexpected banner"));await assert.rejects(createWorkerSandboxAsync(fake,planned),/Sandbox inspect JSON was malformed/);
 }));
 
+test("cleanup-only settlement removes retained registry-image Sandboxes without enabling legacy launch", async () => temp(async (root) => {
+  const workerRoot = path.join(root, "worker"), codeRoot = path.join(root, "Code"), log = path.join(root, "sbx-legacy-image.log"); await mkdir(workerRoot); await mkdir(codeRoot);
+  const planned = planWorkerSandbox({ workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_bbbbbbbb", creationNonce: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", workerRoot, codeRoot, mounts: [], release });
+  const legacy: any = { ...planned, imageReference: `docker.io/akoumjian/pi-managed-worker-image@sha256:${planned.imageDigest}` }; delete legacy.imageArchive; delete legacy.imageArchiveSha256;
+  const fake = path.join(root, "sbx-legacy-image"); await writeFile(fake, `#!/bin/sh
+printf '%s\\n' "$*" >> ${JSON.stringify(log)}
+if [ "$1" = stop ] || [ "$1" = rm ]; then :
+elif [ "$1 $2" = "ls --json" ]; then printf '[]\\n'; printf '%s' '${recordedUpdateTrailer}'
+else exit 64
+fi
+`); await chmod(fake, 0o755);
+  await settleWorkerSandboxAsync(fake, legacy);
+  const commands = await readFile(log, "utf8"); assert.match(commands, new RegExp(`stop ${legacy.sandboxName}`)); assert.match(commands, new RegExp(`rm --force ${legacy.sandboxName}`)); assert.match(commands, /ls --json/); assert.doesNotMatch(commands, /create|template load/);
+  assert.throws(() => assertWorkerSandboxReference(legacy), /content-addressed local tag/);
+  await assert.rejects(createWorkerSandboxAsync(fake, legacy), /content-addressed local tag/);
+  const legacyRelease: any = { ...release, image: { reference: legacy.imageReference, digest: legacy.imageDigest } };
+  assert.throws(() => planWorkerSandbox({ workerId: legacy.workerId, runId: legacy.runId, creationNonce: "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff", workerRoot, codeRoot, mounts: [], release: legacyRelease }), /content-addressed local tag/);
+  assert.equal(await readFile(log, "utf8"), commands, "rejected launch paths must not invoke sbx");
+}));
+
+test("settlement rejects malformed containment identities before invoking sbx", async () => temp(async (root) => {
+  const subject = path.join(root, "subject"), reviewer = path.join(root, "reviewer"), codeRoot = path.join(root, "Code"), log = path.join(root, "dangerous.log"); await mkdir(subject); await mkdir(reviewer); await mkdir(codeRoot);
+  const planned = planWorkerSandbox({ workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_bbbbbbbb", creationNonce: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", workerRoot: reviewer, codeRoot, mounts: [], reviewSubjectWorkspace: subject, release });
+  const fake = path.join(root, "sbx-dangerous"); await writeFile(fake, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(log)}\nexit 99\n`); await chmod(fake, 0o755);
+  const variants: Array<[string, any]> = [
+    ["kind", { ...planned, kind: "docker" }],
+    ["worker binding", { ...planned, workerId: "worker_20260101000000_cccccccc" }],
+    ["run binding", { ...planned, runId: "run_20260101000000_cccccccc" }],
+    ["nonce", { ...planned, creationNonce: "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff" }],
+    ["path", { ...planned, workspaceRoot: "relative/workspace" }],
+    ["overlay", { ...planned, mounts: [] }],
+    ["ownership", { ...planned, workspaceOwnerUid: -1 }],
+  ];
+  for (const [label, value] of variants) await assert.rejects(settleWorkerSandboxAsync(fake, value), (error: unknown) => { assert.ok(error instanceof Error, label); return true; });
+  assert.equal(existsSync(log), false, "malformed settlement records must not execute stop, rm, exec, or ls");
+}));
+
 test("reviewer ownership normalization excludes nested read-only mounts and verifies exact host ownership after removal", async () => temp(async (root) => {
   const subject = path.join(root, "subject"), reviewer = path.join(root, "reviewer"), context = path.join(reviewer, "run-inputs", "context"), codeRoot = path.join(root, "Code"), log = path.join(root, "sbx-review.log");
   await mkdir(subject); await mkdir(context, { recursive: true }); await mkdir(codeRoot); await writeFile(path.join(subject, "source.txt"), "authoritative\n"); await writeFile(path.join(context, "context.json"), "{}\n");
