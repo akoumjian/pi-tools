@@ -52,7 +52,8 @@ export function planReviewWorkspaceOverlay(input: { workerId: string; runId: str
 /**
  * Mount the read-only host lower through a private in-Sandbox upper/work layer.
  * Local sbx v0.49.1 root+privileged exec is mandatory; there is no copy or
- * ordinary-Docker fallback. The Sandbox itself owns and disposes every guest path.
+ * ordinary-Docker fallback. A private tmpfs bounds review writes to half of guest
+ * RAM instead of inheriting /run's 64-MiB limit. The Sandbox disposes every path.
  */
 export async function createReviewWorkspaceOverlayAsync(
   sbxPath: string,
@@ -75,7 +76,9 @@ test "$(id -u)" = 0
 test -d "$lower"
 case "$scratch:$upper:$work:$merged" in /run/pi-worker/review-overlays/*:/run/pi-worker/review-overlays/*/upper:/run/pi-worker/review-overlays/*/work:/review/subject) ;; *) exit 61 ;; esac
 rm -rf "$scratch" "$merged"
-mkdir -p "$upper" "$work" "$merged"
+mkdir -p "$scratch" "$merged"
+mount -t tmpfs -o size=50%,mode=0700,nosuid,nodev tmpfs "$scratch"
+mkdir -p "$upper" "$work"
 mount -t overlay overlay -o "lowerdir=$lower,upperdir=$upper,workdir=$work" "$merged"
 test "$(find "$upper" -mindepth 1 -print -quit)" = ""
 grep -F " $merged overlay " /proc/mounts >/dev/null
