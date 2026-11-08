@@ -8,7 +8,7 @@ import { RpcClient } from "./worker-rpc/rpc-client.js";
 import { captureAsyncJobProcessIdentity } from "../dist/worker-host/extensions/_shared/async-job-process.js";
 import { writeAtomicJson } from "../dist/worker-host/extensions/_shared/atomic-json.js";
 import { checkedWorkerPrompt, requestBoundedInjectedWorkerPrompt } from "../dist/worker-host/extensions/_shared/worker-rpc-prompt.js";
-import { executeWorkerBeadsHostRequest, executeWorkerResultHostRequest } from "../dist/worker-host/extensions/worker/runtime.js";
+import { executeWorkerBeadsHostRequest, executeWorkerResultHostRequest } from "../dist/worker-host/extensions/worker/host-runtime.js";
 
 const execFileAsync = promisify(execFile);
 const configFile = process.argv[2];
