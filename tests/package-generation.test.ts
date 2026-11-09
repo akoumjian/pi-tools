@@ -125,6 +125,7 @@ test("checked-in generation manifest covers local worker runtime imports and exc
     "extensions/_shared/atomic-json.js",
     "extensions/_shared/worker-job-settlement.js",
     "extensions/_shared/worker-rpc-prompt.js",
+    "extensions/worker/host-runtime.ts",
     "extensions/worker/index.ts",
     "extensions/worker/sandbox.ts",
     "scripts/worker-host.mjs",
@@ -144,6 +145,7 @@ test("checked-in generation manifest covers local worker runtime imports and exc
   }
 
   const discovered = discoverLocalImports([
+    "extensions/worker/host-runtime.ts",
     "extensions/worker/index.ts",
     "extensions/worker/runtime.ts",
     "extensions/async-shell/index.ts",

@@ -30,6 +30,7 @@
     "extensions/worker/cache-lineage.ts",
     "extensions/worker/cleanup.ts",
     "extensions/worker/contract.ts",
+    "extensions/worker/host-runtime.ts",
     "extensions/worker/identity.ts",
     "extensions/worker/index.ts",
     "extensions/worker/inputs.ts",
