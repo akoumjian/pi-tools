@@ -175,8 +175,9 @@ fi
   assert.doesNotMatch(commands, /exec --user root --privileged/); assert.match(commands, new RegExp(`stop ${planned.sandboxName}`)); assert.match(commands, new RegExp(`rm --force ${planned.sandboxName}`));
 }));
 
+const currentHostUid = typeof process.getuid === "function" ? process.getuid() : undefined;
 const currentHostGid = typeof process.getgid === "function" ? process.getgid() : undefined;
-const alternateHostGid = currentHostGid === undefined || typeof process.getgroups !== "function" ? undefined : process.getgroups().find((gid) => gid !== currentHostGid);
+const alternateHostGid = currentHostGid === undefined ? undefined : currentHostUid === 0 ? (currentHostGid === 65_534 ? 65_533 : 65_534) : process.getgroups?.().find((gid) => gid !== currentHostGid);
 
 test("post-removal host verification accepts an exact-UID Sandbox-mapped descendant group after guest normalization is unavailable", { skip: alternateHostGid === undefined }, async () => temp(async (root) => {
   const subject = path.join(root, "subject"), reviewer = path.join(root, "reviewer"), codeRoot = path.join(root, "Code"), log = path.join(root, "sbx-review-host-group.log");
@@ -197,11 +198,26 @@ fi
   const commands = await readFile(log, "utf8"); assert.match(commands, /^exec /m); assert.match(commands, new RegExp(`rm --force ${planned.sandboxName}`));
 }));
 
-test("reviewer ownership-normalization failure still removes the exact Sandbox and fails closed", async () => temp(async (root) => {
-  const subject = path.join(root, "subject"), reviewer = path.join(root, "reviewer"), codeRoot = path.join(root, "Code"), log = path.join(root, "sbx-review-failure.log");
+test("post-removal host verification rejects a foreign descendant UID", { skip: currentHostUid !== 0 }, async () => temp(async (root) => {
+  const subject = path.join(root, "subject"), reviewer = path.join(root, "reviewer"), codeRoot = path.join(root, "Code"); await mkdir(subject); await mkdir(reviewer); await mkdir(codeRoot);
+  const planned = planWorkerSandbox({ workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_bbbbbbbb", creationNonce: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", workerRoot: reviewer, codeRoot, mounts: [], reviewSubjectWorkspace: subject, release });
+  const foreign = path.join(reviewer, "foreign"); await writeFile(foreign, "unsafe\n"); await chown(foreign, planned.workspaceOwnerUid! + 1, planned.workspaceOwnerGid!);
+  const fake = path.join(root, "sbx-foreign-uid"); await writeFile(fake, `#!/bin/sh
+if [ "$1" = stop ] || [ "$1" = rm ]; then :
+elif [ "$1 $2" = "ls --json" ]; then printf '[]\\n'; printf '%s' '${recordedUpdateTrailer}'
+else exit 81
+fi
+`); await chmod(fake, 0o755);
+  await withPlatform("linux", () => assert.rejects(settleWorkerSandboxAsync(fake, planned), /unexpected owner UID at /));
+}));
+
+test("reviewer ownership-normalization failure still removes the exact Sandbox and fails closed", async () => temp(async (root) => {  const subject = path.join(root, "subject"), reviewer = path.join(root, "reviewer"), codeRoot = path.join(root, "Code"), log = path.join(root, "sbx-review-failure.log");
   await mkdir(subject); await mkdir(reviewer); await mkdir(codeRoot);
   const planned = planWorkerSandbox({ workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_bbbbbbbb", creationNonce: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", workerRoot: reviewer, codeRoot, mounts: [], reviewSubjectWorkspace: subject, release });
-  const mismatched = { ...planned, workspaceOwnerUid: planned.workspaceOwnerUid! + 1 };
+  const mismatchedOwners = [
+    { ...planned, workspaceOwnerUid: planned.workspaceOwnerUid! + 1 },
+    { ...planned, workspaceOwnerGid: planned.workspaceOwnerGid! + 1 },
+  ];
   const fake = path.join(root, "sbx-review-failure"); await writeFile(fake, `#!/bin/sh
 printf '%s\n' "$*" >> ${JSON.stringify(log)}
 if [ "$1" = exec ]; then exit 81
@@ -210,7 +226,7 @@ elif [ "$1 $2" = "ls --json" ]; then printf '[]\\n'; printf '%s' '${recordedUpda
 else exit 64
 fi
 `); await chmod(fake, 0o755);
-  await withPlatform("linux", () => assert.rejects(settleWorkerSandboxAsync(fake, mismatched), /Sandbox was removed.*manual repair/));
+  for (const mismatched of mismatchedOwners) await withPlatform("linux", () => assert.rejects(settleWorkerSandboxAsync(fake, mismatched), /root identity or owner changed/));
   await withPlatform("linux", () => settleWorkerSandboxAsync(fake, planned));
   const commands = await readFile(log, "utf8"); assert.match(commands, /^exec /m);
   assert.match(commands, new RegExp(`stop ${planned.sandboxName}`)); assert.match(commands, new RegExp(`rm --force ${planned.sandboxName}`));
@@ -271,7 +287,7 @@ elif [ "$1 $2" = "ls --json" ]; then printf '[]\\n'; printf '%s' '${recordedUpda
 else exit 64
 fi
 `); await chmod(fake, 0o755);
-    await withPlatform("linux", () => assert.rejects(settleWorkerSandboxAsync(fake, planned), kind === "special" ? /special file/ : /setuid or setgid/));
+    await withPlatform("linux", () => assert.rejects(settleWorkerSandboxAsync(fake, planned), kind === "special" ? /special file at / : /setuid or setgid mode bits at /));
     const commands = await readFile(log, "utf8"); assert.match(commands, new RegExp(`rm --force ${planned.sandboxName}`));
   }
 }));
