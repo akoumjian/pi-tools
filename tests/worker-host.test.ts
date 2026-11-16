@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, chown, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
@@ -175,6 +175,28 @@ fi
   assert.doesNotMatch(commands, /exec --user root --privileged/); assert.match(commands, new RegExp(`stop ${planned.sandboxName}`)); assert.match(commands, new RegExp(`rm --force ${planned.sandboxName}`));
 }));
 
+const currentHostGid = typeof process.getgid === "function" ? process.getgid() : undefined;
+const alternateHostGid = currentHostGid === undefined || typeof process.getgroups !== "function" ? undefined : process.getgroups().find((gid) => gid !== currentHostGid);
+
+test("post-removal host verification accepts an exact-UID Sandbox-mapped descendant group after guest normalization is unavailable", { skip: alternateHostGid === undefined }, async () => temp(async (root) => {
+  const subject = path.join(root, "subject"), reviewer = path.join(root, "reviewer"), codeRoot = path.join(root, "Code"), log = path.join(root, "sbx-review-host-group.log");
+  await mkdir(subject); await mkdir(reviewer); await mkdir(codeRoot);
+  const planned = planWorkerSandbox({ workerId: "worker_20260101000000_aaaaaaaa", runId: "run_20260101000000_bbbbbbbb", creationNonce: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", workerRoot: reviewer, codeRoot, mounts: [], reviewSubjectWorkspace: subject, release });
+  const mapped = path.join(reviewer, "review-report.md"); await writeFile(mapped, "approved\n"); await chown(mapped, planned.workspaceOwnerUid!, alternateHostGid!);
+  assert.equal(statSync(mapped).gid, alternateHostGid);
+  const fake = path.join(root, "sbx-review-host-group"); await writeFile(fake, `#!/bin/sh
+printf '%s\\n' "$*" >> ${JSON.stringify(log)}
+if [ "$1" = exec ]; then exit 81
+elif [ "$1" = stop ] || [ "$1" = rm ]; then :
+elif [ "$1 $2" = "ls --json" ]; then printf '[]\\n'; printf '%s' '${recordedUpdateTrailer}'
+else exit 64
+fi
+`); await chmod(fake, 0o755);
+  await withPlatform("linux", () => settleWorkerSandboxAsync(fake, planned));
+  assert.deepEqual([statSync(mapped).uid, statSync(mapped).gid], [planned.workspaceOwnerUid, alternateHostGid]);
+  const commands = await readFile(log, "utf8"); assert.match(commands, /^exec /m); assert.match(commands, new RegExp(`rm --force ${planned.sandboxName}`));
+}));
+
 test("reviewer ownership-normalization failure still removes the exact Sandbox and fails closed", async () => temp(async (root) => {
   const subject = path.join(root, "subject"), reviewer = path.join(root, "reviewer"), codeRoot = path.join(root, "Code"), log = path.join(root, "sbx-review-failure.log");
   await mkdir(subject); await mkdir(reviewer); await mkdir(codeRoot);
@@ -249,7 +271,7 @@ elif [ "$1 $2" = "ls --json" ]; then printf '[]\\n'; printf '%s' '${recordedUpda
 else exit 64
 fi
 `); await chmod(fake, 0o755);
-    await withPlatform("darwin", () => assert.rejects(settleWorkerSandboxAsync(fake, planned), kind === "special" ? /special file/ : /setuid or setgid/));
+    await withPlatform("linux", () => assert.rejects(settleWorkerSandboxAsync(fake, planned), kind === "special" ? /special file/ : /setuid or setgid/));
     const commands = await readFile(log, "utf8"); assert.match(commands, new RegExp(`rm --force ${planned.sandboxName}`));
   }
 }));

@@ -202,19 +202,19 @@ process.stdout.write("PI_REVIEW_WORKSPACE_OWNERSHIP_V2\\nuid="+uid+"\\ngid="+gid
 
 function verifyReviewWorkspaceHostOwnership(workspaceRoot: string, ownership: WorkspaceOwnership): void {
   const exactRoot = realpathSync(workspaceRoot); const first = statSync(exactRoot);
-  if (exactRoot !== workspaceRoot || !first.isDirectory() || Number(first.dev) !== ownership.device || Number(first.ino) !== ownership.inode) throw new Error("reviewer workspace root identity changed");
+  if (exactRoot !== workspaceRoot || !first.isDirectory() || Number(first.dev) !== ownership.device || Number(first.ino) !== ownership.inode || Number(first.uid) !== ownership.uid || Number(first.gid) !== ownership.gid) throw new Error("reviewer workspace root identity or owner changed");
   const stack = [exactRoot]; let count = 0;
   while (stack.length) {
     const current = stack.pop()!; if (++count > 1_000_000) throw new Error("reviewer workspace ownership verification exceeded 1000000 entries");
     const info = lstatSync(current);
     if (Number(info.dev) !== ownership.device) throw new Error(`unexpected mounted filesystem at ${current}`);
-    if (Number(info.uid) !== ownership.uid || Number(info.gid) !== ownership.gid) throw new Error(`unexpected owner at ${current}`);
+    if (Number(info.uid) !== ownership.uid) throw new Error(`unexpected owner UID at ${current}`);
     if ((info.mode & 0o6000) !== 0) throw new Error(`setuid or setgid mode bits at ${current}`);
     if (!(info.isFile() || info.isDirectory() || info.isSymbolicLink())) throw new Error(`special file at ${current}`);
     if (info.isDirectory()) for (const name of readdirSync(current)) stack.push(path.join(current, name));
   }
   const last = statSync(exactRoot);
-  if (Number(last.dev) !== ownership.device || Number(last.ino) !== ownership.inode) throw new Error("reviewer workspace root identity changed during verification");
+  if (Number(last.dev) !== ownership.device || Number(last.ino) !== ownership.inode || Number(last.uid) !== ownership.uid || Number(last.gid) !== ownership.gid) throw new Error("reviewer workspace root identity or owner changed during verification");
 }
 
 export function resolveSbxPath(): string { return resolveExecutable("sbx"); }
